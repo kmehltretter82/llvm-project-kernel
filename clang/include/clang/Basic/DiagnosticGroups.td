@@ -1187,6 +1187,21 @@ def Uninitialized  : DiagGroup<"uninitialized", [UninitializedSometimes,
                                                  UninitializedStaticSelfInit,
                                                  UninitializedConstReference,
                                                  UninitializedConstPointer]>;
+
+// Diagnostics for Linux kernel API contracts and bug patterns. Keep these
+// opt-in: their semantics are not generally true for freestanding C programs.
+def LinuxKernelBoolReturn : DiagGroup<"linux-kernel-bool-return">;
+def LinuxKernelUsercopy : DiagGroup<"linux-kernel-usercopy">;
+def LinuxKernelErrorPointer : DiagGroup<"linux-kernel-error-pointer">;
+def LinuxKernelAllocator : DiagGroup<"linux-kernel-allocator">;
+def LinuxKernelIRQ : DiagGroup<"linux-kernel-irq">;
+def LinuxKernelErrno : DiagGroup<"linux-kernel-errno">;
+def LinuxKernel : DiagGroup<"linux-kernel", [LinuxKernelBoolReturn,
+                                             LinuxKernelUsercopy,
+                                             LinuxKernelErrorPointer,
+                                             LinuxKernelAllocator,
+                                             LinuxKernelIRQ,
+                                             UninitializedMaybe]>;
 def IgnoredPragmaIntrinsic : DiagGroup<"ignored-pragma-intrinsic">;
 // #pragma optimize is often used to avoid to work around MSVC codegen bugs or
 // to disable inlining. It's not completely clear what alternative to suggest

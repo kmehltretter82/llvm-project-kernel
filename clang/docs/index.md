@@ -11,6 +11,7 @@
 
 ReleaseNotes
 UsersManual
+LinuxKernelWarnings
 Toolchain
 LanguageExtensions
 ClangCommandLineReference

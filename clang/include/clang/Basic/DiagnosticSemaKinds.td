@@ -584,6 +584,50 @@ def warn_parameter_size: Warning<
 def warn_return_value_size: Warning<
   "return value of %0 is a large (%1 bytes) pass-by-value object; "
   "pass it by reference instead?">, InGroup<LargeByValueCopy>;
+def warn_linux_kernel_bool_negative_return : Warning<
+  "negative value returned from a boolean function evaluates to true">,
+  InGroup<LinuxKernelBoolReturn>, DefaultIgnore;
+def warn_linux_kernel_usercopy_negative_test : Warning<
+  "%0 returns the number of bytes not copied, never a negative errno; test "
+  "for nonzero and convert failures to -EFAULT">,
+  InGroup<LinuxKernelUsercopy>, DefaultIgnore;
+def warn_linux_kernel_usercopy_signed_return : Warning<
+  "returning the residual byte count from %0 exposes a positive failure value "
+  "through a signed return type; convert failures to -EFAULT">,
+  InGroup<LinuxKernelUsercopy>, DefaultIgnore;
+def warn_linux_kernel_is_err_on_nullable : Warning<
+  "%0 returns NULL on failure, which %1 does not detect; test the pointer "
+  "for NULL">,
+  InGroup<LinuxKernelErrorPointer>, DefaultIgnore;
+def warn_linux_kernel_ptr_err_on_nullable : Warning<
+  "%0 returns NULL on failure, which %1 converts to success; test the pointer "
+  "for NULL and return an errno">,
+  InGroup<LinuxKernelErrorPointer>, DefaultIgnore;
+def warn_linux_kernel_null_test_on_err_ptr : Warning<
+  "%0 returns an encoded error pointer on failure, which a NULL test does not "
+  "detect; use IS_ERR()">,
+  InGroup<LinuxKernelErrorPointer>, DefaultIgnore;
+def warn_linux_kernel_err_ptr_nonnegative : Warning<
+  "call to ERR_PTR() requires a negative errno argument">,
+  InGroup<LinuxKernelErrorPointer>, DefaultIgnore;
+def warn_linux_kernel_allocator_mismatch : Warning<
+  "%0() result must not be released with %1(); use %2()">,
+  InGroup<LinuxKernelAllocator>, DefaultIgnore;
+def warn_linux_kernel_irq_boolean_test : Warning<
+  "%0() returns an IRQ number or a negative errno; a boolean test does not "
+  "detect errors; test for a negative value">,
+  InGroup<LinuxKernelIRQ>, DefaultIgnore;
+def warn_linux_kernel_irq_zero_comparison : Warning<
+  "%0() returns an IRQ number or a negative errno; compare with zero using "
+  "'< 0' or '>= 0' and preserve the returned errno">,
+  InGroup<LinuxKernelIRQ>, DefaultIgnore;
+def warn_linux_kernel_positive_errno_return : Warning<
+  "returning positive errno %0 reports success; return -%0 on failure">,
+  InGroup<LinuxKernelErrno>, DefaultIgnore;
+def warn_linux_kernel_negative_errno_unsigned_return : Warning<
+  "negative errno returned from an unsigned function becomes a large "
+  "positive value">,
+  InGroup<LinuxKernelErrno>, DefaultIgnore;
 def warn_return_value_udt: Warning<
   "%0 has C-linkage specified, but returns user-defined type %1 which is "
   "incompatible with C">, InGroup<ReturnTypeCLinkage>;

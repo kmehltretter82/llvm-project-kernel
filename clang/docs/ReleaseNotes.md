@@ -252,6 +252,16 @@ features cannot lower the translation-unit ABI level;
 
 ### New Compiler Flags
 
+- Added `-Wlinux-kernel`, an opt-in warning profile for Linux kernel C. It
+  diagnoses negative integer constants returned from boolean functions,
+  invalid negative tests of usercopy residuals, selected NULL/error-pointer
+  convention mix-ups, allocator/deallocator mismatches, invalid platform IRQ
+  tests, and conditional uninitialized values. The kernel-specific checks can
+  be controlled with `-Wlinux-kernel-bool-return`, `-Wlinux-kernel-usercopy`,
+  `-Wlinux-kernel-error-pointer`, `-Wlinux-kernel-allocator`, and
+  `-Wlinux-kernel-irq`. The broader `-Wlinux-kernel-errno` check remains
+  available as a separate opt-in diagnostic.
+
 - New option `-fdefined-pointer-subtraction` added to preserve stable semantics
   when subtracting pointers to unrelated objects.
 

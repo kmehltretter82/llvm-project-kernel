@@ -14,6 +14,7 @@
 
 #include "clang/Sema/AnalysisBasedWarnings.h"
 #include "SemaLifetimeSafety.h"
+#include "SemaLinuxKernelWarnings.h"
 #include "TypeLocBuilder.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclCXX.h"
@@ -3148,6 +3149,9 @@ void clang::sema::AnalysisBasedWarnings::IssueWarnings(
 
   const Stmt *Body = D->getBody();
   assert(Body);
+
+  if (const auto *FD = dyn_cast<FunctionDecl>(D))
+    IssueLinuxKernelWarnings(S, FD);
 
   // Construct the analysis context with the specified CFG build options.
   AnalysisDeclContext AC(/* AnalysisDeclContextManager */ nullptr, D);
