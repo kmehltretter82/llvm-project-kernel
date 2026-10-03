@@ -23,9 +23,9 @@
 // The checker only reports what it can see on one path through one
 // translation unit: the lock has to be taken and the sleeping call has to be
 // reached without leaving that path.  It gives up on a critical section when
-// a function with a visible body is not inlined, or when an external function
-// that looks like an unlock helper is called, because either may have dropped
-// the lock.
+// a function that is not inlined contains an unlock somewhere below it, or
+// when an external function that looks like an unlock helper is called,
+// because either may have dropped the lock.
 //
 //===----------------------------------------------------------------------===//
 
@@ -38,6 +38,7 @@
 #include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/CheckerHelpers.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringSwitch.h"
 #include <optional>
 
@@ -186,6 +187,11 @@ class LinuxAtomicSleepChecker
   /// Zero if the kernel headers in use do not reveal it.
   mutable std::optional<uint64_t> DirectReclaimMask;
 
+  /// Whether a function with a visible body contains, at any depth, a call
+  /// that leaves an atomic section.
+  mutable llvm::DenseMap<const FunctionDecl *, bool> MayLeave;
+
+  bool mayLeaveAtomicSection(const FunctionDecl *FD, unsigned Depth) const;
   uint64_t getDirectReclaimMask(CheckerContext &C) const;
   bool allowsBlocking(const CallEvent &Call, CheckerContext &C) const;
   void reportSleep(const CallEvent &Call, StringRef What,
@@ -219,6 +225,44 @@ static StringRef describe(SectionKind Kind) {
     return "with bottom halves disabled";
   }
   llvm_unreachable("unknown section kind");
+}
+
+static bool looksLikeUnlock(const FunctionDecl *FD) {
+  if (!FD->getIdentifier())
+    return false;
+  StringRef Name = FD->getName();
+  return classify(Name).R == Role::Leave || Name.contains_insensitive("unlock");
+}
+
+bool LinuxAtomicSleepChecker::mayLeaveAtomicSection(const FunctionDecl *FD,
+                                                    unsigned Depth) const {
+  const FunctionDecl *Def = nullptr;
+  if (!FD->hasBody(Def))
+    return false;
+  auto Known = MayLeave.find(Def);
+  if (Known != MayLeave.end())
+    return Known->second;
+  if (Depth > 8)
+    return true;
+  // The provisional answer ends recursion.
+  MayLeave[Def] = false;
+
+  bool Result = false;
+  llvm::SmallVector<const Stmt *, 32> Worklist;
+  Worklist.push_back(Def->getBody());
+  while (!Worklist.empty() && !Result) {
+    const Stmt *S = Worklist.pop_back_val();
+    if (!S)
+      continue;
+    if (const auto *CE = dyn_cast<CallExpr>(S))
+      if (const FunctionDecl *Callee = CE->getDirectCallee())
+        Result = looksLikeUnlock(Callee) ||
+                 mayLeaveAtomicSection(Callee, Depth + 1);
+    for (const Stmt *Child : S->children())
+      Worklist.push_back(Child);
+  }
+  MayLeave[Def] = Result;
+  return Result;
 }
 
 uint64_t LinuxAtomicSleepChecker::getDirectReclaimMask(CheckerContext &C) const {
@@ -433,11 +477,11 @@ void LinuxAtomicSleepChecker::checkPostCall(const CallEvent &Call,
 
   if (Sections.isEmpty())
     return;
-  // A function that could have been looked into but was not, or an external
-  // one named like an unlock helper, may have left the critical section.
-  bool Opaque = !C.wasInlined && FD->hasBody();
-  bool UnlockHelper = !FD->hasBody() && FD->getName().contains_insensitive(
-                                            "unlock");
+  // A function that was not inlined although it unlocks something further
+  // down, or an external one named like an unlock helper, may have left the
+  // critical section.
+  bool Opaque = !C.wasInlined && mayLeaveAtomicSection(FD, 0);
+  bool UnlockHelper = !FD->hasBody() && looksLikeUnlock(FD);
   if (Opaque || UnlockHelper)
     C.addTransition(State->set<AtomicSections>(Factory.getEmptyList()));
 }
