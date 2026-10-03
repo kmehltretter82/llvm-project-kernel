@@ -124,3 +124,100 @@ void flag_cleared_again(int a) {
   if (have)
     use(x); // maybe-warning {{variable 'x' may be uninitialized when used here}}
 }
+
+// A switch on a variable takes the case that its known value selects.
+void switch_after_value_check(int cmd) {
+  int x; // corr-note {{variable 'x' is declared here}}
+  if (cmd != 1 && cmd != 2)
+    return;
+  switch (cmd) {
+  case 1:
+    x = f();
+    break;
+  case 2:
+    x = 0;
+    break;
+  }
+  use(x); // corr-warning {{variable 'x' is uninitialized when used here only on paths that an earlier condition excludes}}
+}
+
+// Each case edge makes the value known for a later switch or test.
+void two_switches(int mode) {
+  int x; // corr-note {{variable 'x' is declared here}}
+  switch (mode) {
+  case 1:
+  case 2:
+    x = f();
+    break;
+  default:
+    break;
+  }
+  f();
+  switch (mode) {
+  case 2:
+    use(x); // corr-warning {{variable 'x' is uninitialized when used here only on paths that an earlier condition excludes}}
+    break;
+  default:
+    break;
+  }
+}
+
+void switch_then_test(int mode) {
+  int x; // corr-note {{variable 'x' is declared here}}
+  switch (mode) {
+  case 4 ... 6:
+    x = f();
+    break;
+  default:
+    break;
+  }
+  if (mode == 5)
+    use(x); // corr-warning {{variable 'x' is uninitialized when used here only on paths that an earlier condition excludes}}
+}
+
+void switch_leaves_a_value_out(int mode) {
+  int x; // maybe-note {{initialize the variable 'x' to silence this warning}}
+  switch (mode) {
+  case 1:
+    x = f();
+    break;
+  default:
+    break;
+  }
+  if (mode == 1 || mode == 2)
+    use(x); // maybe-warning {{variable 'x' may be uninitialized when used here}}
+}
+
+void switched_variable_changes(int mode) {
+  int x; // maybe-note {{initialize the variable 'x' to silence this warning}}
+  switch (mode) {
+  case 1:
+    x = f();
+    break;
+  default:
+    break;
+  }
+  mode = f();
+  if (mode == 1)
+    use(x); // maybe-warning {{variable 'x' may be uninitialized when used here}}
+}
+
+// A block that ends in "if (a && b)" tests only b.
+void second_operand_decides(int a, int b) {
+  int x; // corr-note {{variable 'x' is declared here}}
+  if (a && b)
+    x = f();
+  f();
+  if (b && a)
+    use(x); // corr-warning {{variable 'x' is uninitialized when used here only on paths that an earlier condition excludes}}
+}
+
+// "Not equal" has no value to remember, but the outcome of the test does.
+void same_value_test(int mode) {
+  int x; // corr-note {{variable 'x' is declared here}}
+  if (mode == 2)
+    x = f();
+  f();
+  if (mode == 2)
+    use(x); // corr-warning {{variable 'x' is uninitialized when used here only on paths that an earlier condition excludes}}
+}

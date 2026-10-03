@@ -520,6 +520,11 @@ class CorrelatedUninitPruner {
   unsigned FunctionSteps = 0;
 
   struct Pred {
+    /// The condition, or null for "EqVar == EqValue", which stands for a
+    /// case of a switch on EqVar.
+    const Expr *Cond = nullptr;
+    const VarDecl *EqVar = nullptr;
+    llvm::APSInt EqValue;
     llvm::FoldingSetNodeID ID;
     SmallVector<const VarDecl *, 2> Locals;
     bool ReadsMemory = false;
@@ -777,6 +782,7 @@ class CorrelatedUninitPruner {
         Vars.push_back(VD);
     if (!Pure || Preds.size() >= MaxPreds || predIndex(E) >= 0)
       return;
+    P.Cond = E;
     E->Profile(P.ID, Ctx, /*Canonical=*/true);
     Preds.push_back(std::move(P));
   }
@@ -788,11 +794,92 @@ class CorrelatedUninitPruner {
            isa_and_nonnull<Expr>(B->getTerminatorCondition());
   }
 
+  /// The condition that decides which way \p B branches.  A block that ends
+  /// in "if (a && b)" evaluates only b: a is the condition of an earlier
+  /// block, and this block is reached with the outcome of a that leaves the
+  /// result open.
+  static const Expr *getBranchCondition(const CFGBlock *B) {
+    const Expr *Cond = cast<Expr>(B->getTerminatorCondition());
+    for (;;) {
+      const auto *BO = dyn_cast<BinaryOperator>(Cond->IgnoreParens());
+      if (!BO || !BO->isLogicalOp())
+        return Cond;
+      Cond = BO->getRHS();
+    }
+  }
+
+  /// The local variable that \p SS switches on, if it can be tracked.
+  const VarDecl *getSwitchVariable(const SwitchStmt *SS) const {
+    const VarDecl *VD = asVarRef(SS->getCond());
+    return VD && isTrackableLocal(VD) ? VD : nullptr;
+  }
+
+  /// Track the variable of a switch and, as conditions, its first cases, so
+  /// that "none of these" on the default edge is not lost.
+  void addSwitch(const SwitchStmt *SS) {
+    const VarDecl *VD = getSwitchVariable(SS);
+    if (!VD)
+      return;
+    if (varIndex(VD) < 0) {
+      if (Vars.size() >= MaxVars)
+        return;
+      Vars.push_back(VD);
+    }
+    unsigned Added = 0;
+    for (const SwitchCase *SC = SS->getSwitchCaseList(); SC && Added < 6;
+         SC = SC->getNextSwitchCase()) {
+      const auto *CS = dyn_cast<CaseStmt>(SC);
+      if (!CS || CS->getRHS() || Preds.size() >= MaxPreds)
+        continue;
+      llvm::APSInt K = CS->getLHS()->EvaluateKnownConstInt(Ctx);
+      if (llvm::any_of(Preds, [&](const Pred &P) {
+            return !P.Cond && P.EqVar == VD &&
+                   llvm::APSInt::isSameValue(P.EqValue, K);
+          }))
+        continue;
+      Pred P;
+      P.EqVar = VD;
+      P.EqValue = K;
+      P.Locals.push_back(VD);
+      Preds.push_back(std::move(P));
+      ++Added;
+    }
+  }
+
+  /// If \p P is "Vars[I] == K" or "Vars[I] != K", return K and which it is.
+  bool isEqualityWith(const Pred &P, unsigned I, llvm::APSInt &K,
+                      bool &IsNE) const {
+    IsNE = false;
+    if (!P.Cond) {
+      K = P.EqValue;
+      return P.EqVar == Vars[I];
+    }
+    const auto *BO = dyn_cast<BinaryOperator>(P.Cond->IgnoreParenImpCasts());
+    if (!BO || !BO->isEqualityOp())
+      return false;
+    const Expr *Other = BO->getRHS();
+    if (asVarRef(BO->getLHS()) != Vars[I]) {
+      if (asVarRef(BO->getRHS()) != Vars[I])
+        return false;
+      Other = BO->getLHS();
+    }
+    State Empty;
+    std::optional<llvm::APSInt> Value = evalInt(Other, Empty);
+    if (!Value)
+      return false;
+    K = *Value;
+    IsNE = BO->getOpcode() == BO_NE;
+    return true;
+  }
+
   void addDominatingConditions(const CFGBlock *B) {
     llvm::SmallPtrSet<const CFGBlock *, 16> Seen;
     while (B && Seen.insert(B).second) {
       if (isConditionalBranch(B))
-        addCondition(cast<Expr>(B->getTerminatorCondition()));
+        addCondition(getBranchCondition(B));
+      else if (const auto *SS =
+                   dyn_cast_or_null<SwitchStmt>(B->getTerminatorStmt()))
+        addSwitch(SS);
       DomTreeNode *N = DomTree->getBase().getNode(const_cast<CFGBlock *>(B));
       DomTreeNode *IDom = N ? N->getIDom() : nullptr;
       B = IDom ? IDom->getBlock() : nullptr;
@@ -994,10 +1081,12 @@ class CorrelatedUninitPruner {
             if (Equal) {
               St.Vals[I].Kind = Value::Const;
               St.Vals[I].Bits = K->extOrTrunc(64).getZExtValue();
-            } else if (K->isZero() && St.Vals[I].Kind == Value::Top) {
-              St.Vals[I].Kind = Value::NonZero;
+              return;
             }
-            return;
+            // "Not equal" is not a value.  Zero aside, it can only be kept
+            // as the outcome of the condition itself, below.
+            if (K->isZero() && St.Vals[I].Kind == Value::Top)
+              St.Vals[I].Kind = Value::NonZero;
           }
         }
       }
@@ -1105,6 +1194,84 @@ class CorrelatedUninitPruner {
 
   using StateMap = llvm::DenseMap<unsigned, SmallVector<State, 2>>;
 
+  /// Whether the value \p V selects the case \p CS.
+  bool matchesCase(const CaseStmt *CS, const llvm::APSInt &V) const {
+    llvm::APSInt Low = CS->getLHS()->EvaluateKnownConstInt(Ctx);
+    if (!CS->getRHS())
+      return llvm::APSInt::isSameValue(Low, V);
+    llvm::APSInt High = CS->getRHS()->EvaluateKnownConstInt(Ctx);
+    return llvm::APSInt::compareValues(Low, V) <= 0 &&
+           llvm::APSInt::compareValues(V, High) <= 0;
+  }
+
+  /// Refine \p St for the edge from a switch on the tracked variable with
+  /// index \p I to its successor \p Next.  Returns false if the edge cannot
+  /// be taken with the value the variable is known to have.
+  bool assumeSwitchEdge(const SwitchStmt *SS, const CFGBlock *Next, unsigned I,
+                        State &St) const {
+    const CaseStmt *Taken = nullptr;
+    if (const auto *CS = dyn_cast_or_null<CaseStmt>(Next->getLabel()))
+      for (const SwitchCase *SC = SS->getSwitchCaseList(); SC;
+           SC = SC->getNextSwitchCase())
+        if (SC == CS)
+          Taken = CS;
+
+    Value &V = St.Vals[I];
+    QualType T = Vars[I]->getType();
+    auto SelectsSomeCase = [&](const llvm::APSInt &Known) {
+      for (const SwitchCase *SC = SS->getSwitchCaseList(); SC;
+           SC = SC->getNextSwitchCase())
+        if (const auto *CS = dyn_cast<CaseStmt>(SC))
+          if (matchesCase(CS, Known))
+            return true;
+      return false;
+    };
+
+    if (!Taken) {
+      // The default label, or the statement after a switch without one.  The
+      // variable has none of the case values here.
+      if (V.Kind == Value::Const)
+        return !SelectsSomeCase(makeValue(T, V.Bits));
+      if (V.Kind == Value::Top && SelectsSomeCase(makeValue(T, 0)))
+        V.Kind = Value::NonZero;
+      for (unsigned P = 0, E = Preds.size(); P != E; ++P) {
+        llvm::APSInt K;
+        bool IsNE;
+        if (!isEqualityWith(Preds[P], I, K, IsNE) || !SelectsSomeCase(K))
+          continue;
+        St.Known |= 1u << P;
+        if (IsNE)
+          St.Truth |= 1u << P;
+        else
+          St.Truth &= ~(1u << P);
+      }
+      return true;
+    }
+
+    if (V.Kind == Value::Const)
+      return matchesCase(Taken, makeValue(T, V.Bits));
+    if (Taken->getRHS())
+      return true;
+    llvm::APSInt K = Taken->getLHS()->EvaluateKnownConstInt(Ctx);
+    if (V.Kind == Value::NonZero && K.isZero())
+      return false;
+    // An earlier default edge or test may have excluded this value.
+    for (unsigned P = 0, E = Preds.size(); P != E; ++P) {
+      llvm::APSInt Other;
+      bool IsNE;
+      if (!(St.Known & (1u << P)) ||
+          !isEqualityWith(Preds[P], I, Other, IsNE) ||
+          !llvm::APSInt::isSameValue(Other, K))
+        continue;
+      bool Holds = St.Truth & (1u << P);
+      if (Holds == IsNE)
+        return false;
+    }
+    V.Kind = Value::Const;
+    V.Bits = K.extOrTrunc(64).getZExtValue();
+    return true;
+  }
+
   bool addState(StateMap &In, const CFGBlock *B, const State &St) {
     SmallVectorImpl<State> &Set = In[B->getBlockID()];
     if (llvm::is_contained(Set, St))
@@ -1177,7 +1344,7 @@ public:
           transfer(AS, St);
 
         if (isConditionalBranch(B)) {
-          const Expr *Cond = cast<Expr>(B->getTerminatorCondition());
+          const Expr *Cond = getBranchCondition(B);
           std::optional<bool> Known = evalTruth(Cond, St);
           unsigned Index = 0;
           for (const CFGBlock::AdjacentBlock &Succ : B->succs()) {
@@ -1192,10 +1359,20 @@ public:
               Worklist.push_back(Next);
           }
         } else {
-          for (const CFGBlock::AdjacentBlock &Succ : B->succs())
-            if (const CFGBlock *Next = Succ.getReachableBlock())
-              if (addState(In, Next, St))
-                Worklist.push_back(Next);
+          // A switch on a tracked variable takes only the case that its
+          // known value selects, and each case edge makes the value known.
+          const auto *SS = dyn_cast_or_null<SwitchStmt>(B->getTerminatorStmt());
+          int Switched = SS ? varIndex(getSwitchVariable(SS)) : -1;
+          for (const CFGBlock::AdjacentBlock &Succ : B->succs()) {
+            const CFGBlock *Next = Succ.getReachableBlock();
+            if (!Next)
+              continue;
+            State Refined = St;
+            if (Switched >= 0 && !assumeSwitchEdge(SS, Next, Switched, Refined))
+              continue;
+            if (addState(In, Next, Refined))
+              Worklist.push_back(Next);
+          }
         }
         if (GaveUp)
           return false;
