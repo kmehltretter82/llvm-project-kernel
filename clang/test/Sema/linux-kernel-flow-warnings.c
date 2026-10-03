@@ -330,6 +330,68 @@ out:
   return ret; // path-warning {{'ret' can be zero here, so this return reports success right after a failure was reported}}
 }
 
+// A count is returned after a message as well, and zero is a valid count.
+int count_by_name(void *dev) {
+  int num_modes = 0;
+
+  if (!get()) {
+    _dev_err(dev, "failed to read the mode list\n");
+    goto out;
+  }
+  num_modes = count_elems(dev);
+out:
+  return num_modes;
+}
+
+// Inside "if (ret)" the variable is not zero, whatever a nested test says.
+int nonzero_stays_nonzero(void *dev) {
+  int ret = step();
+
+  if (ret) {
+    if (!ret)
+      pause();
+    _dev_err(dev, "step failed\n");
+    return ret;
+  }
+  return 0;
+}
+
+// The note names the message of the path that returns zero.
+int note_names_the_message(void *dev) {
+  int ret = step();
+
+  if (ret) {
+    _dev_err(dev, "step failed\n");
+    goto out;
+  }
+  if (!get()) {
+    _dev_err(dev, "no resource\n"); // path-note {{failure reported here}}
+    goto out;
+  }
+  pause();
+out:
+  return ret; // path-warning {{'ret' can be zero here, so this return reports success right after a failure was reported}}
+}
+
+// A goto to a label inside a loop skips one item and carries on.
+int skip_bad_entry(void *dev) {
+  int rc = 0;
+  int i;
+
+  for (i = 0; i < 4; i++) {
+    if (!get()) {
+      _dev_err(dev, "bad entry, lookup failed\n");
+      goto skip_one;
+    }
+    rc = step();
+    if (rc)
+      break;
+skip_one:
+    pause();
+  }
+  return rc;
+}
+
 // An audit record is not a failure message.
 int audit_record(void *dev) {
   int ret = step();

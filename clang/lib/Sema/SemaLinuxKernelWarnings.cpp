@@ -1396,14 +1396,17 @@ public:
 ///     return ret;               // ret is 0 here
 ///   }
 ///
-/// For every local variable that the function returns, a forward dataflow
-/// pass over the CFG tracks three facts:
+/// For every local variable that the function returns and whose name and
+/// assignments say that it carries an error code, a forward dataflow pass
+/// over the CFG tracks these facts:
 ///
 ///   Zero    some path arrives with the variable known to be zero
+///   NonZero every path arrives with the variable known not to be zero
 ///   Message every path arrives after a failure message, and the variable
 ///           has not changed since
 ///   Jumped  some path arrives through "failure message; goto" with the
-///           variable zero and unchanged since
+///           variable zero and unchanged since, where the goto leaves for a
+///           label that is not inside a loop
 ///
 /// `return var` is diagnosed when Zero and Message both hold, which covers a
 /// return that a failure message dominates, or when Jumped holds, which
@@ -1419,8 +1422,21 @@ class ErrorPathSuccessChecker {
   struct Facts {
     bool Reached = false;
     bool Zero = false;
+    /// Every path arrives with the variable known not to be zero.  An edge
+    /// that requires it to be zero is then infeasible.
+    bool NonZero = false;
     bool Message = false;
     bool Jumped = false;
+    /// The calls behind Message and Jumped, for the note.
+    const CallExpr *MessageCall = nullptr;
+    const CallExpr *JumpMessage = nullptr;
+
+    void assigned(bool IsZero, bool IsNonZero) {
+      Zero = IsZero;
+      NonZero = IsNonZero;
+      Message = Jumped = false;
+      MessageCall = JumpMessage = nullptr;
+    }
   };
 
   enum class Knowledge { None, Zero, NonZero };
@@ -1435,6 +1451,24 @@ class ErrorPathSuccessChecker {
   /// them, not a lost error code.
   llvm::SmallPtrSet<const VarDecl *, 8> Counters;
   llvm::SmallVector<const VarDecl *, 4> Candidates;
+  llvm::DenseMap<const CFGBlock *, bool> InCycle;
+
+  /// Whether the name of \p VD says that it carries an error code, as "ret",
+  /// "err", "rc" or "status" do.  Counts and sizes are returned after a
+  /// message as well, and zero is a valid answer for them.
+  static bool isNamedLikeErrorCode(const VarDecl *VD) {
+    std::string Lower = VD->getName().rtrim("0123456789").lower();
+    llvm::SmallVector<StringRef, 4> Words;
+    StringRef(Lower).split(Words, '_', -1, /*KeepEmpty=*/false);
+    for (StringRef Word : Words)
+      if (llvm::StringSwitch<bool>(Word)
+              .Cases({"ret", "retval", "rval", "rv", "rc", "r"}, true)
+              .Cases({"err", "error", "errno", "errcode", "ec", "e"}, true)
+              .Cases({"res", "result", "status"}, true)
+              .Default(false))
+        return true;
+    return false;
+  }
 
   void noteValue(const VarDecl *VD, const Expr *Value) {
     if (!VD || !Value || Value->isValueDependent())
@@ -1478,7 +1512,7 @@ class ErrorPathSuccessChecker {
           !VD->getType().isVolatileQualified() &&
           VD->getType()->isSignedIntegerType() &&
           !VD->getType()->isEnumeralType() &&
-          !VD->getType()->isAnyCharacterType() &&
+          !VD->getType()->isAnyCharacterType() && isNamedLikeErrorCode(VD) &&
           !llvm::is_contained(Candidates, VD))
         Candidates.push_back(VD);
     }
@@ -1486,11 +1520,14 @@ class ErrorPathSuccessChecker {
       collect(Child);
   }
 
-  bool isZeroConstant(const Expr *E) const {
-    if (!E)
-      return false;
+  /// Whether \p E is an integer constant, and if so whether it is zero.
+  std::optional<bool> isZeroConstant(const Expr *E) const {
+    if (!E || E->isValueDependent())
+      return std::nullopt;
     std::optional<llvm::APSInt> V = E->getIntegerConstantExpr(Ctx);
-    return V && V->isZero();
+    if (!V)
+      return std::nullopt;
+    return V->isZero();
   }
 
   static bool hasFailureWords(StringRef Text) {
@@ -1623,39 +1660,10 @@ class ErrorPathSuccessChecker {
     OnFalse = F;
   }
 
-  const CallExpr *findFailureMessage(const CFGBlock *Start,
-                                     const Stmt *Before) const {
-    llvm::SmallPtrSet<const CFGBlock *, 16> Seen;
-    llvm::SmallVector<const CFGBlock *, 8> Worklist;
-    Worklist.push_back(Start);
-    while (!Worklist.empty() && Seen.size() < 64) {
-      const CFGBlock *B = Worklist.pop_back_val();
-      if (!Seen.insert(B).second)
-        continue;
-      const CallExpr *Last = nullptr;
-      for (const CFGElement &Elem : *B) {
-        std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>();
-        if (!CS)
-          continue;
-        if (B == Start && CS->getStmt() == Before)
-          break;
-        if (const auto *CE = dyn_cast<CallExpr>(CS->getStmt()))
-          if (isFailureMessage(CE))
-            Last = CE;
-      }
-      if (Last)
-        return Last;
-      for (const CFGBlock::AdjacentBlock &Pred : B->preds())
-        if (const CFGBlock *P = Pred.getReachableBlock())
-          Worklist.push_back(P);
-    }
-    return nullptr;
-  }
-
   void report(const Stmt *At, unsigned DiagID, const VarDecl *V,
-              const CFGBlock *B) {
+              const CallExpr *Message) {
     S.Diag(At->getBeginLoc(), DiagID) << V << At->getSourceRange();
-    if (const CallExpr *Message = findFailureMessage(B, At))
+    if (Message)
       S.Diag(Message->getExprLoc(), diag::note_linux_kernel_failure_reported)
           << Message->getSourceRange();
   }
@@ -1668,34 +1676,72 @@ class ErrorPathSuccessChecker {
       const Stmt *St_ = CS->getStmt();
       if (const auto *BO = dyn_cast<BinaryOperator>(St_)) {
         if (BO->isAssignmentOp() && getDirectLinuxVariable(BO->getLHS()) == V) {
-          St.Zero = BO->getOpcode() == BO_Assign && isZeroConstant(BO->getRHS());
-          St.Message = St.Jumped = false;
+          std::optional<bool> IsZero;
+          if (BO->getOpcode() == BO_Assign)
+            IsZero = isZeroConstant(BO->getRHS());
+          St.assigned(IsZero && *IsZero, IsZero && !*IsZero);
         }
       } else if (const auto *UO = dyn_cast<UnaryOperator>(St_)) {
         if (UO->isIncrementDecrementOp() &&
             getDirectLinuxVariable(UO->getSubExpr()) == V)
-          St.Zero = St.Message = St.Jumped = false;
+          St.assigned(false, false);
       } else if (const auto *DS = dyn_cast<DeclStmt>(St_)) {
         for (const Decl *D : DS->decls())
           if (D == V) {
-            St.Zero = isZeroConstant(V->getInit());
-            St.Message = St.Jumped = false;
+            std::optional<bool> IsZero = isZeroConstant(V->getInit());
+            St.assigned(IsZero && *IsZero, IsZero && !*IsZero);
           }
       } else if (const auto *CE = dyn_cast<CallExpr>(St_)) {
         const FunctionDecl *Callee = CE->getDirectCallee();
         if (Report && St.Zero && Callee && Callee->getIdentifier() &&
             Callee->getName() == "dev_err_probe" && CE->getNumArgs() >= 2 &&
             getDirectLinuxVariable(CE->getArg(1)) == V)
-          report(CE, diag::warn_linux_kernel_error_probe_zero, V, B);
-        if (isFailureMessage(CE))
+          report(CE, diag::warn_linux_kernel_error_probe_zero, V, nullptr);
+        if (isFailureMessage(CE)) {
           St.Message = true;
+          St.MessageCall = CE;
+        }
       } else if (const auto *RS = dyn_cast<ReturnStmt>(St_)) {
-        if (Report && getDirectLinuxVariable(RS->getRetValue()) == V &&
-            ((St.Zero && St.Message) || St.Jumped))
-          report(RS, diag::warn_linux_kernel_error_path_success, V, B);
+        if (Report && getDirectLinuxVariable(RS->getRetValue()) == V) {
+          if (St.Zero && St.Message)
+            report(RS, diag::warn_linux_kernel_error_path_success, V,
+                   St.MessageCall);
+          else if (St.Jumped)
+            report(RS, diag::warn_linux_kernel_error_path_success, V,
+                   St.JumpMessage);
+        }
       }
     }
     return St;
+  }
+
+  /// Whether \p B can reach itself.  A label inside a loop, as in
+  /// "report the bad entry; goto skip_one;", is not the way out of the
+  /// function, and the work goes on after it.
+  bool isInCycle(const CFGBlock *B) {
+    auto Known = InCycle.find(B);
+    if (Known != InCycle.end())
+      return Known->second;
+    llvm::SmallPtrSet<const CFGBlock *, 32> Seen;
+    llvm::SmallVector<const CFGBlock *, 16> Worklist;
+    Worklist.push_back(B);
+    bool Result = false;
+    while (!Worklist.empty() && !Result) {
+      const CFGBlock *Cur = Worklist.pop_back_val();
+      for (const CFGBlock::AdjacentBlock &Succ : Cur->succs()) {
+        const CFGBlock *Next = Succ.getReachableBlock();
+        if (!Next)
+          continue;
+        if (Next == B || Seen.size() > 512) {
+          Result = true;
+          break;
+        }
+        if (Seen.insert(Next).second)
+          Worklist.push_back(Next);
+      }
+    }
+    InCycle[B] = Result;
+    return Result;
   }
 
   static bool isConditionalBranch(const CFGBlock *B) {
@@ -1733,12 +1779,20 @@ class ErrorPathSuccessChecker {
           if (!Next)
             continue;
           Facts Edge = Out;
-          if (JumpPass && IsGoto && Out.Zero && Out.Message)
+          if (JumpPass && IsGoto && Out.Zero && Out.Message &&
+              !isInCycle(Next)) {
             Edge.Jumped = true;
+            Edge.JumpMessage = Out.MessageCall;
+          }
           if (K == Knowledge::Zero) {
+            // The variable cannot be zero on this path, as in a test that
+            // sits inside "if (ret)".
+            if (Out.NonZero)
+              continue;
             Edge.Zero = true;
           } else if (K == Knowledge::NonZero) {
             Edge.Zero = false;
+            Edge.NonZero = true;
             Edge.Jumped = false;
           }
 
@@ -1746,6 +1800,7 @@ class ErrorPathSuccessChecker {
           if (JumpPass) {
             if (Edge.Jumped && !Target.Jumped) {
               Target.Jumped = true;
+              Target.JumpMessage = Edge.JumpMessage;
               Changed = true;
             }
             continue;
@@ -1754,14 +1809,20 @@ class ErrorPathSuccessChecker {
             Target = Edge;
             Target.Reached = true;
             Target.Jumped = false;
+            Target.JumpMessage = nullptr;
             Changed = true;
             continue;
           }
           bool Zero = Target.Zero || Edge.Zero;
+          bool NonZero = Target.NonZero && Edge.NonZero;
           bool Message = Target.Message && Edge.Message;
-          if (Zero != Target.Zero || Message != Target.Message) {
+          if (Zero != Target.Zero || NonZero != Target.NonZero ||
+              Message != Target.Message) {
             Target.Zero = Zero;
+            Target.NonZero = NonZero;
             Target.Message = Message;
+            if (!Message)
+              Target.MessageCall = nullptr;
             Changed = true;
           }
         }
