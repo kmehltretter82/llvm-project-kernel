@@ -1067,7 +1067,8 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
 
   /// Diagnose a failure test that follows `x = f();` but tests something
   /// other than x.
-  void checkWrongVariableTest(const StoredValue &Stored, const Expr *Cond) {
+  void checkWrongVariableTest(const StoredValue &Stored, const Expr *Cond,
+                              ArrayRef<const Stmt *> EarlierStores) {
     const auto *Call =
         dyn_cast<CallExpr>(Stored.Source->IgnoreParenCasts());
     const FunctionDecl *Callee = Call ? Call->getDirectCallee() : nullptr;
@@ -1124,12 +1125,22 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
     bool NullOnFailure = isNullReturningKind(classifyLinuxKernelCallee(Callee));
     if (!IsErrorPointerTest && !NullOnFailure)
       return;
+    // "a = get(); b = get(); if (IS_ERR(a)) ...; if (IS_ERR(b)) ..." fetches
+    // in a batch and tests afterwards.  The test of 'a' is in order there.
+    for (const Stmt *Earlier : EarlierStores) {
+      StoredValue EarlierStored;
+      if (getStoredValue(Earlier, EarlierStored) &&
+          refersToStoredValue(EarlierStored, Checked))
+        return;
+    }
     S.Diag(Checked->getExprLoc(), diag::warn_linux_kernel_wrong_check_other)
         << getLinuxExprText(Checked, S) << getStoredValueText(Stored)
         << Callee->getName() << Cond->getSourceRange();
   }
 
-  void checkAdjacentStatements(const Stmt *Previous, const Stmt *Current) {
+  /// \p EarlierStores are the assignments that directly precede \p Previous.
+  void checkAdjacentStatements(const Stmt *Previous, const Stmt *Current,
+                               ArrayRef<const Stmt *> EarlierStores) {
     StoredValue Stored;
     if (!getStoredValue(Previous, Stored) || !Stored.Source)
       return;
@@ -1137,7 +1148,7 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
     if (!If || !If->getCond())
       return;
     checkUnsignedErrorTest(Stored, If->getCond());
-    checkWrongVariableTest(Stored, If->getCond());
+    checkWrongVariableTest(Stored, If->getCond(), EarlierStores);
   }
 
 public:
@@ -1190,10 +1201,17 @@ public:
 
   bool VisitCompoundStmt(CompoundStmt *CS) override {
     const Stmt *Previous = nullptr;
+    // The run of assignments that ends right before Previous.
+    llvm::SmallVector<const Stmt *, 8> EarlierStores;
     for (const Stmt *Child : CS->body()) {
       const Stmt *Current = stripStatementLabels(Child);
       if (Previous)
-        checkAdjacentStatements(Previous, Current);
+        checkAdjacentStatements(Previous, Current, EarlierStores);
+      StoredValue Stored;
+      if (Previous && getStoredValue(Previous, Stored))
+        EarlierStores.push_back(Previous);
+      else
+        EarlierStores.clear();
       Previous = Current;
     }
     return true;

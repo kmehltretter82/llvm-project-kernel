@@ -147,6 +147,21 @@ int wrong_local(void) {
   return b != NULL;
 }
 
+// Fetch in a batch, test afterwards.
+int batch_of_gets(struct glue *g, void *pdev) {
+  struct bridge *first;
+  struct bridge *second;
+
+  first = bridge_probe(pdev);
+  second = bridge_probe(pdev);
+  if (IS_ERR(first))
+    return PTR_ERR(first);
+  if (IS_ERR(second))
+    return PTR_ERR(second);
+  g->bridge = first;
+  return 0;
+}
+
 int right_value(struct glue *g, void *pdev) {
   g->bridge = bridge_probe(pdev);
   if (IS_ERR(g->bridge))
