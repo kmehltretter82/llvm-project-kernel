@@ -262,3 +262,66 @@ void address_is_not_null(int type) {
   else
     usep(regular); // corr-warning {{variable 'regular' is uninitialized when used here only on paths that an earlier condition excludes}}
 }
+
+// "a >= b" being false makes "a < b" true.
+void same_comparison(int from, int to) {
+  int err; // corr-note {{variable 'err' is declared here}}
+  if (from >= to)
+    return;
+  for (; from < to; from++)
+    err = f();
+  use(err); // corr-warning {{variable 'err' is uninitialized when used here only on paths that an earlier condition excludes}}
+}
+
+void other_comparison(int from, int to) {
+  int err; // maybe-note {{initialize the variable 'err' to silence this warning}}
+  if (from > to)
+    return;
+  for (; from < to; from++)
+    err = f();
+  use(err); // maybe-warning {{variable 'err' may be uninitialized when used here}}
+}
+
+// A path that dereferences a pointer it knows to be null ends there.
+struct node {
+  struct node *next;
+  int stamp;
+};
+
+void companion_of_pointer(struct node **head) {
+  struct node **oldest_p; // corr-note {{variable 'oldest_p' is declared here}}
+  struct node **p;
+  struct node *n, *oldest = 0;
+
+  for (p = head;; p = &n->next) {
+    n = *p;
+    if (!n)
+      break;
+    if (!oldest || n->stamp < oldest->stamp) {
+      oldest = n;
+      oldest_p = p;
+    }
+  }
+  oldest->stamp = 0;
+  *oldest_p = oldest->next; // corr-warning {{variable 'oldest_p' is uninitialized when used here only on paths that an earlier condition excludes}}
+}
+
+void address_of_member_is_no_access(struct node *n, int a) {
+  int x; // maybe-note {{initialize the variable 'x' to silence this warning}}
+  struct node **link;
+  if (n)
+    x = f();
+  link = &n->next;
+  usep((const int *)link);
+  if (a)
+    use(x); // maybe-warning {{variable 'x' may be uninitialized when used here}}
+}
+
+void access_through_null(struct node *n, int a) {
+  int x; // corr-note {{variable 'x' is declared here}}
+  if (n)
+    x = f();
+  n->stamp = 1;
+  if (a)
+    use(x); // corr-warning {{variable 'x' is uninitialized when used here only on paths that an earlier condition excludes}}
+}

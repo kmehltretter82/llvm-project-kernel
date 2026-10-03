@@ -542,6 +542,8 @@ class CorrelatedUninitPruner {
 
   struct State {
     bool XInit = false;
+    /// The path has dereferenced a pointer that it knows to be null.
+    bool Dead = false;
     Value Vals[MaxVars];
     uint32_t Known = 0;
     uint32_t Truth = 0;
@@ -760,11 +762,34 @@ class CorrelatedUninitPruner {
     return true;
   }
 
-  int predIndex(const Expr *Stripped) const {
+  /// Compute the key of a condition.  The relational comparisons of two
+  /// operands share one key, that of "a < b": "b > a" is the same condition
+  /// and "a >= b" and "b <= a" are its negation.  Returns true if \p E is
+  /// the negation of the condition that the key stands for.
+  bool profileCondition(const Expr *E, llvm::FoldingSetNodeID &ID) const {
+    const auto *BO = dyn_cast<BinaryOperator>(E->IgnoreParenImpCasts());
+    if (!BO || !BO->isRelationalOp()) {
+      E->Profile(ID, Ctx, /*Canonical=*/true);
+      return false;
+    }
+    const Expr *L = BO->getLHS();
+    const Expr *R = BO->getRHS();
+    bool Flip = BO->getOpcode() == BO_GE || BO->getOpcode() == BO_LE;
+    if (BO->getOpcode() == BO_GT || BO->getOpcode() == BO_LE)
+      std::swap(L, R);
+    ID.AddInteger(static_cast<unsigned>(BO_LT));
+    L->Profile(ID, Ctx, /*Canonical=*/true);
+    R->Profile(ID, Ctx, /*Canonical=*/true);
+    return Flip;
+  }
+
+  /// Find the tracked condition with the key of \p Stripped.  \p Flip says
+  /// whether \p Stripped is the negation of what is recorded for it.
+  int predIndex(const Expr *Stripped, bool &Flip) const {
     llvm::FoldingSetNodeID ID;
-    Stripped->Profile(ID, Ctx, /*Canonical=*/true);
+    Flip = profileCondition(Stripped, ID);
     for (unsigned I = 0, E = Preds.size(); I != E; ++I)
-      if (Preds[I].ID == ID)
+      if (Preds[I].Cond && Preds[I].ID == ID)
         return I;
     return -1;
   }
@@ -780,10 +805,11 @@ class CorrelatedUninitPruner {
     for (const VarDecl *VD : Scalars)
       if (Vars.size() < MaxVars && varIndex(VD) < 0)
         Vars.push_back(VD);
-    if (!Pure || Preds.size() >= MaxPreds || predIndex(E) >= 0)
+    bool Flip;
+    if (!Pure || Preds.size() >= MaxPreds || predIndex(E, Flip) >= 0)
       return;
     P.Cond = E;
-    E->Profile(P.ID, Ctx, /*Canonical=*/true);
+    profileCondition(E, P.ID);
     Preds.push_back(std::move(P));
   }
 
@@ -1052,9 +1078,10 @@ class CorrelatedUninitPruner {
     if (isNonNullAddress(E))
       return !Negated;
 
-    int P = predIndex(E);
+    bool Flip;
+    int P = predIndex(E, Flip);
     if (P >= 0 && (St.Known & (1u << P)))
-      return bool(St.Truth & (1u << P)) != Negated;
+      return (bool(St.Truth & (1u << P)) != Flip) != Negated;
     return std::nullopt;
   }
 
@@ -1132,10 +1159,11 @@ class CorrelatedUninitPruner {
       }
     }
 
-    int P = predIndex(E);
+    bool Flip;
+    int P = predIndex(E, Flip);
     if (P >= 0) {
       St.Known |= 1u << P;
-      if (Outcome)
+      if (Outcome != Flip)
         St.Truth |= 1u << P;
       else
         St.Truth &= ~(1u << P);
@@ -1172,6 +1200,47 @@ class CorrelatedUninitPruner {
     forgetLocal(VD, St);
   }
 
+  /// \p E is read or written.  If that goes through a tracked pointer, the
+  /// pointer is not null from here on, and a path that knows it to be null
+  /// ends here.
+  void noteAccess(const Expr *E, State &St) const {
+    for (;;) {
+      E = E->IgnoreParens();
+      const Expr *Pointer = nullptr;
+      if (const auto *ME = dyn_cast<MemberExpr>(E)) {
+        if (!ME->isArrow()) {
+          E = ME->getBase();
+          continue;
+        }
+        Pointer = ME->getBase();
+      } else if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
+        if (UO->getOpcode() != UO_Deref)
+          return;
+        Pointer = UO->getSubExpr();
+      } else if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(E)) {
+        const Expr *Base = ASE->getBase()->IgnoreParens();
+        if (const auto *ICE = dyn_cast<ImplicitCastExpr>(Base);
+            ICE && ICE->getCastKind() == CK_ArrayToPointerDecay) {
+          E = ICE->getSubExpr();
+          continue;
+        }
+        Pointer = Base;
+      } else {
+        return;
+      }
+      const VarDecl *VD = asVarRef(Pointer);
+      int I = VD && VD->getType()->isPointerType() ? varIndex(VD) : -1;
+      if (I < 0)
+        return;
+      Value &V = St.Vals[I];
+      if (V.Kind == Value::Const && V.Bits == 0)
+        St.Dead = true;
+      else if (V.Kind == Value::Top)
+        V.Kind = Value::NonZero;
+      return;
+    }
+  }
+
   void transfer(const Stmt *S, State &St) {
     if (S == Use && !St.XInit) {
       UseReachedUninit = true;
@@ -1179,6 +1248,12 @@ class CorrelatedUninitPruner {
     }
     if (initializesX(S))
       St.XInit = true;
+
+    if (const auto *ICE = dyn_cast<ImplicitCastExpr>(S)) {
+      if (ICE->getCastKind() == CK_LValueToRValue)
+        noteAccess(ICE->getSubExpr(), St);
+      return;
+    }
 
     if (const auto *DS = dyn_cast<DeclStmt>(S)) {
       for (const Decl *D : DS->decls()) {
@@ -1195,6 +1270,7 @@ class CorrelatedUninitPruner {
     if (const auto *BO = dyn_cast<BinaryOperator>(S)) {
       if (!BO->isAssignmentOp())
         return;
+      noteAccess(BO->getLHS(), St);
       if (const VarDecl *VD = asVarRef(BO->getLHS());
           VD && VD->hasLocalStorage() && !AddressTaken.count(VD))
         store(VD, BO->getOpcode() == BO_Assign ? BO->getRHS() : nullptr, St);
@@ -1379,7 +1455,11 @@ public:
           ++FunctionSteps;
           if (UseReachedUninit || ++Steps > MaxSteps)
             return false;
+          if (St.Dead)
+            break;
         }
+        if (St.Dead)
+          continue;
         if (const auto *AS = dyn_cast_or_null<GCCAsmStmt>(B->getTerminatorStmt()))
           transfer(AS, St);
 
