@@ -1426,15 +1426,48 @@ class ErrorPathSuccessChecker {
   enum class Knowledge { None, Zero, NonZero };
 
   llvm::SmallPtrSet<const VarDecl *, 8> AddressTaken;
+  /// Variables that are given something other than a non-negative constant
+  /// and can therefore hold an error code.  A variable that only ever takes
+  /// values such as 0 and 1 is a flag, and returning it after a message is
+  /// deliberate.
+  llvm::SmallPtrSet<const VarDecl *, 8> ErrorCapable;
+  /// Variables that are counted up or down.  Zero is "nothing found" for
+  /// them, not a lost error code.
+  llvm::SmallPtrSet<const VarDecl *, 8> Counters;
   llvm::SmallVector<const VarDecl *, 4> Candidates;
+
+  void noteValue(const VarDecl *VD, const Expr *Value) {
+    if (!VD || !Value || Value->isValueDependent())
+      return;
+    std::optional<llvm::APSInt> K = Value->getIntegerConstantExpr(Ctx);
+    if (!K || K->isNegative())
+      ErrorCapable.insert(VD);
+  }
 
   void collect(const Stmt *St) {
     if (!St)
       return;
     if (const auto *UO = dyn_cast<UnaryOperator>(St)) {
-      if (UO->getOpcode() == UO_AddrOf)
-        if (const VarDecl *VD = getDirectLinuxVariable(UO->getSubExpr()))
-          AddressTaken.insert(VD);
+      const VarDecl *VD = getDirectLinuxVariable(UO->getSubExpr());
+      if (VD && UO->getOpcode() == UO_AddrOf)
+        AddressTaken.insert(VD);
+      else if (VD && UO->isIncrementDecrementOp())
+        Counters.insert(VD);
+    } else if (const auto *BO = dyn_cast<BinaryOperator>(St)) {
+      if (BO->isAssignmentOp()) {
+        const VarDecl *VD = getDirectLinuxVariable(BO->getLHS());
+        if (BO->getOpcode() == BO_Assign)
+          noteValue(VD, BO->getRHS());
+        else if (BO->getOpcode() == BO_AddAssign ||
+                 BO->getOpcode() == BO_SubAssign)
+          Counters.insert(VD);
+        else if (VD)
+          ErrorCapable.insert(VD);
+      }
+    } else if (const auto *DS = dyn_cast<DeclStmt>(St)) {
+      for (const Decl *D : DS->decls())
+        if (const auto *VD = dyn_cast<VarDecl>(D))
+          noteValue(VD, VD->getInit());
     } else if (const auto *AS = dyn_cast<GCCAsmStmt>(St)) {
       for (unsigned I = 0, E = AS->getNumOutputs(); I != E; ++I)
         if (const VarDecl *VD = getDirectLinuxVariable(AS->getOutputExpr(I)))
@@ -1506,6 +1539,10 @@ class ErrorPathSuccessChecker {
                         .Default(false);
     std::string Lower = Name.lower();
     StringRef LowerName(Lower);
+    // An audit record documents a decision, it does not report that the
+    // calling function failed.
+    if (LowerName.contains("audit"))
+      return false;
     bool LooksLikeLogger = false;
     for (StringRef Part : {"err", "dbg", "debug", "log", "print", "msg"})
       LooksLikeLogger |= LowerName.contains(Part);
@@ -1744,7 +1781,8 @@ public:
     collect(FD->getBody());
 
     for (const VarDecl *V : Candidates) {
-      if (AddressTaken.count(V))
+      if (AddressTaken.count(V) || Counters.count(V) ||
+          !ErrorCapable.count(V))
         continue;
       std::vector<Facts> In(Cfg.getNumBlockIDs());
       In[Cfg.getEntry().getBlockID()].Reached = true;

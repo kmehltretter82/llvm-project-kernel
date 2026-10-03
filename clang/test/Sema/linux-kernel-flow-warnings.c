@@ -35,6 +35,7 @@ void _dev_err(void *, const char *, ...);
 void _dev_info(void *, const char *, ...);
 int _printk(const char *, ...);
 void drv_dbg(void *, int, const char *, ...);
+void audit_log_msg(void *, const char *, ...);
 
 int step(void);
 void *get(void);
@@ -280,6 +281,63 @@ int error_code_set(void *dev) {
   if (!get()) {
     _dev_err(dev, "no resource\n");
     ret = -EINVAL;
+    return ret;
+  }
+  return 0;
+}
+
+// A flag that only takes 0 and 1 is not an error code.
+int flag_only(void *dev) {
+  int valid = 0;
+
+  if (get())
+    valid = 1;
+  if (!valid) {
+    _dev_err(dev, "no valid entry, lookup failed\n");
+    return valid;
+  }
+  return 1;
+}
+
+// Neither is a counter.
+int counter(void *dev) {
+  int count = count_elems(dev);
+
+  while (get())
+    count++;
+  if (!count) {
+    _dev_err(dev, "failed to find any element\n");
+    return count;
+  }
+  return count;
+}
+
+// A variable that takes only constants still counts once one of them is a
+// negative errno.
+int constant_error_codes(void *dev) {
+  int ret = 0;
+
+  if (!dev) {
+    ret = -EINVAL;
+    goto out;
+  }
+  if (!get()) {
+    _dev_err(dev, "no resource\n"); // path-note {{failure reported here}}
+    goto out;
+  }
+  pause();
+out:
+  return ret; // path-warning {{'ret' can be zero here, so this return reports success right after a failure was reported}}
+}
+
+// An audit record is not a failure message.
+int audit_record(void *dev) {
+  int ret = step();
+
+  if (ret)
+    return ret;
+  if (!get()) {
+    audit_log_msg(dev, "lookup failed\n");
     return ret;
   }
   return 0;
