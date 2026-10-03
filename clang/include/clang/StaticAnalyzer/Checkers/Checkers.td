@@ -100,6 +100,8 @@ def MPI : Package<"mpi">, ParentPackage<OptIn>;
 def LLVM : Package<"llvm">;
 def LLVMAlpha : Package<"llvm">, ParentPackage<Alpha>;
 
+def LinuxAlpha : Package<"linux">, ParentPackage<Alpha>;
+
 // The APIModeling package is for checkers that model APIs and don't perform
 // any diagnostics. These checkers are always turned on; this package is
 // intended for API modeling that is not controlled by the target triple.
@@ -632,6 +634,20 @@ def SimpleStreamChecker : Checker<"SimpleStream">,
   Documentation<HasDocumentation>;
 
 } // end "alpha.unix"
+
+//===----------------------------------------------------------------------===//
+// Linux kernel checkers.
+//===----------------------------------------------------------------------===//
+
+let ParentPackage = LinuxAlpha in {
+
+def LinuxAtomicSleepChecker : Checker<"AtomicSleep">,
+  HelpText<"Check for calls that may sleep while a Linux kernel spinlock is "
+           "held, inside an RCU read-side critical section, or with "
+           "preemption or bottom halves disabled">,
+  Documentation<NotDocumented>;
+
+} // end "alpha.linux"
 
 //===----------------------------------------------------------------------===//
 // C++ checkers.
