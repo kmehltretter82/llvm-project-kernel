@@ -620,14 +620,39 @@ def warn_linux_kernel_irq_boolean_test : Warning<
 def warn_linux_kernel_irq_zero_comparison : Warning<
   "%0() returns an IRQ number or a negative errno; compare with zero using "
   "'< 0' or '>= 0' and preserve the returned errno">,
-  InGroup<LinuxKernelIRQ>, DefaultIgnore;
+  InGroup<LinuxKernelIRQZero>, DefaultIgnore;
 def warn_linux_kernel_positive_errno_return : Warning<
   "returning positive errno %0 reports success; return -%0 on failure">,
   InGroup<LinuxKernelErrno>, DefaultIgnore;
 def warn_linux_kernel_negative_errno_unsigned_return : Warning<
-  "negative errno returned from an unsigned function becomes a large "
+  "negative errno returned from a function returning %0 becomes a large "
   "positive value">,
   InGroup<LinuxKernelErrno>, DefaultIgnore;
+def warn_linux_kernel_negative_errno_truncated_return : Warning<
+  "negative errno returned from a function returning %0 is truncated and "
+  "cannot be recognized by the caller">,
+  InGroup<LinuxKernelErrnoTruncation>, DefaultIgnore;
+def warn_linux_kernel_unsigned_error_check : Warning<
+  "result of %0() is stored in a variable of unsigned type %1, so this "
+  "comparison is always %select{false|true}2 and a negative error code goes "
+  "undetected">,
+  InGroup<LinuxKernelUnsignedErrorCheck>, DefaultIgnore;
+def warn_linux_kernel_wrong_check_base : Warning<
+  "this tests '%0', but the previous statement stored the result of %2() in "
+  "'%1' and has already dereferenced '%0'">,
+  InGroup<LinuxKernelWrongCheck>, DefaultIgnore;
+def warn_linux_kernel_wrong_check_other : Warning<
+  "this tests '%0', but the previous statement stored the result of %2() in "
+  "'%1'">,
+  InGroup<LinuxKernelWrongCheck>, DefaultIgnore;
+def warn_linux_kernel_error_path_success : Warning<
+  "%0 can be zero here, so this return reports success right after a "
+  "failure was reported">,
+  InGroup<LinuxKernelErrorPathSuccess>, DefaultIgnore;
+def warn_linux_kernel_error_probe_zero : Warning<
+  "%0 can be zero here, so dev_err_probe() returns success">,
+  InGroup<LinuxKernelErrorPathSuccess>, DefaultIgnore;
+def note_linux_kernel_failure_reported : Note<"failure reported here">;
 def warn_return_value_udt: Warning<
   "%0 has C-linkage specified, but returns user-defined type %1 which is "
   "incompatible with C">, InGroup<ReturnTypeCLinkage>;

@@ -10,6 +10,8 @@
 // RUN:   -verify=allocator %s
 // RUN: %clang_cc1 -fsyntax-only -ffreestanding -Wlinux-kernel-irq \
 // RUN:   -verify=irq %s
+// RUN: %clang_cc1 -fsyntax-only -ffreestanding -Wlinux-kernel-irq-zero \
+// RUN:   -verify=irq-zero %s
 // RUN: %clang_cc1 -fsyntax-only -ffreestanding -Wlinux-kernel-errno \
 // RUN:   -verify=errno %s
 // RUN: %clang_cc1 -fsyntax-only -ffreestanding -Wno-everything \
@@ -386,14 +388,14 @@ int irq_boolean_test(void *device) {
 int irq_zero_comparison(void *device) {
   int irq_number = platform_get_irq(device, 0);
 
-  if (irq_number <= 0) // kernel-warning {{platform_get_irq() returns an IRQ number or a negative errno; compare with zero}} irq-warning {{platform_get_irq() returns an IRQ number or a negative errno; compare with zero}}
+  if (irq_number <= 0) // irq-zero-warning {{platform_get_irq() returns an IRQ number or a negative errno; compare with zero}}
     return -EINVAL;
   return irq_number;
 }
 
 int stored_irq_zero_comparison(struct stored_results *results, void *device) {
   results->irq = platform_get_irq(device, 0);
-  if (results->irq == 0) // kernel-warning {{platform_get_irq() returns an IRQ number or a negative errno; compare with zero}} irq-warning {{platform_get_irq() returns an IRQ number or a negative errno; compare with zero}}
+  if (results->irq == 0) // irq-zero-warning {{platform_get_irq() returns an IRQ number or a negative errno; compare with zero}}
     return -EINVAL;
   return results->irq;
 }
@@ -415,7 +417,7 @@ int device_status_to_errno(int status) {
 }
 
 unsigned long negative_errno_from_unsigned_function(void) {
-  return -EFAULT; // errno-warning {{negative errno returned from an unsigned function becomes a large positive value}}
+  return -EFAULT; // errno-warning {{negative errno returned from a function returning 'unsigned long' becomes a large positive value}}
 }
 
 int correct_negative_errno_return(void) {

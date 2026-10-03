@@ -27,13 +27,40 @@ The umbrella currently enables these groups:
 - `-Wlinux-kernel-allocator` diagnoses direct allocation results released by
   an incompatible helper. The modeled families include slab, vmalloc,
   kvmalloc, device-managed, and constant-string allocations.
-- `-Wlinux-kernel-irq` diagnoses boolean and zero-inclusive failure tests of
-  the platform IRQ lookup helpers. These helpers return a positive IRQ number
-  or a negative errno, so callers must test for a negative value and preserve
-  that errno.
-- `-Wconditional-uninitialized` supplies the existing path-sensitive analysis
-  that is especially useful for kernel cleanup labels and configuration-driven
-  control flow.
+- `-Wlinux-kernel-irq` diagnoses boolean tests of the platform IRQ lookup
+  helpers. These helpers return a positive IRQ number or a negative errno, so
+  a boolean test accepts every error as a valid IRQ.
+- `-Wlinux-kernel-errno-truncation` diagnoses a negative errno returned from
+  a function whose return type is narrower than `int`. The value is truncated
+  and the caller cannot recognize it.
+- `-Wlinux-kernel-unsigned-error-check` diagnoses `x < 0` and `x >= 0` when
+  the previous statement stored the result of a function returning a signed
+  integer in the unsigned `x`. The comparison is constant and a negative error
+  code goes undetected. An explicit cast on the stored value states the intent
+  and is not diagnosed.
+- `-Wlinux-kernel-wrong-check` diagnoses a failure test that directly follows
+  `x = f();` but tests something else: the object that `x` is a member of,
+  which the assignment has already dereferenced, or another value of the same
+  type when the test is `IS_ERR()` or `f()` is an allocator that returns
+  `NULL`.
+- `-Wlinux-kernel-error-path-success` diagnoses `return ret` where `ret` is
+  known to be zero on some path and a failure has just been reported. Two
+  shapes are recognized: a return that an error-level message dominates, and
+  a `goto` to a shared exit label directly after such a message. It also
+  diagnoses `dev_err_probe(dev, ret, ...)` with such a `ret`. Error-level
+  messages are the kernel's `*_err` printers, `printk()` with `KERN_ERR` or
+  a more severe level, and driver logging helpers whose text describes a
+  failure.
+- `-Wconditional-uninitialized` supplies the existing analysis that is
+  especially useful for kernel cleanup labels and configuration-driven control
+  flow. Uses that are only reachable uninitialized on paths excluded by
+  correlated conditions are no longer reported there. They remain available
+  under `-Wconditional-uninitialized-correlated`.
+
+`-Wlinux-kernel-irq-zero` is available separately. It diagnoses comparisons
+of a platform IRQ result with zero, such as `irq <= 0`. These lose the
+returned errno but do not miss the failure, and old drivers contain many of
+them.
 
 `-Wlinux-kernel-errno` is available separately. It diagnoses a positive errno
 constant returned by a signed integer function and a negative errno returned

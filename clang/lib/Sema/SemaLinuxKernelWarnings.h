@@ -11,12 +11,20 @@
 
 namespace clang {
 
+class AnalysisDeclContext;
 class FunctionDecl;
 class Sema;
 
 namespace sema {
 
 void IssueLinuxKernelWarnings(Sema &S, const FunctionDecl *FD);
+
+/// Whether any of the checks that need the function's CFG is enabled.
+bool wantsLinuxKernelFlowWarnings(Sema &S, const FunctionDecl *FD);
+
+/// Run the CFG-based Linux kernel checks.
+void IssueLinuxKernelFlowWarnings(Sema &S, const FunctionDecl *FD,
+                                  AnalysisDeclContext &AC);
 
 } // namespace sema
 } // namespace clang

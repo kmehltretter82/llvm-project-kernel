@@ -262,6 +262,21 @@ features cannot lower the translation-unit ABI level;
   `-Wlinux-kernel-irq`. The broader `-Wlinux-kernel-errno` check remains
   available as a separate opt-in diagnostic.
 
+- Added four more groups to `-Wlinux-kernel`:
+  `-Wlinux-kernel-unsigned-error-check` (an error result stored in an unsigned
+  variable and then tested with `< 0`), `-Wlinux-kernel-wrong-check` (a failure
+  test on something other than the value just stored),
+  `-Wlinux-kernel-error-path-success` (a return of a zero status right after a
+  failure message) and `-Wlinux-kernel-errno-truncation` (a negative errno
+  returned through a type narrower than `int`). Comparisons of a platform IRQ
+  number with zero moved from `-Wlinux-kernel-irq` to the separate
+  `-Wlinux-kernel-irq-zero`.
+
+- `-Wconditional-uninitialized` no longer reports a use that is reachable
+  uninitialized only on paths that contradict an earlier branch condition, for
+  example a variable both initialized and used under the same unchanged flag.
+  Those uses are available under `-Wconditional-uninitialized-correlated`.
+
 - New option `-fdefined-pointer-subtraction` added to preserve stable semantics
   when subtracting pointers to unrelated objects.
 

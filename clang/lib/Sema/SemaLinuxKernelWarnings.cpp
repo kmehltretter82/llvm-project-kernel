@@ -16,12 +16,16 @@
 #include "clang/AST/DynamicRecursiveASTVisitor.h"
 #include "clang/AST/Expr.h"
 #include "clang/AST/Stmt.h"
+#include "clang/Analysis/AnalysisDeclContext.h"
+#include "clang/Analysis/CFG.h"
+#include "clang/Basic/Builtins.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/DiagnosticSema.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/Lex/Lexer.h"
 #include "clang/Sema/Sema.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/FoldingSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
@@ -84,6 +88,24 @@ static LinuxKernelAPIKind classifyLinuxKernelAPI(StringRef Name) {
       .Cases({"__kmalloc_noprof", "__kmalloc_node", "__kmalloc_track_caller",
               "__kmalloc_node_track_caller"},
              LinuxKernelAPIKind::KmallocPointer)
+      // Since the kmalloc token was introduced, the kmalloc() family expands
+      // to these inline helpers.
+      .Cases({"_kmalloc_noprof", "_kzalloc_noprof", "_kmalloc_array_noprof",
+              "_kmalloc_node_noprof", "_kmalloc_array_node_noprof"},
+             LinuxKernelAPIKind::KmallocPointer)
+      .Cases({"kmalloc_node_noprof", "kmalloc_array_node_noprof",
+              "__kmalloc_node_noprof", "__kmalloc_cache_noprof",
+              "__kmalloc_cache_node_noprof", "__kmalloc_large_noprof",
+              "__kmalloc_large_node_noprof"},
+             LinuxKernelAPIKind::KmallocPointer)
+      .Cases({"_krealloc_array_noprof", "kmalloc_track_caller_noprof",
+              "kmalloc_node_track_caller_noprof",
+              "__kmalloc_node_track_caller_noprof"},
+             LinuxKernelAPIKind::KmallocPointer)
+      .Cases({"kvmalloc_noprof", "kvmalloc_node_noprof",
+              "kvmalloc_array_node_noprof", "_kvmalloc_array_node_noprof",
+              "kvrealloc_node_align_noprof"},
+             LinuxKernelAPIKind::KvmallocPointer)
       .Cases({"kmem_cache_alloc_trace", "kmem_cache_alloc_node_trace",
               "kmalloc_order", "kmalloc_order_trace"},
              LinuxKernelAPIKind::KmallocPointer)
@@ -289,6 +311,83 @@ static bool isLinuxAssertionMacroExpansion(const Expr *E, const Sema &S) {
       .Default(false);
 }
 
+/// The local variable that \p E names directly, if any.
+static const VarDecl *getDirectLinuxVariable(const Expr *E) {
+  if (!E)
+    return nullptr;
+  const auto *DRE = dyn_cast<DeclRefExpr>(E->IgnoreParenImpCasts());
+  return DRE ? dyn_cast<VarDecl>(DRE->getDecl()) : nullptr;
+}
+
+/// Strip the wrappers that do not change which values make a condition true,
+/// such as unlikely(), and fold logical negations into \p Negated.
+static const Expr *stripLinuxCondition(const Expr *E, bool &Negated) {
+  while (E) {
+    E = E->IgnoreParens();
+    if (const auto *ICE = dyn_cast<ImplicitCastExpr>(E)) {
+      CastKind K = ICE->getCastKind();
+      if (K == CK_IntegralToBoolean || K == CK_PointerToBoolean ||
+          K == CK_NoOp ||
+          (K == CK_IntegralCast &&
+           ICE->getSubExpr()->isKnownToHaveBooleanValue())) {
+        E = ICE->getSubExpr();
+        continue;
+      }
+      break;
+    }
+    if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
+      if (UO->getOpcode() == UO_LNot) {
+        Negated = !Negated;
+        E = UO->getSubExpr();
+        continue;
+      }
+      break;
+    }
+    if (const auto *CE = dyn_cast<CallExpr>(E)) {
+      unsigned ID = CE->getBuiltinCallee();
+      if ((ID == Builtin::BI__builtin_expect ||
+           ID == Builtin::BI__builtin_expect_with_probability) &&
+          CE->getNumArgs() >= 1) {
+        E = CE->getArg(0);
+        continue;
+      }
+    }
+    break;
+  }
+  return E;
+}
+
+static bool isSameLinuxExpr(const ASTContext &Ctx, const Expr *A,
+                            const Expr *B) {
+  if (!A || !B)
+    return false;
+  llvm::FoldingSetNodeID IDA, IDB;
+  A->IgnoreParenImpCasts()->Profile(IDA, Ctx, /*Canonical=*/true);
+  B->IgnoreParenImpCasts()->Profile(IDB, Ctx, /*Canonical=*/true);
+  return IDA == IDB;
+}
+
+/// A variable, or a chain of member accesses that starts at one.
+static bool isSimpleLinuxStorage(const Expr *E) {
+  while (E) {
+    E = E->IgnoreParenImpCasts();
+    if (isa<DeclRefExpr>(E))
+      return isa<VarDecl>(cast<DeclRefExpr>(E)->getDecl());
+    const auto *ME = dyn_cast<MemberExpr>(E);
+    if (!ME || !isa<FieldDecl>(ME->getMemberDecl()))
+      return false;
+    E = ME->getBase();
+  }
+  return false;
+}
+
+static std::string getLinuxExprText(const Expr *E, const Sema &S) {
+  StringRef Text = Lexer::getSourceText(
+      CharSourceRange::getTokenRange(E->getSourceRange()),
+      S.getSourceManager(), S.getLangOpts());
+  return Text.empty() ? std::string("the value") : Text.str();
+}
+
 class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
   using DirectField = std::pair<const VarDecl *, const FieldDecl *>;
 
@@ -301,10 +400,7 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
   bool AssignmentTrackingDisabled = false;
 
   static const VarDecl *getDirectVariable(const Expr *E) {
-    if (!E)
-      return nullptr;
-    const auto *DRE = dyn_cast<DeclRefExpr>(E->IgnoreParenImpCasts());
-    return DRE ? dyn_cast<VarDecl>(DRE->getDecl()) : nullptr;
+    return getDirectLinuxVariable(E);
   }
 
   static std::optional<DirectField> getDirectField(const Expr *E) {
@@ -744,6 +840,262 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
         << Origin.getName() << BO->getSourceRange();
   }
 
+  static const Stmt *stripStatementLabels(const Stmt *St) {
+    while (St) {
+      if (const auto *LS = dyn_cast<LabelStmt>(St))
+        St = LS->getSubStmt();
+      else if (const auto *SC = dyn_cast<SwitchCase>(St))
+        St = SC->getSubStmt();
+      else if (const auto *AS = dyn_cast<AttributedStmt>(St))
+        St = AS->getSubStmt();
+      else
+        break;
+    }
+    return St;
+  }
+
+  /// A value stored by a statement: `target = source;` or a declaration with
+  /// an initializer.
+  struct StoredValue {
+    const Expr *Target = nullptr;
+    const VarDecl *Variable = nullptr;
+    const Expr *Source = nullptr;
+
+    QualType getType() const {
+      return Target ? Target->getType() : Variable->getType();
+    }
+  };
+
+  static bool getStoredValue(const Stmt *St, StoredValue &Stored) {
+    if (const auto *BO = dyn_cast_or_null<BinaryOperator>(St)) {
+      if (BO->getOpcode() != BO_Assign)
+        return false;
+      Stored.Target = BO->getLHS()->IgnoreParens();
+      Stored.Variable = getDirectLinuxVariable(Stored.Target);
+      Stored.Source = BO->getRHS();
+      return true;
+    }
+    if (const auto *DS = dyn_cast_or_null<DeclStmt>(St)) {
+      if (!DS->isSingleDecl())
+        return false;
+      const auto *VD = dyn_cast<VarDecl>(DS->getSingleDecl());
+      if (!VD || !VD->hasLocalStorage() || !VD->hasInit())
+        return false;
+      Stored.Variable = VD;
+      Stored.Source = VD->getInit();
+      return true;
+    }
+    return false;
+  }
+
+  bool refersToStoredValue(const StoredValue &Stored, const Expr *E) const {
+    if (!E)
+      return false;
+    if (Stored.Variable && getDirectLinuxVariable(E) == Stored.Variable)
+      return true;
+    return Stored.Target &&
+           isSameLinuxExpr(S.getASTContext(), Stored.Target, E);
+  }
+
+  bool mentionsStoredValue(const StoredValue &Stored, const Stmt *St) const {
+    if (!St)
+      return false;
+    if (const auto *E = dyn_cast<Expr>(St))
+      if (refersToStoredValue(Stored, E))
+        return true;
+    for (const Stmt *Child : St->children())
+      if (mentionsStoredValue(Stored, Child))
+        return true;
+    return false;
+  }
+
+  std::string getStoredValueText(const StoredValue &Stored) const {
+    if (Stored.Target)
+      return getLinuxExprText(Stored.Target, S);
+    return Stored.Variable->getNameAsString();
+  }
+
+  /// The callee if \p Source is a call that returns a signed integer and is
+  /// converted without an explicit cast.
+  static const FunctionDecl *getSignedResultCallee(const Expr *Source) {
+    const auto *Call =
+        dyn_cast_or_null<CallExpr>(Source ? Source->IgnoreParenImpCasts()
+                                          : nullptr);
+    const FunctionDecl *Callee = Call ? Call->getDirectCallee() : nullptr;
+    if (!Callee || !Callee->getIdentifier())
+      return nullptr;
+    QualType RT = Callee->getReturnType();
+    if (!RT->isSignedIntegerType() || RT->isBooleanType() ||
+        RT->isAnyCharacterType() || RT->isEnumeralType())
+      return nullptr;
+    return Callee;
+  }
+
+  static bool isPlainUnsignedType(QualType T) {
+    return T->isUnsignedIntegerType() && !T->isBooleanType() &&
+           !T->isEnumeralType() && !T->isAnyCharacterType();
+  }
+
+  /// Diagnose `x < 0` and `x >= 0` in \p Cond when x holds, as an unsigned
+  /// value, the result of a call that reports errors as negative numbers.
+  void diagnoseUnsignedErrorTests(const StoredValue &Stored,
+                                  const FunctionDecl *Callee,
+                                  const Expr *Cond) {
+    if (!Cond)
+      return;
+    const Expr *E = Cond->IgnoreParenImpCasts();
+    if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
+      if (UO->getOpcode() == UO_LNot)
+        diagnoseUnsignedErrorTests(Stored, Callee, UO->getSubExpr());
+      return;
+    }
+    if (const auto *CE = dyn_cast<CallExpr>(E)) {
+      unsigned ID = CE->getBuiltinCallee();
+      if ((ID == Builtin::BI__builtin_expect ||
+           ID == Builtin::BI__builtin_expect_with_probability) &&
+          CE->getNumArgs() >= 1)
+        diagnoseUnsignedErrorTests(Stored, Callee, CE->getArg(0));
+      return;
+    }
+    const auto *BO = dyn_cast<BinaryOperator>(E);
+    if (!BO)
+      return;
+    if (BO->isLogicalOp()) {
+      diagnoseUnsignedErrorTests(Stored, Callee, BO->getLHS());
+      diagnoseUnsignedErrorTests(Stored, Callee, BO->getRHS());
+      return;
+    }
+    if (!BO->isRelationalOp())
+      return;
+
+    const Expr *Value = BO->getLHS();
+    const Expr *Other = BO->getRHS();
+    BinaryOperatorKind Opcode = BO->getOpcode();
+    if (!refersToStoredValue(Stored, Value)) {
+      std::swap(Value, Other);
+      Opcode = reverseComparison(Opcode);
+      if (!refersToStoredValue(Stored, Value))
+        return;
+    }
+    if (Opcode != BO_LT && Opcode != BO_GE)
+      return;
+    std::optional<llvm::APSInt> Zero =
+        Other->getIntegerConstantExpr(S.getASTContext());
+    if (!Zero || !Zero->isZero())
+      return;
+
+    S.Diag(BO->getOperatorLoc(), diag::warn_linux_kernel_unsigned_error_check)
+        << Callee->getName() << Stored.getType() << (Opcode == BO_GE)
+        << BO->getSourceRange();
+  }
+
+  void checkUnsignedErrorTest(const StoredValue &Stored, const Expr *Cond) {
+    const FunctionDecl *Callee = getSignedResultCallee(Stored.Source);
+    if (Callee && isPlainUnsignedType(Stored.getType()))
+      diagnoseUnsignedErrorTests(Stored, Callee, Cond);
+  }
+
+  /// `(x = f()) < 0` with an unsigned x.
+  void checkInlineUnsignedErrorTest(const BinaryOperator *BO) {
+    if (!BO->isRelationalOp())
+      return;
+    for (const Expr *Side : {BO->getLHS(), BO->getRHS()}) {
+      StoredValue Stored;
+      if (!getStoredValue(Side->IgnoreParenImpCasts(), Stored))
+        continue;
+      const FunctionDecl *Callee = getSignedResultCallee(Stored.Source);
+      if (!Callee || !isPlainUnsignedType(Stored.getType()))
+        continue;
+      const Expr *Other = Side == BO->getLHS() ? BO->getRHS() : BO->getLHS();
+      BinaryOperatorKind Opcode = Side == BO->getLHS()
+                                      ? BO->getOpcode()
+                                      : reverseComparison(BO->getOpcode());
+      std::optional<llvm::APSInt> Zero =
+          Other->getIntegerConstantExpr(S.getASTContext());
+      if (!Zero || !Zero->isZero() || (Opcode != BO_LT && Opcode != BO_GE))
+        continue;
+      S.Diag(BO->getOperatorLoc(), diag::warn_linux_kernel_unsigned_error_check)
+          << Callee->getName() << Stored.getType() << (Opcode == BO_GE)
+          << BO->getSourceRange();
+    }
+  }
+
+  /// Diagnose a failure test that follows `x = f();` but tests something
+  /// other than x.
+  void checkWrongVariableTest(const StoredValue &Stored, const Expr *Cond) {
+    const auto *Call =
+        dyn_cast<CallExpr>(Stored.Source->IgnoreParenCasts());
+    const FunctionDecl *Callee = Call ? Call->getDirectCallee() : nullptr;
+    if (!Callee || !Callee->getIdentifier())
+      return;
+
+    bool Negated = false;
+    const Expr *Test = stripLinuxCondition(Cond, Negated);
+    if (!Test)
+      return;
+
+    ASTContext &Ctx = S.getASTContext();
+    const Expr *Checked = nullptr;
+    bool IsErrorPointerTest = false;
+    if (const Expr *Value = getErrorPointerCheckValue(Test)) {
+      Checked = Value;
+      IsErrorPointerTest = true;
+    } else if (const auto *BO =
+                   dyn_cast<BinaryOperator>(Test->IgnoreParenImpCasts());
+               BO && BO->isEqualityOp()) {
+      if (BO->getRHS()->isNullPointerConstant(
+              Ctx, Expr::NPC_ValueDependentIsNotNull))
+        Checked = BO->getLHS();
+      else if (BO->getLHS()->isNullPointerConstant(
+                   Ctx, Expr::NPC_ValueDependentIsNotNull))
+        Checked = BO->getRHS();
+    } else if (Test->IgnoreParenImpCasts()->getType()->isPointerType()) {
+      Checked = Test;
+    }
+    if (!Checked)
+      return;
+    Checked = Checked->IgnoreParenImpCasts();
+    if (!isSimpleLinuxStorage(Checked) || mentionsStoredValue(Stored, Cond))
+      return;
+
+    // The test names an object that the assignment has just dereferenced.
+    for (const Expr *Base = Stored.Target; Base;) {
+      const auto *ME = dyn_cast<MemberExpr>(Base->IgnoreParenImpCasts());
+      if (!ME)
+        break;
+      Base = ME->getBase()->IgnoreParenImpCasts();
+      if (isSameLinuxExpr(Ctx, Base, Checked)) {
+        S.Diag(Checked->getExprLoc(), diag::warn_linux_kernel_wrong_check_base)
+            << getLinuxExprText(Checked, S) << getStoredValueText(Stored)
+            << Callee->getName() << Cond->getSourceRange();
+        return;
+      }
+    }
+
+    // The test names another value of the same type.  Only failure tests
+    // that the stored result clearly needs are diagnosed.
+    if (!Ctx.hasSameUnqualifiedType(Stored.getType(), Checked->getType()))
+      return;
+    bool NullOnFailure =
+        isNullReturningKind(classifyLinuxKernelAPI(Callee->getName()));
+    if (!IsErrorPointerTest && !NullOnFailure)
+      return;
+    S.Diag(Checked->getExprLoc(), diag::warn_linux_kernel_wrong_check_other)
+        << getLinuxExprText(Checked, S) << getStoredValueText(Stored)
+        << Callee->getName() << Cond->getSourceRange();
+  }
+
+  void checkAdjacentStatements(const Stmt *Previous, const Stmt *Current) {
+    StoredValue Stored;
+    if (!getStoredValue(Previous, Stored) || !Stored.Source)
+      return;
+    const auto *If = dyn_cast_or_null<IfStmt>(Current);
+    if (!If || !If->getCond())
+      return;
+    checkUnsignedErrorTest(Stored, If->getCond());
+    checkWrongVariableTest(Stored, If->getCond());
+  }
+
 public:
   LinuxKernelWarningsVisitor(Sema &S, const FunctionDecl *FD)
       : S(S), CurrentFunction(FD) {
@@ -792,6 +1144,17 @@ public:
     return Result;
   }
 
+  bool VisitCompoundStmt(CompoundStmt *CS) override {
+    const Stmt *Previous = nullptr;
+    for (const Stmt *Child : CS->body()) {
+      const Stmt *Current = stripStatementLabels(Child);
+      if (Previous)
+        checkAdjacentStatements(Previous, Current);
+      Previous = Current;
+    }
+    return true;
+  }
+
   bool VisitVarDecl(VarDecl *VD) override {
     if (AssignmentTrackingDisabled || !VD->hasLocalStorage() || !VD->hasInit())
       return true;
@@ -832,9 +1195,16 @@ public:
     } else if (ReturnType->isUnsignedIntegerType() && Value &&
                Value->isSigned() && Value->isNegative() &&
                !getLinuxErrnoMacroName(ValueExpr, S).empty()) {
+      // A type narrower than int cannot carry the errno back at all.  With a
+      // wider unsigned type the caller can still recover it by conversion,
+      // which several kernel interfaces rely on.
+      ASTContext &Ctx = S.getASTContext();
+      bool Truncated = !ReturnType->isEnumeralType() &&
+                       Ctx.getIntWidth(ReturnType) < Ctx.getIntWidth(Ctx.IntTy);
       S.Diag(ValueExpr->getExprLoc(),
-             diag::warn_linux_kernel_negative_errno_unsigned_return)
-          << ValueExpr->getSourceRange();
+             Truncated ? diag::warn_linux_kernel_negative_errno_truncated_return
+                       : diag::warn_linux_kernel_negative_errno_unsigned_return)
+          << ReturnType << ValueExpr->getSourceRange();
     }
     return true;
   }
@@ -950,6 +1320,7 @@ public:
     checkUsercopyComparison(BO);
     checkErrorPointerNullComparison(BO);
     checkIRQComparison(BO);
+    checkInlineUnsignedErrorTest(BO);
     return true;
   }
 
@@ -965,6 +1336,378 @@ public:
     VariableOrigins.clear();
     FieldOrigins.clear();
     return true;
+  }
+};
+
+/// Finds returns that report success on a path that has just reported a
+/// failure:
+///
+///   ret = step_one();
+///   if (ret)
+///     return ret;
+///   if (!resource) {
+///     dev_err(dev, "no resource\n");
+///     return ret;               // ret is 0 here
+///   }
+///
+/// For every local variable that the function returns, a forward dataflow
+/// pass over the CFG tracks three facts:
+///
+///   Zero    some path arrives with the variable known to be zero
+///   Message every path arrives after a failure message, and the variable
+///           has not changed since
+///   Jumped  some path arrives through "failure message; goto" with the
+///           variable zero and unchanged since
+///
+/// `return var` is diagnosed when Zero and Message both hold, which covers a
+/// return that a failure message dominates, or when Jumped holds, which
+/// covers the shared exit label.  A message that the code merely passes on
+/// its way to the common success path does not make Message hold at the
+/// return, because the path around the message does not carry it.
+class ErrorPathSuccessChecker {
+  Sema &S;
+  const FunctionDecl *FD;
+  const CFG &Cfg;
+  ASTContext &Ctx;
+
+  struct Facts {
+    bool Reached = false;
+    bool Zero = false;
+    bool Message = false;
+    bool Jumped = false;
+  };
+
+  enum class Knowledge { None, Zero, NonZero };
+
+  llvm::SmallPtrSet<const VarDecl *, 8> AddressTaken;
+  llvm::SmallVector<const VarDecl *, 4> Candidates;
+
+  void collect(const Stmt *St) {
+    if (!St)
+      return;
+    if (const auto *UO = dyn_cast<UnaryOperator>(St)) {
+      if (UO->getOpcode() == UO_AddrOf)
+        if (const VarDecl *VD = getDirectLinuxVariable(UO->getSubExpr()))
+          AddressTaken.insert(VD);
+    } else if (const auto *AS = dyn_cast<GCCAsmStmt>(St)) {
+      for (unsigned I = 0, E = AS->getNumOutputs(); I != E; ++I)
+        if (const VarDecl *VD = getDirectLinuxVariable(AS->getOutputExpr(I)))
+          AddressTaken.insert(VD);
+    } else if (const auto *RS = dyn_cast<ReturnStmt>(St)) {
+      const VarDecl *VD = getDirectLinuxVariable(RS->getRetValue());
+      if (VD && VD->hasLocalStorage() && !isa<ParmVarDecl>(VD) &&
+          !VD->getType().isVolatileQualified() &&
+          VD->getType()->isSignedIntegerType() &&
+          !VD->getType()->isEnumeralType() &&
+          !VD->getType()->isAnyCharacterType() &&
+          !llvm::is_contained(Candidates, VD))
+        Candidates.push_back(VD);
+    }
+    for (const Stmt *Child : St->children())
+      collect(Child);
+  }
+
+  bool isZeroConstant(const Expr *E) const {
+    if (!E)
+      return false;
+    std::optional<llvm::APSInt> V = E->getIntegerConstantExpr(Ctx);
+    return V && V->isZero();
+  }
+
+  static bool hasFailureWords(StringRef Text) {
+    std::string Lower = Text.lower();
+    StringRef L(Lower);
+    for (StringRef Word :
+         {"fail", "error", "unable to", "cannot", "can't", "could not",
+          "couldn't", "timeout", "timed out"})
+      if (L.contains(Word))
+        return true;
+    return false;
+  }
+
+  /// A call that reports an error: an error-level kernel print, or a
+  /// driver's own logging helper printing text that describes a failure.
+  static bool isFailureMessage(const CallExpr *CE) {
+    const FunctionDecl *Callee = CE->getDirectCallee();
+    if (!Callee || !Callee->getIdentifier())
+      return false;
+    StringRef Name = Callee->getName();
+
+    if (llvm::StringSwitch<bool>(Name)
+            .Cases({"_dev_err", "_dev_crit", "_dev_alert", "_dev_emerg"}, true)
+            .Cases({"netdev_err", "netdev_crit", "netdev_alert",
+                    "netdev_emerg"},
+                   true)
+            .Default(false))
+      return true;
+
+    // Standard helpers below the error level never count, whatever they say.
+    if (llvm::StringSwitch<bool>(Name)
+            .Cases({"_dev_warn", "_dev_notice", "_dev_info", "_dev_dbg"}, true)
+            .Cases({"__dynamic_dev_dbg", "__dynamic_pr_debug",
+                    "__dynamic_netdev_dbg"},
+                   true)
+            .Cases({"netdev_warn", "netdev_notice", "netdev_info",
+                    "netdev_dbg"},
+                   true)
+            .Default(false))
+      return false;
+
+    bool IsPrintk = llvm::StringSwitch<bool>(Name)
+                        .Cases({"_printk", "printk", "_printk_deferred",
+                                "_dev_printk", "dev_printk_emit"},
+                               true)
+                        .Default(false);
+    std::string Lower = Name.lower();
+    StringRef LowerName(Lower);
+    bool LooksLikeLogger = false;
+    for (StringRef Part : {"err", "dbg", "debug", "log", "print", "msg"})
+      LooksLikeLogger |= LowerName.contains(Part);
+    if (!IsPrintk && !LooksLikeLogger)
+      return false;
+
+    for (const Expr *Arg : CE->arguments()) {
+      const auto *SL = dyn_cast<StringLiteral>(Arg->IgnoreParenImpCasts());
+      if (!SL || !SL->isOrdinary())
+        continue;
+      StringRef Text = SL->getString();
+      // printk() carries its level in the format string: "\001" "3" is
+      // KERN_ERR and smaller digits are more severe.
+      if (Text.size() >= 2 && Text[0] == '\001')
+        return Text[1] >= '0' && Text[1] <= '3';
+      if (IsPrintk)
+        return false;
+      if (hasFailureWords(Text))
+        return true;
+    }
+    return false;
+  }
+
+  /// What each outcome of \p Cond says about \p V.
+  void classify(const Expr *Cond, const VarDecl *V, Knowledge &OnTrue,
+                Knowledge &OnFalse) const {
+    OnTrue = OnFalse = Knowledge::None;
+    bool Negated = false;
+    const Expr *E = stripLinuxCondition(Cond, Negated);
+    if (!E)
+      return;
+
+    Knowledge T = Knowledge::None, F = Knowledge::None;
+    if (getDirectLinuxVariable(E) == V) {
+      T = Knowledge::NonZero;
+      F = Knowledge::Zero;
+    } else if (const auto *BO =
+                   dyn_cast<BinaryOperator>(E->IgnoreParenImpCasts());
+               BO && BO->isComparisonOp()) {
+      const Expr *Other = BO->getRHS();
+      BinaryOperatorKind Opcode = BO->getOpcode();
+      if (getDirectLinuxVariable(BO->getLHS()) != V) {
+        if (getDirectLinuxVariable(BO->getRHS()) != V)
+          return;
+        Other = BO->getLHS();
+        switch (Opcode) {
+        case BO_LT: Opcode = BO_GT; break;
+        case BO_GT: Opcode = BO_LT; break;
+        case BO_LE: Opcode = BO_GE; break;
+        case BO_GE: Opcode = BO_LE; break;
+        default: break;
+        }
+      }
+      std::optional<llvm::APSInt> K = Other->getIntegerConstantExpr(Ctx);
+      if (!K)
+        return;
+      if (K->isZero()) {
+        switch (Opcode) {
+        case BO_NE: T = Knowledge::NonZero; F = Knowledge::Zero; break;
+        case BO_EQ: T = Knowledge::Zero; F = Knowledge::NonZero; break;
+        case BO_LT:
+        case BO_GT: T = Knowledge::NonZero; break;
+        case BO_LE:
+        case BO_GE: F = Knowledge::NonZero; break;
+        default: break;
+        }
+      } else if (Opcode == BO_EQ) {
+        T = Knowledge::NonZero;
+      } else if (Opcode == BO_NE) {
+        F = Knowledge::NonZero;
+      }
+    } else {
+      return;
+    }
+    if (Negated)
+      std::swap(T, F);
+    OnTrue = T;
+    OnFalse = F;
+  }
+
+  const CallExpr *findFailureMessage(const CFGBlock *Start,
+                                     const Stmt *Before) const {
+    llvm::SmallPtrSet<const CFGBlock *, 16> Seen;
+    llvm::SmallVector<const CFGBlock *, 8> Worklist;
+    Worklist.push_back(Start);
+    while (!Worklist.empty() && Seen.size() < 64) {
+      const CFGBlock *B = Worklist.pop_back_val();
+      if (!Seen.insert(B).second)
+        continue;
+      const CallExpr *Last = nullptr;
+      for (const CFGElement &Elem : *B) {
+        std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>();
+        if (!CS)
+          continue;
+        if (B == Start && CS->getStmt() == Before)
+          break;
+        if (const auto *CE = dyn_cast<CallExpr>(CS->getStmt()))
+          if (isFailureMessage(CE))
+            Last = CE;
+      }
+      if (Last)
+        return Last;
+      for (const CFGBlock::AdjacentBlock &Pred : B->preds())
+        if (const CFGBlock *P = Pred.getReachableBlock())
+          Worklist.push_back(P);
+    }
+    return nullptr;
+  }
+
+  void report(const Stmt *At, unsigned DiagID, const VarDecl *V,
+              const CFGBlock *B) {
+    S.Diag(At->getBeginLoc(), DiagID) << V << At->getSourceRange();
+    if (const CallExpr *Message = findFailureMessage(B, At))
+      S.Diag(Message->getExprLoc(), diag::note_linux_kernel_failure_reported)
+          << Message->getSourceRange();
+  }
+
+  Facts runBlock(const CFGBlock *B, Facts St, const VarDecl *V, bool Report) {
+    for (const CFGElement &Elem : *B) {
+      std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>();
+      if (!CS)
+        continue;
+      const Stmt *St_ = CS->getStmt();
+      if (const auto *BO = dyn_cast<BinaryOperator>(St_)) {
+        if (BO->isAssignmentOp() && getDirectLinuxVariable(BO->getLHS()) == V) {
+          St.Zero = BO->getOpcode() == BO_Assign && isZeroConstant(BO->getRHS());
+          St.Message = St.Jumped = false;
+        }
+      } else if (const auto *UO = dyn_cast<UnaryOperator>(St_)) {
+        if (UO->isIncrementDecrementOp() &&
+            getDirectLinuxVariable(UO->getSubExpr()) == V)
+          St.Zero = St.Message = St.Jumped = false;
+      } else if (const auto *DS = dyn_cast<DeclStmt>(St_)) {
+        for (const Decl *D : DS->decls())
+          if (D == V) {
+            St.Zero = isZeroConstant(V->getInit());
+            St.Message = St.Jumped = false;
+          }
+      } else if (const auto *CE = dyn_cast<CallExpr>(St_)) {
+        const FunctionDecl *Callee = CE->getDirectCallee();
+        if (Report && St.Zero && Callee && Callee->getIdentifier() &&
+            Callee->getName() == "dev_err_probe" && CE->getNumArgs() >= 2 &&
+            getDirectLinuxVariable(CE->getArg(1)) == V)
+          report(CE, diag::warn_linux_kernel_error_probe_zero, V, B);
+        if (isFailureMessage(CE))
+          St.Message = true;
+      } else if (const auto *RS = dyn_cast<ReturnStmt>(St_)) {
+        if (Report && getDirectLinuxVariable(RS->getRetValue()) == V &&
+            ((St.Zero && St.Message) || St.Jumped))
+          report(RS, diag::warn_linux_kernel_error_path_success, V, B);
+      }
+    }
+    return St;
+  }
+
+  static bool isConditionalBranch(const CFGBlock *B) {
+    const Stmt *Term = B->getTerminatorStmt();
+    return Term && B->succ_size() == 2 && !isa<SwitchStmt>(Term) &&
+           !isa<GCCAsmStmt>(Term) &&
+           isa_and_nonnull<Expr>(B->getTerminatorCondition());
+  }
+
+  /// Propagate facts to fixpoint.  With \p JumpPass false only Zero and
+  /// Message are computed.  With it true, those are taken as final and only
+  /// Jumped is propagated, so that it cannot depend on an early, optimistic
+  /// value of Message.
+  void solve(const VarDecl *V, std::vector<Facts> &In, bool JumpPass) {
+    bool Changed = true;
+    unsigned Rounds = 0;
+    while (Changed && ++Rounds < 64) {
+      Changed = false;
+      for (const CFGBlock *B : Cfg) {
+        const Facts &Entry = In[B->getBlockID()];
+        if (!Entry.Reached)
+          continue;
+        Facts Out = runBlock(B, Entry, V, /*Report=*/false);
+
+        Knowledge OnTrue = Knowledge::None, OnFalse = Knowledge::None;
+        if (isConditionalBranch(B))
+          classify(cast<Expr>(B->getTerminatorCondition()), V, OnTrue,
+                   OnFalse);
+        bool IsGoto = isa_and_nonnull<GotoStmt>(B->getTerminatorStmt());
+
+        unsigned Index = 0;
+        for (const CFGBlock::AdjacentBlock &Succ : B->succs()) {
+          Knowledge K = Index++ == 0 ? OnTrue : OnFalse;
+          const CFGBlock *Next = Succ.getReachableBlock();
+          if (!Next)
+            continue;
+          Facts Edge = Out;
+          if (JumpPass && IsGoto && Out.Zero && Out.Message)
+            Edge.Jumped = true;
+          if (K == Knowledge::Zero) {
+            Edge.Zero = true;
+          } else if (K == Knowledge::NonZero) {
+            Edge.Zero = false;
+            Edge.Jumped = false;
+          }
+
+          Facts &Target = In[Next->getBlockID()];
+          if (JumpPass) {
+            if (Edge.Jumped && !Target.Jumped) {
+              Target.Jumped = true;
+              Changed = true;
+            }
+            continue;
+          }
+          if (!Target.Reached) {
+            Target = Edge;
+            Target.Reached = true;
+            Target.Jumped = false;
+            Changed = true;
+            continue;
+          }
+          bool Zero = Target.Zero || Edge.Zero;
+          bool Message = Target.Message && Edge.Message;
+          if (Zero != Target.Zero || Message != Target.Message) {
+            Target.Zero = Zero;
+            Target.Message = Message;
+            Changed = true;
+          }
+        }
+      }
+    }
+  }
+
+public:
+  ErrorPathSuccessChecker(Sema &S, const FunctionDecl *FD, const CFG &Cfg)
+      : S(S), FD(FD), Cfg(Cfg), Ctx(S.getASTContext()) {}
+
+  void run() {
+    QualType RT = FD->getReturnType();
+    if (!RT->isSignedIntegerType() || RT->isBooleanType() ||
+        RT->isEnumeralType() || RT->isAnyCharacterType())
+      return;
+    collect(FD->getBody());
+
+    for (const VarDecl *V : Candidates) {
+      if (AddressTaken.count(V))
+        continue;
+      std::vector<Facts> In(Cfg.getNumBlockIDs());
+      In[Cfg.getEntry().getBlockID()].Reached = true;
+      solve(V, In, /*JumpPass=*/false);
+      solve(V, In, /*JumpPass=*/true);
+      for (const CFGBlock *B : Cfg)
+        if (In[B->getBlockID()].Reached)
+          runBlock(B, In[B->getBlockID()], V, /*Report=*/true);
+    }
   }
 };
 
@@ -984,7 +1727,12 @@ static bool shouldRunLinuxKernelWarnings(const Sema &S, SourceLocation Loc) {
          !Diags.isIgnored(diag::warn_linux_kernel_irq_zero_comparison, Loc) ||
          !Diags.isIgnored(diag::warn_linux_kernel_positive_errno_return, Loc) ||
          !Diags.isIgnored(
-             diag::warn_linux_kernel_negative_errno_unsigned_return, Loc);
+             diag::warn_linux_kernel_negative_errno_unsigned_return, Loc) ||
+         !Diags.isIgnored(
+             diag::warn_linux_kernel_negative_errno_truncated_return, Loc) ||
+         !Diags.isIgnored(diag::warn_linux_kernel_unsigned_error_check, Loc) ||
+         !Diags.isIgnored(diag::warn_linux_kernel_wrong_check_base, Loc) ||
+         !Diags.isIgnored(diag::warn_linux_kernel_wrong_check_other, Loc);
 }
 
 } // namespace
@@ -995,4 +1743,22 @@ void clang::sema::IssueLinuxKernelWarnings(Sema &S, const FunctionDecl *FD) {
     return;
 
   LinuxKernelWarningsVisitor(S, FD).TraverseStmt(FD->getBody());
+}
+
+bool clang::sema::wantsLinuxKernelFlowWarnings(Sema &S,
+                                               const FunctionDecl *FD) {
+  if (!FD || S.getLangOpts().CPlusPlus)
+    return false;
+  const DiagnosticsEngine &Diags = S.getDiagnostics();
+  SourceLocation Loc = FD->getBeginLoc();
+  return !Diags.isIgnored(diag::warn_linux_kernel_error_path_success, Loc) ||
+         !Diags.isIgnored(diag::warn_linux_kernel_error_probe_zero, Loc);
+}
+
+void clang::sema::IssueLinuxKernelFlowWarnings(Sema &S, const FunctionDecl *FD,
+                                               AnalysisDeclContext &AC) {
+  if (!wantsLinuxKernelFlowWarnings(S, FD) || !FD->getBody())
+    return;
+  if (const CFG *Cfg = AC.getCFG())
+    ErrorPathSuccessChecker(S, FD, *Cfg).run();
 }

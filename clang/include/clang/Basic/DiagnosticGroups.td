@@ -1199,12 +1199,25 @@ def LinuxKernelUsercopy : DiagGroup<"linux-kernel-usercopy">;
 def LinuxKernelErrorPointer : DiagGroup<"linux-kernel-error-pointer">;
 def LinuxKernelAllocator : DiagGroup<"linux-kernel-allocator">;
 def LinuxKernelIRQ : DiagGroup<"linux-kernel-irq">;
+// Comparing an IRQ number with zero is imprecise, not wrong: the helpers do
+// not return zero.  Too common in old drivers to be part of the umbrella.
+def LinuxKernelIRQZero : DiagGroup<"linux-kernel-irq-zero">;
 def LinuxKernelErrno : DiagGroup<"linux-kernel-errno">;
+def LinuxKernelErrnoTruncation : DiagGroup<"linux-kernel-errno-truncation">;
+def LinuxKernelUnsignedErrorCheck :
+  DiagGroup<"linux-kernel-unsigned-error-check">;
+def LinuxKernelWrongCheck : DiagGroup<"linux-kernel-wrong-check">;
+def LinuxKernelErrorPathSuccess :
+  DiagGroup<"linux-kernel-error-path-success">;
 def LinuxKernel : DiagGroup<"linux-kernel", [LinuxKernelBoolReturn,
                                              LinuxKernelUsercopy,
                                              LinuxKernelErrorPointer,
                                              LinuxKernelAllocator,
                                              LinuxKernelIRQ,
+                                             LinuxKernelErrnoTruncation,
+                                             LinuxKernelUnsignedErrorCheck,
+                                             LinuxKernelWrongCheck,
+                                             LinuxKernelErrorPathSuccess,
                                              UninitializedMaybe]>;
 def IgnoredPragmaIntrinsic : DiagGroup<"ignored-pragma-intrinsic">;
 // #pragma optimize is often used to avoid to work around MSVC codegen bugs or
