@@ -7,7 +7,10 @@
 // RUN: %clang_cc1 -fsyntax-only -ffreestanding \
 // RUN:   -Wlinux-kernel-errno-truncation -verify=trunc %s
 // RUN: %clang_cc1 -fsyntax-only -ffreestanding -Wlinux-kernel \
-// RUN:   -Wno-conditional-uninitialized -verify=unsigned,wrong,path,trunc %s
+// RUN:   -Wno-conditional-uninitialized \
+// RUN:   -verify=unsigned,wrong,path,trunc,annot %s
+// RUN: %clang_cc1 -fsyntax-only -ffreestanding -Wlinux-kernel-error-pointer \
+// RUN:   -Wlinux-kernel-irq -verify=annot %s
 // RUN: %clang_cc1 -fsyntax-only -ffreestanding -Wno-everything \
 // RUN:   -verify=disabled %s
 
@@ -294,4 +297,54 @@ unsigned int wide_return(int x) {
   if (x)
     return -EINVAL;
   return 1;
+}
+
+// A contract stated by an annotation instead of the built-in table.
+
+#define __returns_err_ptr \
+  __attribute__((annotate("linux_kernel::returns_err_ptr")))
+#define __returns_null_on_failure \
+  __attribute__((annotate("linux_kernel::returns_null_on_failure")))
+
+__returns_err_ptr void *widget_get(void *);
+__returns_null_on_failure void *widget_alloc(void);
+void *widget_other(void);
+
+int annotated_err_ptr(void *dev) {
+  void *w = widget_get(dev);
+  if (!w) // annot-warning {{widget_get returns an encoded error pointer on failure, which a NULL test does not detect; use IS_ERR()}}
+    return -EINVAL;
+  return 0;
+}
+
+int annotated_null(void) {
+  void *w = widget_alloc();
+  if (IS_ERR(w)) // annot-warning {{widget_alloc returns NULL on failure, which IS_ERR does not detect; test the pointer for NULL}}
+    return -EINVAL;
+  return 0;
+}
+
+int not_annotated(void) {
+  void *w = widget_other();
+  if (!w)
+    return -EINVAL;
+  return 0;
+}
+
+// A boolean test of an IRQ number after a negative test only handles zero.
+
+int irq_negative_then_zero(void *pdev) {
+  int irq = platform_get_irq(pdev, 0);
+  if (irq < 0)
+    return irq;
+  if (!irq)
+    return -EINVAL;
+  return irq;
+}
+
+int irq_boolean_only(void *pdev) {
+  int irq = platform_get_irq(pdev, 0);
+  if (!irq) // annot-warning {{platform_get_irq() returns an IRQ number or a negative errno; a boolean test does not detect errors; test for a negative value}}
+    return -EINVAL;
+  return irq;
 }

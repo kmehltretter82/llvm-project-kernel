@@ -186,6 +186,39 @@ static LinuxKernelAPIKind classifyLinuxKernelAPI(StringRef Name) {
       .Default(LinuxKernelAPIKind::None);
 }
 
+/// A declaration can state its contract with an annotation instead of being
+/// listed above:
+///
+///   __attribute__((annotate("linux_kernel::returns_err_ptr")))
+///   struct clk *my_clk_get(struct device *dev);
+///
+/// Kernel headers would hide the attribute behind a macro.
+static LinuxKernelAPIKind classifyLinuxKernelAnnotation(const FunctionDecl *FD) {
+  for (const auto *A : FD->specific_attrs<AnnotateAttr>()) {
+    LinuxKernelAPIKind Kind =
+        llvm::StringSwitch<LinuxKernelAPIKind>(A->getAnnotation())
+            .Case("linux_kernel::returns_err_ptr",
+                  LinuxKernelAPIKind::ErrorPointer)
+            .Case("linux_kernel::returns_null_on_failure",
+                  LinuxKernelAPIKind::NullablePointer)
+            .Case("linux_kernel::returns_uncopied_bytes",
+                  LinuxKernelAPIKind::UsercopyResidual)
+            .Case("linux_kernel::returns_irq_or_errno",
+                  LinuxKernelAPIKind::IRQNumber)
+            .Default(LinuxKernelAPIKind::None);
+    if (Kind != LinuxKernelAPIKind::None)
+      return Kind;
+  }
+  return LinuxKernelAPIKind::None;
+}
+
+static LinuxKernelAPIKind classifyLinuxKernelCallee(const FunctionDecl *FD) {
+  LinuxKernelAPIKind Kind = classifyLinuxKernelAnnotation(FD);
+  if (Kind == LinuxKernelAPIKind::None && FD->getIdentifier())
+    Kind = classifyLinuxKernelAPI(FD->getName());
+  return Kind;
+}
+
 static bool isNullReturningKind(LinuxKernelAPIKind Kind) {
   switch (Kind) {
   case LinuxKernelAPIKind::NullablePointer:
@@ -396,6 +429,9 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
   llvm::DenseMap<const VarDecl *, LinuxKernelAPIOrigin> VariableOrigins;
   llvm::DenseMap<DirectField, LinuxKernelAPIOrigin> FieldOrigins;
   llvm::SmallPtrSet<const Expr *, 4> CoveredNullTests;
+  /// IRQ results that have already been tested for a negative value.  A
+  /// later boolean test of the same value only handles zero.
+  llvm::SmallPtrSet<const VarDecl *, 4> NegativeTestedIRQs;
   unsigned ControlFlowDepth = 0;
   bool AssignmentTrackingDisabled = false;
 
@@ -425,8 +461,10 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
   }
 
   void forgetDirectStorage(const Expr *E) {
-    if (const VarDecl *VD = getDirectVariable(E))
+    if (const VarDecl *VD = getDirectVariable(E)) {
       VariableOrigins.erase(VD);
+      NegativeTestedIRQs.erase(VD);
+    }
     if (std::optional<DirectField> Field = getDirectField(E))
       FieldOrigins.erase(*Field);
   }
@@ -555,7 +593,7 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
           return {};
         return {LinuxKernelAPIKind::ErrorPointer, Callee};
       }
-      LinuxKernelAPIKind Kind = classifyLinuxKernelAPI(Callee->getName());
+      LinuxKernelAPIKind Kind = classifyLinuxKernelCallee(Callee);
       return {Kind, Kind == LinuxKernelAPIKind::None ? nullptr : Callee};
     }
 
@@ -833,6 +871,13 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
     if (!Value || !Value->isZero())
       return;
 
+    if (Opcode == BO_LT || Opcode == BO_GE) {
+      const Expr *Tested =
+          Other == BO->getRHS() ? BO->getLHS() : BO->getRHS();
+      if (const VarDecl *VD = getDirectVariable(Tested))
+        NegativeTestedIRQs.insert(VD);
+      return;
+    }
     if (Opcode != BO_EQ && Opcode != BO_NE && Opcode != BO_LE)
       return;
 
@@ -1076,8 +1121,7 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
     // that the stored result clearly needs are diagnosed.
     if (!Ctx.hasSameUnqualifiedType(Stored.getType(), Checked->getType()))
       return;
-    bool NullOnFailure =
-        isNullReturningKind(classifyLinuxKernelAPI(Callee->getName()));
+    bool NullOnFailure = isNullReturningKind(classifyLinuxKernelCallee(Callee));
     if (!IsErrorPointerTest && !NullOnFailure)
       return;
     S.Diag(Checked->getExprLoc(), diag::warn_linux_kernel_wrong_check_other)
@@ -1259,7 +1303,8 @@ public:
     if (UO->getOpcode() == UO_LNot) {
       checkErrorPointerBooleanTest(UO);
       LinuxKernelAPIOrigin Origin = getOrigin(UO->getSubExpr());
-      if (Origin.Kind == LinuxKernelAPIKind::IRQNumber)
+      if (Origin.Kind == LinuxKernelAPIKind::IRQNumber &&
+          !NegativeTestedIRQs.contains(getDirectVariable(UO->getSubExpr())))
         S.Diag(UO->getExprLoc(), diag::warn_linux_kernel_irq_boolean_test)
             << Origin.getName() << UO->getSourceRange();
     }
@@ -1272,7 +1317,8 @@ public:
     if (ICE->getCastKind() != CK_IntegralToBoolean)
       return true;
     LinuxKernelAPIOrigin Origin = getOrigin(ICE->getSubExpr());
-    if (Origin.Kind == LinuxKernelAPIKind::IRQNumber)
+    if (Origin.Kind == LinuxKernelAPIKind::IRQNumber &&
+        !NegativeTestedIRQs.contains(getDirectVariable(ICE->getSubExpr())))
       S.Diag(ICE->getExprLoc(), diag::warn_linux_kernel_irq_boolean_test)
           << Origin.getName() << ICE->getSourceRange();
     return true;

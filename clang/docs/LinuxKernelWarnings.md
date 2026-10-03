@@ -92,6 +92,25 @@ $ make LLVM=1 CC=/path/to/llvm-build/bin/clang \
     KCFLAGS='-Wlinux-kernel -Wno-conditional-uninitialized'
 ```
 
+## Declaring a contract
+
+The checks know a built-in table of kernel functions. A declaration can also
+state its contract itself, which lets the kernel describe APIs that the table
+does not list:
+
+```c
+#define __returns_err_ptr \
+  __attribute__((annotate("linux_kernel::returns_err_ptr")))
+
+__returns_err_ptr struct clk *my_clk_get(struct device *dev);
+```
+
+The recognized annotations are `linux_kernel::returns_err_ptr`,
+`linux_kernel::returns_null_on_failure`,
+`linux_kernel::returns_uncopied_bytes` and
+`linux_kernel::returns_irq_or_errno`. An annotation takes precedence over the
+table.
+
 ## API provenance
 
 The API checks follow values through direct calls, local initializers, simple
