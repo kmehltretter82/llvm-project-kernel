@@ -42,7 +42,8 @@ The umbrella currently enables these groups:
   `x = f();` but tests something else: the object that `x` is a member of,
   which the assignment has already dereferenced, or another value of the same
   type when the test is `IS_ERR()` or `f()` is an allocator that returns
-  `NULL`.
+  `NULL`. A batch of assignments followed by their tests
+  (`a = f(); b = f(); if (IS_ERR(a))`) is left alone.
 - `-Wlinux-kernel-error-path-success` diagnoses `return ret` where `ret` is
   known to be zero on some path and a failure has just been reported. Two
   shapes are recognized: a return that an error-level message dominates, and
@@ -50,7 +51,12 @@ The umbrella currently enables these groups:
   diagnoses `dev_err_probe(dev, ret, ...)` with such a `ret`. Error-level
   messages are the kernel's `*_err` printers, `printk()` with `KERN_ERR` or
   a more severe level, and driver logging helpers whose text describes a
-  failure.
+  failure. Audit records do not count. Only variables that look like an
+  error code are followed: the name is `ret`, `err`, `rc`, `status` or
+  similar, the variable is given a non-constant value or a negative
+  constant somewhere, and it is not counted up or down. A `goto` to a label
+  inside a loop is not an exit. The note points at the message that makes
+  the path a failure path.
 - `-Wconditional-uninitialized` supplies the existing analysis that is
   especially useful for kernel cleanup labels and configuration-driven control
   flow. Uses that are only reachable uninitialized on paths excluded by
@@ -110,6 +116,24 @@ The recognized annotations are `linux_kernel::returns_err_ptr`,
 `linux_kernel::returns_uncopied_bytes` and
 `linux_kernel::returns_irq_or_errno`. An annotation takes precedence over the
 table.
+
+## Static analyzer
+
+Whether a call may sleep while a spinlock is held depends on the path, so
+that check is a static analyzer checker and not a warning:
+
+```sh
+clang --analyze -Xclang -analyzer-checker=alpha.linux.AtomicSleep ...
+```
+
+`alpha.linux.AtomicSleep` tracks spinlocks and rwlocks (through
+`_raw_spin_lock()` and the other functions the kernel's inline wrappers end
+in), `rcu_read_lock()`, `preempt_disable()` and `local_bh_disable()` along a
+path. While one of them is open it reports `might_sleep()`, a list of
+functions that always sleep, and a call to a function without a visible body
+that is passed gfp flags known to allow direct reclaim. It sees one
+translation unit, so both the lock and the sleeping call have to be on one
+path in it.
 
 ## API provenance
 
