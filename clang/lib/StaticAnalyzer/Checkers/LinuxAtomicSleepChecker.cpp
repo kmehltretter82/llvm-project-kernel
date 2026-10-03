@@ -20,6 +20,9 @@
 //   - its body is not visible and it is passed gfp flags that allow direct
 //     reclaim, as in kmalloc(size, GFP_KERNEL).
 //
+// Out-of-line lock functions are evaluated by the checker so that taking a
+// lock inside a structure does not invalidate the rest of the structure.
+//
 // The checker only reports what it can see on one path through one
 // translation unit: the lock has to be taken and the sleeping call has to be
 // reached without leaving that path.  It gives up on a critical section when
@@ -179,7 +182,7 @@ static CallRole classify(StringRef Name) {
 namespace {
 
 class LinuxAtomicSleepChecker
-    : public Checker<check::PreCall, check::PostCall> {
+    : public Checker<check::PreCall, check::PostCall, eval::Call> {
   const BugType SleepBug{this, "Sleeping call in atomic context",
                          "Linux kernel"};
 
@@ -202,6 +205,7 @@ class LinuxAtomicSleepChecker
 public:
   void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
   void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
+  bool evalCall(const CallEvent &Call, CheckerContext &C) const;
 };
 
 } // namespace
@@ -211,6 +215,38 @@ static const FunctionDecl *getCallee(const CallEvent &Call) {
   if (!FD || !FD->getIdentifier() || !FD->getDeclContext()->isFileContext())
     return nullptr;
   return FD;
+}
+
+/// Out-of-line lock and unlock functions.  They change nothing but the lock,
+/// so they are evaluated here instead of conservatively.  Otherwise a call
+/// such as spin_lock(&dev->lock) makes the analyzer forget every field of
+/// *dev, and with it conditions like "if (dev->flags & ATOMIC)" that decide
+/// between a spinlock and a mutex and later between a busy wait and a sleep.
+static bool isLockOperation(StringRef Name) {
+  switch (classify(Name).R) {
+  case Role::Enter:
+  case Role::TryEnter:
+  case Role::Leave:
+    return true;
+  default:
+    break;
+  }
+  return llvm::StringSwitch<bool>(Name)
+      .Cases({"mutex_lock", "mutex_lock_nested", "mutex_lock_interruptible",
+              "mutex_lock_interruptible_nested", "mutex_lock_killable",
+              "mutex_lock_killable_nested", "mutex_trylock", "mutex_unlock"},
+             true)
+      .Cases({"down_read", "down_read_nested", "down_write",
+              "down_write_nested", "up_read", "up_write"},
+             true)
+      .Default(false);
+}
+
+/// Functions that take gfp flags and are meant to be called with a spinlock
+/// held: the XArray drops and retakes its lock around a blocking allocation.
+static bool dropsLockToAllocate(StringRef Name) {
+  return Name.starts_with("__xa_") || Name.starts_with("xa_") ||
+         Name.starts_with("xas_");
 }
 
 static StringRef describe(SectionKind Kind) {
@@ -293,7 +329,7 @@ uint64_t LinuxAtomicSleepChecker::getDirectReclaimMask(CheckerContext &C) const 
 bool LinuxAtomicSleepChecker::allowsBlocking(const CallEvent &Call,
                                              CheckerContext &C) const {
   const FunctionDecl *FD = getCallee(Call);
-  if (!FD || FD->hasBody())
+  if (!FD || FD->hasBody() || dropsLockToAllocate(FD->getName()))
     return false;
   uint64_t Mask = getDirectReclaimMask(C);
   if (!Mask)
@@ -484,6 +520,22 @@ void LinuxAtomicSleepChecker::checkPostCall(const CallEvent &Call,
   bool UnlockHelper = !FD->hasBody() && looksLikeUnlock(FD);
   if (Opaque || UnlockHelper)
     C.addTransition(State->set<AtomicSections>(Factory.getEmptyList()));
+}
+
+bool LinuxAtomicSleepChecker::evalCall(const CallEvent &Call,
+                                       CheckerContext &C) const {
+  const FunctionDecl *FD = getCallee(Call);
+  const Expr *Origin = Call.getOriginExpr();
+  if (!FD || FD->hasBody() || !Origin || !isLockOperation(FD->getName()))
+    return false;
+
+  ProgramStateRef State = C.getState();
+  if (!Call.getResultType()->isVoidType())
+    State = State->BindExpr(
+        Origin, C.getStackFrame(),
+        C.getSValBuilder().conjureSymbolVal(Call, C.blockCount()));
+  C.addTransition(State);
+  return true;
 }
 
 void ento::registerLinuxAtomicSleepChecker(CheckerManager &Mgr) {

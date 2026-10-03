@@ -169,3 +169,36 @@ void nested_locks(struct dev *a, struct dev *b) {
   spin_unlock(&a->lock);
   msleep(10);
 }
+
+// A flag in the structure that holds the lock decides between the atomic and
+// the sleeping variant.  Taking the lock must not make the analyzer forget
+// the flag.
+struct portal {
+  spinlock_t lock;
+  struct mutex mutex;
+  unsigned int flags;
+};
+
+void flag_selects_the_lock(struct portal *p) {
+  if (p->flags & 1)
+    spin_lock(&p->lock);
+  else
+    mutex_lock(&p->mutex);
+
+  if (!(p->flags & 1))
+    msleep(1);
+  else
+    udelay(1);
+
+  if (p->flags & 1)
+    spin_unlock(&p->lock);
+}
+
+// The XArray drops its lock around a blocking allocation.
+void *__xa_store(void *xa, unsigned long index, void *entry, gfp_t gfp);
+
+void xarray_under_its_lock(struct dev *d, void *xa) {
+  spin_lock(&d->lock);
+  __xa_store(xa, 1, d, GFP_KERNEL);
+  spin_unlock(&d->lock);
+}
