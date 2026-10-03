@@ -28,6 +28,7 @@
 #include "clang/StaticAnalyzer/Core/PathSensitive/ExprEngine.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/FunctionSummary.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/WorkList.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/TimeProfiler.h"
@@ -460,10 +461,27 @@ void CoreEngine::HandleBlockExit(const CFGBlock * B, ExplodedNode *Pred) {
         HandleBranch(cast<WhileStmt>(Term)->getCond(), Term, B, Pred);
         return;
 
-      case Stmt::GCCAsmStmtClass:
-        assert(cast<GCCAsmStmt>(Term)->isAsmGoto() && "Encountered GCCAsmStmt without labels");
-        // TODO: Handle jumping to labels
+      case Stmt::GCCAsmStmtClass: {
+        const auto *Asm = cast<GCCAsmStmt>(Term);
+        assert(Asm->isAsmGoto() && "Encountered GCCAsmStmt without labels");
+        // Nothing is known about what the assembly does.  It may have
+        // written its outputs, and it may fall through or jump to any of its
+        // labels, so forget the outputs and follow every successor.
+        ProgramStateRef State = Pred->getState();
+        const StackFrame *SF = Pred->getStackFrame();
+        for (const Expr *Output : Asm->outputs())
+          if (std::optional<Loc> LV = State->getSVal(Output, SF).getAs<Loc>())
+            State = State->bindLoc(*LV, UnknownVal(), SF);
+        llvm::SmallPtrSet<const CFGBlock *, 4> Followed;
+        for (const CFGBlock::AdjacentBlock &Succ : B->succs()) {
+          const CFGBlock *Next = Succ.getReachableBlock();
+          if (!Next || !Followed.insert(Next).second)
+            continue;
+          if (ExplodedNode *N = makeNode(BlockEdge(B, Next, SF), State, Pred))
+            WList->enqueue(N);
+        }
         return;
+      }
     }
   }
 
