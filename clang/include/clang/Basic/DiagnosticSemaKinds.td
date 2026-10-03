@@ -2663,6 +2663,10 @@ def warn_maybe_uninit_var : Warning<
   "variable %0 may be uninitialized when "
   "%select{used here|captured by block}1">,
   InGroup<UninitializedMaybe>, DefaultIgnore;
+def warn_maybe_uninit_var_correlated : Warning<
+  "variable %0 is uninitialized when used here only on paths that an earlier "
+  "condition excludes">,
+  InGroup<UninitializedMaybeCorrelated>, DefaultIgnore;
 def note_var_declared_here : Note<"variable %0 is declared here">;
 def note_uninit_var_use : Note<
   "%select{uninitialized use occurs|variable is captured by block}0 here">;

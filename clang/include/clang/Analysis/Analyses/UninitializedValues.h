@@ -53,6 +53,10 @@ private:
   /// Is this use a const pointer to this variable?
   bool ConstPtrUse = false;
 
+  /// The use is only reachable with the variable uninitialized on paths
+  /// that contradict a condition they established earlier.
+  bool Correlated = false;
+
   /// This use is always uninitialized if it occurs after any of these branches
   /// is taken.
   SmallVector<Branch, 2> UninitBranches;
@@ -69,6 +73,7 @@ public:
   void setUninitAfterDecl() { UninitAfterDecl = true; }
   void setConstRefUse() { ConstRefUse = true; }
   void setConstPtrUse() { ConstPtrUse = true; }
+  void setCorrelated() { Correlated = true; }
 
   /// Get the expression containing the uninitialized use.
   const Expr *getUser() const { return User; }
@@ -76,6 +81,7 @@ public:
   bool isConstRefUse() const { return ConstRefUse; }
   bool isConstPtrUse() const { return ConstPtrUse; }
   bool isConstRefOrPtrUse() const { return ConstRefUse || ConstPtrUse; }
+  bool isCorrelated() const { return Correlated; }
 
   /// The kind of uninitialized use.
   enum Kind {
@@ -117,6 +123,10 @@ class UninitVariablesHandler {
 public:
   UninitVariablesHandler() = default;
   virtual ~UninitVariablesHandler();
+
+  /// Whether 'may be uninitialized' uses should be checked for correlated
+  /// guarding conditions.  The check costs a path-sensitive replay per use.
+  virtual bool wantsCorrelationPruning() const { return false; }
 
   /// Called when the uninitialized variable is used at the given expression.
   virtual void handleUseOfUninitVariable(const VarDecl *vd,

@@ -179,17 +179,17 @@ int test23(void) {
   return 0;
 }
 
-// The basic uninitialized value analysis doesn't have enough path-sensitivity
-// to catch initializations relying on control-dependencies spanning multiple
-// conditionals.  This possibly can be handled by making the CFG itself
-// represent such control-dependencies, but it is a niche case.
+// The dataflow analysis alone cannot see initializations that rely on
+// control dependencies spanning multiple conditionals.  The use below is
+// only reachable uninitialized on a path that takes 'flag' as both false and
+// true, so it is not reported.
 int test24(int flag) {
-  unsigned val; // expected-note{{initialize the variable 'val' to silence this warning}}
+  unsigned val;
   if (flag)
     val = 1;
   if (!flag)
     val = 1;
-  return val; // expected-warning{{variable 'val' may be uninitialized when used here}}
+  return val; // no-warning
 }
 
 float test25(void) {

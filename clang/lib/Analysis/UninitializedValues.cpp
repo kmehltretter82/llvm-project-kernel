@@ -11,6 +11,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "clang/Analysis/Analyses/UninitializedValues.h"
+#include "clang/Analysis/Analyses/Dominators.h"
+#include "clang/Basic/Builtins.h"
 #include "clang/AST/Attr.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclBase.h"
@@ -27,6 +29,7 @@
 #include "clang/Basic/LLVM.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/FoldingSet.h"
 #include "llvm/ADT/PackedVector.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/SmallVector.h"
@@ -464,6 +467,704 @@ void ClassifyRefs::VisitCastExpr(const CastExpr *CE) {
 }
 
 //------------------------------------------------------------------------====//
+// Pruning of 'may be uninitialized' uses guarded by correlated conditions.
+//====------------------------------------------------------------------------//
+
+namespace {
+
+/// Decides whether a use that the dataflow analysis reports as "may be
+/// uninitialized" is only reachable, with the variable still uninitialized,
+/// along paths that contradict themselves.
+///
+/// The check replays the function over its CFG and tracks a few facts per
+/// path: whether the variable has been initialized, the constant values of
+/// some local scalars that occur in branch conditions, and the outcome of
+/// some side-effect-free branch conditions.  A path that would have to take a
+/// branch against a fact it established earlier is dropped.  If no remaining
+/// path reaches the use without initializing the variable, the use is guarded
+/// by conditions that are correlated with the initialization, as in
+///
+///   if (flag)
+///     x = f();
+///   ...
+///   if (flag)
+///     use(x);
+///
+/// Facts are tracked only for conditions that dominate the use or one of the
+/// initializations, which keeps the state small.  The check is conservative:
+/// calls and stores through memory forget conditions that read memory, and
+/// the use is reported as before whenever the search exceeds its budget.
+class CorrelatedUninitPruner {
+  static constexpr unsigned MaxVars = 6;
+  static constexpr unsigned MaxPreds = 16;
+  static constexpr unsigned MaxStatesPerBlock = 48;
+  static constexpr unsigned MaxSteps = 40000;
+
+  const CFG &Cfg;
+  AnalysisDeclContext &AC;
+  ASTContext &Ctx;
+  const ClassifyRefs &Classification;
+  const DeclContext *DC;
+
+  bool Prepared = false;
+  llvm::SmallPtrSet<const VarDecl *, 16> AddressTaken;
+  std::unique_ptr<CFGDomTree> DomTree;
+
+  struct Pred {
+    llvm::FoldingSetNodeID ID;
+    SmallVector<const VarDecl *, 2> Locals;
+    bool ReadsMemory = false;
+  };
+
+  struct Value {
+    enum KindTy : uint8_t { Top, Const, NonZero };
+    KindTy Kind = Top;
+    uint64_t Bits = 0;
+
+    bool operator==(const Value &O) const {
+      return Kind == O.Kind && (Kind != Const || Bits == O.Bits);
+    }
+  };
+
+  struct State {
+    bool XInit = false;
+    Value Vals[MaxVars];
+    uint32_t Known = 0;
+    uint32_t Truth = 0;
+
+    bool operator==(const State &O) const {
+      if (XInit != O.XInit || Known != O.Known ||
+          (Truth & Known) != (O.Truth & O.Known))
+        return false;
+      for (unsigned I = 0; I != MaxVars; ++I)
+        if (!(Vals[I] == O.Vals[I]))
+          return false;
+      return true;
+    }
+  };
+
+  // Per query.
+  const VarDecl *X = nullptr;
+  const Expr *Use = nullptr;
+  SmallVector<const VarDecl *, MaxVars> Vars;
+  SmallVector<Pred, MaxPreds> Preds;
+  unsigned Steps = 0;
+  bool UseReachedUninit = false;
+  bool GaveUp = false;
+
+  void collectAddressTaken(const Stmt *S) {
+    if (!S)
+      return;
+    if (const auto *UO = dyn_cast<UnaryOperator>(S)) {
+      if (UO->getOpcode() == UO_AddrOf)
+        if (const auto *DRE =
+                dyn_cast<DeclRefExpr>(UO->getSubExpr()->IgnoreParens()))
+          if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))
+            AddressTaken.insert(VD);
+    } else if (const auto *AS = dyn_cast<GCCAsmStmt>(S)) {
+      for (unsigned I = 0, E = AS->getNumOutputs(); I != E; ++I)
+        if (const auto *DRE = dyn_cast<DeclRefExpr>(
+                AS->getOutputExpr(I)->IgnoreParenCasts()))
+          if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))
+            AddressTaken.insert(VD);
+    }
+    for (const Stmt *Child : S->children())
+      collectAddressTaken(Child);
+  }
+
+  void prepare() {
+    if (Prepared)
+      return;
+    Prepared = true;
+    collectAddressTaken(AC.getBody());
+    DomTree = std::make_unique<CFGDomTree>(const_cast<CFG *>(&Cfg));
+  }
+
+  bool isTrackableLocal(const VarDecl *VD) const {
+    if (!VD || !VD->hasLocalStorage() || VD->getDeclContext() != DC ||
+        AddressTaken.count(VD))
+      return false;
+    QualType T = VD->getType();
+    if (T.isVolatileQualified())
+      return false;
+    return T->isIntegralOrEnumerationType() || T->isPointerType();
+  }
+
+  int varIndex(const VarDecl *VD) const {
+    for (unsigned I = 0, E = Vars.size(); I != E; ++I)
+      if (Vars[I] == VD)
+        return I;
+    return -1;
+  }
+
+  static const VarDecl *asVarRef(const Expr *E) {
+    if (!E)
+      return nullptr;
+    const auto *DRE = dyn_cast<DeclRefExpr>(E->IgnoreParenImpCasts());
+    return DRE ? dyn_cast<VarDecl>(DRE->getDecl()) : nullptr;
+  }
+
+  /// Strip the wrappers that do not change which values make a condition
+  /// true, and fold logical negations into \p Negated.
+  const Expr *stripCondition(const Expr *E, bool &Negated) const {
+    while (E) {
+      E = E->IgnoreParens();
+      if (const auto *ICE = dyn_cast<ImplicitCastExpr>(E)) {
+        CastKind K = ICE->getCastKind();
+        if (K == CK_IntegralToBoolean || K == CK_PointerToBoolean ||
+            K == CK_NoOp ||
+            (K == CK_IntegralCast &&
+             ICE->getSubExpr()->isKnownToHaveBooleanValue())) {
+          E = ICE->getSubExpr();
+          continue;
+        }
+        break;
+      }
+      if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
+        if (UO->getOpcode() == UO_LNot) {
+          Negated = !Negated;
+          E = UO->getSubExpr();
+          continue;
+        }
+        break;
+      }
+      if (const auto *CE = dyn_cast<CallExpr>(E)) {
+        unsigned ID = CE->getBuiltinCallee();
+        if ((ID == Builtin::BI__builtin_expect ||
+             ID == Builtin::BI__builtin_expect_with_probability) &&
+            CE->getNumArgs() >= 1) {
+          E = CE->getArg(0);
+          continue;
+        }
+      }
+      break;
+    }
+    return E;
+  }
+
+  /// Collect what a condition reads.  Returns false if evaluating it could
+  /// have a side effect or its value cannot be assumed to be stable.
+  bool scanCondition(const Stmt *S, Pred &P,
+                     SmallVectorImpl<const VarDecl *> &Scalars) const {
+    if (!S)
+      return true;
+    if (const auto *E = dyn_cast<Expr>(S))
+      if (E->getType().isVolatileQualified())
+        return false;
+
+    switch (S->getStmtClass()) {
+    case Stmt::DeclRefExprClass: {
+      const auto *VD = dyn_cast<VarDecl>(cast<DeclRefExpr>(S)->getDecl());
+      if (!VD)
+        return true;
+      if (isTrackableLocal(VD)) {
+        if (!llvm::is_contained(P.Locals, VD))
+          P.Locals.push_back(VD);
+        if (!llvm::is_contained(Scalars, VD))
+          Scalars.push_back(VD);
+      } else {
+        P.ReadsMemory = true;
+      }
+      return true;
+    }
+    case Stmt::MemberExprClass:
+    case Stmt::ArraySubscriptExprClass:
+      P.ReadsMemory = true;
+      break;
+    case Stmt::UnaryOperatorClass: {
+      const auto *UO = cast<UnaryOperator>(S);
+      if (UO->isIncrementDecrementOp())
+        return false;
+      if (UO->getOpcode() == UO_Deref)
+        P.ReadsMemory = true;
+      break;
+    }
+    case Stmt::BinaryOperatorClass:
+      if (cast<BinaryOperator>(S)->isAssignmentOp())
+        return false;
+      break;
+    case Stmt::CallExprClass: {
+      const auto *CE = cast<CallExpr>(S);
+      unsigned ID = CE->getBuiltinCallee();
+      if (ID != Builtin::BI__builtin_expect &&
+          ID != Builtin::BI__builtin_expect_with_probability &&
+          ID != Builtin::BI__builtin_constant_p) {
+        const FunctionDecl *FD = CE->getDirectCallee();
+        if (!FD || !(FD->hasAttr<ConstAttr>() || FD->hasAttr<PureAttr>()))
+          return false;
+        if (FD->hasAttr<PureAttr>())
+          P.ReadsMemory = true;
+      }
+      break;
+    }
+    case Stmt::CompoundAssignOperatorClass:
+    case Stmt::StmtExprClass:
+    case Stmt::VAArgExprClass:
+    case Stmt::AtomicExprClass:
+    case Stmt::ConditionalOperatorClass:
+    case Stmt::BinaryConditionalOperatorClass:
+      return false;
+    default:
+      break;
+    }
+    for (const Stmt *Child : S->children())
+      if (!scanCondition(Child, P, Scalars))
+        return false;
+    return true;
+  }
+
+  int predIndex(const Expr *Stripped) const {
+    llvm::FoldingSetNodeID ID;
+    Stripped->Profile(ID, Ctx, /*Canonical=*/true);
+    for (unsigned I = 0, E = Preds.size(); I != E; ++I)
+      if (Preds[I].ID == ID)
+        return I;
+    return -1;
+  }
+
+  void addCondition(const Expr *Cond) {
+    bool Negated = false;
+    const Expr *E = stripCondition(Cond, Negated);
+    if (!E)
+      return;
+    Pred P;
+    SmallVector<const VarDecl *, 4> Scalars;
+    bool Pure = scanCondition(E, P, Scalars);
+    for (const VarDecl *VD : Scalars)
+      if (Vars.size() < MaxVars && varIndex(VD) < 0)
+        Vars.push_back(VD);
+    if (!Pure || Preds.size() >= MaxPreds || predIndex(E) >= 0)
+      return;
+    E->Profile(P.ID, Ctx, /*Canonical=*/true);
+    Preds.push_back(std::move(P));
+  }
+
+  static bool isConditionalBranch(const CFGBlock *B) {
+    const Stmt *Term = B->getTerminatorStmt();
+    return Term && B->succ_size() == 2 && !isa<SwitchStmt>(Term) &&
+           !isa<GCCAsmStmt>(Term) &&
+           isa_and_nonnull<Expr>(B->getTerminatorCondition());
+  }
+
+  void addDominatingConditions(const CFGBlock *B) {
+    llvm::SmallPtrSet<const CFGBlock *, 16> Seen;
+    while (B && Seen.insert(B).second) {
+      if (isConditionalBranch(B))
+        addCondition(cast<Expr>(B->getTerminatorCondition()));
+      DomTreeNode *N = DomTree->getBase().getNode(const_cast<CFGBlock *>(B));
+      DomTreeNode *IDom = N ? N->getIDom() : nullptr;
+      B = IDom ? IDom->getBlock() : nullptr;
+    }
+  }
+
+  bool initializesX(const Stmt *S) const {
+    if (const auto *BO = dyn_cast<BinaryOperator>(S))
+      return BO->getOpcode() == BO_Assign &&
+             ::findVar(BO->getLHS(), DC).getDecl() == X;
+    if (const auto *DS = dyn_cast<DeclStmt>(S)) {
+      for (const Decl *D : DS->decls())
+        if (D == X && X->getInit() && !getSelfInitExpr(X))
+          return true;
+      return false;
+    }
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(S))
+      return DRE->getDecl() == X &&
+             Classification.get(DRE) == ClassifyRefs::Init;
+    if (const auto *AS = dyn_cast<GCCAsmStmt>(S)) {
+      for (unsigned I = 0, E = AS->getNumOutputs(); I != E; ++I)
+        if (::findVar(AS->getOutputExpr(I), DC).getDecl() == X)
+          return true;
+    }
+    return false;
+  }
+
+  llvm::APSInt makeValue(QualType T, uint64_t Bits) const {
+    unsigned Width =
+        T->isPointerType() ? Ctx.getTypeSize(T) : Ctx.getIntWidth(T);
+    bool Unsigned = T->isPointerType() || T->isUnsignedIntegerOrEnumerationType();
+    return llvm::APSInt(
+        llvm::APInt(Width, Bits, /*isSigned=*/false, /*implicitTrunc=*/true),
+        Unsigned);
+  }
+
+  /// Evaluate \p E to an integer if the facts of \p St determine it.
+  std::optional<llvm::APSInt> evalInt(const Expr *E, const State &St) const {
+    E = E->IgnoreParens();
+    QualType T = E->getType();
+    if (!T->isIntegralOrEnumerationType() && !T->isPointerType())
+      return std::nullopt;
+
+    if (const auto *CE = dyn_cast<CastExpr>(E)) {
+      const Expr *Sub = CE->getSubExpr();
+      switch (CE->getCastKind()) {
+      case CK_LValueToRValue:
+      case CK_NoOp:
+        return evalInt(Sub, St);
+      case CK_IntegralCast: {
+        std::optional<llvm::APSInt> V = evalInt(Sub, St);
+        if (!V)
+          return std::nullopt;
+        llvm::APSInt R = V->extOrTrunc(Ctx.getIntWidth(T));
+        R.setIsUnsigned(T->isUnsignedIntegerOrEnumerationType());
+        return R;
+      }
+      case CK_IntegralToBoolean:
+      case CK_PointerToBoolean: {
+        std::optional<bool> B = evalTruth(Sub, St);
+        if (!B)
+          return std::nullopt;
+        return makeValue(T, *B);
+      }
+      case CK_NullToPointer:
+        return makeValue(T, 0);
+      default:
+        return std::nullopt;
+      }
+    }
+
+    if (const VarDecl *VD = asVarRef(E)) {
+      int I = varIndex(VD);
+      if (I >= 0) {
+        if (St.Vals[I].Kind == Value::Const)
+          return makeValue(VD->getType(), St.Vals[I].Bits);
+        return std::nullopt;
+      }
+    }
+
+    if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
+      if (UO->getOpcode() == UO_LNot) {
+        std::optional<bool> B = evalTruth(UO->getSubExpr(), St);
+        if (!B)
+          return std::nullopt;
+        return makeValue(T, !*B);
+      }
+      if (UO->getOpcode() == UO_Minus || UO->getOpcode() == UO_Plus) {
+        std::optional<llvm::APSInt> V = evalInt(UO->getSubExpr(), St);
+        if (!V)
+          return std::nullopt;
+        return UO->getOpcode() == UO_Minus ? -*V : *V;
+      }
+    }
+
+    if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
+      if (BO->isComparisonOp()) {
+        std::optional<llvm::APSInt> L = evalInt(BO->getLHS(), St);
+        std::optional<llvm::APSInt> R = evalInt(BO->getRHS(), St);
+        if (L && R) {
+          int C = llvm::APSInt::compareValues(*L, *R);
+          bool Result = false;
+          switch (BO->getOpcode()) {
+          case BO_LT: Result = C < 0; break;
+          case BO_GT: Result = C > 0; break;
+          case BO_LE: Result = C <= 0; break;
+          case BO_GE: Result = C >= 0; break;
+          case BO_EQ: Result = C == 0; break;
+          case BO_NE: Result = C != 0; break;
+          default: return std::nullopt;
+          }
+          return makeValue(T, Result);
+        }
+        // A value known to be nonzero still decides a test against zero.
+        if (BO->isEqualityOp()) {
+          const Expr *Other = nullptr;
+          if (R && R->isZero())
+            Other = BO->getLHS();
+          else if (L && L->isZero())
+            Other = BO->getRHS();
+          if (Other)
+            if (std::optional<bool> B = evalTruth(Other, St))
+              if (*B)
+                return makeValue(T, BO->getOpcode() == BO_NE);
+        }
+        return std::nullopt;
+      }
+    }
+
+    Expr::EvalResult Result;
+    if (!E->isValueDependent() && E->EvaluateAsInt(Result, Ctx))
+      return Result.Val.getInt();
+    if (T->isPointerType() &&
+        E->isNullPointerConstant(Ctx, Expr::NPC_ValueDependentIsNotNull))
+      return makeValue(T, 0);
+    return std::nullopt;
+  }
+
+  /// Decide whether \p E is true if the facts of \p St determine it.
+  std::optional<bool> evalTruth(const Expr *E, const State &St) const {
+    bool Negated = false;
+    E = stripCondition(E, Negated);
+    if (!E)
+      return std::nullopt;
+
+    if (const VarDecl *VD = asVarRef(E)) {
+      int I = varIndex(VD);
+      if (I >= 0 && St.Vals[I].Kind == Value::Const)
+        return (makeValue(VD->getType(), St.Vals[I].Bits) != 0) != Negated;
+      if (I >= 0 && St.Vals[I].Kind == Value::NonZero)
+        return !Negated;
+    }
+    if (std::optional<llvm::APSInt> V = evalInt(E, St))
+      return (*V != 0) != Negated;
+    if (isa<StringLiteral>(E->IgnoreParenImpCasts()))
+      return !Negated;
+
+    int P = predIndex(E);
+    if (P >= 0 && (St.Known & (1u << P)))
+      return bool(St.Truth & (1u << P)) != Negated;
+    return std::nullopt;
+  }
+
+  /// Record that the branch condition \p Cond evaluated to \p Outcome.
+  void assume(const Expr *Cond, bool Outcome, State &St) const {
+    bool Negated = false;
+    const Expr *E = stripCondition(Cond, Negated);
+    if (!E)
+      return;
+    if (Negated)
+      Outcome = !Outcome;
+
+    if (const VarDecl *VD = asVarRef(E)) {
+      int I = varIndex(VD);
+      if (I >= 0) {
+        if (!Outcome) {
+          St.Vals[I].Kind = Value::Const;
+          St.Vals[I].Bits = 0;
+        } else if (St.Vals[I].Kind == Value::Top) {
+          St.Vals[I].Kind = Value::NonZero;
+        }
+        return;
+      }
+    }
+
+    if (const auto *BO = dyn_cast<BinaryOperator>(E->IgnoreParenImpCasts())) {
+      if (BO->isEqualityOp()) {
+        const VarDecl *VD = asVarRef(BO->getLHS());
+        const Expr *Other = BO->getRHS();
+        if (!VD || varIndex(VD) < 0) {
+          VD = asVarRef(BO->getRHS());
+          Other = BO->getLHS();
+        }
+        int I = VD ? varIndex(VD) : -1;
+        if (I >= 0) {
+          State Empty;
+          if (std::optional<llvm::APSInt> K = evalInt(Other, Empty)) {
+            bool Equal = (BO->getOpcode() == BO_EQ) == Outcome;
+            if (Equal) {
+              St.Vals[I].Kind = Value::Const;
+              St.Vals[I].Bits = K->extOrTrunc(64).getZExtValue();
+            } else if (K->isZero() && St.Vals[I].Kind == Value::Top) {
+              St.Vals[I].Kind = Value::NonZero;
+            }
+            return;
+          }
+        }
+      }
+    }
+
+    int P = predIndex(E);
+    if (P >= 0) {
+      St.Known |= 1u << P;
+      if (Outcome)
+        St.Truth |= 1u << P;
+      else
+        St.Truth &= ~(1u << P);
+    }
+  }
+
+  void forgetLocal(const VarDecl *VD, State &St) const {
+    for (unsigned I = 0, E = Preds.size(); I != E; ++I)
+      if (llvm::is_contained(Preds[I].Locals, VD))
+        St.Known &= ~(1u << I);
+  }
+
+  void forgetMemory(State &St) const {
+    for (unsigned I = 0, E = Preds.size(); I != E; ++I)
+      if (Preds[I].ReadsMemory)
+        St.Known &= ~(1u << I);
+  }
+
+  void store(const VarDecl *VD, const Expr *RHS, State &St) const {
+    int I = varIndex(VD);
+    if (I >= 0) {
+      Value V;
+      if (RHS) {
+        if (std::optional<llvm::APSInt> K = evalInt(RHS, St)) {
+          V.Kind = Value::Const;
+          V.Bits = K->extOrTrunc(64).getZExtValue();
+        } else if (std::optional<bool> B = evalTruth(RHS, St)) {
+          if (*B)
+            V.Kind = Value::NonZero;
+        }
+      }
+      St.Vals[I] = V;
+    }
+    forgetLocal(VD, St);
+  }
+
+  void transfer(const Stmt *S, State &St) {
+    if (S == Use && !St.XInit) {
+      UseReachedUninit = true;
+      return;
+    }
+    if (initializesX(S))
+      St.XInit = true;
+
+    if (const auto *DS = dyn_cast<DeclStmt>(S)) {
+      for (const Decl *D : DS->decls()) {
+        const auto *VD = dyn_cast<VarDecl>(D);
+        if (!VD)
+          continue;
+        if (VD == X && !(X->getInit() && !getSelfInitExpr(X)))
+          St.XInit = false;
+        if (VD->hasLocalStorage())
+          store(VD, VD->getInit(), St);
+      }
+      return;
+    }
+    if (const auto *BO = dyn_cast<BinaryOperator>(S)) {
+      if (!BO->isAssignmentOp())
+        return;
+      if (const VarDecl *VD = asVarRef(BO->getLHS());
+          VD && VD->hasLocalStorage() && !AddressTaken.count(VD))
+        store(VD, BO->getOpcode() == BO_Assign ? BO->getRHS() : nullptr, St);
+      else
+        forgetMemory(St);
+      return;
+    }
+    if (const auto *UO = dyn_cast<UnaryOperator>(S)) {
+      if (!UO->isIncrementDecrementOp())
+        return;
+      if (const VarDecl *VD = asVarRef(UO->getSubExpr());
+          VD && VD->hasLocalStorage() && !AddressTaken.count(VD))
+        store(VD, nullptr, St);
+      else
+        forgetMemory(St);
+      return;
+    }
+    if (const auto *CE = dyn_cast<CallExpr>(S)) {
+      unsigned ID = CE->getBuiltinCallee();
+      if (ID == Builtin::BI__builtin_expect ||
+          ID == Builtin::BI__builtin_expect_with_probability ||
+          ID == Builtin::BI__builtin_constant_p)
+        return;
+      const FunctionDecl *FD = CE->getDirectCallee();
+      if (FD && (FD->hasAttr<ConstAttr>() || FD->hasAttr<PureAttr>()))
+        return;
+      forgetMemory(St);
+      return;
+    }
+    if (const auto *AS = dyn_cast<GCCAsmStmt>(S)) {
+      for (unsigned I = 0, E = AS->getNumOutputs(); I != E; ++I)
+        if (const VarDecl *VD = asVarRef(AS->getOutputExpr(I)))
+          store(VD, nullptr, St);
+      forgetMemory(St);
+    }
+  }
+
+  bool addState(std::vector<SmallVector<State, 4>> &In, const CFGBlock *B,
+                const State &St) {
+    SmallVectorImpl<State> &Set = In[B->getBlockID()];
+    if (llvm::is_contained(Set, St))
+      return false;
+    if (Set.size() >= MaxStatesPerBlock) {
+      GaveUp = true;
+      return false;
+    }
+    Set.push_back(St);
+    return true;
+  }
+
+public:
+  CorrelatedUninitPruner(const CFG &Cfg, AnalysisDeclContext &AC,
+                         const ClassifyRefs &Classification)
+      : Cfg(Cfg), AC(AC), Ctx(AC.getASTContext()),
+        Classification(Classification),
+        DC(cast<DeclContext>(AC.getDecl())) {}
+
+  /// Returns true if \p UseExpr cannot be reached with \p VD uninitialized
+  /// without contradicting a condition established earlier on the path.
+  bool isUseInfeasible(const VarDecl *VD, const Expr *UseExpr,
+                       const CFGBlock *UseBlock) {
+    prepare();
+    X = VD;
+    Use = UseExpr;
+    Vars.clear();
+    Preds.clear();
+    Steps = 0;
+    UseReachedUninit = false;
+    GaveUp = false;
+
+    // Choose the conditions to track: those that decide whether the use or
+    // an initialization is reached.
+    addDominatingConditions(UseBlock);
+    for (const CFGBlock *B : Cfg) {
+      bool HasInit = false;
+      for (const CFGElement &Elem : *B)
+        if (std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>())
+          if (initializesX(CS->getStmt())) {
+            HasInit = true;
+            break;
+          }
+      if (HasInit)
+        addDominatingConditions(B);
+    }
+    if (Vars.empty() && Preds.empty())
+      return false;
+
+    std::vector<SmallVector<State, 4>> In(Cfg.getNumBlockIDs());
+    std::vector<unsigned> Done(Cfg.getNumBlockIDs(), 0);
+    SmallVector<const CFGBlock *, 32> Worklist;
+
+    const CFGBlock *Entry = &Cfg.getEntry();
+    In[Entry->getBlockID()].push_back(State());
+    Worklist.push_back(Entry);
+
+    while (!Worklist.empty()) {
+      const CFGBlock *B = Worklist.pop_back_val();
+      unsigned ID = B->getBlockID();
+      while (Done[ID] < In[ID].size()) {
+        State St = In[ID][Done[ID]++];
+        for (const CFGElement &Elem : *B) {
+          if (std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>())
+            transfer(CS->getStmt(), St);
+          if (UseReachedUninit || ++Steps > MaxSteps)
+            return false;
+        }
+        if (const auto *AS = dyn_cast_or_null<GCCAsmStmt>(B->getTerminatorStmt()))
+          transfer(AS, St);
+
+        if (isConditionalBranch(B)) {
+          const Expr *Cond = cast<Expr>(B->getTerminatorCondition());
+          std::optional<bool> Known = evalTruth(Cond, St);
+          unsigned Index = 0;
+          for (const CFGBlock::AdjacentBlock &Succ : B->succs()) {
+            bool Outcome = Index++ == 0;
+            const CFGBlock *Next = Succ.getReachableBlock();
+            if (!Next || (Known && *Known != Outcome))
+              continue;
+            State Refined = St;
+            if (!Known)
+              assume(Cond, Outcome, Refined);
+            if (addState(In, Next, Refined))
+              Worklist.push_back(Next);
+          }
+        } else {
+          for (const CFGBlock::AdjacentBlock &Succ : B->succs())
+            if (const CFGBlock *Next = Succ.getReachableBlock())
+              if (addState(In, Next, St))
+                Worklist.push_back(Next);
+        }
+        if (GaveUp)
+          return false;
+      }
+    }
+    return true;
+  }
+};
+
+} // namespace
+
+//------------------------------------------------------------------------====//
 // Transfer function for uninitialized values analysis.
 //====------------------------------------------------------------------------//
 
@@ -477,15 +1178,17 @@ class TransferFunctions : public ConstStmtVisitor<TransferFunctions> {
   const ClassifyRefs &classification;
   ObjCNoReturn objCNoRet;
   UninitVariablesHandler &handler;
+  CorrelatedUninitPruner *pruner;
 
 public:
   TransferFunctions(CFGBlockValues &vals, const CFG &cfg,
                     const CFGBlock *block, AnalysisDeclContext &ac,
                     const ClassifyRefs &classification,
-                    UninitVariablesHandler &handler)
+                    UninitVariablesHandler &handler,
+                    CorrelatedUninitPruner *pruner)
       : vals(vals), cfg(cfg), block(block), ac(ac),
         classification(classification), objCNoRet(ac.getASTContext()),
-        handler(handler) {}
+        handler(handler), pruner(pruner) {}
 
   void reportUse(const Expr *ex, const VarDecl *vd);
   void reportConstRefUse(const Expr *ex, const VarDecl *vd);
@@ -663,8 +1366,13 @@ public:
 
 void TransferFunctions::reportUse(const Expr *ex, const VarDecl *vd) {
   Value v = vals[vd];
-  if (isUninitialized(v))
-    handler.handleUseOfUninitVariable(vd, getUninitUse(ex, vd, v));
+  if (!isUninitialized(v))
+    return;
+  UninitUse Use = getUninitUse(ex, vd, v);
+  if (pruner && Use.getKind() == UninitUse::Maybe &&
+      pruner->isUseInfeasible(vd, ex, block))
+    Use.setCorrelated();
+  handler.handleUseOfUninitVariable(vd, Use);
 }
 
 void TransferFunctions::reportConstRefUse(const Expr *ex, const VarDecl *vd) {
@@ -848,7 +1556,8 @@ static bool runOnBlock(const CFGBlock *block, const CFG &cfg,
                        AnalysisDeclContext &ac, CFGBlockValues &vals,
                        const ClassifyRefs &classification,
                        llvm::BitVector &wasAnalyzed,
-                       UninitVariablesHandler &handler) {
+                       UninitVariablesHandler &handler,
+                       CorrelatedUninitPruner *pruner = nullptr) {
   wasAnalyzed[block->getBlockID()] = true;
   vals.resetScratch();
   // Merge in values of predecessor blocks.
@@ -864,7 +1573,7 @@ static bool runOnBlock(const CFGBlock *block, const CFG &cfg,
     }
   }
   // Apply the transfer function.
-  TransferFunctions tf(vals, cfg, block, ac, classification, handler);
+  TransferFunctions tf(vals, cfg, block, ac, classification, handler, pruner);
   for (const auto &I : *block) {
     if (std::optional<CFGStmt> cs = I.getAs<CFGStmt>())
       tf.Visit(const_cast<Stmt *>(cs->getStmt()));
@@ -962,9 +1671,13 @@ void clang::runUninitializedVariablesAnalysis(
     return;
 
   // Run through the blocks one more time, and report uninitialized variables.
+  std::optional<CorrelatedUninitPruner> pruner;
+  if (handler.wantsCorrelationPruning())
+    pruner.emplace(cfg, ac, classification);
   for (const auto *block : cfg)
     if (PBH.hadUse[block->getBlockID()]) {
-      runOnBlock(block, cfg, ac, vals, classification, wasAnalyzed, handler);
+      runOnBlock(block, cfg, ac, vals, classification, wasAnalyzed, handler,
+                 pruner ? &*pruner : nullptr);
       ++stats.NumBlockVisits;
     }
 }

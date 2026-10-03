@@ -1142,6 +1142,22 @@ static void DiagUninitUse(Sema &S, const VarDecl *VD, const UninitUse &Use,
         << Use.getUser()->getSourceRange();
 }
 
+/// Diagnose a 'may be uninitialized' use that is only reachable on paths
+/// excluded by correlated conditions.  Such uses are reported under their own
+/// warning group, which is off unless requested, so that
+/// -Wconditional-uninitialized stays readable.
+static bool DiagnoseCorrelatedUninitUse(Sema &S, const VarDecl *VD,
+                                        const UninitUse &Use) {
+  SourceLocation Loc = Use.getUser()->getBeginLoc();
+  if (S.getDiagnostics().isIgnored(diag::warn_maybe_uninit_var_correlated,
+                                   Loc))
+    return false;
+  S.Diag(Loc, diag::warn_maybe_uninit_var_correlated)
+      << VD->getDeclName() << Use.getUser()->getSourceRange();
+  S.Diag(VD->getBeginLoc(), diag::note_var_declared_here) << VD->getDeclName();
+  return true;
+}
+
 /// Diagnose uninitialized const reference usages.
 static bool DiagnoseUninitializedConstRefUse(Sema &S, const VarDecl *VD,
                                              const UninitUse &Use) {
@@ -1697,10 +1713,14 @@ class UninitValsDiagReporter : public UninitVariablesHandler {
   // order of diagnostics when calling flushDiagnostics().
   typedef llvm::MapVector<const VarDecl *, MappedType> UsesMap;
   UsesMap uses;
+  bool PruneCorrelated;
 
 public:
-  UninitValsDiagReporter(Sema &S) : S(S) {}
+  UninitValsDiagReporter(Sema &S, bool PruneCorrelated)
+      : S(S), PruneCorrelated(PruneCorrelated) {}
   ~UninitValsDiagReporter() override { flushDiagnostics(); }
+
+  bool wantsCorrelationPruning() const override { return PruneCorrelated; }
 
   MappedType &getUses(const VarDecl *vd) {
     MappedType &V = uses[vd];
@@ -1782,6 +1802,12 @@ private:
       } else {
         // If we have self-init, downgrade all uses to 'may be uninitialized'.
         UninitUse Use = hasSelfInit ? UninitUse(U.getUser(), false) : U;
+        if (Use.isCorrelated()) {
+          // Not a use worth stopping at: keep looking for one that is.
+          if (DiagnoseCorrelatedUninitUse(S, vd, Use))
+            return;
+          continue;
+        }
         if (DiagnoseUninitializedUse(S, vd, Use))
           return;
       }
@@ -3255,10 +3281,15 @@ void clang::sema::AnalysisBasedWarnings::IssueWarnings(
   if (!Diags.isIgnored(diag::warn_uninit_var, D->getBeginLoc()) ||
       !Diags.isIgnored(diag::warn_sometimes_uninit_var, D->getBeginLoc()) ||
       !Diags.isIgnored(diag::warn_maybe_uninit_var, D->getBeginLoc()) ||
+      !Diags.isIgnored(diag::warn_maybe_uninit_var_correlated,
+                       D->getBeginLoc()) ||
       !Diags.isIgnored(diag::warn_uninit_const_reference, D->getBeginLoc()) ||
       !Diags.isIgnored(diag::warn_uninit_const_pointer, D->getBeginLoc())) {
     if (CFG *cfg = AC.getCFG()) {
-      UninitValsDiagReporter reporter(S);
+      UninitValsDiagReporter reporter(
+          S, !Diags.isIgnored(diag::warn_maybe_uninit_var, D->getBeginLoc()) ||
+                 !Diags.isIgnored(diag::warn_maybe_uninit_var_correlated,
+                                  D->getBeginLoc()));
       UninitVariablesAnalysisStats stats;
       std::memset(&stats, 0, sizeof(UninitVariablesAnalysisStats));
       runUninitializedVariablesAnalysis(*cast<DeclContext>(D), *cfg, AC,

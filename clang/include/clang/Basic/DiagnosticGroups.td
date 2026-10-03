@@ -1179,6 +1179,10 @@ def ReinterpretBaseClass : DiagGroup<"reinterpret-base-class">;
 def Unicode  : DiagGroup<"unicode">;
 def UninitializedExplicitInit : DiagGroup<"uninitialized-explicit-init">;
 def UninitializedMaybe : DiagGroup<"conditional-uninitialized">;
+// Uses that -Wconditional-uninitialized would report, but that are only
+// reachable uninitialized on paths excluded by correlated conditions.
+def UninitializedMaybeCorrelated :
+  DiagGroup<"conditional-uninitialized-correlated">;
 def UninitializedSometimes : DiagGroup<"sometimes-uninitialized">;
 def UninitializedStaticSelfInit : DiagGroup<"static-self-init">;
 def UninitializedConstReference : DiagGroup<"uninitialized-const-reference">;
