@@ -976,6 +976,19 @@ class CorrelatedUninitPruner {
     }
 
     if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
+      if (BO->getOpcode() == BO_Comma)
+        return evalInt(BO->getRHS(), St);
+      if (BO->isLogicalOp()) {
+        // One false operand decides "&&" and one true operand decides "||".
+        bool IsAnd = BO->getOpcode() == BO_LAnd;
+        std::optional<bool> L = evalTruth(BO->getLHS(), St);
+        std::optional<bool> R = evalTruth(BO->getRHS(), St);
+        if ((L && *L != IsAnd) || (R && *R != IsAnd))
+          return makeValue(T, !IsAnd);
+        if (L && R)
+          return makeValue(T, IsAnd);
+        return std::nullopt;
+      }
       if (BO->isComparisonOp()) {
         std::optional<llvm::APSInt> L = evalInt(BO->getLHS(), St);
         std::optional<llvm::APSInt> R = evalInt(BO->getRHS(), St);
@@ -1036,11 +1049,29 @@ class CorrelatedUninitPruner {
       return (*V != 0) != Negated;
     if (isa<StringLiteral>(E->IgnoreParenImpCasts()))
       return !Negated;
+    if (isNonNullAddress(E))
+      return !Negated;
 
     int P = predIndex(E);
     if (P >= 0 && (St.Known & (1u << P)))
       return bool(St.Truth & (1u << P)) != Negated;
     return std::nullopt;
+  }
+
+  /// The address of an object or function, as in "table = some_array".
+  bool isNonNullAddress(const Expr *E) const {
+    E = E->IgnoreParenCasts();
+    if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
+      if (UO->getOpcode() != UO_AddrOf)
+        return false;
+      E = UO->getSubExpr()->IgnoreParens();
+    } else if (!E->getType()->isArrayType() &&
+               !E->getType()->isFunctionType()) {
+      return false;
+    }
+    const auto *DRE = dyn_cast<DeclRefExpr>(E);
+    return DRE && isa<VarDecl, FunctionDecl>(DRE->getDecl()) &&
+           !DRE->getDecl()->isWeak();
   }
 
   /// Record that the branch condition \p Cond evaluated to \p Outcome.
@@ -1051,6 +1082,15 @@ class CorrelatedUninitPruner {
       return;
     if (Negated)
       Outcome = !Outcome;
+
+    // "a && b" is true only if both are, and "a || b" false only if both
+    // are.
+    if (const auto *BO = dyn_cast<BinaryOperator>(E->IgnoreParenImpCasts());
+        BO && BO->isLogicalOp() &&
+        (BO->getOpcode() == BO_LAnd) == Outcome) {
+      assume(BO->getLHS(), Outcome, St);
+      assume(BO->getRHS(), Outcome, St);
+    }
 
     if (const VarDecl *VD = asVarRef(E)) {
       int I = varIndex(VD);

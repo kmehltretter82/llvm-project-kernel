@@ -221,3 +221,44 @@ void same_value_test(int mode) {
   if (mode == 2)
     use(x); // corr-warning {{variable 'x' is uninitialized when used here only on paths that an earlier condition excludes}}
 }
+
+// The iterator macros of the Linux kernel assign in the second operand of
+// "&&" under a negation: if (!(cond)) {} else body.
+struct set {
+  int n;
+  int *item[8];
+};
+#define for_each_if(condition) if (!(condition)) {} else
+#define for_each_item(s, p, i)                                                \
+  for ((i) = 0; (i) < (s)->n; (i)++)                                          \
+    for_each_if ((s)->item[i] && ((p) = (s)->item[i], 1))
+
+void usep(const int *);
+
+void iterator_macro(struct set *s) {
+  int *p; // corr-note {{variable 'p' is declared here}}
+  int i;
+  for_each_item(s, p, i)
+    usep(p); // corr-warning {{variable 'p' is uninitialized when used here only on paths that an earlier condition excludes}}
+}
+
+// The address of an object is not null.
+extern const int table_a[4], table_b[4];
+
+void address_is_not_null(int type) {
+  const int *special = 0;
+  const int *regular; // corr-note {{variable 'regular' is declared here}}
+  switch (type) {
+  case 1:
+    special = table_a;
+    break;
+  default:
+    regular = table_b;
+    break;
+  }
+  f();
+  if (special)
+    usep(special);
+  else
+    usep(regular); // corr-warning {{variable 'regular' is uninitialized when used here only on paths that an earlier condition excludes}}
+}
