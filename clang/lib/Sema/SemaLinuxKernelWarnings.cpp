@@ -1595,8 +1595,11 @@ class ErrorPathSuccessChecker {
     std::string Lower = Name.lower();
     StringRef LowerName(Lower);
     // An audit record documents a decision, it does not report that the
-    // calling function failed.
-    if (LowerName.contains("audit"))
+    // calling function failed.  seq_printf(), snprintf() and their relatives
+    // format text for a file or a buffer, whatever the text says.
+    if (LowerName.contains("audit") || LowerName.contains("printf") ||
+        LowerName.starts_with("seq_") || LowerName.starts_with("sysfs_") ||
+        LowerName.starts_with("trace_"))
       return false;
     bool LooksLikeLogger = false;
     for (StringRef Part : {"err", "dbg", "debug", "log", "print", "msg"})

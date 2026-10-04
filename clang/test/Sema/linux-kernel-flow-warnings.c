@@ -36,6 +36,7 @@ void _dev_info(void *, const char *, ...);
 int _printk(const char *, ...);
 void drv_dbg(void *, int, const char *, ...);
 void audit_log_msg(void *, const char *, ...);
+void seq_printf(void *, const char *, ...);
 
 int step(void);
 void *get(void);
@@ -405,6 +406,19 @@ skip_one:
     pause();
   }
   return rc;
+}
+
+// Text that is formatted for a file is not a failure message.
+int formatted_output(void *m) {
+  int ret = step();
+
+  if (ret)
+    return ret;
+  if (!get()) {
+    seq_printf(m, "last error: lookup failed\n");
+    return ret;
+  }
+  return 0;
 }
 
 // An audit record is not a failure message.
