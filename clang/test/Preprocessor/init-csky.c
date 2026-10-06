@@ -17,6 +17,7 @@
 // CSKY: #define __CHAR16_TYPE__ unsigned short
 // CSKY: #define __CHAR32_TYPE__ unsigned int
 // CSKY: #define __CHAR_BIT__ 8
+// CSKY: #define __CSKYABIV2__ 1
 // CSKY: #define __DBL_DECIMAL_DIG__ 17
 // CSKY: #define __DBL_DENORM_MIN__ 4.9406564584124654e-324
 // CSKY: #define __DBL_DIG__ 15
@@ -211,6 +212,7 @@
 // CSKY: #define __cskyLE__ 1
 // CSKY: #define __csky__ 2
 // CSKY: #define __cskyabi__ 2
+// CSKY: #define __cskyabiv2__ 1
 // CSKY: #define __cskyle__ 1
 // CSKY-LINUX: #define __gnu_linux__ 1
 // CSKY-LINUX: #define __linux 1

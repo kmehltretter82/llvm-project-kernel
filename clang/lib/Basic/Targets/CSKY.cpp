@@ -40,6 +40,12 @@ void CSKYTargetInfo::getTargetDefines(const LangOptions &Opts,
 
   Builder.defineMacro("__CSKYABI__", ABI == "abiv2" ? "2" : "1");
   Builder.defineMacro("__cskyabi__", ABI == "abiv2" ? "2" : "1");
+  // GCC, which has the second ABI only, also defines a macro that says so
+  // by its name.  The Linux kernel tests that one.
+  if (ABI == "abiv2") {
+    Builder.defineMacro("__CSKYABIV2__");
+    Builder.defineMacro("__cskyabiv2__");
+  }
 
   StringRef ArchName = "ck810";
   StringRef CPUName = "ck810";
