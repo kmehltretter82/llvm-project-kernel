@@ -9092,6 +9092,37 @@ class LinuxUnwindChecker : LinuxPathSearch::Client {
     }
   }
 
+  /// The states in which the block of the acquisition is entered, one for
+  /// each way into it.  "if (a || b) get();" is entered with a true, or
+  /// with a false and b true: neither outcome holds for both ways, and a
+  /// search that knows nothing about a and b walks past "if (a || b)
+  /// put();" as if both could be false.
+  void guardStates(const CFGBlock *B,
+                   llvm::SmallVectorImpl<LinuxPathSearch::State> &Out) {
+    llvm::SmallVector<const CFGBlock *, 4> Ways;
+    bool Branches = true;
+    for (const CFGBlock::AdjacentBlock &Adj : B->preds()) {
+      const CFGBlock *Pred = Adj.getReachableBlock();
+      if (!Pred || llvm::is_contained(Ways, Pred))
+        continue;
+      Ways.push_back(Pred);
+      Branches &= LinuxPathSearch::isConditionalBranch(Pred) &&
+                  Pred->succ_begin()->getReachableBlock() !=
+                      (Pred->succ_begin() + 1)->getReachableBlock();
+    }
+    if (Ways.size() < 2 || Ways.size() > 4 || !Branches) {
+      Out.emplace_back();
+      fixGuards(B, Out.back());
+      return;
+    }
+    for (const CFGBlock *Pred : Ways) {
+      Out.emplace_back();
+      Search.fix(LinuxPathSearch::getBranchCondition(Pred),
+                 Pred->succ_begin()->getReachableBlock() == B, Out.back());
+      fixGuards(Pred, Out.back());
+    }
+  }
+
   /// Set up the handle of the acquisition \p CE in \p B.  Returns the index
   /// of the CFG element behind it, or 0 if there is nothing to follow.
   unsigned prepare(const CFGBlock *B, unsigned Index, const CallExpr *CE) {
@@ -9270,15 +9301,22 @@ public:
           ++Unit.Stats.Capped;
           return;
         }
-        LinuxPathSearch::State Init;
-        fixGuards(B, Init);
-        // "spin_lock(&parent->lock)": there is a parent.
-        if (Root && Root != HandleVar && Root->getType()->isPointerType())
-          if (int RootLoc = Search.locate(Root); RootLoc >= 0) {
-            Search.pin(RootLoc);
-            LinuxPathSearch::set(Init, RootLoc, Value::ofMask(Value::Pos));
-          }
-        Search.run(B, First, Init, *this);
+        llvm::SmallVector<LinuxPathSearch::State, 4> Inits;
+        guardStates(B, Inits);
+        for (LinuxPathSearch::State &Init : Inits) {
+          // "spin_lock(&parent->lock)": there is a parent.
+          if (Root && Root != HandleVar && Root->getType()->isPointerType())
+            if (int RootLoc = Search.locate(Root); RootLoc >= 0) {
+              Search.pin(RootLoc);
+              LinuxPathSearch::set(Init, RootLoc, Value::ofMask(Value::Pos));
+            }
+          Found = nullptr;
+          PassedOn = nullptr;
+          LastStatus = nullptr;
+          Search.run(B, First, Init, *this);
+          if (Found)
+            break;
+        }
         if (!Found)
           continue;
         std::string Text = HandleVar ? HandleVar->getNameAsString()

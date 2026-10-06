@@ -250,6 +250,40 @@ int conditional_missing(struct priv *p) {
   return 0;
 }
 
+// Taken under one of two conditions: the block of the acquisition is
+// entered with the first one true, or with the first one false and the
+// second one true.  The release may name them in the other order.
+
+int either(struct priv *p, int a, int b) {
+  int ret;
+
+  if (a == 1 || b == 1)
+    mutex_lock(&p->lock);
+  ret = setup(p->dev);
+  if (ret)
+    goto out;
+  ret = setup(p->dev);
+out:
+  if (b == 1 || a == 1)
+    mutex_unlock(&p->lock);
+  return ret;
+}
+
+int either_missing(struct priv *p, int a, int b) {
+  int ret;
+
+  if (a == 1 || b == 1)
+    mutex_lock(&p->lock); // unwind-note {{acquired here}}
+  ret = setup(p->dev);
+  if (ret)
+    goto out;
+  ret = setup(p->dev);
+out:
+  if (a == 1)
+    mutex_unlock(&p->lock); // unwind-note {{another path releases it here}}
+  return ret; // unwind-warning {{'&p->lock' was acquired with mutex_lock() and this error path returns without mutex_unlock(), which other paths call}}
+}
+
 // A mapping that the result names.
 
 int mapping(struct priv *p) {
