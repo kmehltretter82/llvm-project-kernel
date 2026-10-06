@@ -347,10 +347,15 @@ group of its own once a kernel scan has shown what it finds. The names:
   each function with a body, for which return values a pointer parameter is
   left unwritten, and follows the caller's paths on which the call returned
   such a value. `ret = read(&val); if (ret) return ret;` is fine,
-  `read(&val); use(val);` is not if `read()` can fail before it writes. A
-  loop that fills the buffer is taken to run, a size parameter is taken to
-  be what the caller needs unless the call passes a constant, and a path
-  that writes another output parameter does not count.
+  `read(&val); use(val);` is not if `read()` can fail before it writes.
+  Where the function returns a constant without writing, the caller's paths
+  are followed for that value alone, so `if (index == -1) return;` deals
+  with a `return -1;`. Several things are taken on trust to keep the check
+  quiet: a loop that fills the buffer runs, a size or count parameter is
+  what the caller needs unless the call passes a constant, an assertion
+  (`if (WARN_ON(...)) return;`) does not fire, a path that writes another
+  output parameter has told the caller what to look at, and a caller that
+  branches on another output of the same call knows what it is doing.
 - `null-argument`: a literal `NULL` is passed for a parameter that the
   callee dereferences before its first branch and tests nowhere.
 - `container-of-null`: a NULL test of the result of `container_of()`. The
@@ -361,17 +366,29 @@ group of its own once a kernel scan has shown what it finds. The names:
   and one after it jump to cleanup code, the later one to the same code or
   to more of it, and nothing in between calls what that code calls. This
   check knows no resources, the function's own error handling is the
-  evidence.
+  evidence. Cleanup code is a label whose code calls something and then
+  returns an error code or a variable that is named like one. A label that
+  leads to another way of doing the work (`slow_path: return do_slow();`)
+  or that only prints is not. The return is left alone if it reports the
+  failure of the very thing that the label would free, if its block hands
+  that thing to someone (`si->buf = buf; return -EAGAIN;`), or if a
+  sibling of the cleanup function was called on the way with the same
+  arguments (`nla_nest_end()` where the label has `nla_nest_cancel()`).
 - `unwind-return-call`: `-Wlinux-kernel-missing-unwind` for `return
   register(priv);` and for `return ret;` with a status that no test has
   looked at. If that call fails, the resource is still held.
 - `unwind-far`: `-Wlinux-kernel-missing-unwind` for a function that
   releases the resource nowhere, when another function of the translation
   unit releases what the same structure member holds, typically the remove
-  callback. It is reported at the end of the translation unit, and not if
-  a function that calls the one in question, directly or through two
-  others, releases the member, nor for a function that other translation
-  units can call unless this one uses it as a callback.
+  callback, or `exit` for the `init` of a PHY. It is reported at the end of
+  the translation unit. Not reported: a function whose callers, up to
+  three levels, release the member or name the releasing function (a
+  destructor that is registered, such as `card->private_free`), a function
+  that other translation units can call unless this one uses it as a
+  callback, locks (one callback takes them and another drops them by
+  design), and memory, which goes where the structure goes. A function
+  that both acquires and releases the member is not taken as the one that
+  tears down.
 
 Two more names change how the path checks work and are not part of `all`:
 `path-notes` adds a note for each branch between the test and the misuse,

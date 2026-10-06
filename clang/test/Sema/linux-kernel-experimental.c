@@ -587,6 +587,8 @@ void reassigned(struct work *work, struct info *other) {
 // direct-return
 
 int clk_prepare_enable(struct clk *);
+int clk_enable(struct clk *);
+void clk_disable(struct clk *);
 void clk_disable_unprepare(struct clk *);
 int setup_a(struct dev *);
 int setup_b(struct dev *);
@@ -988,3 +990,301 @@ int out_warn_on(struct dev *d) {
     return -EIO;
   return val;
 }
+
+// ---------------------------------------------------------------------------
+// What the path search knows about a value.
+
+// "int ret = PTR_ERR(p);" keeps the sign.
+struct thing_group {
+  int id;
+};
+struct thing_group *make_group(struct dev *d);
+int attach_group(struct thing_group *g);
+int attach_item(struct dev *d);
+
+int narrowed_errno(struct dev *d) {
+  struct thing_group *group = make_group(d);
+  int ret = 0;
+
+  if (!group)
+    group = ERR_PTR(-ENOMEM);
+  if (IS_ERR(group))
+    ret = PTR_ERR(group);
+  if (ret)
+    return ret;
+  if (group)
+    ret = attach_group(group);
+  else
+    ret = attach_item(d);
+  return ret;
+}
+
+// A function that compares its argument with a constant is evaluated.
+enum bfs_result { BFS_EINVALIDNODE = -2, BFS_EQUEUEFULL = -1, BFS_RMATCH = 0,
+                  BFS_RNOMATCH = 1 };
+static inline bool bfs_error(enum bfs_result res) {
+  return res < 0;
+}
+
+static enum bfs_result find_usage(struct dev *d, u32 *target) {
+  if (!d->regs)
+    return BFS_EINVALIDNODE;
+  if (!d->cached)
+    return BFS_RNOMATCH; // expected-note {{'find_usage' returns here without having written through 'target'}}
+  *target = d->cache;
+  return BFS_RMATCH;
+}
+
+int predicate(struct dev *d) {
+  u32 target;
+  enum bfs_result ret = find_usage(d, &target);
+
+  if (bfs_error(ret))
+    return 0;
+  if (ret == BFS_RNOMATCH)
+    return 1;
+  return target;
+}
+
+int predicate_missing(struct dev *d) {
+  u32 target;
+  enum bfs_result ret = find_usage(d, &target); // expected-note {{the address of 'target' is passed to 'find_usage' here}}
+
+  if (bfs_error(ret))
+    return 0;
+  return target; // expected-warning {{'target' is read here, but 'find_usage' can return 1 without writing to it (experimental check 'uninit-output')}}
+}
+
+// The result is compared with the one value that says "nothing written".
+static int find_slot(struct dev *d, struct dev **pool) {
+  if (!d->cached)
+    return -1;
+  *pool = d;
+  return d->cache;
+}
+
+int exact_value(struct dev *d) {
+  struct dev *pool;
+  int index = find_slot(d, &pool);
+
+  if (index == -1)
+    return -ENOMEM;
+  return pool->cached + index;
+}
+
+// Another output of the same call says whether this one was written.
+struct lruvec;
+void unlock_lruvec(struct lruvec *l, unsigned long flags);
+static void release_it(struct dev *d, struct lruvec **lruvecp,
+                       unsigned long *flagsp) {
+  if (d->cached) {
+    *lruvecp = d->regs;
+    *flagsp = 1;
+  }
+}
+
+void sibling_output(struct dev *d) {
+  struct lruvec *lruvec = NULL;
+  unsigned long flags;
+
+  release_it(d, &lruvec, &flags);
+  if (lruvec)
+    unlock_lruvec(lruvec, flags);
+}
+
+// A count that the caller passes through a pointer.
+static int copy_in(unsigned int *count, const void **buf, void *data) {
+  if (*count == 0)
+    return 0;
+  memcpy(data, *buf, *count);
+  return 0;
+}
+
+int through_pointer(const void *buf, unsigned int count) {
+  u32 val;
+  int r;
+
+  if (count != sizeof(val))
+    return -EINVAL;
+  r = copy_in(&count, &buf, &val);
+  if (r)
+    return r;
+  return val;
+}
+
+// ---------------------------------------------------------------------------
+// direct-return: a label that is another way to do the work
+
+int submit_sync(struct dev *d);
+int submit_async(struct dev *d, void *src);
+int wait_io(struct dev *d);
+
+int other_way(struct dev *d) {
+  void *src;
+  int ret;
+
+  if (!d->regs)
+    goto sync_io;
+  src = kmalloc(16, 0);
+  if (!src) {
+    ret = wait_io(d);
+    if (ret)
+      return ret;
+    src = kmalloc(16, 0);
+    if (!src)
+      goto sync_io;
+  }
+  return submit_async(d, src);
+sync_io:
+  return submit_sync(d);
+}
+
+// error-deref-path: the function that is given the result may test it.
+struct name {
+  const char *name;
+};
+int lookup(struct dev *d, struct name *name);
+
+static struct name *get_name(struct dev *d) {
+  struct name *name = kzalloc(sizeof(*name), 0);
+
+  if (!name)
+    return ERR_PTR(-ENOMEM);
+  return name;
+}
+
+int tested_by_callee(struct dev *d) {
+  struct name *name = get_name(d);
+  int error = lookup(d, name);
+
+  if (error)
+    return error;
+  return name->name[0];
+}
+
+// direct-return: the buffer goes to the caller before the return.
+struct split {
+  void *ib;
+};
+void *kvzalloc(size_t, int);
+void kvfree(const void *);
+int ib_read(struct dev *d, void *ib);
+int ib_write(struct dev *d, void *ib);
+
+int handed_over(struct dev *d, struct split *si) {
+  void *ib = kvzalloc(64, 0);
+  int err;
+
+  if (!ib)
+    return -ENOMEM;
+  err = ib_read(d, ib);
+  if (err)
+    goto err_out;
+  if (d->cached) {
+    si->ib = ib;
+    return -EINVAL;
+  }
+  err = ib_write(d, ib);
+  if (err)
+    goto err_out;
+  err = 0;
+err_out:
+  kvfree(ib);
+  return err;
+}
+
+// direct-return: code that the configuration has switched off.
+#define IS_OFF 0
+#define SET_MSG(d) do { (d)->cache = 1; } while (0)
+
+int switched_off(struct dev *d) {
+  int err = setup_a(d);
+
+  if (err)
+    return err;
+  if (IS_OFF) {
+    SET_MSG(d);
+    return -EINVAL;
+  }
+  if (d->cached) {
+    void *buf = kmalloc(8, 0);
+
+    if (!buf) {
+      err = -ENOMEM;
+      goto err;
+    }
+    err = setup_b(d);
+    kfree(buf);
+    if (err)
+      goto err;
+  }
+  return 0;
+err:
+  clk_disable_unprepare(d->clk);
+  return err;
+}
+
+// unwind-return-call: the call that acquires is the one that is returned.
+int event(struct priv *priv, int on) {
+  if (on)
+    return clk_prepare_enable(priv->clk);
+  clk_disable_unprepare(priv->clk);
+  return 0;
+}
+
+// unwind-far: a function that takes and gives back is not the one that
+// tears down, and a destructor that is registered runs when this one fails.
+struct card {
+  void (*private_free)(struct card *);
+  struct priv *priv;
+};
+int request_firmware(const void **fw, const char *name, void *dev);
+void release_firmware(const void *fw);
+struct chip {
+  const void *image;
+  struct clk *clk;
+};
+
+static void chip_free(struct card *card);
+
+static int chip_create(struct card *card, struct chip *chip) {
+  int err;
+
+  card->private_free = chip_free;
+  err = request_firmware(&chip->image, "image", card);
+  if (err < 0)
+    return err;
+  if (get_irq(card->priv) < 0)
+    return -ENODEV;
+  return 0;
+}
+
+static struct chip the_chip;
+static void chip_free(struct card *card) {
+  release_firmware(the_chip.image);
+}
+
+int chip_probe(struct card *card) {
+  return chip_create(card, &the_chip);
+}
+
+static int chip_set_rate(struct chip *chip) {
+  int ret = clk_enable(chip->clk);
+
+  if (ret)
+    return ret;
+  if (!chip->image)
+    return -EINVAL;
+  return 0;
+}
+
+static int chip_measure(struct chip *chip) {
+  int ret = clk_enable(chip->clk);
+
+  if (ret)
+    return ret;
+  clk_disable(chip->clk);
+  return 0;
+}
+
+int (*const chip_ops[])(struct chip *) = { chip_set_rate, chip_measure };
