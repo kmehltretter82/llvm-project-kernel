@@ -460,6 +460,12 @@ and say so under this switch if one of them ends without a fixpoint.
 `wide-search` multiplies the limits of a search by four. It costs time in
 the functions that reach them and none elsewhere.
 
+A search remembers the outcome of a condition that the function tests in
+more than one place, and a comparison counts as the same condition however
+it is written: `a != b` is the negation of `a == b`, `a >= b` that of `a <
+b`, and `b > a` is `a < b`. `if (status == DONE) break;` in a loop and `if
+(status != DONE) return;` behind it are one question.
+
 A search does not carry everything it has learned along a path to the end
 of the function. What it knows about a variable is dropped at the first
 block from which nothing mentions the variable any more, so that paths

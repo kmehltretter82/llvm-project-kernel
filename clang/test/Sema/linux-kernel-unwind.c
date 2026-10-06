@@ -550,3 +550,59 @@ int claim(struct priv *p, int busy) {
   mutex_unlock(&p->lock);
   return 0;
 }
+
+// A comparison is one question however it is written.  The lock is taken
+// for one mode and dropped for the same one, which the test on the error
+// path asks about the other way round.
+int same_question(struct priv *p, int mode) {
+  int ret;
+
+  if (mode == 3)
+    mutex_lock(&p->lock);
+  ret = setup(p->dev);
+  if (ret) {
+    if (mode != 3)
+      return ret;
+    mutex_unlock(&p->lock);
+    return ret;
+  }
+  if (mode == 3)
+    mutex_unlock(&p->lock);
+  return 0;
+}
+
+int same_question_order(struct priv *p, int mode, int limit) {
+  int ret;
+
+  if (mode < limit)
+    mutex_lock(&p->lock);
+  ret = setup(p->dev);
+  if (ret) {
+    if (limit <= mode)
+      return ret;
+    mutex_unlock(&p->lock);
+    return ret;
+  }
+  if (mode < limit)
+    mutex_unlock(&p->lock);
+  return 0;
+}
+
+// Another question: the lock is held for mode 3, and the error path
+// returns with it.
+int other_question(struct priv *p, int mode) {
+  int ret;
+
+  if (mode == 3)
+    mutex_lock(&p->lock); // unwind-note {{acquired here}}
+  ret = setup(p->dev);
+  if (ret) {
+    if (mode != 4)
+      return ret; // unwind-warning {{'&p->lock' was acquired with mutex_lock() and this error path returns without mutex_unlock(), which other paths call}}
+    mutex_unlock(&p->lock); // unwind-note {{another path releases it here}}
+    return ret;
+  }
+  if (mode == 3)
+    mutex_unlock(&p->lock);
+  return 0;
+}

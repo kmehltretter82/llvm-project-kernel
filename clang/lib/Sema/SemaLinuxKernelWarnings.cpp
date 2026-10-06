@@ -6221,11 +6221,55 @@ private:
     TableFull = true;
   }
 
-  /// The index of the condition \p E, which is already stripped, or -1 if
-  /// it has a side effect or there is no room for it.
-  int conditionIndex(const Expr *E, bool Create, bool Always = false) {
+  /// What makes the condition \p E the one it is.  A comparison is brought
+  /// into one form first: "a != b" is "!(a == b)", "a >= b" is "!(a < b)",
+  /// "a > b" is "!(a <= b)", and the operands have one order.  A function
+  /// that tests "status == DONE" in one place and "status != DONE" in
+  /// another then asks one question twice.  \p Flipped says that \p E is
+  /// the negation of the form that the answer stands for.
+  llvm::FoldingSetNodeID conditionID(const Expr *E, bool &Flipped) const {
     llvm::FoldingSetNodeID ID;
-    E->Profile(ID, Ctx, /*Canonical=*/true);
+    Flipped = false;
+    const auto *BO = dyn_cast<BinaryOperator>(E->IgnoreParens());
+    if (!BO || !BO->isComparisonOp() || BO->getOpcode() == BO_Cmp ||
+        BO->getLHS()->getType()->isFloatingType() ||
+        BO->getRHS()->getType()->isFloatingType()) {
+      E->Profile(ID, Ctx, /*Canonical=*/true);
+      return ID;
+    }
+    llvm::FoldingSetNodeID Left, Right;
+    BO->getLHS()->Profile(Left, Ctx, /*Canonical=*/true);
+    BO->getRHS()->Profile(Right, Ctx, /*Canonical=*/true);
+    BinaryOperatorKind Op = BO->getOpcode();
+    if (Op == BO_NE || Op == BO_GE || Op == BO_GT) {
+      Op = Op == BO_NE ? BO_EQ : Op == BO_GE ? BO_LT : BO_LE;
+      Flipped = true;
+    }
+    // "b < a" is "!(a <= b)", and "b <= a" is "!(a < b)".
+    if (Right < Left) {
+      std::swap(Left, Right);
+      if (Op != BO_EQ) {
+        Op = Op == BO_LT ? BO_LE : BO_LT;
+        Flipped = !Flipped;
+      }
+    }
+    ID.AddInteger(0x636d70u);
+    ID.AddInteger(unsigned(Op));
+    ID.AddNodeID(Left);
+    ID.AddNodeID(Right);
+    return ID;
+  }
+
+  /// The index of the condition \p E, which is already stripped, or -1 if
+  /// it has a side effect or there is no room for it.  \p Flipped is set
+  /// if the outcome that is kept under the index is that of the opposite
+  /// comparison (see conditionID()).
+  int conditionIndex(const Expr *E, bool Create, bool Always = false,
+                     bool *Flipped = nullptr) {
+    bool Opposite = false;
+    llvm::FoldingSetNodeID ID = conditionID(E, Opposite);
+    if (Flipped)
+      *Flipped = Opposite;
     for (unsigned I = 0, N = Conditions.size(); I != N; ++I)
       if (Conditions[I].ID == ID)
         return I;
@@ -7161,9 +7205,11 @@ public:
       return *B != Negated;
     if (St.Preds.empty() && St.Fixed.empty())
       return std::nullopt;
-    int I = conditionIndex(E, /*Create=*/false);
+    bool Flipped = false;
+    int I = conditionIndex(E, /*Create=*/false, /*Always=*/false, &Flipped);
     if (I < 0)
       return std::nullopt;
+    Negated ^= Flipped;
     for (const auto &[C, Holds] : St.Fixed)
       if (C == unsigned(I))
         return Holds != Negated;
@@ -7181,9 +7227,10 @@ public:
     const Expr *E = stripLinuxCondition(Cond, Negated);
     if (!E || St.Fixed.size() >= 4)
       return;
-    int I = conditionIndex(E, /*Create=*/true, /*Always=*/true);
+    bool Flipped = false;
+    int I = conditionIndex(E, /*Create=*/true, /*Always=*/true, &Flipped);
     if (I >= 0)
-      St.Fixed.push_back({unsigned(I), Outcome != Negated});
+      St.Fixed.push_back({unsigned(I), Outcome != (Negated != Flipped)});
   }
 
   /// Narrow \p Loc to the values in \p Mask, and with it the locations that
@@ -7330,7 +7377,8 @@ public:
       }
     }
 
-    int I = conditionIndex(E, /*Create=*/false);
+    bool Flipped = false;
+    int I = conditionIndex(E, /*Create=*/false, /*Always=*/false, &Flipped);
     if (I >= 0 && Conditions[I].Sites >= 2) {
       auto It = llvm::lower_bound(
           St.Preds, unsigned(I),
@@ -7338,9 +7386,9 @@ public:
             return P.first < C;
           });
       if (It != St.Preds.end() && It->first == unsigned(I))
-        It->second = Outcome;
+        It->second = Outcome != Flipped;
       else
-        St.Preds.insert(It, {unsigned(I), Outcome});
+        St.Preds.insert(It, {unsigned(I), Outcome != Flipped});
     }
     return true;
   }
