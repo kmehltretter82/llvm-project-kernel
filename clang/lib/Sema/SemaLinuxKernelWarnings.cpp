@@ -7520,6 +7520,12 @@ public:
         if (std::optional<Value> Known = Running->callValue(CE, St))
           return *Known;
       const FunctionDecl *FD = CE->getDirectCallee();
+      // "ret = dev_err_probe(dev, -EINVAL, ...);": these return the error
+      // code that they are given.
+      if (FD && FD->getIdentifier() && CE->getNumArgs() >= 2 &&
+          (FD->getName() == "dev_err_probe" ||
+           FD->getName() == "dev_warn_probe"))
+        return value(CE->getArg(1), St);
       if (FD)
         if (const std::optional<Predicate> &P = predicate(FD);
             P && P->Param < CE->getNumArgs()) {
@@ -13713,6 +13719,402 @@ public:
   }
 };
 
+/// A loop over device tree nodes holds a reference to the node of each
+/// pass, which the next call of the iterator drops:
+///
+///   for_each_child_of_node(parent, child) {
+///           ret = setup(child);
+///           if (ret)
+///                   return ret;     /* of_node_put(child) is missing */
+///   }
+///
+/// The checker follows the paths from the start of a pass to the end of
+/// the function.  A path ends where the reference is dropped, by
+/// of_node_put() or by the iterator itself, and where the pointer is kept:
+/// stored, returned, or given another reference with of_node_get(), which
+/// says that somebody means to keep it.  A function that is only given the
+/// node does not take the reference over: one that keeps the pointer takes
+/// its own.  The exceptions are device_set_node() and its relatives, and a
+/// function whose body is at hand and stores the pointer.
+///
+/// The other way round is followed too.  A pointer that is stored in
+/// memory has the reference of the pass and no other, and if the path then
+/// comes to the place where that one is dropped, the copy is left with
+/// none:
+///
+///   for_each_child_of_node(parent, child) {
+///           priv->port[i++].np = child;     /* of_node_get() is missing */
+///   }
+///
+/// That is reported only with the switch "iterator-ref-stored", which
+/// "all" does not include: on the 422 kernel sources with such a loop that
+/// were tried it was said of 37 places, against 6 for the first kind.
+///
+/// The loops whose variable has a cleanup function
+/// (for_each_child_of_node_scoped()) need nothing and are not looked at.
+class LinuxIteratorRefChecker : LinuxPathSearch::Client {
+  Sema &S;
+  const FunctionDecl *FD;
+  const CFG &Cfg;
+  LinuxPathSearch &Search;
+
+  struct Candidate {
+    const Stmt *Loop = nullptr;
+    const VarDecl *Var = nullptr;
+    const CallExpr *Next = nullptr;
+  };
+  llvm::SmallVector<Candidate, 2> Candidates;
+
+  // Per search.
+  const Candidate *Active = nullptr;
+  llvm::SmallVector<const CFGBlock *, 4> Leaks;
+  /// Where the pointer was stored on a path that then came to the place
+  /// where the reference is dropped, and that place.
+  llvm::SmallVector<std::pair<const Stmt *, const Stmt *>, 2> Unreferenced;
+  /// The last place where a path stored the pointer.  Paths that differ in
+  /// it are one state, so this is the place of one of them.
+  const Stmt *LastStore = nullptr;
+
+  /// The path has stored the pointer in memory, with nothing but the
+  /// reference of the pass to keep the node there.
+  enum : uint32_t { Stored = 1 };
+
+  /// The functions that walk a set of nodes: each call drops the reference
+  /// to the node that it is given and returns the next one with a
+  /// reference.
+  static bool isIterator(const FunctionDecl *Callee) {
+    if (!Callee || !Callee->getIdentifier())
+      return false;
+    return llvm::StringSwitch<bool>(Callee->getName())
+        .Cases({"of_get_next_child", "of_get_next_available_child",
+                "of_get_next_reserved_child", "of_get_next_child_with_prefix",
+                "of_get_next_cpu_node", "of_get_next_parent"},
+               true)
+        .Cases({"of_find_matching_node_and_match", "of_find_matching_node",
+                "of_find_compatible_node", "of_find_node_by_name",
+                "of_find_node_by_type", "of_find_node_with_property",
+                "of_find_all_nodes"},
+               true)
+        .Cases({"of_graph_get_next_endpoint", "of_graph_get_next_port",
+                "of_graph_get_next_port_endpoint"},
+               true)
+        .Cases({"fwnode_get_next_child_node",
+                "fwnode_get_next_available_child_node",
+                "device_get_next_child_node", "fwnode_get_next_parent",
+                "fwnode_graph_get_next_endpoint"},
+               true)
+        .Default(false);
+  }
+
+  static bool isPut(const FunctionDecl *Callee) {
+    return Callee && Callee->getIdentifier() &&
+           (Callee->getName() == "of_node_put" ||
+            Callee->getName() == "fwnode_handle_put");
+  }
+
+  static bool isGet(const FunctionDecl *Callee) {
+    return Callee && Callee->getIdentifier() &&
+           (Callee->getName() == "of_node_get" ||
+            Callee->getName() == "fwnode_handle_get");
+  }
+
+  /// Whether \p St stores the pointer in \p VD in memory: it assigns it
+  /// to something that is no variable of the function, or hands it to a
+  /// function that keeps it.
+  bool stores(const Stmt *St, const VarDecl *VD, unsigned Depth) {
+    if (!St)
+      return false;
+    if (const auto *BO = dyn_cast<BinaryOperator>(St)) {
+      if (BO->getOpcode() == BO_Assign && refersTo(BO->getRHS(), VD) &&
+          !isLocalName(BO->getLHS()))
+        return true;
+    } else if (const auto *CE = dyn_cast<CallExpr>(St)) {
+      for (unsigned I = 0, E = CE->getNumArgs(); I != E; ++I)
+        if (refersTo(CE->getArg(I), VD) &&
+            keeps(CE->getDirectCallee(), I, Depth + 1))
+          return true;
+    }
+    for (const Stmt *Child : St->children())
+      if (stores(Child, VD, Depth))
+        return true;
+    return false;
+  }
+
+  /// Whether the function keeps the pointer that it gets as argument
+  /// \p I, with the reference that the caller holds: device_set_node()
+  /// stores the node in the device and takes no reference, unlike
+  /// platform_device_set_of_node(), which takes its own.  A function with
+  /// a body here keeps it if the body stores it.  One that only hands it
+  /// to a function of another file does not: whoever keeps a node there
+  /// takes a reference.
+  bool keeps(const FunctionDecl *Callee, unsigned I, unsigned Depth = 0) {
+    if (!Callee || !Callee->getIdentifier())
+      return false;
+    if (Callee->getName() == "device_set_node" ||
+        Callee->getName() == "set_primary_fwnode" ||
+        Callee->getName() == "set_secondary_fwnode")
+      return true;
+    const FunctionDecl *Def = nullptr;
+    if (Depth > 3 || !Callee->hasBody(Def) || I >= Def->getNumParams())
+      return false;
+    return stores(Def->getBody(), Def->getParamDecl(I), Depth);
+  }
+
+  /// The variable itself, or the handle inside the node that it points
+  /// to: "child" and "&child->fwnode".
+  static bool refersTo(const Expr *E, const VarDecl *VD) {
+    E = E ? E->IgnoreParenCasts() : nullptr;
+    if (!E)
+      return false;
+    if (getDirectLinuxVariable(E) == VD)
+      return true;
+    const auto *UO = dyn_cast<UnaryOperator>(E);
+    const auto *ME =
+        UO && UO->getOpcode() == UO_AddrOf
+            ? dyn_cast<MemberExpr>(UO->getSubExpr()->IgnoreParens())
+            : nullptr;
+    return ME && ME->isArrow() && getDirectLinuxVariable(ME->getBase()) == VD;
+  }
+
+  static bool mentions(const Stmt *St, const VarDecl *VD) {
+    if (!St)
+      return false;
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(St))
+      if (DRE->getDecl() == VD)
+        return true;
+    for (const Stmt *Child : St->children())
+      if (mentions(Child, VD))
+        return true;
+    return false;
+  }
+
+  /// "Var = next(..., Var, ...)" in \p St, the part of a loop that runs
+  /// for every pass.
+  static const CallExpr *findAdvance(const Stmt *St, const VarDecl *&Var) {
+    if (!St)
+      return nullptr;
+    if (const auto *BO = dyn_cast<BinaryOperator>(St))
+      if (BO->getOpcode() == BO_Assign) {
+        const VarDecl *VD = getDirectLinuxVariable(BO->getLHS());
+        const auto *CE =
+            dyn_cast<CallExpr>(BO->getRHS()->IgnoreParenCasts());
+        if (VD && VD->hasLocalStorage() && !VD->hasAttr<CleanupAttr>() &&
+            CE && isIterator(CE->getDirectCallee()) &&
+            llvm::any_of(CE->arguments(), [&](const Expr *Arg) {
+              return refersTo(Arg, VD);
+            })) {
+          Var = VD;
+          return CE;
+        }
+      }
+    for (const Stmt *Child : St->children())
+      if (const CallExpr *CE = findAdvance(Child, Var))
+        return CE;
+    return nullptr;
+  }
+
+  void collect(const Stmt *St) {
+    if (!St)
+      return;
+    Candidate C;
+    if (const auto *For = dyn_cast<ForStmt>(St)) {
+      C.Next = findAdvance(For->getInc(), C.Var);
+      if (!C.Next)
+        C.Next = findAdvance(For->getCond(), C.Var);
+    } else if (const auto *While = dyn_cast<WhileStmt>(St)) {
+      C.Next = findAdvance(While->getCond(), C.Var);
+    }
+    if (C.Next) {
+      C.Loop = St;
+      Candidates.push_back(C);
+    }
+    for (const Stmt *Child : St->children())
+      collect(Child);
+  }
+
+  /// A variable of the function itself or a part of one, which goes when
+  /// the function does: a copy there is another name for the node, not a
+  /// place that keeps it.  "np = child;" and "clkspec.np = np;".
+  static bool isLocalName(const Expr *E) {
+    for (;;) {
+      E = E->IgnoreParenImpCasts();
+      if (const auto *ME = dyn_cast<MemberExpr>(E); ME && !ME->isArrow()) {
+        E = ME->getBase();
+        continue;
+      }
+      if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(E);
+          ASE && ASE->getBase()->IgnoreParenImpCasts()->getType()->isArrayType()) {
+        E = ASE->getBase();
+        continue;
+      }
+      break;
+    }
+    const auto *DRE = dyn_cast<DeclRefExpr>(E);
+    const auto *VD = DRE ? dyn_cast<VarDecl>(DRE->getDecl()) : nullptr;
+    return VD && VD->hasLocalStorage() && !isa<ParmVarDecl>(VD);
+  }
+
+  bool statement(const Stmt *Node, LinuxPathSearch::State &St) override {
+    const VarDecl *Var = Active->Var;
+    auto Store = [&](const Stmt *Where) {
+      St.Client |= Stored;
+      LastStore = Where;
+      return true;
+    };
+    // The reference is dropped.  A copy in memory has nothing left to
+    // stand on.
+    auto Drop = [&](const Stmt *Where) {
+      if ((St.Client & Stored) && LastStore && Unreferenced.size() < 2 &&
+          llvm::none_of(Unreferenced, [&](const auto &P) {
+            return P.first == LastStore;
+          }))
+        Unreferenced.push_back({LastStore, Where});
+      return false;
+    };
+    if (const auto *CE = dyn_cast<CallExpr>(Node)) {
+      const FunctionDecl *Callee = CE->getDirectCallee();
+      for (unsigned I = 0, E = CE->getNumArgs(); I != E; ++I) {
+        if (!refersTo(CE->getArg(I), Var))
+          continue;
+        if (isPut(Callee) || isIterator(Callee))
+          return Drop(CE);
+        // Another reference: whoever has the pointer may keep it.
+        if (isGet(Callee))
+          return false;
+        if (keeps(Callee, I))
+          return Store(CE);
+      }
+      return true;
+    }
+    if (const auto *BO = dyn_cast<BinaryOperator>(Node)) {
+      if (!BO->isAssignmentOp())
+        return true;
+      // Another value for the variable ends what is known about it.
+      if (getDirectLinuxVariable(BO->getLHS()) == Var)
+        return false;
+      if (!refersTo(BO->getRHS(), Var))
+        return true;
+      return isLocalName(BO->getLHS()) ? false : Store(BO);
+    }
+    if (const auto *DS = dyn_cast<DeclStmt>(Node)) {
+      for (const Decl *D : DS->decls())
+        if (const auto *VD = dyn_cast<VarDecl>(D); VD && VD->getInit())
+          if (refersTo(VD->getInit(), Var) ||
+              (isa<InitListExpr>(VD->getInit()->IgnoreParenCasts()) &&
+               mentions(VD->getInit(), Var)))
+            return false;
+      return true;
+    }
+    if (const auto *RS = dyn_cast<ReturnStmt>(Node))
+      return !refersTo(RS->getRetValue(), Var);
+    return true;
+  }
+
+  bool edge(const CFGBlock *From, const CFGBlock *To,
+            LinuxPathSearch::State &St) override {
+    if (To != &Cfg.getExit())
+      return true;
+    // With the pointer stored, the reference went where the pointer went.
+    if (!(St.Client & Stored) && !From->hasNoReturnElement() &&
+        !llvm::is_contained(Leaks, From) && Leaks.size() < 4)
+      Leaks.push_back(From);
+    return false;
+  }
+
+  void reportUnreferenced(const Stmt *Store, const Stmt *Drop) {
+    const Candidate &C = *Active;
+    std::string Text;
+    llvm::raw_string_ostream OS(Text);
+    OS << "'" << C.Var->getName() << "' is ";
+    if (const auto *CE = dyn_cast<CallExpr>(Store);
+        CE && CE->getDirectCallee())
+      OS << "given to '" << CE->getDirectCallee()->getName()
+         << "', which keeps it";
+    else
+      OS << "stored here";
+    OS << ", but nothing takes a reference for the copy, and the one that "
+          "the loop holds is dropped ";
+    const auto *DropCall = cast<CallExpr>(Drop);
+    OS << (isPut(DropCall->getDirectCallee()) ? "afterwards"
+                                              : "when the loop goes on");
+    S.Diag(Store->getBeginLoc(), diag::warn_linux_kernel_experimental)
+        << Text << "iterator-ref-stored" << Store->getSourceRange();
+    S.Diag(Drop->getBeginLoc(), diag::note_linux_kernel_experimental)
+        << "the reference is dropped here";
+  }
+
+  void report(const CFGBlock *B) {
+    const Candidate &C = *Active;
+    const ReturnStmt *RS = nullptr;
+    for (const CFGElement &Elem : *B)
+      if (std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>())
+        if (const auto *R = dyn_cast<ReturnStmt>(CS->getStmt()))
+          RS = R;
+    SourceLocation Loc =
+        RS ? RS->getBeginLoc() : FD->getBody()->getEndLoc();
+    const FunctionDecl *Next = C.Next->getDirectCallee();
+    StringRef Put =
+        Next->getName().starts_with("of_") ? "of_node_put"
+                                           : "fwnode_handle_put";
+    std::string Text;
+    llvm::raw_string_ostream OS(Text);
+    OS << "the function returns here from inside the loop over nodes, with "
+          "the reference to '"
+       << C.Var->getName() << "' that " << Next->getName()
+       << "() took for this pass: " << Put << "(" << C.Var->getName()
+       << ") is missing on this path";
+    S.Diag(Loc, diag::warn_linux_kernel_experimental)
+        << Text << "iterator-ref-leak";
+    S.Diag(C.Next->getExprLoc(), diag::note_linux_kernel_experimental)
+        << "the next pass drops the reference here, a pass that leaves the "
+           "function does not get there";
+  }
+
+public:
+  LinuxIteratorRefChecker(Sema &S, const FunctionDecl *FD, const CFG &Cfg,
+                          LinuxPathSearch &Search)
+      : S(S), FD(FD), Cfg(Cfg), Search(Search) {}
+
+  static bool wanted(const Sema &S, SourceLocation Loc) {
+    return isLinuxExperimentEnabled(S, "iterator-ref-leak", Loc);
+  }
+
+  void run() {
+    collect(FD->getBody());
+    for (const Candidate &C : Candidates) {
+      Active = &C;
+      Leaks.clear();
+      Unreferenced.clear();
+      LastStore = nullptr;
+      int Loc = Search.locate(C.Var);
+      for (const CFGBlock *B : Cfg) {
+        // The block that decides whether there is another pass.
+        if (B->getTerminatorStmt() != C.Loop ||
+            !LinuxPathSearch::isConditionalBranch(B))
+          continue;
+        const CFGBlock *Body = B->succ_begin()->getReachableBlock();
+        if (!Body)
+          continue;
+        LinuxPathSearch::State Init;
+        // There is a node, or there would be no pass.
+        if (Loc >= 0)
+          LinuxPathSearch::set(Init, Loc,
+                               LinuxPathValue::ofMask(LinuxPathValue::Pos));
+        Search.run(Body, 0, Init, *this);
+      }
+      for (const CFGBlock *B : Leaks)
+        report(B);
+      // Most drivers that keep a node from such a loop take no reference
+      // for it, and little comes of that as long as nodes are not removed.
+      // The reports are there for whoever asks.
+      if (isLinuxExperimentEnabled(S, "iterator-ref-stored", FD->getBeginLoc(),
+                                   /*IsCheck=*/false))
+        for (const auto &[Store, Drop] : Unreferenced)
+          reportUnreferenced(Store, Drop);
+    }
+  }
+};
+
 /// The second half of the unwind check, at the end of the translation unit:
 /// an error path that returns with a resource which its own function never
 /// releases, while another function releases what the same member holds.
@@ -14119,7 +14521,9 @@ void clang::sema::IssueLinuxKernelFlowWarnings(Sema &S, const FunctionDecl *FD,
   bool WantUnwind = LinuxUnwindChecker::wanted(S, Loc);
   bool WantOutput = LinuxOutputParamChecker::wanted(S, Loc);
   bool WantLoopEnd = LinuxLoopEndChecker::wanted(S, Loc);
-  if (!WantTestedValue && !WantUnwind && !WantOutput && !WantLoopEnd)
+  bool WantIterator = LinuxIteratorRefChecker::wanted(S, Loc);
+  if (!WantTestedValue && !WantUnwind && !WantOutput && !WantLoopEnd &&
+      !WantIterator)
     return;
   LinuxPathSearch Search(S.getASTContext(), FD, *Cfg, *Unit.State);
   if (WantTestedValue)
@@ -14132,4 +14536,6 @@ void clang::sema::IssueLinuxKernelFlowWarnings(Sema &S, const FunctionDecl *FD,
         .run();
   if (WantLoopEnd)
     LinuxLoopEndChecker(S, FD, *Cfg, Search, *Unit.State).run();
+  if (WantIterator)
+    LinuxIteratorRefChecker(S, FD, *Cfg, Search).run();
 }

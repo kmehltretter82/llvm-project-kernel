@@ -466,11 +466,40 @@ group of its own once a kernel scan has shown what it finds. The names:
   in the variable anywhere (it assigns one, or negates the variable, as in
   `return -ret;`), and a variable that is compared with the same error
   number in both forms, `ret == -EAGAIN || ret == EAGAIN`.
+- `iterator-ref-leak`: a pass of a loop over device tree or firmware nodes
+  leaves the function with the reference that the iterator took for it:
+  `for_each_child_of_node(parent, child) { if (err) return err; }`. The
+  loop is known by its advance, `child = of_get_next_child(parent, child)`
+  or one of the other functions that drop the node they are given and
+  return the next one, so `while ((np = of_find_compatible_node(np, ...)))`
+  is one too. A path ends where the reference is dropped (`of_node_put()`,
+  `fwnode_handle_put()`, the iterator itself) and where the pointer is
+  kept: assigned to something, returned, or given another reference with
+  `of_node_get()`. A function that is only passed the node does not take
+  the reference over, by the convention that whoever keeps a node takes a
+  reference of its own. `device_set_node()` is the exception, and so is a
+  function whose body is at hand and stores the pointer. A loop variable
+  with a cleanup function (`for_each_child_of_node_scoped()`) is not
+  looked at.
 
 Some names change how the path checks work and are not part of `all`.
 `path-notes` adds a note for each branch between the test and the misuse,
 and `unconfirmed-paths` reports candidates without the second search from
 the function entry.
+
+`iterator-ref-stored` adds the other half of `iterator-ref-leak`: a node
+pointer from such a loop is stored in memory, by an assignment or by a
+function that keeps it, and the path then comes to where the loop or
+`of_node_put()` drops the only reference. It is not part of `all`. Most
+drivers that keep a node from a loop take no reference for it, which
+matters only where nodes can go away, so the reports are many and worth
+little: 37 places on the 422 kernel sources with such a loop that were
+tried, against six for the leak.
+
+A search knows what two functions return that only hand a value on:
+`dev_err_probe()` and `dev_warn_probe()` return the error code that they
+are given, so `ret = dev_err_probe(dev, -EINVAL, ...); break;` leaves the
+loop with a `ret` that is not zero.
 
 `statistics` says where the analyses stopped short, so that a function
 without a report can be told from one that was not looked at in full. The
