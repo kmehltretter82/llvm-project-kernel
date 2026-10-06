@@ -371,6 +371,68 @@ int out_one_way(struct dev *d) {
   return val; // expected-warning {{'val' is read here, but 'read_reg' does not write to it when it fails, and the result of the call is not tested (experimental check 'uninit-output')}}
 }
 
+// The callee tests a sum of two parameters, and the call gives both.
+static void read_cfg(struct dev *d, int where, int size, u32 *val) {
+  if (where + size <= 8)
+    *val = d->cache;
+  else
+    _printk("beyond the end\n");
+} // expected-note {{'read_cfg' returns here without having written through 'val'}}
+
+u32 out_sum_fits(struct dev *d) {
+  u32 val;
+
+  read_cfg(d, 4, 2, &val);
+  return val;
+}
+
+u32 out_sum_too_large(struct dev *d) {
+  u32 val;
+
+  read_cfg(d, 8, 2, &val); // expected-note {{the address of 'val' is passed to 'read_cfg' here}}
+  return val; // expected-warning {{'val' is read here, but 'read_cfg' can return without writing to it (experimental check 'uninit-output')}}
+}
+
+// The path on which the call has failed ends where the pointer that it
+// returned is dereferenced, here or first thing in a function that is
+// given it.
+static struct dev *pick(struct dev *d, u32 *off) {
+  if (!d->cached)
+    return NULL; // expected-note {{'pick' returns here without having written through 'off'}}
+  *off = d->cache;
+  return d;
+}
+
+static bool usable(const struct dev *d) {
+  return !d->cached;
+}
+
+u32 out_null_goes_to_callee(struct dev *d) {
+  u32 off;
+  struct dev *o = pick(d, &off);
+
+  if (!usable(o))
+    return 0;
+  return off;
+}
+
+u32 out_null_is_dereferenced(struct dev *d) {
+  u32 off;
+  struct dev *o = pick(d, &off);
+
+  if (o->cached)
+    return 0;
+  return off;
+}
+
+u32 out_null_goes_on(struct dev *d) {
+  u32 off;
+  struct dev *o = pick(d, &off); // expected-note {{the address of 'off' is passed to 'pick' here}}
+
+  consume(o != NULL);
+  return off; // expected-warning {{'off' is read here, but on this path 'pick' has failed and has not written to it (experimental check 'uninit-output')}}
+}
+
 // bool: false is the failure.
 static bool parse(const char *s, int *out) {
   if (!s[0])

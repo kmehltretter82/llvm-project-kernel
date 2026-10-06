@@ -6491,7 +6491,50 @@ public:
         std::optional<bool> B = compare(BO, St);
         return B ? Value::constant(*B) : Value::ofMask(Value::Zero | Value::Pos);
       }
-      return Value();
+      // Arithmetic on two known numbers: "where + size <= 4" in a callee
+      // that was given both as constants.
+      if (T->isPointerType() || BO->isAssignmentOp() || BO->isPtrMemOp())
+        return Value();
+      Value L = value(BO->getLHS(), St), R = value(BO->getRHS(), St);
+      if (!L.HasConst || !R.HasConst)
+        return Value();
+      unsigned Width = Ctx.getIntWidth(T);
+      bool Unsigned = T->isUnsignedIntegerOrEnumerationType();
+      auto Make = [&](int64_t V) {
+        llvm::APSInt K(llvm::APInt(64, uint64_t(V), /*isSigned=*/true),
+                       /*isUnsigned=*/false);
+        K = K.extOrTrunc(Width);
+        K.setIsUnsigned(Unsigned);
+        return K;
+      };
+      llvm::APSInt A = Make(L.Const), B = Make(R.Const), Result;
+      switch (BO->getOpcode()) {
+      case BO_Add: Result = A + B; break;
+      case BO_Sub: Result = A - B; break;
+      case BO_Mul: Result = A * B; break;
+      case BO_And: Result = A & B; break;
+      case BO_Or:  Result = A | B; break;
+      case BO_Xor: Result = A ^ B; break;
+      case BO_Div:
+      case BO_Rem:
+        // Not INT_MIN / -1 either.
+        if (B.isZero() || (!Unsigned && B.isAllOnes()))
+          return Value();
+        Result = BO->getOpcode() == BO_Div ? A / B : A % B;
+        break;
+      case BO_Shl:
+      case BO_Shr:
+        if (R.Const < 0 || R.Const >= int64_t(Width))
+          return Value();
+        Result = BO->getOpcode() == BO_Shl ? A << unsigned(R.Const)
+                                           : A >> unsigned(R.Const);
+        break;
+      default:
+        return Value();
+      }
+      if (std::optional<int64_t> Fits = Result.tryExtValue())
+        return Value::constant(*Fits);
+      return Value::ofMask(Value::Pos);
     }
 
     if (const auto *CO = dyn_cast<AbstractConditionalOperator>(E)) {
@@ -6872,6 +6915,31 @@ public:
   /// End the search: the check has what it was looking for.
   void stop() { Stopped = true; }
 
+  /// Whether a path ends at \p Node because the pointer that it
+  /// dereferences is NULL there, in \p Node itself or first thing in a
+  /// function that it calls.  Either the path does not exist, because the
+  /// code knows something that the search does not, or the dereference is a
+  /// bug of its own, which the check for that reports.  Nothing behind it
+  /// is worth a report in either case.
+  bool crashes(const Stmt *Node, const State &St) {
+    if (const Expr *Pointer = accessedPointer(Node))
+      if (value(Pointer, St).Mask == Value::Zero)
+        return true;
+    const auto *CE = dyn_cast<CallExpr>(Node);
+    const FunctionDecl *Callee = CE ? CE->getDirectCallee() : nullptr;
+    if (!Callee)
+      return false;
+    for (unsigned I = 0, E = std::min(CE->getNumArgs(), Callee->getNumParams());
+         I != E; ++I) {
+      const Expr *Arg = CE->getArg(I);
+      if (Arg->getType()->isPointerType() &&
+          value(Arg, St).Mask == Value::Zero &&
+          getUnconditionalParameterDeref(Callee, I, Unit))
+        return true;
+    }
+    return false;
+  }
+
   /// The blocks from the start of the search to the one it is in.
   void getPath(llvm::SmallVectorImpl<const CFGBlock *> &Out) const {
     for (int Node = Current; Node >= 0; Node = Trail[Node].second)
@@ -6918,7 +6986,8 @@ public:
         std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>();
         if (!CS)
           continue;
-        if (++Steps > MaxSteps || !C.statement(CS->getStmt(), St) || Stopped) {
+        if (++Steps > MaxSteps || !C.statement(CS->getStmt(), St) || Stopped ||
+            crashes(CS->getStmt(), St)) {
           Alive = false;
           break;
         }
