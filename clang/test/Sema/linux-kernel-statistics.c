@@ -1,0 +1,231 @@
+// The switch "statistics" says where the bounded analyses stopped short: a
+// function without a report is then told from one that was not looked at
+// in full.  "all" does not turn it on.
+//
+// RUN: %clang_cc1 -fsyntax-only -ffreestanding -Wlinux-kernel-missing-unwind \
+// RUN:   -Wlinux-kernel-experimental -flinux-kernel-experimental=statistics \
+// RUN:   -verify %s
+// RUN: %clang_cc1 -fsyntax-only -ffreestanding -Wlinux-kernel-missing-unwind \
+// RUN:   -Wlinux-kernel-experimental \
+// RUN:   -flinux-kernel-experimental=statistics,wide-search -verify %s
+// RUN: %clang_cc1 -fsyntax-only -ffreestanding -Wlinux-kernel-missing-unwind \
+// RUN:   -Wlinux-kernel-experimental -flinux-kernel-experimental=all \
+// RUN:   -verify=off %s
+
+// off-no-diagnostics
+
+// The line for the translation unit is at the start of the file.
+// expected-warning@1 {{statistics for this file: functions 2, path searches 25, out of steps 0, dropped paths 0, not run 0, checks stopped early 1 (experimental check 'statistics')}}
+
+#define EIO 5
+
+struct device;
+struct mutex {
+  int owner;
+};
+struct priv {
+  struct device *dev;
+  struct mutex lock;
+  struct mutex l0;
+  struct mutex l1;
+  struct mutex l2;
+  struct mutex l3;
+  struct mutex l4;
+  struct mutex l5;
+  struct mutex l6;
+  struct mutex l7;
+  struct mutex l8;
+  struct mutex l9;
+  struct mutex l10;
+  struct mutex l11;
+  struct mutex l12;
+  struct mutex l13;
+  struct mutex l14;
+  struct mutex l15;
+  struct mutex l16;
+  struct mutex l17;
+  struct mutex l18;
+  struct mutex l19;
+  struct mutex l20;
+  struct mutex l21;
+  struct mutex l22;
+  struct mutex l23;
+  struct mutex l24;
+  struct mutex l25;
+};
+
+void mutex_lock(struct mutex *lock);
+void mutex_unlock(struct mutex *lock);
+int setup(struct device *dev);
+
+int few(struct priv *p) {
+  mutex_lock(&p->lock);
+  if (setup(p->dev)) {
+    mutex_unlock(&p->lock);
+    return -EIO;
+  }
+  mutex_unlock(&p->lock);
+  return 0;
+}
+
+// The unwind check follows two dozen acquisitions in one function and then
+// leaves the function alone.
+int many(struct priv *p) { // expected-warning {{statistics for 'many': path searches 24, out of steps 0, dropped paths 0, not run 0, checks stopped early 1 (experimental check 'statistics')}}
+  mutex_lock(&p->l0);
+  if (setup(p->dev)) {
+    mutex_unlock(&p->l0);
+    return -EIO;
+  }
+  mutex_unlock(&p->l0);
+  mutex_lock(&p->l1);
+  if (setup(p->dev)) {
+    mutex_unlock(&p->l1);
+    return -EIO;
+  }
+  mutex_unlock(&p->l1);
+  mutex_lock(&p->l2);
+  if (setup(p->dev)) {
+    mutex_unlock(&p->l2);
+    return -EIO;
+  }
+  mutex_unlock(&p->l2);
+  mutex_lock(&p->l3);
+  if (setup(p->dev)) {
+    mutex_unlock(&p->l3);
+    return -EIO;
+  }
+  mutex_unlock(&p->l3);
+  mutex_lock(&p->l4);
+  if (setup(p->dev)) {
+    mutex_unlock(&p->l4);
+    return -EIO;
+  }
+  mutex_unlock(&p->l4);
+  mutex_lock(&p->l5);
+  if (setup(p->dev)) {
+    mutex_unlock(&p->l5);
+    return -EIO;
+  }
+  mutex_unlock(&p->l5);
+  mutex_lock(&p->l6);
+  if (setup(p->dev)) {
+    mutex_unlock(&p->l6);
+    return -EIO;
+  }
+  mutex_unlock(&p->l6);
+  mutex_lock(&p->l7);
+  if (setup(p->dev)) {
+    mutex_unlock(&p->l7);
+    return -EIO;
+  }
+  mutex_unlock(&p->l7);
+  mutex_lock(&p->l8);
+  if (setup(p->dev)) {
+    mutex_unlock(&p->l8);
+    return -EIO;
+  }
+  mutex_unlock(&p->l8);
+  mutex_lock(&p->l9);
+  if (setup(p->dev)) {
+    mutex_unlock(&p->l9);
+    return -EIO;
+  }
+  mutex_unlock(&p->l9);
+  mutex_lock(&p->l10);
+  if (setup(p->dev)) {
+    mutex_unlock(&p->l10);
+    return -EIO;
+  }
+  mutex_unlock(&p->l10);
+  mutex_lock(&p->l11);
+  if (setup(p->dev)) {
+    mutex_unlock(&p->l11);
+    return -EIO;
+  }
+  mutex_unlock(&p->l11);
+  mutex_lock(&p->l12);
+  if (setup(p->dev)) {
+    mutex_unlock(&p->l12);
+    return -EIO;
+  }
+  mutex_unlock(&p->l12);
+  mutex_lock(&p->l13);
+  if (setup(p->dev)) {
+    mutex_unlock(&p->l13);
+    return -EIO;
+  }
+  mutex_unlock(&p->l13);
+  mutex_lock(&p->l14);
+  if (setup(p->dev)) {
+    mutex_unlock(&p->l14);
+    return -EIO;
+  }
+  mutex_unlock(&p->l14);
+  mutex_lock(&p->l15);
+  if (setup(p->dev)) {
+    mutex_unlock(&p->l15);
+    return -EIO;
+  }
+  mutex_unlock(&p->l15);
+  mutex_lock(&p->l16);
+  if (setup(p->dev)) {
+    mutex_unlock(&p->l16);
+    return -EIO;
+  }
+  mutex_unlock(&p->l16);
+  mutex_lock(&p->l17);
+  if (setup(p->dev)) {
+    mutex_unlock(&p->l17);
+    return -EIO;
+  }
+  mutex_unlock(&p->l17);
+  mutex_lock(&p->l18);
+  if (setup(p->dev)) {
+    mutex_unlock(&p->l18);
+    return -EIO;
+  }
+  mutex_unlock(&p->l18);
+  mutex_lock(&p->l19);
+  if (setup(p->dev)) {
+    mutex_unlock(&p->l19);
+    return -EIO;
+  }
+  mutex_unlock(&p->l19);
+  mutex_lock(&p->l20);
+  if (setup(p->dev)) {
+    mutex_unlock(&p->l20);
+    return -EIO;
+  }
+  mutex_unlock(&p->l20);
+  mutex_lock(&p->l21);
+  if (setup(p->dev)) {
+    mutex_unlock(&p->l21);
+    return -EIO;
+  }
+  mutex_unlock(&p->l21);
+  mutex_lock(&p->l22);
+  if (setup(p->dev)) {
+    mutex_unlock(&p->l22);
+    return -EIO;
+  }
+  mutex_unlock(&p->l22);
+  mutex_lock(&p->l23);
+  if (setup(p->dev)) {
+    mutex_unlock(&p->l23);
+    return -EIO;
+  }
+  mutex_unlock(&p->l23);
+  mutex_lock(&p->l24);
+  if (setup(p->dev)) {
+    mutex_unlock(&p->l24);
+    return -EIO;
+  }
+  mutex_unlock(&p->l24);
+  mutex_lock(&p->l25);
+  if (setup(p->dev)) {
+    mutex_unlock(&p->l25);
+    return -EIO;
+  }
+  mutex_unlock(&p->l25);
+  return 0;
+}

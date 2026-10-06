@@ -163,6 +163,21 @@ struct sema::LinuxKernelUnit::Impl {
   };
   std::vector<PendingUnwind> PendingUnwinds;
 
+  /// How the bounded analyses of this translation unit ended, for the
+  /// switch "statistics".
+  struct Statistics {
+    unsigned Functions = 0;   ///< functions that the flow checks looked at
+    unsigned Searches = 0;    ///< path searches
+    unsigned OutOfSteps = 0;  ///< searches that used up their steps
+    unsigned OutOfStates = 0; ///< searches that dropped a path at a block
+                              ///< with too many states
+    unsigned Refused = 0;     ///< searches that did not run, because the
+                              ///< function had used up its steps
+    unsigned Capped = 0;      ///< checks that stopped at the number of
+                              ///< searches they allow themselves
+  };
+  Statistics Stats;
+
   Impl() { OpaqueSources.Opaque = true; }
 };
 
@@ -171,6 +186,10 @@ sema::LinuxKernelUnit::~LinuxKernelUnit() = default;
 
 namespace {
 
+static bool isLinuxExperimentEnabled(const Sema &S, StringRef Name,
+                                     SourceLocation Loc, bool IsCheck = true);
+static void noteLinuxNoFixpoint(Sema &S, const FunctionDecl *FD,
+                                StringRef Check);
 static bool isLinuxLvalueThrough(const Expr *LV, const VarDecl *P);
 static const Expr *getUnconditionalParameterDeref(
     const FunctionDecl *Callee, unsigned Index,
@@ -4355,8 +4374,10 @@ public:
       std::vector<Facts> In(Cfg.getNumBlockIDs());
       In[Cfg.getEntry().getBlockID()].Reached = true;
       if (!solve(V, In, /*JumpPass=*/false) ||
-          !solve(V, In, /*JumpPass=*/true))
+          !solve(V, In, /*JumpPass=*/true)) {
+        noteLinuxNoFixpoint(S, FD, "error-path-success");
         continue;
+      }
       for (const CFGBlock *B : Cfg)
         if (In[B->getBlockID()].Reached)
           runBlock(B, In[B->getBlockID()], V, /*Report=*/true);
@@ -4660,8 +4681,10 @@ public:
           }
         }
       }
-      if (Changed)
+      if (Changed) {
+        noteLinuxNoFixpoint(S, FD, "counted-by-order");
         continue;
+      }
       for (const CFGBlock *B : Cfg)
         if (In[B->getBlockID()] != Unreached)
           runBlock(B, In[B->getBlockID()], O, /*Report=*/true);
@@ -4924,8 +4947,10 @@ public:
         }
       }
     }
-    if (Changed)
+    if (Changed) {
+      noteLinuxNoFixpoint(S, FD, "deref-before-check");
       return;
+    }
 
     for (const CFGBlock *B : Cfg) {
       if (!Reached.test(B->getBlockID()))
@@ -5194,11 +5219,13 @@ public:
 private:
   static constexpr unsigned MaxLocations = 96;
   static constexpr unsigned MaxConditions = 64;
-  static constexpr unsigned MaxStatesPerBlock = 16;
+  /// The states that a block is visited in.  A path that comes to a block
+  /// with another one is dropped.
+  unsigned MaxStatesPerBlock = 16;
   /// Budget for one search: block visits plus statements.
-  static constexpr unsigned MaxSteps = 20000;
+  unsigned MaxSteps = 20000;
   /// Budget for all searches in one function.
-  static constexpr unsigned MaxFunctionSteps = 600000;
+  unsigned MaxFunctionSteps = 600000;
 
   const CFG &Cfg;
   ASTContext &Ctx;
@@ -5749,6 +5776,14 @@ public:
   LinuxPathSearch(ASTContext &Ctx, const FunctionDecl *FD, const CFG &Cfg,
                   sema::LinuxKernelUnit::Impl &Unit)
       : Cfg(Cfg), Ctx(Ctx), Unit(Unit) {
+    // The switch "wide-search" trades time for the paths that the budgets
+    // cut off.  The switch "statistics" says how many those are.
+    if (llvm::is_contained(Ctx.getLangOpts().LinuxKernelExperimentalChecks,
+                           "wide-search")) {
+      MaxStatesPerBlock *= 4;
+      MaxSteps *= 4;
+      MaxFunctionSteps *= 4;
+    }
     collectAddressTaken(FD->getBody());
     countSites();
   }
@@ -6416,8 +6451,11 @@ public:
            Client &C) {
     Stopped = GaveUp = false;
     Steps = 0;
-    if (FunctionSteps > MaxFunctionSteps)
+    ++Unit.Stats.Searches;
+    if (FunctionSteps > MaxFunctionSteps) {
+      ++Unit.Stats.Refused;
       return false;
+    }
 
     llvm::DenseMap<unsigned, llvm::SmallVector<State, 2>> Seen;
     llvm::SmallVector<Item, 16> Work;
@@ -6509,6 +6547,10 @@ public:
     }
     Running = nullptr;
     FunctionSteps += Steps;
+    if (Steps > MaxSteps)
+      ++Unit.Stats.OutOfSteps;
+    else if (GaveUp)
+      ++Unit.Stats.OutOfStates;
     return Steps <= MaxSteps && !GaveUp;
   }
 };
@@ -6518,7 +6560,7 @@ public:
 /// for every check, but not for a switch that changes how a check works
 /// (\p IsCheck false).
 static bool isLinuxExperimentEnabled(const Sema &S, StringRef Name,
-                                     SourceLocation Loc, bool IsCheck = true) {
+                                     SourceLocation Loc, bool IsCheck) {
   const auto &Names = S.getLangOpts().LinuxKernelExperimentalChecks;
   if (!llvm::is_contained(Names, Name) &&
       !(IsCheck && llvm::is_contained(Names, "all")))
@@ -6526,6 +6568,66 @@ static bool isLinuxExperimentEnabled(const Sema &S, StringRef Name,
   return !S.getDiagnostics().isIgnored(diag::warn_linux_kernel_experimental,
                                        Loc);
 }
+
+/// A dataflow that has not come to a fixpoint has nothing to report from,
+/// and the check is silent about the function.  The switch "statistics"
+/// says so.
+static void noteLinuxNoFixpoint(Sema &S, const FunctionDecl *FD,
+                                StringRef Check) {
+  if (!isLinuxExperimentEnabled(S, "statistics", FD->getBeginLoc(),
+                                /*IsCheck=*/false))
+    return;
+  std::string Text;
+  llvm::raw_string_ostream OS(Text);
+  OS << "the dataflow of '" << Check << "' did not come to a fixpoint in '"
+     << FD->getName() << "'";
+  S.Diag(FD->getLocation(), diag::warn_linux_kernel_experimental)
+      << Text << "statistics";
+}
+
+/// With the switch "statistics": says for a function how many of the path
+/// searches in it and in the functions that it calls were cut short.
+///
+///   out of steps         a search used up its steps
+///   dropped paths        a search came to a block in more states than it
+///                        keeps for one, and left the path
+///   not run              the function had used up its steps
+///   checks stopped early a check came to the number of searches that it
+///                        allows itself in one function
+class LinuxStatisticsScope {
+  using Statistics = sema::LinuxKernelUnit::Impl::Statistics;
+
+  Sema &S;
+  const FunctionDecl *FD;
+  Statistics &Stats;
+  Statistics Before;
+
+public:
+  LinuxStatisticsScope(Sema &S, const FunctionDecl *FD,
+                       sema::LinuxKernelUnit::Impl &Unit)
+      : S(S), FD(FD), Stats(Unit.Stats), Before(Unit.Stats) {
+    ++Stats.Functions;
+  }
+
+  ~LinuxStatisticsScope() {
+    unsigned Steps = Stats.OutOfSteps - Before.OutOfSteps;
+    unsigned States = Stats.OutOfStates - Before.OutOfStates;
+    unsigned Refused = Stats.Refused - Before.Refused;
+    unsigned Capped = Stats.Capped - Before.Capped;
+    if (!(Steps + States + Refused + Capped) ||
+        !isLinuxExperimentEnabled(S, "statistics", FD->getBeginLoc(),
+                                  /*IsCheck=*/false))
+      return;
+    std::string Text;
+    llvm::raw_string_ostream OS(Text);
+    OS << "statistics for '" << FD->getName() << "': path searches "
+       << Stats.Searches - Before.Searches << ", out of steps " << Steps
+       << ", dropped paths " << States << ", not run " << Refused
+       << ", checks stopped early " << Capped;
+    S.Diag(FD->getLocation(), diag::warn_linux_kernel_experimental)
+        << Text << "statistics";
+  }
+};
 
 /// Whether the function \p Def tests its parameter \p Param anywhere, or
 /// gives it another value.  A function that tests its argument is prepared
@@ -7952,8 +8054,10 @@ public:
             llvm::is_contained(Reported, std::make_pair(unsigned(Where),
                                                         unsigned(UntestedError))))
           continue;
-        if (++Searches > 16)
+        if (++Searches > 16) {
+          ++Unit.Stats.Capped;
           return;
+        }
         Active = UntestedError;
         Place = Where;
         Within = Value::Neg | Value::Pos;
@@ -9162,8 +9266,10 @@ public:
         OnlyPassedOn = !Local && Release && !WantUnwind;
         if (!Local && retakesAfterRelease(B))
           continue;
-        if (++Searches > 24)
+        if (++Searches > 24) {
+          ++Unit.Stats.Capped;
           return;
+        }
         LinuxPathSearch::State Init;
         fixGuards(B, Init);
         // "spin_lock(&parent->lock)": there is a parent.
@@ -9479,8 +9585,10 @@ public:
         }
       }
     }
-    if (Changed)
+    if (Changed) {
+      noteLinuxNoFixpoint(S, FD, "use-after-free");
       return;
+    }
     for (const CFGBlock *B : Cfg)
       if (Reached.test(B->getBlockID())) {
         llvm::SmallBitVector Out = In[B->getBlockID()];
@@ -9833,8 +9941,10 @@ public:
         }
       }
     }
-    if (Changed)
+    if (Changed) {
+      noteLinuxNoFixpoint(S, FD, "duplicate-check");
       return;
+    }
 
     for (const CFGBlock *B : Cfg) {
       if (!Reached.test(B->getBlockID()) || !isConditionalBranch(B))
@@ -10270,8 +10380,10 @@ public:
         }
       }
     }
-    if (Changed)
+    if (Changed) {
+      noteLinuxNoFixpoint(S, FD, "uninit-output");
       return;
+    }
 
     llvm::SmallVector<Site, 8> Sites;
     for (const CFGBlock *B : Cfg) {
@@ -10298,8 +10410,10 @@ public:
         // numbers that it passes.
         Sum = getLinuxOutputSummary(Def, Where.Arg, Unit);
         if (LinuxOutputSummarizer::hasConstantArguments(Def, Where.Call)) {
-          if (++Searches > 16)
+          if (++Searches > 16) {
+            ++Unit.Stats.Capped;
             return;
+          }
           Sum = LinuxOutputSummarizer(Def, Def->getParamDecl(Where.Arg), Unit,
                                       0, Where.Call)
                     .run();
@@ -10331,8 +10445,10 @@ public:
         Values.push_back(std::nullopt);
       Read = nullptr;
       for (const std::optional<Value> &V : Values) {
-        if (++Searches > 40)
+        if (++Searches > 40) {
+          ++Unit.Stats.Capped;
           return;
+        }
         Returned = V;
         Search.run(Where.Block, Where.Element + 1, LinuxPathSearch::State(),
                    *this);
@@ -10593,8 +10709,10 @@ public:
         }
       }
     }
-    if (Changed)
+    if (Changed) {
+      noteLinuxNoFixpoint(S, FD, "container-of-null");
       return;
+    }
 
     for (const CFGBlock *B : Cfg) {
       if (!Reached.test(B->getBlockID()))
@@ -11425,6 +11543,20 @@ void clang::sema::FinishLinuxKernelWarnings(Sema &S, LinuxKernelUnit &Unit) {
   if (S.getLangOpts().CPlusPlus)
     return;
   LinuxFarUnwindReporter(S, *Unit.State).run();
+  const SourceManager &SM = S.getSourceManager();
+  SourceLocation Start = SM.getLocForStartOfFile(SM.getMainFileID());
+  if (isLinuxExperimentEnabled(S, "statistics", Start, /*IsCheck=*/false)) {
+    const LinuxKernelUnit::Impl::Statistics &Stats = Unit.State->Stats;
+    std::string Text;
+    llvm::raw_string_ostream OS(Text);
+    OS << "statistics for this file: functions " << Stats.Functions
+       << ", path searches " << Stats.Searches << ", out of steps "
+       << Stats.OutOfSteps << ", dropped paths " << Stats.OutOfStates
+       << ", not run " << Stats.Refused << ", checks stopped early "
+       << Stats.Capped;
+    S.Diag(Start, diag::warn_linux_kernel_experimental)
+        << Text << "statistics";
+  }
   if (S.getLangOpts().LinuxKernelFactsFile.empty())
     return;
   LinuxKernelInference(S, Unit).emitFacts();
@@ -11465,6 +11597,7 @@ void clang::sema::IssueLinuxKernelFlowWarnings(Sema &S, const FunctionDecl *FD,
   if (!Cfg)
     return;
   LinuxKernelInference(S, Unit).ensureContracts();
+  LinuxStatisticsScope Statistics(S, FD, *Unit.State);
   const DiagnosticsEngine &Diags = S.getDiagnostics();
   SourceLocation Loc = FD->getBeginLoc();
   if (!Diags.isIgnored(diag::warn_linux_kernel_error_path_success, Loc) ||

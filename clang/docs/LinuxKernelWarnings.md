@@ -400,10 +400,37 @@ group of its own once a kernel scan has shown what it finds. The names:
   that both acquires and releases the member is not taken as the one that
   tears down.
 
-Two more names change how the path checks work and are not part of `all`:
+Some names change how the path checks work and are not part of `all`.
 `path-notes` adds a note for each branch between the test and the misuse,
 and `unconfirmed-paths` reports candidates without the second search from
 the function entry.
+
+`statistics` says where the analyses stopped short, so that a function
+without a report can be told from one that was not looked at in full. The
+checks that follow single paths work within limits: a search has a number of
+steps, a block is visited in at most sixteen states and a path that comes to
+it in another one is dropped, a function has a number of steps for all of
+its searches, and each check allows itself a number of searches in one
+function. With the switch, a function in which a limit was reached gets a
+line, and so does each translation unit:
+
+```console
+drivers/net/ethernet/intel/ixgbe/ixgbe_main.c:11549:12: warning: statistics
+      for 'ixgbe_probe': path searches 14, out of steps 0, dropped paths 1,
+      not run 0, checks stopped early 0 (experimental check 'statistics')
+drivers/net/ethernet/intel/ixgbe/ixgbe_main.c:1:1: warning: statistics for
+      this file: functions 8656, path searches 868, out of steps 0, dropped
+      paths 6, not run 0, checks stopped early 0 (experimental check
+      'statistics')
+```
+
+The numbers of a function include the searches in the functions that it
+calls, which are made to learn what those do with their parameters. The
+dataflow checks have a limit as well, a number of passes over the function,
+and say so under this switch if one of them ends without a fixpoint.
+
+`wide-search` multiplies the limits of a search by four. It costs time in
+the functions that reach them and none elsewhere.
 
 ## Architectures without a code generator
 
