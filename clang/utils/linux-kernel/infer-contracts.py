@@ -6,6 +6,7 @@ function that other translation units can call:
 
     fn <name> <file> <return sources> <functions it always calls>
     par <name> <file> <what it does with its pointer parameters>
+    int <name> <file> <how its integer result can be negative>
 
 This script closes those facts over the whole build and writes what the
 second build reads with -flinux-kernel-contracts=<file>:
@@ -15,6 +16,7 @@ second build reads with -flinux-kernel-contracts=<file>:
     sleeps  <name>    sleeps whenever it runs to its end
     derefs  <name> <i>          dereferences parameter i whenever it is called
     nowrite <name> <i> <mask>   can return without writing through parameter i
+    negative <name>   can return a negative number, which is an error code
 
 The return sources are letters: E (ERR_PTR), e (the result of an error
 pointer function), N (NULL), n (the untested result of a function that
@@ -36,6 +38,12 @@ classes of return values for which the parameter is left alone: 1 negative,
 of a function with a pointer parameter has a line, so that a function with
 several definitions, such as a weak default and its override, gets a
 contract only as far as all of them agree.
+
+The integer facts are "N" (a return statement has a negative constant, or
+the function returns the result of a function in the same translation unit
+that has one) or "-", and ",c:<name>" for a function of another translation
+unit whose result is returned.  One definition that can return a negative
+number is enough here: the caller has to be ready for it.
 
 usage: infer-contracts.py [-o contracts] [--explain name] facts...
 """
@@ -139,6 +147,42 @@ def parse_params(paths):
                     continue
                 defs[name][file] = (derefs, passes, nowrite)
     return defs
+
+
+def parse_ints(paths):
+    """name -> list of (negative, [callee]) per definition."""
+    defs = collections.defaultdict(list)
+    seen = set()
+    for path in paths:
+        with open(path, errors="replace") as f:
+            for line in f:
+                if line in seen:
+                    continue
+                seen.add(line)
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) != 4 or parts[0] != "int":
+                    continue
+                _, name, _, facts = parts
+                first, *rest = facts.split(",")
+                defs[name].append((first == "N",
+                                   [t[2:] for t in rest if t.startswith("c:")]))
+    return defs
+
+
+def negatives(idefs):
+    """The functions that can return a negative number."""
+    result = {name for name, entries in idefs.items()
+              if any(negative for negative, _ in entries)}
+    changed = True
+    while changed:
+        changed = False
+        for name, entries in idefs.items():
+            if name in result:
+                continue
+            if any(c in result for _, callees in entries for c in callees):
+                result.add(name)
+                changed = True
+    return result
 
 
 def dereferences(pdefs):
@@ -293,6 +337,10 @@ def main():
         out.write(f"derefs\t{name}\t{index}\n")
     for (name, index), mask in sorted(nowrite.items()):
         out.write(f"nowrite\t{name}\t{index}\t{mask}\n")
+    idefs = parse_ints(args.facts)
+    negative = negatives(idefs)
+    for name in sorted(negative):
+        out.write(f"negative\t{name}\n")
     if out is not sys.stdout:
         out.close()
     count = collections.Counter(conv.values())
@@ -302,6 +350,8 @@ def main():
     print(f"{len(pdefs)} functions with pointer parameters: "
           f"{len(derefs)} parameters are always dereferenced, "
           f"{len(nowrite)} can be left unwritten", file=sys.stderr)
+    print(f"{len(idefs)} functions with integer facts: "
+          f"{len(negative)} can return a negative number", file=sys.stderr)
 
 
 if __name__ == "__main__":

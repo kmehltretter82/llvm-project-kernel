@@ -40,6 +40,7 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/IOSandbox.h"
@@ -148,6 +149,19 @@ struct sema::LinuxKernelUnit::Impl {
     SourceLocation Failure, Success;
   };
   llvm::DenseMap<const ParmVarDecl *, OutputSummary> OutputSummaries;
+  /// How a function with a body and a signed integer result comes to
+  /// return a negative number, which in kernel code is an error code.
+  struct IntReturns {
+    /// "return -EINVAL;", in the function or in a function with a body
+    /// whose result it returns.
+    bool Negative = false;
+    /// The functions without a body here whose result it returns.
+    llvm::SmallVector<const FunctionDecl *, 2> External;
+  };
+  llvm::DenseMap<const FunctionDecl *, IntReturns> IntSummaries;
+  /// From the contracts file: the functions that can return a negative
+  /// number.
+  llvm::StringSet<> NegativeContracts;
   /// An error path that returns with a resource which its function
   /// releases nowhere.  Whether another function of the translation unit
   /// does is known at its end.
@@ -197,6 +211,12 @@ static bool isLinuxExperimentEnabled(const Sema &S, StringRef Name,
 static void noteLinuxNoFixpoint(Sema &S, const FunctionDecl *FD,
                                 StringRef Check);
 static bool isLinuxLvalueThrough(const Expr *LV, const VarDecl *P);
+static bool hasLinuxSignedResult(const FunctionDecl *FD);
+static bool mayLinuxReturnNegative(const FunctionDecl *FD,
+                                   sema::LinuxKernelUnit::Impl &Unit);
+static sema::LinuxKernelUnit::Impl::IntReturns
+getLinuxIntReturns(const FunctionDecl *Def, sema::LinuxKernelUnit::Impl &Unit,
+                   unsigned Depth = 0);
 static const Expr *getUnconditionalParameterDeref(
     const FunctionDecl *Callee, unsigned Index,
     sema::LinuxKernelUnit::Impl &Unit, unsigned Depth = 0,
@@ -726,6 +746,11 @@ class LinuxKernelInference {
                    Mask < 16) {
           U.NoWriteContracts[Fields[0]].push_back({Index, uint8_t(Mask)});
         }
+        continue;
+      }
+      if (Kind == "negative") {
+        if (!Name.trim().empty())
+          U.NegativeContracts.insert(Name.trim());
         continue;
       }
       uint8_t Flag = llvm::StringSwitch<uint8_t>(Kind)
@@ -1344,6 +1369,22 @@ public:
       if (Returns != "-" || Calls != "-")
         OS << "fn\t" << FD->getName() << '\t' << File << '\t' << Returns
            << '\t' << Calls << '\n';
+      // Whether an integer result can be negative.
+      if (hasLinuxSignedResult(FD)) {
+        Impl::IntReturns R = getLinuxIntReturns(FD, U);
+        std::vector<std::string> Callees;
+        for (const FunctionDecl *F : R.External)
+          Callees.push_back("c:" + F->getName().str());
+        llvm::sort(Callees);
+        Callees.erase(llvm::unique(Callees), Callees.end());
+        if (R.Negative || !Callees.empty()) {
+          OS << "int\t" << FD->getName() << '\t' << File << '\t'
+             << (R.Negative ? "N" : "-");
+          for (const std::string &C : Callees)
+            OS << ',' << C;
+          OS << '\n';
+        }
+      }
       // Every definition gets a line: a weak default and its override can
       // differ, and the closure needs to see both.
       if (HasPointerParam)
@@ -1769,6 +1810,7 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
   Sema &S;
   const FunctionDecl *CurrentFunction;
   mutable LinuxKernelInference Inference;
+  sema::LinuxKernelUnit::Impl &UnitState;
   /// __free() variables whose cleanup the function switches off somewhere,
   /// with no_free_ptr() or by storing NULL.
   llvm::DenseMap<const VarDecl *, bool> CleanupDisarmed;
@@ -3801,6 +3843,234 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
         << BO->getSourceRange();
   }
 
+  /// How the function tests each of its integer variables.
+  enum : unsigned {
+    /// It compares the variable with something, or branches on it.
+    AnyTest = 1,
+    /// It compares it with a bound, which an error code in an unsigned
+    /// variable does not pass: "n > MAX_ITEMS".  A test for zero says
+    /// nothing about that.
+    RangeTest = 2,
+  };
+  std::optional<llvm::DenseMap<const VarDecl *, unsigned>> IntegerTests;
+
+  static bool isSizeType(QualType T) {
+    // "typedef size_t foo_t;" is not looked through: only what is declared
+    // as a size counts.
+    const auto *TT = T->getAs<TypedefType>();
+    if (!TT)
+      return false;
+    StringRef Name = TT->getDecl()->getName();
+    return Name == "size_t" || Name == "__kernel_size_t";
+  }
+
+  /// Whether argument \p I of \p Call is a size: the parameter is a
+  /// "size_t", or the length of a user copy, which is an "unsigned long".
+  static bool isSizeArgument(const CallExpr *Call, unsigned I) {
+    const FunctionDecl *Callee = Call->getDirectCallee();
+    if (!Callee || !Callee->getIdentifier() || I >= Callee->getNumParams())
+      return false;
+    if (isSizeType(Callee->getParamDecl(I)->getType()))
+      return true;
+    return I + 1 == Callee->getNumParams() &&
+           llvm::StringSwitch<bool>(Callee->getName())
+               .Cases({"copy_from_user", "copy_to_user", "_copy_from_user",
+                       "_copy_to_user", "__copy_from_user", "__copy_to_user",
+                       "clear_user", "__clear_user"},
+                      true)
+               .Default(false);
+  }
+
+  void checkErrorCodeArguments(const CallExpr *Call) {
+    const FunctionDecl *Callee = Call->getDirectCallee();
+    if (!Callee || !Callee->getIdentifier())
+      return;
+    for (unsigned I = 0, E = Call->getNumArgs(); I != E; ++I)
+      if (isSizeArgument(Call, I))
+        checkErrorCodeAsSize(Call->getArg(I), "the size that '" +
+                                                  Callee->getName() +
+                                                  "' is given");
+  }
+
+  /// The variables that a call in the condition \p St is given.
+  void noteTestingCalls(const Stmt *St) {
+    if (!St)
+      return;
+    // Not as a size: "if (copy_to_user(to, from, len))" uses the number,
+    // and does not ask about it.
+    if (const auto *CE = dyn_cast<CallExpr>(St))
+      for (unsigned I = 0, E = CE->getNumArgs(); I != E; ++I)
+        if (const VarDecl *VD =
+                getDirectVariable(CE->getArg(I)->IgnoreParenCasts());
+            VD && !isSizeArgument(CE, I))
+          (*IntegerTests)[VD] |= AnyTest | RangeTest;
+    for (const Stmt *Child : St->children())
+      noteTestingCalls(Child);
+  }
+
+  void collectIntegerTests(const Stmt *St) {
+    if (!St)
+      return;
+    auto Note = [&](const Expr *E, unsigned Flags) {
+      if (const VarDecl *VD =
+              E ? getDirectVariable(E->IgnoreParenCasts()) : nullptr)
+        (*IntegerTests)[VD] |= Flags;
+    };
+    auto IsZero = [&](const Expr *E) {
+      std::optional<llvm::APSInt> K =
+          E->isValueDependent()
+              ? std::nullopt
+              : E->getIntegerConstantExpr(S.getASTContext());
+      return K && K->isZero();
+    };
+    // "if (!is_valid_id(id)) return -EINVAL;": a function that is asked
+    // about the variable in a condition is a test of it.
+    auto NoteCondition = [&](const Expr *Cond) {
+      Note(Cond, AnyTest);
+      noteTestingCalls(Cond);
+    };
+    if (const auto *BO = dyn_cast<BinaryOperator>(St)) {
+      if (BO->isComparisonOp()) {
+        bool Range = BO->isRelationalOp();
+        Note(BO->getLHS(),
+             AnyTest | (Range && !IsZero(BO->getRHS()) ? RangeTest : 0));
+        Note(BO->getRHS(),
+             AnyTest | (Range && !IsZero(BO->getLHS()) ? RangeTest : 0));
+      } else if (BO->isLogicalOp()) {
+        NoteCondition(BO->getLHS());
+        NoteCondition(BO->getRHS());
+      }
+    } else if (const auto *UO = dyn_cast<UnaryOperator>(St)) {
+      if (UO->getOpcode() == UO_LNot)
+        NoteCondition(UO->getSubExpr());
+      else if (UO->getOpcode() == UO_AddrOf)
+        Note(UO->getSubExpr(), AnyTest | RangeTest);
+    } else if (const auto *IS = dyn_cast<IfStmt>(St)) {
+      NoteCondition(IS->getCond());
+    } else if (const auto *WS = dyn_cast<WhileStmt>(St)) {
+      NoteCondition(WS->getCond());
+    } else if (const auto *DS = dyn_cast<DoStmt>(St)) {
+      NoteCondition(DS->getCond());
+    } else if (const auto *FS = dyn_cast<ForStmt>(St)) {
+      NoteCondition(FS->getCond());
+    } else if (const auto *CO = dyn_cast<AbstractConditionalOperator>(St)) {
+      NoteCondition(CO->getCond());
+    } else if (const auto *SS = dyn_cast<SwitchStmt>(St)) {
+      Note(SS->getCond(), AnyTest | RangeTest);
+    }
+    for (const Stmt *Child : St->children())
+      collectIntegerTests(Child);
+  }
+
+  unsigned getIntegerTests(const VarDecl *VD) {
+    if (!IntegerTests) {
+      IntegerTests.emplace();
+      collectIntegerTests(CurrentFunction->getBody());
+    }
+    return IntegerTests->lookup(VD);
+  }
+
+  /// The function whose result \p Use holds, if that is the one assignment
+  /// that the use sees and the function can return a negative number.
+  const FunctionDecl *getNegativeSource(const Expr *Use,
+                                        SourceLocation &Stored) {
+    const LinuxReachingDefs::Def *D = Reaching ? Reaching->unique(Use) : nullptr;
+    const FunctionDecl *Callee =
+        D && D->Value ? getSignedResultCallee(D->Value) : nullptr;
+    if (!Callee || !mayLinuxReturnNegative(Callee, UnitState))
+      return nullptr;
+    Stored = D->Loc;
+    return Callee;
+  }
+
+  /// "n = sg_nents_for_len(sg, len); ... if (n <= 0)" with an unsigned n:
+  /// the test is for an error or nothing, and the error is a large number
+  /// there, which it lets through.
+  void checkUnsignedErrorCompare(const BinaryOperator *BO) {
+    if (!Reaching || !BO->isRelationalOp() ||
+        !isLinuxExperimentEnabled(S, "unsigned-error-test",
+                                  BO->getOperatorLoc()))
+      return;
+    ASTContext &Ctx = S.getASTContext();
+    const Expr *Value = BO->getLHS(), *Other = BO->getRHS();
+    BinaryOperatorKind Opcode = BO->getOpcode();
+    auto IsZero = [&](const Expr *E) {
+      std::optional<llvm::APSInt> K =
+          E->isValueDependent() ? std::nullopt : E->getIntegerConstantExpr(Ctx);
+      return K && K->isZero();
+    };
+    if (!IsZero(Other)) {
+      std::swap(Value, Other);
+      Opcode = reverseComparison(Opcode);
+      if (!IsZero(Other))
+        return;
+    }
+    if (Opcode != BO_LE && Opcode != BO_GT)
+      return;
+    const Expr *Place = Value->IgnoreParenImpCasts();
+    if (!isa<DeclRefExpr, MemberExpr>(Place) ||
+        !isPlainUnsignedType(Place->getType()))
+      return;
+    SourceLocation Stored;
+    const FunctionDecl *Callee = getNegativeSource(Place, Stored);
+    if (!Callee)
+      return;
+    std::string Text;
+    llvm::raw_string_ostream OS(Text);
+    OS << "'" << getLinuxExprText(Place, S)
+       << "' is unsigned and holds the result of '" << Callee->getName()
+       << "', so this test takes the negative error code that '"
+       << Callee->getName() << "' can return for a large number";
+    S.Diag(BO->getOperatorLoc(), diag::warn_linux_kernel_experimental)
+        << Text << "unsigned-error-test" << BO->getSourceRange();
+    if (Stored.isValid())
+      S.Diag(Stored, diag::note_linux_kernel_experimental)
+          << "the result is stored here";
+  }
+
+  llvm::SmallPtrSet<const VarDecl *, 4> ReportedErrorSizes;
+
+  /// "n = of_property_count_u32_elems(np, name); p = kcalloc(n, ...)": a
+  /// result that can be a negative error code is used as a size or as an
+  /// index, and the function never looks at it.  \p What says what it is
+  /// used as.
+  void checkErrorCodeAsSize(const Expr *Use, const Twine &What) {
+    if (!Reaching || !Use ||
+        !isLinuxExperimentEnabled(S, "error-code-as-size", Use->getExprLoc()))
+      return;
+    const auto *DRE = dyn_cast<DeclRefExpr>(Use->IgnoreParenCasts());
+    const VarDecl *VD = DRE ? dyn_cast<VarDecl>(DRE->getDecl()) : nullptr;
+    if (!VD || !VD->hasLocalStorage() || isa<ParmVarDecl>(VD) ||
+        ReportedErrorSizes.count(VD))
+      return;
+    QualType T = VD->getType();
+    if (!T->isIntegerType() || T->isBooleanType() || T->isEnumeralType() ||
+        T->isAnyCharacterType())
+      return;
+    SourceLocation Stored;
+    const FunctionDecl *Callee = getNegativeSource(DRE, Stored);
+    if (!Callee)
+      return;
+    // An error code in an unsigned variable is a large number, which a
+    // comparison with a limit catches.  In a signed one any test may be for
+    // it.
+    unsigned Tests = getIntegerTests(VD);
+    if (Tests & (T->isUnsignedIntegerType() ? RangeTest : AnyTest))
+      return;
+    ReportedErrorSizes.insert(VD);
+    std::string Text;
+    llvm::raw_string_ostream OS(Text);
+    OS << "'" << VD->getName() << "' is " << What.str()
+       << " here, but it holds the result of '" << Callee->getName()
+       << "', which can be a negative error code, and nothing in this "
+          "function tests it for that";
+    S.Diag(Use->getExprLoc(), diag::warn_linux_kernel_experimental)
+        << Text << "error-code-as-size" << Use->getSourceRange();
+    if (Stored.isValid())
+      S.Diag(Stored, diag::note_linux_kernel_experimental)
+          << "the result is stored here";
+  }
+
   void checkUnsignedErrorTest(const StoredValue &Stored, const Expr *Cond) {
     const FunctionDecl *Callee = getSignedResultCallee(Stored.Source);
     if (Callee && isPlainUnsignedType(Stored.getType()))
@@ -3922,7 +4192,7 @@ public:
   LinuxKernelWarningsVisitor(Sema &S, const FunctionDecl *FD,
                              sema::LinuxKernelUnit &Unit,
                              const LinuxReachingDefs *Reaching = nullptr)
-      : S(S), CurrentFunction(FD), Inference(S, Unit) {
+      : S(S), CurrentFunction(FD), Inference(S, Unit), UnitState(*Unit.State) {
     ShouldVisitImplicitCode = false;
     this->Reaching = Reaching;
   }
@@ -4018,6 +4288,11 @@ public:
   }
 
   bool VisitVarDecl(VarDecl *VD) override {
+    // memcpy() and its relatives are macros that keep the size in a
+    // variable of their own: "size_t __fortify_size = (size_t)(size);".
+    if (VD->hasInit() && VD->getIdentifier() &&
+        VD->getName() == "__fortify_size")
+      checkErrorCodeAsSize(VD->getInit(), "the size of a memory operation");
     if (AssignmentTrackingDisabled || !VD->hasLocalStorage() || !VD->hasInit())
       return true;
     LinuxKernelAPIOrigin Origin = getOrigin(VD->getInit());
@@ -4077,8 +4352,17 @@ public:
     return true;
   }
 
+  bool VisitArraySubscriptExpr(ArraySubscriptExpr *ASE) override {
+    checkErrorCodeAsSize(
+        ASE->getIdx(),
+        "the index into '" +
+            getLinuxExprText(ASE->getBase()->IgnoreParenImpCasts(), S) + "'");
+    return true;
+  }
+
   bool VisitCallExpr(CallExpr *Call) override {
     checkErrorPointerArgument(Call);
+    checkErrorCodeArguments(Call);
     const FunctionDecl *Checker = Call->getDirectCallee();
     if (!Checker || !Checker->getIdentifier() || Call->getNumArgs() == 0)
       return true;
@@ -4217,6 +4501,7 @@ public:
     checkErrorPointerNullComparison(BO);
     checkIRQComparison(BO);
     checkInlineUnsignedErrorTest(BO);
+    checkUnsignedErrorCompare(BO);
     return true;
   }
 
@@ -7712,6 +7997,235 @@ static bool isLinuxParameterTested(const FunctionDecl *Def,
   } Tested{Param};
   Tested.visit(Def->getBody());
   return Tested.Hit;
+}
+
+/// A function whose result is a signed number: "int", "long", "ssize_t".
+static bool hasLinuxSignedResult(const FunctionDecl *FD) {
+  QualType T = FD->getReturnType();
+  return T->isSignedIntegerType() && !T->isBooleanType() &&
+         !T->isAnyCharacterType() && !T->isEnumeralType();
+}
+
+/// How the function \p Def comes to return a negative number: a constant
+/// in one of its return statements, "return -EINVAL;", or the result of
+/// another function, "return do_it(dev);" and "ret = do_it(dev); ...
+/// return ret;".  Which assignment a return statement sees is not looked
+/// at: the question is what the function can return at all.  A variable
+/// that the function gives another value after a test of it is left out,
+/// because "idx = find(); if (idx == -1) idx = LAST; return idx;" does
+/// not return what find() does.
+static sema::LinuxKernelUnit::Impl::IntReturns
+getLinuxIntReturns(const FunctionDecl *Def, sema::LinuxKernelUnit::Impl &Unit,
+                   unsigned Depth) {
+  using IntReturns = sema::LinuxKernelUnit::Impl::IntReturns;
+  // An empty answer stands in while this one is worked out, for a function
+  // that calls itself.
+  auto [Known, New] = Unit.IntSummaries.try_emplace(Def);
+  if (!New)
+    return Known->second;
+
+  struct Walk {
+    ASTContext &Ctx;
+    sema::LinuxKernelUnit::Impl &Unit;
+    unsigned Depth;
+    IntReturns R;
+    llvm::SmallVector<const Expr *, 8> Returned;
+    llvm::DenseMap<const VarDecl *, llvm::SmallVector<const Expr *, 2>>
+        Assigned;
+    llvm::SmallPtrSet<const VarDecl *, 4> Seen;
+    /// Variables that the function gives another value after it has
+    /// looked at them: "if (idx == -1) idx = LAST;", "n = n < 0 ? 0 : n;"
+    /// and "n = max(n, 0);".  What they are returned with is not what the
+    /// function got.
+    llvm::SmallPtrSet<const VarDecl *, 4> Replaced;
+
+    static bool mentions(const Stmt *St, const VarDecl *VD) {
+      if (!St)
+        return false;
+      if (const auto *DRE = dyn_cast<DeclRefExpr>(St))
+        if (DRE->getDecl() == VD)
+          return true;
+      for (const Stmt *Child : St->children())
+        if (mentions(Child, VD))
+          return true;
+      return false;
+    }
+
+    /// The variables that \p St assigns, each if \p Cond reads it.
+    void noteReplaced(const Stmt *St, const Expr *Cond) {
+      if (!St)
+        return;
+      if (const auto *BO = dyn_cast<BinaryOperator>(St))
+        if (BO->isAssignmentOp())
+          if (const VarDecl *VD = getDirectLinuxVariable(BO->getLHS());
+              VD && mentions(Cond, VD))
+            Replaced.insert(VD);
+      for (const Stmt *Child : St->children())
+        noteReplaced(Child, Cond);
+    }
+
+    void collect(const Stmt *St) {
+      if (!St)
+        return;
+      if (const auto *IS = dyn_cast<IfStmt>(St)) {
+        noteReplaced(IS->getThen(), IS->getCond());
+        noteReplaced(IS->getElse(), IS->getCond());
+      }
+      if (const auto *RS = dyn_cast<ReturnStmt>(St)) {
+        if (RS->getRetValue())
+          Returned.push_back(RS->getRetValue());
+      } else if (const auto *BO = dyn_cast<BinaryOperator>(St)) {
+        if (BO->getOpcode() == BO_Assign)
+          if (const VarDecl *VD = getDirectLinuxVariable(BO->getLHS());
+              VD && VD->hasLocalStorage() && !isa<ParmVarDecl>(VD)) {
+            Assigned[VD].push_back(BO->getRHS());
+            const Expr *RHS = BO->getRHS()->IgnoreParenCasts();
+            if (isa<AbstractConditionalOperator, StmtExpr>(RHS) &&
+                mentions(RHS, VD))
+              Replaced.insert(VD);
+          }
+      } else if (const auto *DS = dyn_cast<DeclStmt>(St)) {
+        for (const Decl *D : DS->decls())
+          if (const auto *VD = dyn_cast<VarDecl>(D);
+              VD && VD->hasLocalStorage() && VD->getInit())
+            Assigned[VD].push_back(VD->getInit());
+      }
+      for (const Stmt *Child : St->children())
+        collect(Child);
+    }
+
+    void add(const FunctionDecl *F) {
+      F = F->getCanonicalDecl();
+      if (R.External.size() < 8 && !llvm::is_contained(R.External, F))
+        R.External.push_back(F);
+    }
+
+    void classify(const Expr *E, unsigned Level) {
+      if (!E || Level > 8)
+        return;
+      E = E->IgnoreParenCasts();
+      Expr::EvalResult V;
+      if (!E->isValueDependent() &&
+          E->EvaluateAsInt(V, Ctx, Expr::SE_NoSideEffects)) {
+        // An error code, and not a mask or INT_MIN.
+        const llvm::APSInt &K = V.Val.getInt();
+        if (K.isSigned() && K.isNegative() && K.getSignificantBits() <= 13)
+          R.Negative = true;
+        return;
+      }
+      if (const auto *CO = dyn_cast<ConditionalOperator>(E)) {
+        classify(CO->getTrueExpr(), Level + 1);
+        classify(CO->getFalseExpr(), Level + 1);
+        return;
+      }
+      if (const auto *BCO = dyn_cast<BinaryConditionalOperator>(E)) {
+        classify(BCO->getCommon(), Level + 1);
+        classify(BCO->getFalseExpr(), Level + 1);
+        return;
+      }
+      if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
+        if (BO->getOpcode() == BO_Comma || BO->getOpcode() == BO_Assign)
+          classify(BO->getRHS(), Level + 1);
+        return;
+      }
+      if (const auto *CE = dyn_cast<CallExpr>(E)) {
+        call(CE, Level);
+        return;
+      }
+      const VarDecl *VD = getDirectLinuxVariable(E);
+      if (!VD || !VD->hasLocalStorage() || Replaced.count(VD) ||
+          !Seen.insert(VD).second)
+        return;
+      auto It = Assigned.find(VD);
+      if (It != Assigned.end())
+        for (const Expr *RHS : It->second)
+          classify(RHS, Level + 1);
+    }
+
+    void call(const CallExpr *CE, unsigned Level) {
+      unsigned ID = CE->getBuiltinCallee();
+      if ((ID == Builtin::BI__builtin_expect ||
+           ID == Builtin::BI__builtin_expect_with_probability) &&
+          CE->getNumArgs() >= 1) {
+        classify(CE->getArg(0), Level + 1);
+        return;
+      }
+      const FunctionDecl *FD = CE->getDirectCallee();
+      if (!FD || !FD->getIdentifier())
+        return;
+      StringRef Name = FD->getName();
+      if (Name == "PTR_ERR" || Name == "PTR_ERR_OR_ZERO") {
+        R.Negative = true;
+        return;
+      }
+      // These return the error code that they are given.
+      if ((Name == "dev_err_probe" || Name == "dev_warn_probe") &&
+          CE->getNumArgs() >= 2) {
+        classify(CE->getArg(1), Level + 1);
+        return;
+      }
+      if (!hasLinuxSignedResult(FD))
+        return;
+      const FunctionDecl *Body = nullptr;
+      if (!FD->hasBody(Body)) {
+        if (FD->isExternallyVisible())
+          add(FD);
+        return;
+      }
+      if (Depth >= 6)
+        return;
+      IntReturns Sub = getLinuxIntReturns(Body, Unit, Depth + 1);
+      R.Negative |= Sub.Negative;
+      for (const FunctionDecl *F : Sub.External)
+        add(F);
+    }
+  };
+
+  Walk W{Def->getASTContext(), Unit, Depth, {}, {}, {}, {}, {}};
+  W.collect(Def->getBody());
+  for (const Expr *E : W.Returned)
+    W.classify(E, 0);
+  Unit.IntSummaries[Def] = W.R;
+  return W.R;
+}
+
+/// Kernel functions that return a count or a number, or a negative error
+/// code: a few that matter, for a build without a contracts file.
+static bool isLinuxNegativeByName(StringRef Name) {
+  return llvm::StringSwitch<bool>(Name)
+      .Cases({"platform_irq_count", "sg_nents_for_len", "gpiod_count",
+              "of_property_count_elems_of_size", "of_count_phandle_with_args",
+              "of_alias_get_id", "of_property_match_string"},
+             true)
+      .Cases({"i2c_smbus_read_byte", "i2c_smbus_read_byte_data",
+              "i2c_smbus_read_word_data", "i2c_smbus_read_block_data",
+              "i2c_smbus_read_i2c_block_data", "i2c_master_recv",
+              "i2c_master_send", "i2c_transfer"},
+             true)
+      .Cases({"ida_alloc_range", "idr_alloc", "idr_alloc_cyclic",
+              "kernel_read", "kernel_write", "usb_control_msg",
+              "device_property_read_u32_array", "fwnode_property_count_u32",
+              "match_string", "__sysfs_match_string", "sysfs_match_string"},
+             true)
+      .Default(false);
+}
+
+/// Whether \p FD can return a negative number: by its body, by the
+/// contracts file or by its name.
+static bool mayLinuxReturnNegative(const FunctionDecl *FD,
+                                   sema::LinuxKernelUnit::Impl &Unit) {
+  if (!FD || !hasLinuxSignedResult(FD))
+    return false;
+  auto Listed = [&](const FunctionDecl *F) {
+    return F->getIdentifier() && F->isExternallyVisible() &&
+           (Unit.NegativeContracts.count(F->getName()) ||
+            isLinuxNegativeByName(F->getName()));
+  };
+  const FunctionDecl *Def = nullptr;
+  if (!FD->hasBody(Def))
+    return Listed(FD);
+  sema::LinuxKernelUnit::Impl::IntReturns R = getLinuxIntReturns(Def, Unit);
+  return R.Negative || llvm::any_of(R.External, Listed);
 }
 
 /// Whether the contracts file says that \p Callee, which has no body here,
@@ -13332,7 +13846,9 @@ static bool shouldRunLinuxKernelWarnings(const Sema &S, SourceLocation Loc) {
          !Diags.isIgnored(diag::warn_linux_kernel_buffer_size, Loc) ||
          !Diags.isIgnored(diag::warn_linux_kernel_off_by_one, Loc) ||
          !Diags.isIgnored(diag::warn_linux_kernel_inconsistent_indent, Loc) ||
-         !Diags.isIgnored(diag::warn_zero_extended_complement, Loc);
+         !Diags.isIgnored(diag::warn_zero_extended_complement, Loc) ||
+         isLinuxExperimentEnabled(S, "unsigned-error-test", Loc) ||
+         isLinuxExperimentEnabled(S, "error-code-as-size", Loc);
 }
 
 } // namespace

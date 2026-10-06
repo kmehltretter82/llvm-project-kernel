@@ -445,6 +445,19 @@ group of its own once a kernel scan has shown what it finds. The names:
   entries off the list leaves an empty list when it runs to its end, and
   one that has no branch on the cursor, because a loop that counts to the
   entry with a given number relies on the list having that many.
+- `unsigned-error-test`: `x <= 0` or `x > 0` where `x` is unsigned and the
+  one assignment that the test sees gives it the result of a function that
+  can return a negative number. `-Wlinux-kernel-unsigned-error-check` has
+  `x < 0`, which is always false. This test is not, and it takes the error
+  code for a large number.
+- `error-code-as-size`: a local variable that holds the result of a
+  function that can return a negative number is used as an array index, as
+  the argument for a `size_t` parameter, as the length of a user copy or as
+  the size of `memcpy()`, `memmove()` or `memset()`, and the function tests
+  it nowhere. For an unsigned variable a comparison with zero does not
+  count as a test, because the error code is a large number there, and a
+  comparison with a limit does. Which functions can return a negative
+  number is inferred, see below.
 
 Some names change how the path checks work and are not part of `all`.
 `path-notes` adds a note for each branch between the test and the misuse,
@@ -638,6 +651,18 @@ was found to be NULL, `null-argument`, `error-deref-path` and
 one whose body is at hand. Every definition of a function has to agree: a
 weak default that tests its argument takes the contract away from the
 override that does not.
+
+A third line is written for a function with a signed integer result that
+can be negative: one of its return statements has a negative constant
+(`return -EINVAL;`, also `return PTR_ERR(p);`), or returns the result of a
+function that can, directly or through a variable. Which assignment a
+return statement sees is not looked at, the question is what the function
+can return at all. The closure writes a `negative` line for each such
+function, and one definition is enough here, because the caller has to be
+ready for it. `unsigned-error-test` and `error-code-as-size` ask this
+question. Without a contracts file they know the functions whose body is
+at hand, which includes the inline wrappers of the headers, and a short
+list of names such as `platform_irq_count()` and `sg_nents_for_len()`.
 
 ## Static analyzer
 
