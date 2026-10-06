@@ -57,9 +57,19 @@ struct TrackedLock {
     Foreign,  ///< released first, so the caller holds it: not ours to judge
   };
   Kind K = Held;
+  /// A spinlock, a mutex or a rwsem, and the order in which the path took
+  /// its locks.
+  unsigned LockKind = 0;
+  unsigned Order = 0;
 
-  bool operator==(const TrackedLock &Other) const { return K == Other.K; }
-  void Profile(llvm::FoldingSetNodeID &ID) const { ID.AddInteger(K); }
+  bool operator==(const TrackedLock &Other) const {
+    return K == Other.K && LockKind == Other.LockKind && Order == Other.Order;
+  }
+  void Profile(llvm::FoldingSetNodeID &ID) const {
+    ID.AddInteger(K);
+    ID.AddInteger(LockKind);
+    ID.AddInteger(Order);
+  }
 };
 
 /// What kind of result a return path has.
@@ -68,6 +78,7 @@ enum ReturnClass : unsigned { RCVoid, RCFailure, RCSuccess, RCUnknown };
 } // namespace
 
 REGISTER_MAP_WITH_PROGRAMSTATE(TrackedLocks, const MemRegion *, TrackedLock)
+REGISTER_TRAIT_WITH_PROGRAMSTATE(LocksTaken, unsigned)
 
 namespace {
 
@@ -169,24 +180,46 @@ void LinuxLockBalanceChecker::checkPostCall(const CallEvent &Call,
   ProgramStateRef State = C.getState();
   const TrackedLock *Known = State->get<TrackedLocks>(Lock);
 
+  unsigned Kind = static_cast<unsigned>(LC.Kind);
   if (inScopedGuard(C)) {
-    C.addTransition(
-        State->set<TrackedLocks>(Lock, TrackedLock{TrackedLock::Foreign}));
+    C.addTransition(State->set<TrackedLocks>(
+        Lock, TrackedLock{TrackedLock::Foreign, Kind, 0}));
     return;
   }
 
   if (LC.Op == LockOp::Release) {
-    if (!Known)
-      C.addTransition(
-          State->set<TrackedLocks>(Lock, TrackedLock{TrackedLock::Foreign}));
-    else if (Known->K == TrackedLock::Held)
-      C.addTransition(
-          State->set<TrackedLocks>(Lock, TrackedLock{TrackedLock::Released}));
+    if (Known) {
+      if (Known->K == TrackedLock::Held)
+        C.addTransition(State->set<TrackedLocks>(
+            Lock, TrackedLock{TrackedLock::Released, Kind, Known->Order}));
+      return;
+    }
+    // "mutex_unlock(&dev->parent->lock)" after a call that made the
+    // analyzer forget dev->parent names a lock that it has not seen being
+    // taken.  It is far more likely the lock of this kind that the path
+    // took last than one that the caller holds.
+    const MemRegion *Last = nullptr;
+    unsigned LastOrder = 0;
+    for (const auto &[Other, Tracked] : State->get<TrackedLocks>())
+      if (Tracked.K == TrackedLock::Held && Tracked.LockKind == Kind &&
+          Tracked.Order >= LastOrder) {
+        Last = Other;
+        LastOrder = Tracked.Order;
+      }
+    if (Last)
+      C.addTransition(State->set<TrackedLocks>(
+          Last, TrackedLock{TrackedLock::Released, Kind, LastOrder}));
+    else
+      C.addTransition(State->set<TrackedLocks>(
+          Lock, TrackedLock{TrackedLock::Foreign, Kind, 0}));
     return;
   }
 
   if (Known && Known->K != TrackedLock::Released)
     return;
+  unsigned Order = State->get<LocksTaken>() + 1;
+  State = State->set<LocksTaken>(Order);
+  TrackedLock Taken{TrackedLock::Held, Kind, Order};
   const BugType *BT = &LeftHeld;
   const NoteTag *Note = C.getNoteTag(
       [Lock, BT](PathSensitiveBugReport &BR, llvm::raw_ostream &OS) {
@@ -195,8 +228,7 @@ void LinuxLockBalanceChecker::checkPostCall(const CallEvent &Call,
       });
 
   if (LC.Op == LockOp::Acquire) {
-    C.addTransition(
-        State->set<TrackedLocks>(Lock, TrackedLock{TrackedLock::Held}), Note);
+    C.addTransition(State->set<TrackedLocks>(Lock, Taken), Note);
     return;
   }
 
@@ -208,11 +240,10 @@ void LinuxLockBalanceChecker::checkPostCall(const CallEvent &Call,
     return;
   ProgramStateRef NonZero, Zero;
   std::tie(NonZero, Zero) = State->assume(*Result);
-  ProgramStateRef Taken = LC.Op == LockOp::TryAcquire ? NonZero : Zero;
+  ProgramStateRef Got = LC.Op == LockOp::TryAcquire ? NonZero : Zero;
   ProgramStateRef Missed = LC.Op == LockOp::TryAcquire ? Zero : NonZero;
-  if (Taken)
-    C.addTransition(
-        Taken->set<TrackedLocks>(Lock, TrackedLock{TrackedLock::Held}), Note);
+  if (Got)
+    C.addTransition(Got->set<TrackedLocks>(Lock, Taken), Note);
   if (Missed)
     C.addTransition(Missed);
 }

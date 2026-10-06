@@ -164,3 +164,27 @@ int guarded(struct dev *d) {
     return -EINVAL;
   return 0;
 }
+
+// The lock is named again after a call that may have changed the pointer
+// it is reached through.
+struct parent {
+  struct mutex lock;
+};
+
+struct child {
+  struct parent *parent;
+  int value;
+};
+
+int read_value(struct child *c);
+
+int through_reloaded_pointer(struct child *c) {
+  int ret;
+
+  mutex_lock(&c->parent->lock);
+  ret = read_value(c);
+  mutex_unlock(&c->parent->lock);
+  if (ret < 0)
+    return ret;
+  return 0;
+}
