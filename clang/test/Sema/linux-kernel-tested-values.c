@@ -219,6 +219,83 @@ int root_reassigned(struct dev *d) {
   return d->priv->id;
 }
 
+// A function whose body is here: it is known which members it stores to.
+
+static void count_miss(struct dev *d) { d->flags++; }
+
+static void set_priv(struct dev *d, struct thing *t) { d->priv = t; }
+
+void fill_slot(struct thing **slot);
+
+int member_after_static_call(struct dev *d) {
+  if (!d->priv) // deref-note {{'d->priv' is tested here}}
+    count_miss(d);
+  return d->priv->id; // deref-warning {{'d->priv' is dereferenced here}}
+}
+
+int member_set_by_static_call(struct dev *d, struct thing *t) {
+  if (!d->priv)
+    set_priv(d, t);
+  return d->priv->id;
+}
+
+int member_address_passed(struct dev *d) {
+  if (!d->priv)
+    fill_slot(&d->priv);
+  return d->priv->id;
+}
+
+// What the code before the test establishes counts as well.
+
+int counted_before(struct thing *t) {
+  int n = 0, i, sum = 0;
+
+  if (t)
+    n = t->count;
+  for (i = 0; i < n; i++)
+    sum += t->id;
+  return sum;
+}
+
+int flag_before(struct dev *d, int status) {
+  int done = 0;
+
+  if (status & 1) {
+    if (d->priv) {
+      d->priv->count = 0;
+      done = 1;
+    }
+  }
+  if (status & 2) {
+    _printk("second\n");
+    if (d->priv)
+      d->priv->count++;
+  }
+  if (done)
+    return d->priv->id;
+  return 0;
+}
+
+// A copy of a member holds what the member holds.
+
+int copy_of_member(struct dev *d) {
+  struct thing *t = d->priv;
+
+  if (!t)
+    _printk("no private data\n");
+  if (d->priv)
+    return t->id;
+  return 0;
+}
+
+int copy_tested_through_member(struct dev *d) {
+  struct thing *t = d->priv;
+
+  if (!d->priv) // deref-note {{'d->priv' is tested here}}
+    _printk("no private data\n");
+  return t->id + d->priv->count; // deref-warning {{'d->priv' is dereferenced here}}
+}
+
 // Taking the address of a member is not an access.
 
 int member_address(struct thing *t) {
