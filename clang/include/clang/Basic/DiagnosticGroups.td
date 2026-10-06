@@ -1183,6 +1183,12 @@ def UninitializedMaybe : DiagGroup<"conditional-uninitialized">;
 // reachable uninitialized on paths excluded by correlated conditions.
 def UninitializedMaybeCorrelated :
   DiagGroup<"conditional-uninitialized-correlated">;
+// A variable with the 'cleanup' attribute whose cleanup function runs while
+// the variable is uninitialized: on every path to that scope exit, or only on
+// some of them.
+def UninitializedCleanup : DiagGroup<"uninitialized-cleanup">;
+def UninitializedMaybeCleanup :
+  DiagGroup<"conditional-uninitialized-cleanup">;
 def UninitializedSometimes : DiagGroup<"sometimes-uninitialized">;
 def UninitializedStaticSelfInit : DiagGroup<"static-self-init">;
 def UninitializedConstReference : DiagGroup<"uninitialized-const-reference">;

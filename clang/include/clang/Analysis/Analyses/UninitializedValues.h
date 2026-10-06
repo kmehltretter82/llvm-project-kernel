@@ -128,6 +128,16 @@ public:
   /// guarding conditions.  The check costs a path-sensitive replay per use.
   virtual bool wantsCorrelationPruning() const { return false; }
 
+  /// Whether the cleanup functions of variables with the 'cleanup' attribute
+  /// should be treated as uses of those variables.
+  virtual bool wantsCleanupUses() const { return false; }
+
+  /// Called when the cleanup function of \p VD runs at a scope exit while
+  /// the variable is uninitialized.  \p Leave is the statement that leaves
+  /// the scope, or null if the scope simply ends.
+  virtual void handleUninitCleanup(const VarDecl *VD, bool AlwaysUninit,
+                                   const Stmt *Leave) {}
+
   /// Called when the uninitialized variable is used at the given expression.
   virtual void handleUseOfUninitVariable(const VarDecl *vd,
                                          const UninitUse &use) {}

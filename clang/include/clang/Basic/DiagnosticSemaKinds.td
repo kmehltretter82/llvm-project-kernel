@@ -2692,6 +2692,13 @@ def warn_maybe_uninit_var_correlated : Warning<
   "variable %0 is uninitialized when used here only on paths that an earlier "
   "condition excludes">,
   InGroup<UninitializedMaybeCorrelated>, DefaultIgnore;
+def warn_uninit_cleanup_var : Warning<
+  "variable %0 is uninitialized when its cleanup function %1 runs">,
+  InGroup<UninitializedCleanup>, DefaultIgnore;
+def warn_maybe_uninit_cleanup_var : Warning<
+  "variable %0 may be uninitialized when its cleanup function %1 runs">,
+  InGroup<UninitializedMaybeCleanup>, DefaultIgnore;
+def note_uninit_cleanup_scope_left : Note<"the scope of %0 is left here">;
 def note_var_declared_here : Note<"variable %0 is declared here">;
 def note_uninit_var_use : Note<
   "%select{uninitialized use occurs|variable is captured by block}0 here">;

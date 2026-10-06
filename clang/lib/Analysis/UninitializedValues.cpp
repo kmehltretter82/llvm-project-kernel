@@ -1531,6 +1531,7 @@ public:
         handler(handler), pruner(pruner) {}
 
   void reportUse(const Expr *ex, const VarDecl *vd);
+  void reportCleanup(const VarDecl *vd, const Stmt *leave);
   void reportConstRefUse(const Expr *ex, const VarDecl *vd);
   void reportConstPtrUse(const Expr *ex, const VarDecl *vd);
 
@@ -1713,6 +1714,16 @@ void TransferFunctions::reportUse(const Expr *ex, const VarDecl *vd) {
       pruner->isUseInfeasible(vd, ex, block))
     Use.setCorrelated();
   handler.handleUseOfUninitVariable(vd, Use);
+}
+
+/// The cleanup function of \p vd runs here.  It is handed the address of the
+/// variable and reads it, so an uninitialized variable is used.
+void TransferFunctions::reportCleanup(const VarDecl *vd, const Stmt *leave) {
+  if (!handler.wantsCleanupUses() || !isTrackedVar(vd))
+    return;
+  Value v = vals[vd];
+  if (isUninitialized(v))
+    handler.handleUninitCleanup(vd, isAlwaysUninit(v), leave);
 }
 
 void TransferFunctions::reportConstRefUse(const Expr *ex, const VarDecl *vd) {
@@ -1914,9 +1925,20 @@ static bool runOnBlock(const CFGBlock *block, const CFG &cfg,
   }
   // Apply the transfer function.
   TransferFunctions tf(vals, cfg, block, ac, classification, handler, pruner);
+  // The statement that leaves the scopes whose cleanup functions follow it.
+  const Stmt *leave = nullptr;
+  if (const Stmt *term = block->getTerminatorStmt())
+    if (isa<GotoStmt, BreakStmt, ContinueStmt>(term))
+      leave = term;
   for (const auto &I : *block) {
-    if (std::optional<CFGStmt> cs = I.getAs<CFGStmt>())
+    if (std::optional<CFGStmt> cs = I.getAs<CFGStmt>()) {
       tf.Visit(const_cast<Stmt *>(cs->getStmt()));
+      if (isa<ReturnStmt>(cs->getStmt()))
+        leave = cs->getStmt();
+    } else if (std::optional<CFGCleanupFunction> cf =
+                   I.getAs<CFGCleanupFunction>()) {
+      tf.reportCleanup(cf->getVarDecl(), leave);
+    }
   }
   CFGTerminator terminator = block->getTerminator();
   if (auto *as = dyn_cast_or_null<GCCAsmStmt>(terminator.getStmt()))
@@ -1941,9 +1963,20 @@ struct PruneBlocksHandler : public UninitVariablesHandler {
   /// The current block to scribble use information.
   unsigned currentBlock = 0;
 
+  /// Whether the handler that this one stands in for wants cleanup uses.
+  bool cleanupUses = false;
+
   PruneBlocksHandler(unsigned numBlocks) : hadUse(numBlocks, false) {}
 
   ~PruneBlocksHandler() override = default;
+
+  bool wantsCleanupUses() const override { return cleanupUses; }
+
+  void handleUninitCleanup(const VarDecl *vd, bool alwaysUninit,
+                           const Stmt *leave) override {
+    hadUse[currentBlock] = true;
+    hadAnyUse = true;
+  }
 
   void handleUseOfUninitVariable(const VarDecl *vd,
                                  const UninitUse &use) override {
@@ -1994,6 +2027,7 @@ void clang::runUninitializedVariablesAnalysis(
   llvm::BitVector wasAnalyzed(cfg.getNumBlockIDs(), false);
   wasAnalyzed[cfg.getEntry().getBlockID()] = true;
   PruneBlocksHandler PBH(cfg.getNumBlockIDs());
+  PBH.cleanupUses = handler.wantsCleanupUses();
 
   while (const CFGBlock *block = worklist.dequeue()) {
     PBH.currentBlock = block->getBlockID();

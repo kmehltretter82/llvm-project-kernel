@@ -1714,13 +1714,32 @@ class UninitValsDiagReporter : public UninitVariablesHandler {
   typedef llvm::MapVector<const VarDecl *, MappedType> UsesMap;
   UsesMap uses;
   bool PruneCorrelated;
+  bool CleanupUses;
+  /// Where the cleanup function of a variable runs on an uninitialized
+  /// value: the statement that leaves the scope, and whether the variable is
+  /// uninitialized on every path to it.
+  struct CleanupUse {
+    const Stmt *Leave;
+    bool Always;
+  };
+  llvm::MapVector<const VarDecl *, CleanupUse> UninitCleanups;
 
 public:
-  UninitValsDiagReporter(Sema &S, bool PruneCorrelated)
-      : S(S), PruneCorrelated(PruneCorrelated) {}
+  UninitValsDiagReporter(Sema &S, bool PruneCorrelated, bool CleanupUses)
+      : S(S), PruneCorrelated(PruneCorrelated), CleanupUses(CleanupUses) {}
   ~UninitValsDiagReporter() override { flushDiagnostics(); }
 
   bool wantsCorrelationPruning() const override { return PruneCorrelated; }
+  bool wantsCleanupUses() const override { return CleanupUses; }
+
+  void handleUninitCleanup(const VarDecl *VD, bool AlwaysUninit,
+                           const Stmt *Leave) override {
+    // One report per variable.  A scope exit that always sees the variable
+    // uninitialized is the one to show.
+    auto [It, Inserted] = UninitCleanups.insert({VD, {Leave, AlwaysUninit}});
+    if (!Inserted && AlwaysUninit && !It->second.Always)
+      It->second = {Leave, true};
+  }
 
   MappedType &getUses(const VarDecl *vd) {
     MappedType &V = uses[vd];
@@ -1751,6 +1770,20 @@ public:
     }
 
     uses.clear();
+
+    for (const auto &[VD, Use] : UninitCleanups) {
+      unsigned DiagID = Use.Always ? diag::warn_uninit_cleanup_var
+                                   : diag::warn_maybe_uninit_cleanup_var;
+      if (S.getDiagnostics().isIgnored(DiagID, VD->getLocation()))
+        continue;
+      const FunctionDecl *Cleanup =
+          VD->getAttr<CleanupAttr>()->getFunctionDecl();
+      S.Diag(VD->getLocation(), DiagID) << VD->getDeclName() << Cleanup;
+      if (Use.Leave)
+        S.Diag(Use.Leave->getBeginLoc(), diag::note_uninit_cleanup_scope_left)
+            << VD->getDeclName() << Use.Leave->getSourceRange();
+    }
+    UninitCleanups.clear();
   }
 
 private:
@@ -3286,13 +3319,18 @@ void clang::sema::AnalysisBasedWarnings::IssueWarnings(
       !Diags.isIgnored(diag::warn_maybe_uninit_var, D->getBeginLoc()) ||
       !Diags.isIgnored(diag::warn_maybe_uninit_var_correlated,
                        D->getBeginLoc()) ||
+      !Diags.isIgnored(diag::warn_uninit_cleanup_var, D->getBeginLoc()) ||
+      !Diags.isIgnored(diag::warn_maybe_uninit_cleanup_var, D->getBeginLoc()) ||
       !Diags.isIgnored(diag::warn_uninit_const_reference, D->getBeginLoc()) ||
       !Diags.isIgnored(diag::warn_uninit_const_pointer, D->getBeginLoc())) {
     if (CFG *cfg = AC.getCFG()) {
       UninitValsDiagReporter reporter(
           S, !Diags.isIgnored(diag::warn_maybe_uninit_var, D->getBeginLoc()) ||
                  !Diags.isIgnored(diag::warn_maybe_uninit_var_correlated,
-                                  D->getBeginLoc()));
+                                  D->getBeginLoc()),
+          !Diags.isIgnored(diag::warn_uninit_cleanup_var, D->getBeginLoc()) ||
+              !Diags.isIgnored(diag::warn_maybe_uninit_cleanup_var,
+                               D->getBeginLoc()));
       UninitVariablesAnalysisStats stats;
       std::memset(&stats, 0, sizeof(UninitVariablesAnalysisStats));
       runUninitializedVariablesAnalysis(*cast<DeclContext>(D), *cfg, AC,
