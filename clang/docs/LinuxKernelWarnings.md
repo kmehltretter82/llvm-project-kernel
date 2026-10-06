@@ -136,8 +136,11 @@ if (!req)
 
 Either the test is dead or the dereference is unsafe. Taking the address of
 a member (`&p->member`, `container_of()`) is not an access, and a test that
-is part of a macro body is ignored. Old code has many dead tests of this
-kind, so the warning is most useful on changed lines.
+is part of a macro body is ignored. An access through a pointer to a part
+is one, though: after `struct stream *s = &ext->stream;` the read of
+`s->index` reads through `ext`, as long as neither variable is given
+another value anywhere in the function. Old code has many dead tests of
+this kind, so the warning is most useful on changed lines.
 
 `-Wlinux-kernel-cleanup-escape` is available separately. It diagnoses
 `obj->field = p;` and `*out = p;` where `p` was declared with `__free()` and
@@ -200,7 +203,10 @@ reports nothing then.
 
   The pointer can be a local variable, a parameter or a member chain. The
   dereference can also be in a function that is handed the pointer and reads
-  or writes through its parameter before its first branch. Tests inside
+  or writes through its parameter before its first branch. A branch that
+  the configuration has decided is none: the `if (__builtin_constant_p(fmt))`
+  inside `dev_err()` and the `while (0)` at the end of a macro do not end
+  that part of the function. Tests inside
   macros do not count: `dev_err()`, `kfree()` and many others test whatever
   they get. The test says that the author expects NULL. If NULL cannot
   happen there, the test is what is wrong.
@@ -381,7 +387,9 @@ group of its own once a kernel scan has shown what it finds. The names:
   releases the resource nowhere, when another function of the translation
   unit releases what the same structure member holds, typically the remove
   callback, or `exit` for the `init` of a PHY. It is reported at the end of
-  the translation unit. Not reported: a function whose callers, up to
+  the translation unit, for a return with an error and, together with
+  `unwind-return-call`, for `return ret;` behind the last call of the
+  function. Not reported: a function whose callers, up to
   three levels, release the member or name the releasing function (a
   destructor that is registered, such as `card->private_free`), a function
   that other translation units can call unless this one uses it as a

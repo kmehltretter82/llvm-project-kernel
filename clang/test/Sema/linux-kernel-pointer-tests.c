@@ -299,3 +299,47 @@ int tested_original(struct holder *h) {
   w = (struct wide *)t;
   return w->more;
 }
+
+// A pointer to a part of the object: an access through it is an access
+// through the pointer to the whole.
+
+struct stream {
+  int index;
+  int offset;
+};
+
+struct ext_stream {
+  int id;
+  struct stream hstream;
+};
+
+int part_before_check(struct ext_stream *hext) {
+  struct stream *hstream = &hext->hstream;
+  int mask = 1 << hstream->index; // order-note {{'hext' is dereferenced here}}
+
+  if (!hext) // order-warning {{'hext' is tested for NULL here, but every path to this test has dereferenced it}}
+    return -ENODEV;
+  return mask + hstream->offset;
+}
+
+// The address alone is no access.
+int part_address_only(struct ext_stream *hext) {
+  struct stream *hstream = &hext->hstream;
+
+  if (!hext)
+    return -ENODEV;
+  return hstream->index;
+}
+
+// The part pointer is given another value somewhere.
+int part_reassigned(struct ext_stream *hext, struct stream *other) {
+  struct stream *hstream = &hext->hstream;
+  int index;
+
+  if (other)
+    hstream = other;
+  index = hstream->index;
+  if (!hext)
+    return -ENODEV;
+  return index;
+}

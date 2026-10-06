@@ -895,23 +895,24 @@ int near_probe(struct priv *priv, void *np) {
 int return_call(struct priv *priv) {
   int ret;
 
-  ret = clk_prepare_enable(priv->clk);
+  ret = clk_prepare_enable(priv->clk); // expected-note {{acquired here}}
   if (ret)
     return ret;
   ret = get_irq(priv);
   if (ret < 0)
     goto err_disable;
   return register_it(priv);
+// expected-warning@-1 {{'priv->clk' was acquired with clk_prepare_enable() and is still held if 'register_it' fails and this return passes the error on, although other error paths call clk_disable_unprepare() (experimental check 'unwind-return-call')}}
 
 err_disable:
-  clk_disable_unprepare(priv->clk);
+  clk_disable_unprepare(priv->clk); // expected-note {{another path releases it here}}
   return ret;
 }
 
 int return_status(struct priv *priv) {
   int ret;
 
-  ret = clk_prepare_enable(priv->clk);
+  ret = clk_prepare_enable(priv->clk); // expected-note {{acquired here}}
   if (ret)
     return ret;
   ret = get_irq(priv);
@@ -919,9 +920,10 @@ int return_status(struct priv *priv) {
     goto err_disable;
   ret = register_it(priv);
   return ret;
+// expected-warning@-1 {{'priv->clk' was acquired with clk_prepare_enable() and is still held if the call that set 'ret' fails and this return passes the error on, although other error paths call clk_disable_unprepare() (experimental check 'unwind-return-call')}}
 
 err_disable:
-  clk_disable_unprepare(priv->clk);
+  clk_disable_unprepare(priv->clk); // expected-note {{another path releases it here}}
   return ret;
 }
 
@@ -1288,3 +1290,60 @@ static int chip_measure(struct chip *chip) {
 }
 
 int (*const chip_ops[])(struct chip *) = { chip_set_rate, chip_measure };
+
+// ---------------------------------------------------------------------------
+// The code before the first branch of a function goes on behind a branch
+// that the configuration has decided, as every logging macro has one.
+
+#define log_it(d, fmt, ...) do { \
+  if (__builtin_constant_p(fmt)) \
+    (d)->cache = sizeof(fmt); \
+  _printk(fmt, ##__VA_ARGS__); \
+} while (0)
+
+static int system_error(struct dev *d, struct pkt *pkt) {
+  log_it(d, "received system error of type %d\n", pkt->type); // expected-note {{'pkt' is dereferenced here}}
+  d->cached = 0;
+  return 0;
+}
+
+int null_behind_macro(struct dev *d) {
+  return system_error(d, NULL); // expected-warning {{NULL is passed for parameter 2 of 'system_error', which dereferences it without a test (experimental check 'null-argument')}}
+}
+
+// ---------------------------------------------------------------------------
+// unwind-far for a status that is handed on: the last call of probe fails.
+
+int request_irq(unsigned int irq, void *handler, unsigned long flags,
+                const char *name, void *dev);
+void free_irq(unsigned int irq, void *dev);
+int register_component(struct priv *priv);
+
+struct client {
+  unsigned int irq;
+  struct priv *priv;
+};
+
+static int codec_probe(struct client *client) {
+  int ret;
+
+  ret = request_irq(client->irq, NULL, 0, "codec", client); // expected-note {{acquired here}}
+  if (ret)
+    return ret;
+  ret = register_component(client->priv);
+  return ret;
+// expected-warning@-1 {{'client->irq' was acquired with request_irq() and is still held if the call that set 'ret' fails and this return passes the error on: only 'codec_remove' calls free_irq() for it (experimental check 'unwind-far')}}
+}
+
+static void codec_remove(struct client *client) {
+  free_irq(client->irq, client); // expected-note {{another path releases it here}}
+}
+
+struct client_ops {
+  int (*probe)(struct client *);
+  void (*remove)(struct client *);
+};
+const struct client_ops codec_ops = {
+  .probe = codec_probe,
+  .remove = codec_remove,
+};
