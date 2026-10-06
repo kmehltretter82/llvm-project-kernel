@@ -485,6 +485,18 @@ to its end. `infer-contracts.py --explain <function>` shows how an answer
 came about. The second list is what `alpha.linux.AtomicSleep` uses to know
 that a function in another translation unit sleeps.
 
+A second line says what the function does with its pointer parameters: which
+it dereferences before its first branch, which it hands to a function of
+another translation unit there, and which it can leave unwritten when it
+returns, with the kind of return value for which it does. The closure turns
+these into `derefs` and `nowrite` lines of the contracts file. With them the
+checks that ask about a callee, that is the dereference of a pointer that
+was found to be NULL, `null-argument`, `error-deref-path` and
+`uninit-output`, give the same answer for a function of another file as for
+one whose body is at hand. Every definition of a function has to agree: a
+weak default that tests its argument takes the contract away from the
+override that does not.
+
 ## Static analyzer
 
 Whether a call may sleep while a spinlock is held depends on the path, so

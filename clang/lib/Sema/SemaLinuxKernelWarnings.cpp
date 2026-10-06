@@ -85,6 +85,13 @@ struct sema::LinuxKernelUnit::Impl {
 
   bool ContractsLoaded = false;
   llvm::StringMap<uint8_t> Contracts;
+  /// From the contracts file, for functions without a body here: the
+  /// pointer parameters that the function dereferences whenever it is
+  /// called, and those that it can leave unwritten, with the classes of
+  /// return values for which it does (see OutputSummary).
+  llvm::StringMap<llvm::SmallVector<unsigned, 2>> DerefContracts;
+  llvm::StringMap<llvm::SmallVector<std::pair<unsigned, uint8_t>, 2>>
+      NoWriteContracts;
   llvm::DenseMap<const FunctionDecl *, ReturnSources> Sources;
   llvm::SmallPtrSet<const FunctionDecl *, 8> InProgress;
   ReturnSources OpaqueSources;
@@ -145,6 +152,15 @@ sema::LinuxKernelUnit::LinuxKernelUnit() : State(std::make_unique<Impl>()) {}
 sema::LinuxKernelUnit::~LinuxKernelUnit() = default;
 
 namespace {
+
+static const Expr *getUnconditionalParameterDeref(
+    const FunctionDecl *Callee, unsigned Index,
+    sema::LinuxKernelUnit::Impl &Unit, unsigned Depth = 0,
+    llvm::SmallVectorImpl<std::pair<const FunctionDecl *, unsigned>> *Passes =
+        nullptr);
+static const sema::LinuxKernelUnit::Impl::OutputSummary &
+getLinuxOutputSummary(const FunctionDecl *Def, unsigned Index,
+                      sema::LinuxKernelUnit::Impl &Unit, unsigned Depth = 0);
 
 enum class LinuxKernelAPIKind {
   None,
@@ -623,6 +639,22 @@ class LinuxKernelInference {
     for (llvm::line_iterator Line(**Buffer, /*SkipBlanks=*/true, '#');
          !Line.is_at_end(); ++Line) {
       auto [Kind, Name] = Line->split('\t');
+      // "derefs <name> <index>" and "nowrite <name> <index> <mask>".
+      if (Kind == "derefs" || Kind == "nowrite") {
+        llvm::SmallVector<StringRef, 3> Fields;
+        Name.split(Fields, '\t');
+        unsigned Index = 0, Mask = 0;
+        if (Fields.size() < 2 || Fields[1].trim().getAsInteger(10, Index))
+          continue;
+        if (Kind == "derefs") {
+          U.DerefContracts[Fields[0]].push_back(Index);
+        } else if (Fields.size() >= 3 &&
+                   !Fields[2].trim().getAsInteger(10, Mask) && Mask &&
+                   Mask < 16) {
+          U.NoWriteContracts[Fields[0]].push_back({Index, uint8_t(Mask)});
+        }
+        continue;
+      }
       uint8_t Flag = llvm::StringSwitch<uint8_t>(Kind)
                          .Case("err_ptr", Impl::ErrPtr)
                          .Case("null", Impl::Null)
@@ -1101,6 +1133,10 @@ public:
   LinuxKernelInference(Sema &S, sema::LinuxKernelUnit::Impl &U)
       : S(S), Ctx(S.getASTContext()), U(U) {}
 
+  /// Read the contracts file now, for the code that looks at the tables of
+  /// the unit without going through this class.
+  void ensureContracts() { loadContracts(); }
+
   LinuxKernelReturnConvention convention(const FunctionDecl *FD) {
     if (!FD->getReturnType()->isPointerType())
       return LinuxKernelReturnConvention::Unknown;
@@ -1138,6 +1174,15 @@ public:
   /// translation units can call:
   ///
   ///   fn <name> <file> <return sources> <functions it always calls>
+  ///   par <name> <file> <what it does with its pointer parameters>
+  ///
+  /// For a pointer parameter with the index i, counted from zero: "d<i>" if
+  /// the function dereferences it whenever it is called, "p<i>:<name>:<j>"
+  /// if it hands it, before its first branch, to parameter j of a function
+  /// defined elsewhere, and "w<i>:<mask>" if it can return without having
+  /// written through it, the mask being the classes of return values for
+  /// which it does (1 negative, 2 zero, 4 positive, 8 for a function that
+  /// returns nothing).
   ///
   /// The return sources are the letters E (ERR_PTR), e (error pointer
   /// callee), N (NULL), n (NULL-on-failure callee), V (valid), M (memory)
@@ -1194,13 +1239,44 @@ public:
         if (!Names.empty())
           Calls = llvm::join(Names, ",");
       }
-      if (Returns == "-" && Calls == "-")
-        continue;
+      // What the function does with its pointer parameters.
+      std::vector<std::string> Params;
+      bool HasPointerParam = false;
+      for (unsigned I = 0, E = FD->getNumParams(); I != E; ++I) {
+        QualType T = FD->getParamDecl(I)->getType();
+        if (!T->isPointerType())
+          continue;
+        HasPointerParam = true;
+        llvm::SmallVector<std::pair<const FunctionDecl *, unsigned>, 2> Passes;
+        if (getUnconditionalParameterDeref(FD, I, U, 0, &Passes)) {
+          Params.push_back("d" + std::to_string(I));
+        } else {
+          for (auto [Callee, J] : Passes)
+            Params.push_back("p" + std::to_string(I) + ":" +
+                             Callee->getName().str() + ":" + std::to_string(J));
+        }
+        // A variable is what a caller passes the address of.
+        QualType Pointee = T->getPointeeType();
+        if (Pointee.isConstQualified() ||
+            !(Pointee->isIntegralOrEnumerationType() ||
+              Pointee->isPointerType() || Pointee->isVoidType()))
+          continue;
+        if (unsigned Mask = getLinuxOutputSummary(FD, I, U).Mask)
+          Params.push_back("w" + std::to_string(I) + ":" +
+                           std::to_string(Mask));
+      }
 
       PresumedLoc PLoc = SM.getPresumedLoc(SM.getExpansionLoc(FD->getLocation()));
-      OS << "fn\t" << FD->getName() << '\t'
-         << (PLoc.isValid() ? PLoc.getFilename() : "?") << '\t' << Returns
-         << '\t' << Calls << '\n';
+      StringRef File = PLoc.isValid() ? PLoc.getFilename() : "?";
+      if (Returns != "-" || Calls != "-")
+        OS << "fn\t" << FD->getName() << '\t' << File << '\t' << Returns
+           << '\t' << Calls << '\n';
+      // Every definition gets a line: a weak default and its override can
+      // differ, and the closure needs to see both.
+      if (HasPointerParam)
+        OS << "par\t" << FD->getName() << '\t' << File << '\t'
+           << (Params.empty() ? std::string("-") : llvm::join(Params, ","))
+           << '\n';
     }
     if (Text.empty())
       return;
@@ -6261,27 +6337,11 @@ static bool isLinuxExperimentEnabled(const Sema &S, StringRef Name,
                                        Loc);
 }
 
-/// Where a function with a body reads or writes through its pointer
-/// parameter \p Index whenever it is called: in the code that runs before
-/// its first branch, directly or in a function that it hands the parameter
-/// to.  Null if it does not, or if it tests the parameter anywhere: a
-/// function that tests its argument is prepared for NULL.
-static const Expr *getUnconditionalParameterDeref(
-    const FunctionDecl *Callee, unsigned Index,
-    sema::LinuxKernelUnit::Impl &Unit, unsigned Depth = 0) {
-  const FunctionDecl *Def = nullptr;
-  if (!Callee->hasBody(Def) || Index >= Def->getNumParams())
-    return nullptr;
-  const ParmVarDecl *Param = Def->getParamDecl(Index);
-  if (!Param->getType()->isPointerType())
-    return nullptr;
-  auto Known = Unit.EntryDerefs.find(Param);
-  if (Known != Unit.EntryDerefs.end())
-    return Known->second;
-  // Also the answer while this is being worked out, for recursion.
-  Unit.EntryDerefs[Param] = nullptr;
-
-  // Is the parameter tested, or given another value, anywhere?
+/// Whether the function \p Def tests its parameter \p Param anywhere, or
+/// gives it another value.  A function that tests its argument is prepared
+/// for NULL.
+static bool isLinuxParameterTested(const FunctionDecl *Def,
+                                   const ParmVarDecl *Param) {
   struct Scan {
     const VarDecl *P;
     bool Hit = false;
@@ -6325,7 +6385,50 @@ static const Expr *getUnconditionalParameterDeref(
     }
   } Tested{Param};
   Tested.visit(Def->getBody());
-  if (Tested.Hit)
+  return Tested.Hit;
+}
+
+/// Whether the contracts file says that \p Callee, which has no body here,
+/// dereferences its parameter \p Index whenever it is called.
+static bool derefsParameterByContract(const FunctionDecl *Callee,
+                                      unsigned Index,
+                                      const sema::LinuxKernelUnit::Impl &Unit) {
+  if (Unit.DerefContracts.empty() || !Callee->getIdentifier() ||
+      !Callee->isExternallyVisible() || Callee->hasBody())
+    return false;
+  auto It = Unit.DerefContracts.find(Callee->getName());
+  return It != Unit.DerefContracts.end() &&
+         llvm::is_contained(It->second, Index);
+}
+
+/// Where a function with a body reads or writes through its pointer
+/// parameter \p Index whenever it is called: in the code that runs before
+/// its first branch, directly or in a function that it hands the parameter
+/// to.  Null if it does not, or if it tests the parameter anywhere.
+///
+/// With \p Passes, the functions without a body that the parameter is handed
+/// to in that code are collected as well, each with the parameter that gets
+/// it.  Whether they dereference it is for the closure over all translation
+/// units to say.  Nothing is cached then.
+static const Expr *getUnconditionalParameterDeref(
+    const FunctionDecl *Callee, unsigned Index,
+    sema::LinuxKernelUnit::Impl &Unit, unsigned Depth,
+    llvm::SmallVectorImpl<std::pair<const FunctionDecl *, unsigned>> *Passes) {
+  const FunctionDecl *Def = nullptr;
+  if (!Callee->hasBody(Def) || Index >= Def->getNumParams())
+    return nullptr;
+  const ParmVarDecl *Param = Def->getParamDecl(Index);
+  if (!Param->getType()->isPointerType())
+    return nullptr;
+  if (!Passes) {
+    auto Known = Unit.EntryDerefs.find(Param);
+    if (Known != Unit.EntryDerefs.end())
+      return Known->second;
+    // Also the answer while this is being worked out, for recursion.
+    Unit.EntryDerefs[Param] = nullptr;
+  }
+
+  if (isLinuxParameterTested(Def, Param))
     return nullptr;
 
   AnalysisDeclContext AC(/*ADCMgr=*/nullptr, Def);
@@ -6355,11 +6458,17 @@ static const Expr *getUnconditionalParameterDeref(
         const FunctionDecl *Next = CE->getDirectCallee();
         if (!Next || Depth >= 2)
           continue;
-        for (unsigned I = 0, E = CE->getNumArgs(); I != E && !Result; ++I)
-          if (getDirectLinuxVariable(CE->getArg(I)->IgnoreParenCasts()) ==
-                  Param &&
-              getUnconditionalParameterDeref(Next, I, Unit, Depth + 1))
+        for (unsigned I = 0, E = CE->getNumArgs(); I != E && !Result; ++I) {
+          if (getDirectLinuxVariable(CE->getArg(I)->IgnoreParenCasts()) !=
+              Param)
+            continue;
+          if (getUnconditionalParameterDeref(Next, I, Unit, Depth + 1) ||
+              derefsParameterByContract(Next, I, Unit))
             Result = CE->getArg(I);
+          else if (Passes && !Next->hasBody() && Next->getIdentifier() &&
+                   Next->isExternallyVisible())
+            Passes->push_back({Next, I});
+        }
         if (Result)
           break;
       }
@@ -6368,7 +6477,8 @@ static const Expr *getUnconditionalParameterDeref(
       break;
     B = B->succ_begin()->getReachableBlock();
   }
-  Unit.EntryDerefs[Param] = Result;
+  if (!Passes)
+    Unit.EntryDerefs[Param] = Result;
   return Result;
 }
 
@@ -6441,9 +6551,23 @@ static bool isLinuxPrintCallee(const FunctionDecl *FD) {
   return false;
 }
 
-static const sema::LinuxKernelUnit::Impl::OutputSummary &
-getLinuxOutputSummary(const FunctionDecl *Def, unsigned Index,
-                      sema::LinuxKernelUnit::Impl &Unit, unsigned Depth = 0);
+/// The classes of return values for which the contracts file says that
+/// \p Callee, which has no body here, leaves its parameter \p Index
+/// unwritten.
+static uint8_t
+getLinuxOutputContract(const FunctionDecl *Callee, unsigned Index,
+                       const sema::LinuxKernelUnit::Impl &Unit) {
+  if (Unit.NoWriteContracts.empty() || !Callee->getIdentifier() ||
+      !Callee->isExternallyVisible() || Callee->hasBody())
+    return 0;
+  auto It = Unit.NoWriteContracts.find(Callee->getName());
+  if (It == Unit.NoWriteContracts.end())
+    return 0;
+  for (auto [Param, Mask] : It->second)
+    if (Param == Index)
+      return Mask;
+  return 0;
+}
 
 /// Works out how a function can return without having written through one of
 /// its pointer parameters:
@@ -6533,25 +6657,27 @@ class LinuxOutputSummarizer : LinuxPathSearch::Client {
     return false;
   }
 
-  /// The summary of the callee of \p CE for the argument that is the
-  /// parameter itself, if the callee can leave it unwritten.
-  const Summary *forwarded(const CallExpr *CE) const {
+  /// The classes of return values for which the callee of \p CE leaves the
+  /// argument that is the parameter itself unwritten.  Zero if it writes it,
+  /// or if the call does not hand the parameter on like that.
+  uint8_t forwarded(const CallExpr *CE) const {
     const FunctionDecl *Callee = CE->getDirectCallee();
     const FunctionDecl *CalleeDef = nullptr;
-    if (!Callee || Depth >= 2 || !Callee->hasBody(CalleeDef))
-      return nullptr;
+    if (!Callee || Depth >= 2)
+      return 0;
+    bool HasBody = Callee->hasBody(CalleeDef);
     for (unsigned I = 0, E = CE->getNumArgs(); I != E; ++I) {
       const auto *DRE =
           dyn_cast<DeclRefExpr>(CE->getArg(I)->IgnoreParenCasts());
       if (!DRE || DRE->getDecl() != Param)
         continue;
+      if (!HasBody)
+        return getLinuxOutputContract(Callee, I, Unit);
       if (I >= CalleeDef->getNumParams())
-        return nullptr;
-      const Summary &Inner =
-          getLinuxOutputSummary(CalleeDef, I, Unit, Depth + 1);
-      return Inner.Mask ? &Inner : nullptr;
+        return 0;
+      return getLinuxOutputSummary(CalleeDef, I, Unit, Depth + 1).Mask;
     }
-    return nullptr;
+    return 0;
   }
 
   /// Whether the call may write through the parameter or keep the pointer.
@@ -6568,7 +6694,7 @@ class LinuxOutputSummarizer : LinuxPathSearch::Client {
     if (Callee && (isLinuxReadOnlyCallee(Callee) ||
                    Callee->hasAttr<ConstAttr>() || Callee->hasAttr<PureAttr>()))
       return false;
-    bool Forwarded = Walk && forwarded(CE) != nullptr;
+    bool Forwarded = Walk && forwarded(CE) != 0;
     for (const Expr *Arg : CE->arguments()) {
       if (!isLinuxPointerInto(Arg, Param))
         continue;
@@ -6743,10 +6869,10 @@ class LinuxOutputSummarizer : LinuxPathSearch::Client {
 
   std::optional<Value> callValue(const CallExpr *CE,
                                  const LinuxPathSearch::State &St) override {
-    const Summary *Inner = forwarded(CE);
-    if (!Inner || !(Inner->Mask & Value::Any))
+    uint8_t Inner = forwarded(CE);
+    if (!(Inner & Value::Any))
       return std::nullopt;
-    return Value::ofMask(Inner->Mask & Value::Any);
+    return Value::ofMask(Inner & Value::Any);
   }
 
   /// A path without a write leaves the function from \p From.
@@ -7176,14 +7302,16 @@ class LinuxTestedValueChecker : LinuxPathSearch::Client {
         if (isPlace(Pointer))
           return found(Pointer);
       } else if (Callee) {
-        for (unsigned I = 0, E = CE->getNumArgs(); I != E; ++I)
-          if (isPlace(CE->getArg(I)))
-            if (const Expr *Inner =
-                    getUnconditionalParameterDeref(Callee, I, Unit)) {
-              Call = CE;
-              CalleeAccess = Inner;
-              return found(CE->getArg(I));
-            }
+        for (unsigned I = 0, E = CE->getNumArgs(); I != E; ++I) {
+          if (!isPlace(CE->getArg(I)))
+            continue;
+          const Expr *Inner = getUnconditionalParameterDeref(Callee, I, Unit);
+          if (!Inner && !derefsParameterByContract(Callee, I, Unit))
+            continue;
+          Call = CE;
+          CalleeAccess = Inner;
+          return found(CE->getArg(I));
+        }
       }
       break;
     case PtrErrOfValid:
@@ -7360,6 +7488,19 @@ class LinuxTestedValueChecker : LinuxPathSearch::Client {
     return false;
   }
 
+  /// Where the callee dereferences what it was given.
+  void noteCalleeAccess() {
+    if (CalleeAccess)
+      S.Diag(CalleeAccess->getExprLoc(),
+             diag::note_linux_kernel_dereferenced_here)
+          << CalleeAccess << CalleeAccess->getSourceRange();
+    else
+      S.Diag(Call->getExprLoc(), diag::note_linux_kernel_experimental)
+          << ("'" + Call->getDirectCallee()->getNameAsString() +
+              "' is defined in another file, and the contracts file says "
+              "that it dereferences this parameter");
+  }
+
   void report(const Expr *Cond) {
     std::string Text = Search.text(Place);
     switch (Active) {
@@ -7381,9 +7522,7 @@ class LinuxTestedValueChecker : LinuxPathSearch::Client {
         S.Diag(Misuse->getExprLoc(),
                diag::warn_linux_kernel_deref_after_check_call)
             << Text << Call->getDirectCallee() << Misuse->getSourceRange();
-        S.Diag(CalleeAccess->getExprLoc(),
-               diag::note_linux_kernel_dereferenced_here)
-            << CalleeAccess << CalleeAccess->getSourceRange();
+        noteCalleeAccess();
       } else {
         S.Diag(Misuse->getExprLoc(), diag::warn_linux_kernel_deref_after_check)
             << Text << Misuse->getSourceRange();
@@ -7434,9 +7573,7 @@ class LinuxTestedValueChecker : LinuxPathSearch::Client {
       S.Diag(Misuse->getExprLoc(), diag::warn_linux_kernel_experimental)
           << Message << "error-deref-path" << Misuse->getSourceRange();
       if (Call)
-        S.Diag(CalleeAccess->getExprLoc(),
-               diag::note_linux_kernel_dereferenced_here)
-            << CalleeAccess << CalleeAccess->getSourceRange();
+        noteCalleeAccess();
       S.Diag(Cond->getExprLoc(), diag::note_linux_kernel_experimental)
           << "the value is assigned here" << Cond->getSourceRange();
       return;
@@ -9676,8 +9813,8 @@ class LinuxOutputParamChecker : LinuxPathSearch::Client {
     return false;
   }
 
-  void report(const FunctionDecl *Callee, const ParmVarDecl *Param,
-              const Summary &Sum, ResultUse Use) {
+  void report(const FunctionDecl *Callee, unsigned Arg, const Summary &Sum,
+              ResultUse Use) {
     QualType RT = Callee->getReturnType();
     uint8_t Success = RT->isPointerType() || RT->isBooleanType()
                           ? uint8_t(Value::Pos)
@@ -9710,9 +9847,15 @@ class LinuxOutputParamChecker : LinuxPathSearch::Client {
     SourceLocation Where = Succeeded ? Sum.Success : Sum.Failure;
     if (Where.isInvalid())
       Where = Succeeded ? Sum.Failure : Sum.Success;
-    S.Diag(Where, diag::note_linux_kernel_experimental)
-        << ("'" + Name + "' returns here without having written through '" +
-            Param->getNameAsString() + "'");
+    if (Where.isValid())
+      S.Diag(Where, diag::note_linux_kernel_experimental)
+          << ("'" + Name + "' returns here without having written through '" +
+              Callee->getParamDecl(Arg)->getNameAsString() + "'");
+    else
+      S.Diag(Call->getExprLoc(), diag::note_linux_kernel_experimental)
+          << ("'" + Name +
+              "' is defined in another file, and the contracts file says "
+              "for which results it leaves the parameter alone");
   }
 
 public:
@@ -9785,17 +9928,23 @@ public:
         continue;
       const FunctionDecl *Callee = Where.Call->getDirectCallee();
       const FunctionDecl *Def = nullptr;
-      if (!Callee || !Callee->hasBody(Def) || Where.Arg >= Def->getNumParams())
+      if (!Callee)
         continue;
-      // For any call first, which is kept, then for this one with the
-      // numbers that it passes.
-      Summary Sum = getLinuxOutputSummary(Def, Where.Arg, Unit);
-      if (LinuxOutputSummarizer::hasConstantArguments(Def, Where.Call)) {
-        if (++Searches > 16)
-          return;
-        Sum = LinuxOutputSummarizer(Def, Def->getParamDecl(Where.Arg), Unit, 0,
-                                    Where.Call)
-                  .run();
+      Summary Sum;
+      if (!Callee->hasBody(Def)) {
+        // What the contracts file knows about a function of another file.
+        Sum.Mask = getLinuxOutputContract(Callee, Where.Arg, Unit);
+      } else if (Where.Arg < Def->getNumParams()) {
+        // For any call first, which is kept, then for this one with the
+        // numbers that it passes.
+        Sum = getLinuxOutputSummary(Def, Where.Arg, Unit);
+        if (LinuxOutputSummarizer::hasConstantArguments(Def, Where.Call)) {
+          if (++Searches > 16)
+            return;
+          Sum = LinuxOutputSummarizer(Def, Def->getParamDecl(Where.Arg), Unit,
+                                      0, Where.Call)
+                    .run();
+        }
       }
       if (!Sum.Mask)
         continue;
@@ -9817,7 +9966,7 @@ public:
       if (!Read)
         continue;
       Reported.insert(Var);
-      report(Def, Def->getParamDecl(Where.Arg), Sum, Use);
+      report(Def ? Def : Callee, Where.Arg, Sum, Use);
     }
   }
 };
@@ -9860,7 +10009,7 @@ static void checkLinuxNullArguments(Sema &S, const CFG &Cfg,
                 Ctx, Expr::NPC_ValueDependentIsNotNull))
           continue;
         const Expr *Access = getUnconditionalParameterDeref(Callee, I, Unit);
-        if (!Access)
+        if (!Access && !derefsParameterByContract(Callee, I, Unit))
           continue;
         std::string Message =
             "NULL is passed for parameter " + std::to_string(I + 1) + " of '" +
@@ -9868,8 +10017,15 @@ static void checkLinuxNullArguments(Sema &S, const CFG &Cfg,
             "', which dereferences it without a test";
         S.Diag(Arg->getExprLoc(), diag::warn_linux_kernel_experimental)
             << Message << "null-argument" << Arg->getSourceRange();
-        S.Diag(Access->getExprLoc(), diag::note_linux_kernel_dereferenced_here)
-            << Access << Access->getSourceRange();
+        if (Access)
+          S.Diag(Access->getExprLoc(),
+                 diag::note_linux_kernel_dereferenced_here)
+              << Access << Access->getSourceRange();
+        else
+          S.Diag(CE->getExprLoc(), diag::note_linux_kernel_experimental)
+              << ("'" + Callee->getNameAsString() +
+                  "' is defined in another file, and the contracts file "
+                  "says that it dereferences this parameter");
       }
     }
   }
@@ -10663,6 +10819,7 @@ void clang::sema::IssueLinuxKernelWarnings(Sema &S, const FunctionDecl *FD,
       !shouldRunLinuxKernelWarnings(S, FD->getBeginLoc()))
     return;
 
+  LinuxKernelInference(S, Unit).ensureContracts();
   LinuxKernelWarningsVisitor(S, FD, Unit).TraverseStmt(FD->getBody());
 }
 
@@ -10706,6 +10863,7 @@ void clang::sema::IssueLinuxKernelFlowWarnings(Sema &S, const FunctionDecl *FD,
   const CFG *Cfg = AC.getCFG();
   if (!Cfg)
     return;
+  LinuxKernelInference(S, Unit).ensureContracts();
   const DiagnosticsEngine &Diags = S.getDiagnostics();
   SourceLocation Loc = FD->getBeginLoc();
   if (!Diags.isIgnored(diag::warn_linux_kernel_error_path_success, Loc) ||

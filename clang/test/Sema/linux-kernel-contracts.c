@@ -163,7 +163,7 @@ void ext_branch(struct ctx *c) {
 }
 
 // Told whether it may sleep.
-// FACTS-NOT: ext_hint
+// FACTS-NOT: fn{{	}}ext_hint
 void ext_hint(struct ctx *c, int atomic) {
   if (!atomic)
     helper();
@@ -173,10 +173,10 @@ void ext_hint(struct ctx *c, int atomic) {
 // CONTRACTS-DAG: err_ptr{{	}}ext_wrap
 // CONTRACTS-DAG: null{{	}}ext_null
 // CONTRACTS-DAG: sleeps{{	}}ext_sleeps
-// CONTRACTS-NOT: ext_mixed
-// CONTRACTS-NOT: ext_branch
-// CONTRACTS-NOT: ext_optional
-// CONTRACTS-NOT: ext_untested
+// CONTRACTS-NOT: {{^(err_ptr|null|sleeps)	}}ext_mixed
+// CONTRACTS-NOT: {{^(err_ptr|null|sleeps)	}}ext_branch
+// CONTRACTS-NOT: {{^(err_ptr|null|sleeps)	}}ext_optional
+// CONTRACTS-NOT: {{^(err_ptr|null|sleeps)	}}ext_untested
 
 #else
 

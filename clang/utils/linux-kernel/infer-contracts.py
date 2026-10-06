@@ -5,6 +5,7 @@ A build with -flinux-kernel-emit-facts=<file> appends one line for every
 function that other translation units can call:
 
     fn <name> <file> <return sources> <functions it always calls>
+    par <name> <file> <what it does with its pointer parameters>
 
 This script closes those facts over the whole build and writes what the
 second build reads with -flinux-kernel-contracts=<file>:
@@ -12,6 +13,8 @@ second build reads with -flinux-kernel-contracts=<file>:
     err_ptr <name>    returns ERR_PTR() on failure and never NULL
     null    <name>    returns NULL on failure and never ERR_PTR()
     sleeps  <name>    sleeps whenever it runs to its end
+    derefs  <name> <i>          dereferences parameter i whenever it is called
+    nowrite <name> <i> <mask>   can return without writing through parameter i
 
 The return sources are letters: E (ERR_PTR), e (the result of an error
 pointer function), N (NULL), n (the untested result of a function that
@@ -23,6 +26,16 @@ is returned, ",k:<name>" if that result was tested for NULL first, and
 A result that the caller tests counts as valid once the test has passed,
 also where nothing is known about the function it comes from: the test is
 what the author of the caller knows about it.
+
+The parameter facts are "d<i>" (dereferences parameter i, counted from zero,
+before its first branch), "p<i>:<name>:<j>" (hands it to parameter j of a
+function of another translation unit there) and "w<i>:<mask>" (can return
+without having written through it), or "-" for none.  The mask has the
+classes of return values for which the parameter is left alone: 1 negative,
+2 zero, 4 positive, 8 for a function that returns nothing.  Every definition
+of a function with a pointer parameter has a line, so that a function with
+several definitions, such as a weak default and its override, gets a
+contract only as far as all of them agree.
 
 usage: infer-contracts.py [-o contracts] [--explain name] facts...
 """
@@ -91,6 +104,79 @@ def parse(paths):
                 always = [] if calls == "-" else calls.split(",")
                 defs[name].append((file, flags, callees, always))
     return defs
+
+
+def parse_params(paths):
+    """name -> {file: (derefs, passes, nowrite)}, one entry per definition.
+
+    derefs is a set of indices, passes a list of (index, callee, index of the
+    callee's parameter), nowrite a dict from index to mask.
+    """
+    defs = collections.defaultdict(dict)
+    seen = set()
+    for path in paths:
+        with open(path, errors="replace") as f:
+            for line in f:
+                if line in seen:
+                    continue
+                seen.add(line)
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) != 4 or parts[0] != "par":
+                    continue
+                _, name, file, facts = parts
+                derefs, passes, nowrite = set(), [], {}
+                try:
+                    for token in facts.split(","):
+                        if token.startswith("d"):
+                            derefs.add(int(token[1:]))
+                        elif token.startswith("p"):
+                            index, callee, other = token[1:].split(":")
+                            passes.append((int(index), callee, int(other)))
+                        elif token.startswith("w"):
+                            index, mask = token[1:].split(":")
+                            nowrite[int(index)] = int(mask)
+                except ValueError:
+                    continue
+                defs[name][file] = (derefs, passes, nowrite)
+    return defs
+
+
+def dereferences(pdefs):
+    """The (name, index) pairs of parameters that are always dereferenced."""
+    result = set()
+    changed = True
+    while changed:
+        changed = False
+        for name, entries in pdefs.items():
+            candidates = set()
+            for derefs, passes, _ in entries.values():
+                candidates |= derefs | {i for i, _, _ in passes}
+            for index in candidates:
+                if (name, index) in result:
+                    continue
+                if all(index in derefs or
+                       any(i == index and (callee, j) in result
+                           for i, callee, j in passes)
+                       for derefs, passes, _ in entries.values()):
+                    result.add((name, index))
+                    changed = True
+    return result
+
+
+def unwritten(pdefs):
+    """(name, index) -> mask for the parameters that can be left unwritten."""
+    result = {}
+    for name, entries in pdefs.items():
+        indices = set()
+        for _, _, nowrite in entries.values():
+            indices |= set(nowrite)
+        for index in indices:
+            mask = 15
+            for _, _, nowrite in entries.values():
+                mask &= nowrite.get(index, 0)
+            if mask:
+                result[(name, index)] = mask
+    return result
 
 
 UNKNOWN, ERR, NULL = "unknown", "err_ptr", "null"
@@ -200,12 +286,22 @@ def main():
             out.write(f"{kind}\t{name}\n")
     for name in sorted(sleeps - SLEEPS):
         out.write(f"sleeps\t{name}\n")
+    pdefs = parse_params(args.facts)
+    derefs = dereferences(pdefs)
+    nowrite = unwritten(pdefs)
+    for name, index in sorted(derefs):
+        out.write(f"derefs\t{name}\t{index}\n")
+    for (name, index), mask in sorted(nowrite.items()):
+        out.write(f"nowrite\t{name}\t{index}\t{mask}\n")
     if out is not sys.stdout:
         out.close()
     count = collections.Counter(conv.values())
     print(f"{len(defs)} functions: {count[ERR]} return error pointers, "
           f"{count[NULL]} return NULL on failure, "
           f"{len(sleeps - SLEEPS)} always sleep", file=sys.stderr)
+    print(f"{len(pdefs)} functions with pointer parameters: "
+          f"{len(derefs)} parameters are always dereferenced, "
+          f"{len(nowrite)} can be left unwritten", file=sys.stderr)
 
 
 if __name__ == "__main__":
