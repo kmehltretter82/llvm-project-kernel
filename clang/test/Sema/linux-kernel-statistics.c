@@ -277,6 +277,8 @@ int flags(struct priv *p, int a, int b, int c, int d, int e) { // dead-warning {
 #define TEST(n) if (p->lock.owner == (n)) note(n);
 #define TEST10(b) TEST(b + 0) TEST(b + 1) TEST(b + 2) TEST(b + 3) TEST(b + 4) \
                   TEST(b + 5) TEST(b + 6) TEST(b + 7) TEST(b + 8) TEST(b + 9)
+#define TEST50(b) TEST10(b + 0) TEST10(b + 10) TEST10(b + 20) TEST10(b + 30) \
+                  TEST10(b + 40)
 void crowded(struct priv *p) { // expected-warning {{statistics for 'crowded': path searches 0, out of steps 0, dropped paths 0, not run 0, checks stopped early 0, tables full 1 (experimental check 'statistics')}}
-  TEST10(0) TEST10(10) TEST10(20) TEST10(30) TEST10(40) TEST10(50) TEST10(60)
+  TEST50(0) TEST50(50) TEST50(100) TEST50(150) TEST50(200) TEST50(250)
 }

@@ -114,6 +114,10 @@ struct sema::LinuxKernelUnit::Impl {
     llvm::SmallPtrSet<const RecordDecl *, 4> Records;
   };
   llvm::DenseMap<const FunctionDecl *, Writes> WriteSummaries;
+  /// What a call of a function with a body can change outside the function:
+  /// nothing, what its pointer parameters point to, or anything.
+  enum Effect : uint8_t { NoEffect, ParamsOnly, AnyEffect };
+  llvm::DenseMap<const FunctionDecl *, Effect> Effects;
   /// Whether a function with a body may keep the pointer that a parameter
   /// is given.
   llvm::DenseMap<const ParmVarDecl *, bool> Captures;
@@ -5633,6 +5637,146 @@ static bool isLinuxReadOnlyCallee(const FunctionDecl *FD) {
          Name.starts_with("trace_") || Name.starts_with("__trace");
 }
 
+/// Whether a call of \p Def can change something outside it, as far as its
+/// body tells: nothing, only what its pointer parameters point to, or
+/// anything.  "device_may_wakeup(dev)" changes nothing, and neither does
+/// "pwm_is_enabled(pwm)", which has pwm_get_state() fill in a variable of
+/// its own.  A condition that calls such a function can be remembered like
+/// one that reads a member.
+static sema::LinuxKernelUnit::Impl::Effect
+getLinuxEffect(const FunctionDecl *Def, sema::LinuxKernelUnit::Impl &Unit,
+               unsigned Depth = 0) {
+  using Impl = sema::LinuxKernelUnit::Impl;
+  auto Known = Unit.Effects.find(Def);
+  if (Known != Unit.Effects.end())
+    return Known->second;
+  // The answer while this is being worked out, for recursion.
+  Unit.Effects[Def] = Impl::AnyEffect;
+
+  struct Scan {
+    sema::LinuxKernelUnit::Impl &Unit;
+    unsigned Depth;
+    Impl::Effect E = Impl::NoEffect;
+
+    void note(Impl::Effect Other) { E = std::max(E, Other); }
+
+    static bool isLocal(const Expr *Ex) {
+      const auto *DRE = dyn_cast<DeclRefExpr>(Ex);
+      const auto *VD = DRE ? dyn_cast<VarDecl>(DRE->getDecl()) : nullptr;
+      return VD && VD->hasLocalStorage();
+    }
+
+    /// A store through the pointer \p P.
+    void through(const Expr *P) {
+      P = P->IgnoreParenImpCasts();
+      const auto *DRE = dyn_cast<DeclRefExpr>(P);
+      note(DRE && isa<ParmVarDecl>(DRE->getDecl()) ? Impl::ParamsOnly
+                                                   : Impl::AnyEffect);
+    }
+
+    void store(const Expr *LHS) {
+      for (;;) {
+        LHS = LHS->IgnoreParens();
+        if (const auto *ME = dyn_cast<MemberExpr>(LHS)) {
+          if (ME->isArrow())
+            return through(ME->getBase());
+          LHS = ME->getBase();
+        } else if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(LHS)) {
+          const Expr *Base = ASE->getBase()->IgnoreParens();
+          const auto *ICE = dyn_cast<ImplicitCastExpr>(Base);
+          if (!ICE || ICE->getCastKind() != CK_ArrayToPointerDecay)
+            return through(Base);
+          LHS = ICE->getSubExpr();
+        } else if (const auto *UO = dyn_cast<UnaryOperator>(LHS)) {
+          if (UO->getOpcode() != UO_Deref)
+            return note(Impl::AnyEffect);
+          return through(UO->getSubExpr());
+        } else {
+          // A variable of the function itself, or something else.
+          if (!isLocal(LHS))
+            note(Impl::AnyEffect);
+          return;
+        }
+      }
+    }
+
+    /// The callee writes through the pointer that it is given as \p Arg,
+    /// unless that is a pointer to something constant.
+    void handsOver(const Expr *Arg) {
+      if (!Arg->getType()->isPointerType() ||
+          Arg->getType()->getPointeeType().isConstQualified())
+        return;
+      Arg = Arg->IgnoreParenImpCasts();
+      // The address of a variable of this function, or of a part of it.
+      if (const auto *UO = dyn_cast<UnaryOperator>(Arg))
+        if (UO->getOpcode() == UO_AddrOf) {
+          const Expr *Sub = UO->getSubExpr()->IgnoreParens();
+          while (const auto *ME = dyn_cast<MemberExpr>(Sub)) {
+            if (ME->isArrow())
+              break;
+            Sub = ME->getBase()->IgnoreParens();
+          }
+          if (isLocal(Sub))
+            return;
+        }
+      // A local array.
+      if (isLocal(Arg) && cast<DeclRefExpr>(Arg)->getType()->isArrayType())
+        return;
+      through(Arg);
+    }
+
+    void visit(const Stmt *St) {
+      if (!St || E == Impl::AnyEffect)
+        return;
+      // What is read through a volatile type can change by itself: a device
+      // register, or what READ_ONCE() reads.  Reading it twice is not
+      // reading it once.
+      if (const auto *Ex = dyn_cast<Expr>(St))
+        if (Ex->getType().isVolatileQualified())
+          return note(Impl::AnyEffect);
+      if (const auto *BO = dyn_cast<BinaryOperator>(St)) {
+        if (BO->isAssignmentOp())
+          store(BO->getLHS());
+      } else if (const auto *UO = dyn_cast<UnaryOperator>(St)) {
+        if (UO->isIncrementDecrementOp())
+          store(UO->getSubExpr());
+      } else if (isa<GCCAsmStmt>(St)) {
+        note(Impl::AnyEffect);
+      } else if (const auto *CE = dyn_cast<CallExpr>(St)) {
+        const FunctionDecl *Callee = CE->getDirectCallee();
+        const FunctionDecl *CalleeDef = nullptr;
+        unsigned ID = CE->getBuiltinCallee();
+        if (ID == Builtin::BI__builtin_expect ||
+            ID == Builtin::BI__builtin_expect_with_probability ||
+            ID == Builtin::BI__builtin_constant_p ||
+            (Callee && (Callee->hasAttr<ConstAttr>() ||
+                        Callee->hasAttr<PureAttr>() ||
+                        isLinuxErrorPointerHelper(Callee)))) {
+          // Nothing is stored.
+        } else if (!Callee || ID || !Callee->hasBody(CalleeDef) || Depth >= 3) {
+          note(Impl::AnyEffect);
+        } else {
+          switch (getLinuxEffect(CalleeDef, Unit, Depth + 1)) {
+          case Impl::NoEffect:
+            break;
+          case Impl::ParamsOnly:
+            for (const Expr *Arg : CE->arguments())
+              handsOver(Arg);
+            break;
+          case Impl::AnyEffect:
+            note(Impl::AnyEffect);
+            break;
+          }
+        }
+      }
+      for (const Stmt *Child : St->children())
+        visit(Child);
+    }
+  } S{Unit, Depth};
+  S.visit(Def->getBody());
+  return Unit.Effects[Def] = S.E;
+}
+
 /// What the function \p Def can store to: the members that it or the
 /// functions it calls assign, and the structures that it hands to functions
 /// whose body is not here.  A call of such a function leaves every other
@@ -5795,8 +5939,13 @@ public:
   };
 
 private:
-  static constexpr unsigned MaxLocations = 96;
-  static constexpr unsigned MaxConditions = 64;
+  /// How many locations and conditions of a function get a number.  The
+  /// search knows nothing about the rest, which makes paths look possible
+  /// that are not: a probe function of six hundred lines has more than a
+  /// hundred conditions, and the one that guards the acquisition has to be
+  /// among those that are known.
+  static constexpr unsigned MaxLocations = 256;
+  static constexpr unsigned MaxConditions = 256;
   /// The states that a block is visited in.  A path that comes to a block
   /// with another one is dropped.
   unsigned MaxStatesPerBlock = 16;
@@ -6005,10 +6154,15 @@ private:
           ID != Builtin::BI__builtin_expect_with_probability &&
           ID != Builtin::BI__builtin_constant_p) {
         const FunctionDecl *FD = CE->getDirectCallee();
+        const FunctionDecl *Def = nullptr;
+        // A function with a body that changes nothing outside it.
+        bool Observer =
+            FD && FD->hasBody(Def) &&
+            getLinuxEffect(Def, Unit) == sema::LinuxKernelUnit::Impl::NoEffect;
         if (!FD || !(FD->hasAttr<ConstAttr>() || FD->hasAttr<PureAttr>() ||
-                     isErrorPointerHelper(FD)))
+                     isErrorPointerHelper(FD) || Observer))
           return false;
-        if (FD->hasAttr<PureAttr>())
+        if (FD->hasAttr<PureAttr>() || Observer)
           C.ReadsMemory = true;
       }
       break;
@@ -6039,7 +6193,7 @@ private:
 
   /// The index of the condition \p E, which is already stripped, or -1 if
   /// it has a side effect or there is no room for it.
-  int conditionIndex(const Expr *E, bool Create) {
+  int conditionIndex(const Expr *E, bool Create, bool Always = false) {
     llvm::FoldingSetNodeID ID;
     E->Profile(ID, Ctx, /*Canonical=*/true);
     for (unsigned I = 0, N = Conditions.size(); I != N; ++I)
@@ -6047,7 +6201,8 @@ private:
         return I;
     if (!Create)
       return -1;
-    if (Conditions.size() >= MaxConditions) {
+    // A condition that a check asks for by name gets a number in any case.
+    if (Conditions.size() >= MaxConditions && !Always) {
       noteTableFull();
       return -1;
     }
@@ -6245,6 +6400,12 @@ private:
   void assign(const Expr *LHS, const Expr *RHS, State &St) {
     // The new value first: it can depend on the old one.
     Value V = RHS ? value(RHS, St) : Value();
+    // "p++" and "p += n": a pointer that was not NULL still is not.
+    if (!RHS && LHS->getType()->isPointerType()) {
+      Value Old = value(LHS, St);
+      if (!(Old.Mask & Value::Zero))
+        V = Value::ofMask(Old.Mask);
+    }
     const VarDecl *Root = nullptr;
     llvm::SmallVector<const FieldDecl *, 3> Path;
     if (!decompose(LHS, Root, Path)) {
@@ -6747,6 +6908,15 @@ public:
         std::optional<bool> B = compare(BO, St);
         return B ? Value::constant(*B) : Value::ofMask(Value::Zero | Value::Pos);
       }
+      // "p + n" and "p - n": a pointer that is not NULL stays so.
+      if (T->isPointerType() && BO->isAdditiveOp()) {
+        Value Pointer = value(BO->getLHS()->getType()->isPointerType()
+                                  ? BO->getLHS()
+                                  : BO->getRHS(),
+                              St);
+        return (Pointer.Mask & Value::Zero) ? Value()
+                                            : Value::ofMask(Pointer.Mask);
+      }
       // Arithmetic on two known numbers: "where + size <= 4" in a callee
       // that was given both as constants.
       if (T->isPointerType() || BO->isAssignmentOp() || BO->isPtrMemOp())
@@ -6981,7 +7151,7 @@ public:
     const Expr *E = stripLinuxCondition(Cond, Negated);
     if (!E || St.Fixed.size() >= 4)
       return;
-    int I = conditionIndex(E, /*Create=*/true);
+    int I = conditionIndex(E, /*Create=*/true, /*Always=*/true);
     if (I >= 0)
       St.Fixed.push_back({unsigned(I), Outcome != Negated});
   }
@@ -7170,6 +7340,19 @@ public:
 
   /// End the search: the check has what it was looking for.
   void stop() { Stopped = true; }
+
+  /// Apply to \p St what the elements of \p B before number \p End do.  A
+  /// search that starts in the middle of a block then knows what the block
+  /// has assigned by that point: "locked = true; down_read(&sem);".
+  void prefix(const CFGBlock *B, unsigned End, State &St) {
+    unsigned Index = 0;
+    for (const CFGElement &Elem : *B) {
+      if (Index++ >= End)
+        break;
+      if (std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>())
+        transfer(CS->getStmt(), St);
+    }
+  }
 
   /// Whether a path ends at \p Node because the pointer that it
   /// dereferences is NULL there, in \p Node itself or first thing in a
@@ -10081,6 +10264,9 @@ public:
         llvm::SmallVector<LinuxPathSearch::State, 4> Inits;
         guardStates(B, Inits);
         for (LinuxPathSearch::State &Init : Inits) {
+          // A flag that is set next to the acquisition and tested before
+          // the release.
+          Search.prefix(B, This, Init);
           // "spin_lock(&parent->lock)": there is a parent.
           if (Root && Root != HandleVar && Root->getType()->isPointerType())
             if (int RootLoc = Search.locate(Root); RootLoc >= 0) {

@@ -284,6 +284,106 @@ out:
   return ret; // unwind-warning {{'&p->lock' was acquired with mutex_lock() and this error path returns without mutex_unlock(), which other paths call}}
 }
 
+// Taken and released under one condition that calls a function.  A function
+// that changes nothing outside itself gives the same answer both times: one
+// that reads a member, and one that has another function fill in a variable
+// of its own.  A function that stores something does not.
+
+static inline int may_wakeup(const struct priv *p) {
+  return p->value != 0;
+}
+
+static void get_state(const struct priv *p, struct priv *state) {
+  *state = *p;
+}
+
+static inline int is_on(const struct priv *p) {
+  struct priv state;
+
+  get_state(p, &state);
+  return state.value;
+}
+
+static int count_up(struct priv *p) {
+  return p->value++;
+}
+
+int guarded_by_a_getter(struct priv *p) {
+  int ret;
+
+  if (!is_on(p)) {
+    ret = clk_prepare_enable(p->clk);
+    if (ret)
+      return ret;
+  }
+  ret = setup(p->dev);
+  if (!is_on(p))
+    clk_disable_unprepare(p->clk);
+  if (ret)
+    return ret;
+  return 0;
+}
+
+int guarded_by_two(struct priv *p, int quirk) {
+  int ret;
+
+  if (!may_wakeup(p) && quirk) {
+    ret = clk_prepare_enable(p->clk);
+    if (ret)
+      return ret;
+  }
+  ret = setup(p->dev);
+  if (ret)
+    goto disable;
+  return 0;
+disable:
+  if (!may_wakeup(p) && quirk)
+    clk_disable_unprepare(p->clk);
+  return ret;
+}
+
+int guarded_by_a_call_that_stores(struct priv *p) {
+  int ret;
+
+  if (!count_up(p)) {
+    ret = clk_prepare_enable(p->clk); // unwind-note {{acquired here}}
+    if (ret)
+      return ret;
+  }
+  ret = setup(p->dev);
+  if (!count_up(p))
+    clk_disable_unprepare(p->clk); // unwind-note {{another path releases it here}}
+  if (ret)
+    return ret; // unwind-warning {{'p->clk' was acquired with clk_prepare_enable() and this error path returns without clk_disable_unprepare(), which other paths call}}
+  return 0;
+}
+
+// A pointer that is not NULL stays so when it is moved along an array.
+
+struct item {
+  int len;
+};
+
+int walked(struct priv *p, struct item *list) {
+  struct item *it;
+  int ret;
+
+  mutex_lock(&p->lock);
+  it = list;
+  if (!it) {
+    mutex_unlock(&p->lock);
+    return -EIO;
+  }
+  while (it->len)
+    it++;
+  ret = setup(p->dev);
+  if (it)
+    mutex_unlock(&p->lock);
+  if (ret)
+    return ret;
+  return 0;
+}
+
 // A mapping that the result names.
 
 int mapping(struct priv *p) {

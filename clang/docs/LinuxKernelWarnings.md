@@ -246,7 +246,14 @@ reports nothing then.
   for it. So is an acquisition that takes back what the function released
   before (`unlock(); ...; lock();`), and the branches that lead to the
   acquisition alone are taken to hold for the rest of the function
-  (`if (c) get(); ... if (c) put();`).
+  (`if (c) get(); ... if (c) put();`). The condition can be two that are
+  joined by `||`, in either order, and it can call a function that changes
+  nothing outside itself: `if (!device_may_wakeup(dev))`, or
+  `if (!pwm_is_enabled(pwm))`, which has a helper fill in a variable of its
+  own. A function that stores something, or reads through a volatile type,
+  is not taken to give the same answer twice. A flag that is set in the
+  same block as the acquisition and before it is known as well
+  (`held = true; down_read(&sem); ... if (held) up_read(&sem);`).
 - `-Wlinux-kernel-memory-leak` diagnoses a return at which a local variable
   still holds the result of `kmalloc()` or one of its relatives, and the
   path has neither freed the memory nor stored the pointer nor handed it to
@@ -428,9 +435,10 @@ drivers/net/ethernet/intel/ixgbe/ixgbe_main.c:1:1: warning: statistics for
       (experimental check 'statistics')
 ```
 
-"Tables full" counts the functions that have more locations (96) or more
-conditions (64) than a search gives numbers to. It knows nothing about the
-ones that are left.
+"Tables full" counts the functions that have more locations or more
+conditions than a search gives numbers to, 256 of each. It knows nothing
+about the ones that are left, except for a condition that a check names as
+the guard of an acquisition.
 
 The numbers of a function include the searches in the functions that it
 calls, which are made to learn what those do with their parameters. The
