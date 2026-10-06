@@ -6312,8 +6312,15 @@ public:
     return nullptr;
   }
 
-  /// The location that \p E names, or -1.
+  /// The location that \p E names, or -1.  "(err = step())" as a value is
+  /// err: a branch on it has tested err.
   int locate(const Expr *E, bool Create = true) {
+    while (E) {
+      const auto *BO = dyn_cast<BinaryOperator>(E->IgnoreParenImpCasts());
+      if (!BO || BO->getOpcode() != BO_Assign)
+        break;
+      E = BO->getLHS();
+    }
     const VarDecl *Root = nullptr;
     llvm::SmallVector<const FieldDecl *, 3> Path;
     if (!E || !isTrackedType(E->getType()) || !decompose(E, Root, Path))

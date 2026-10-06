@@ -433,6 +433,31 @@ u32 out_null_goes_on(struct dev *d) {
   return off; // expected-warning {{'off' is read here, but on this path 'pick' has failed and has not written to it (experimental check 'uninit-output')}}
 }
 
+// The status is assigned in the condition that tests it, and tested again
+// at the label: it is not zero there.
+static int find_head(struct dev *d, u32 *val) {
+  int error;
+
+  if ((error = use(1)))
+    goto out;
+  if ((error = use(2)) < 0)
+    goto out;
+  *val = d->cache;
+  return 0;
+out:
+  if (error)
+    _printk("failed\n");
+  return error;
+}
+
+u32 out_assigned_in_condition(struct dev *d) {
+  u32 val;
+
+  if (find_head(d, &val))
+    return 0;
+  return val;
+}
+
 // bool: false is the failure.
 static bool parse(const char *s, int *out) {
   if (!s[0])
