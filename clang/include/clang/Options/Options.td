@@ -2294,6 +2294,12 @@ defm linux_kernel_lenient_asm : BoolFOption<"linux-kernel-lenient-asm",
           "assembly that the target description does not know. For checking "
           "code with -fsyntax-only for a target whose description is "
           "incomplete">>;
+def flinux_kernel_experimental_EQ : CommaJoined<["-"],
+  "flinux-kernel-experimental=">,
+  Group<f_Group>, Visibility<[ClangOption, CC1Option]>, MetaVarName<"<checks>">,
+  HelpText<"Run the named experimental Linux kernel checks, which report "
+           "under -Wlinux-kernel-experimental">,
+  MarshallingInfoStringVector<LangOpts<"LinuxKernelExperimentalChecks">>;
 def fconstant_array_class_EQ : Joined<["-"], "fconstant-array-class=">, Group<f_Group>,
   Visibility<[ClangOption, CC1Option]>,
   MarshallingInfoString<LangOpts<"ObjCConstantArrayClass">>;

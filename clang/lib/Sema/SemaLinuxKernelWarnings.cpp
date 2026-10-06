@@ -16,6 +16,7 @@
 #include "clang/AST/Decl.h"
 #include "clang/AST/DynamicRecursiveASTVisitor.h"
 #include "clang/AST/Expr.h"
+#include "clang/AST/RecordLayout.h"
 #include "clang/AST/Stmt.h"
 #include "clang/Analysis/AnalysisDeclContext.h"
 #include "clang/Analysis/CFG.h"
@@ -24,6 +25,7 @@
 #include "clang/Basic/DiagnosticSema.h"
 #include "clang/Basic/FileManager.h"
 #include "clang/Basic/SourceManager.h"
+#include "clang/Basic/TargetInfo.h"
 #include "clang/Lex/Lexer.h"
 #include "clang/Sema/Sema.h"
 #include "llvm/ADT/DenseMap.h"
@@ -41,8 +43,10 @@
 #include "llvm/Support/LineIterator.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
+#include <algorithm>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -84,6 +88,9 @@ struct sema::LinuxKernelUnit::Impl {
   llvm::DenseMap<const FunctionDecl *,
                  llvm::SmallVector<const FunctionDecl *, 4>>
       AlwaysCalled;
+  /// For a pointer parameter of a function with a body: where the function
+  /// dereferences it before its first branch, or null.
+  llvm::DenseMap<const ParmVarDecl *, const Expr *> EntryDerefs;
 
   Impl() { OpaqueSources.Opaque = true; }
 };
@@ -422,6 +429,24 @@ static const VarDecl *getDirectLinuxVariable(const Expr *E) {
     return nullptr;
   const auto *DRE = dyn_cast<DeclRefExpr>(E->IgnoreParenImpCasts());
   return DRE ? dyn_cast<VarDecl>(DRE->getDecl()) : nullptr;
+}
+
+/// Whether the branch at the end of \p B is spelled in the body of a macro:
+/// its "if", "while" or "for" keyword, or its "&&", "||" or "?".  The
+/// condition can still be an argument that the user of the macro wrote.
+static bool isLinuxBranchWrittenInMacro(const CFGBlock *B,
+                                        const SourceManager &SM) {
+  const Stmt *Term = B->getTerminatorStmt();
+  if (!Term)
+    return false;
+  SourceLocation Loc = Term->getBeginLoc();
+  if (const auto *BO = dyn_cast<BinaryOperator>(Term))
+    Loc = BO->getOperatorLoc();
+  else if (const auto *CO = dyn_cast<ConditionalOperator>(Term))
+    Loc = CO->getQuestionLoc();
+  else if (const auto *DS = dyn_cast<DoStmt>(Term))
+    Loc = DS->getWhileLoc();
+  return isWrittenInMacro(Loc, SM);
 }
 
 /// Strip the wrappers that do not change which values make a condition true,
@@ -1099,6 +1124,12 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
   /// or NULL, which the cleanup functions of <linux/cleanup.h> leave alone.
   llvm::SmallPtrSet<const ReturnStmt *, 4> NothingToRelease;
   llvm::SmallPtrSet<const VarDecl *, 4> ReportedErrorDerefs;
+  /// "x & ~mask" expressions whose result is cut down to the width of the
+  /// mask anyway.
+  llvm::SmallPtrSet<const Expr *, 4> NarrowedAnds;
+  /// Where a diagnostic about a macro argument was already given: the
+  /// kernel's bit operation macros expand their argument several times.
+  llvm::SmallVector<SourceLocation, 4> ReportedSpellings;
   /// For each parameter of a function with a body: where the function
   /// dereferences it without a test, or null.
   llvm::DenseMap<const ParmVarDecl *, const MemberExpr *> ParameterDerefs;
@@ -1108,6 +1139,8 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
   /// IRQ results that have already been tested for a negative value.  A
   /// later boolean test of the same value only handles zero.
   llvm::SmallPtrSet<const VarDecl *, 4> NegativeTestedIRQs;
+  /// Pointers that hold an allocation made with __GFP_NOFAIL.
+  llvm::SmallPtrSet<const VarDecl *, 4> AllocationsThatCannotFail;
   unsigned ControlFlowDepth = 0;
   bool AssignmentTrackingDisabled = false;
 
@@ -1594,8 +1627,14 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
     }
   }
 
+  using PointerCopies =
+      llvm::SmallVector<std::pair<const VarDecl *, const VarDecl *>, 8>;
+
+  /// The pointers that \p St tests, and the pairs of pointers of which one
+  /// is a plain copy of the other.
   static void collectTestedPointers(
-      const Stmt *St, llvm::SmallPtrSetImpl<const VarDecl *> &Out) {
+      const Stmt *St, llvm::SmallPtrSetImpl<const VarDecl *> &Out,
+      PointerCopies *Copies = nullptr) {
     if (!St)
       return;
     auto Add = [&](const Expr *E) {
@@ -1603,6 +1642,21 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
               getDirectLinuxVariable(E ? E->IgnoreParenCasts() : nullptr))
         Out.insert(VD);
     };
+    auto AddCopy = [&](const VarDecl *To, const Expr *From) {
+      const VarDecl *Source =
+          getDirectLinuxVariable(From ? From->IgnoreParenCasts() : nullptr);
+      if (Copies && To && Source && To != Source &&
+          To->getType()->isPointerType() && Source->getType()->isPointerType())
+        Copies->push_back({To, Source});
+    };
+    if (const auto *DS = dyn_cast<DeclStmt>(St)) {
+      for (const Decl *D : DS->decls())
+        if (const auto *VD = dyn_cast<VarDecl>(D))
+          AddCopy(VD, VD->getInit());
+    } else if (const auto *BO = dyn_cast<BinaryOperator>(St)) {
+      if (BO->getOpcode() == BO_Assign)
+        AddCopy(getDirectLinuxVariable(BO->getLHS()), BO->getRHS());
+    }
     if (const auto *CE = dyn_cast<CallExpr>(St)) {
       const FunctionDecl *Callee = CE->getDirectCallee();
       if (Callee && Callee->getIdentifier() &&
@@ -1627,7 +1681,30 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
       Add(CO->getCond());
     }
     for (const Stmt *Child : St->children())
-      collectTestedPointers(Child, Out);
+      collectTestedPointers(Child, Out, Copies);
+  }
+
+  /// The pointers that the function tests somewhere.  A test of a copy
+  /// counts for the original and the other way round: the KUnit assertions
+  /// test a copy of their argument, and "xdst = (struct xfrm_dst *)dst"
+  /// after IS_ERR(dst) is the tested pointer under another type.
+  const llvm::SmallPtrSetImpl<const VarDecl *> &getTestedPointers() {
+    if (!TestedPointers) {
+      TestedPointers.emplace();
+      PointerCopies Copies;
+      collectTestedPointers(CurrentFunction->getBody(), *TestedPointers,
+                            &Copies);
+      for (bool Changed = true; Changed;) {
+        Changed = false;
+        for (auto [To, From] : Copies)
+          if (TestedPointers->count(To) != TestedPointers->count(From)) {
+            TestedPointers->insert(To);
+            TestedPointers->insert(From);
+            Changed = true;
+          }
+      }
+    }
+    return *TestedPointers;
   }
 
   /// "p = get(); p->member": the result of an error pointer function is
@@ -1643,15 +1720,39 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
     if (It == VariableOrigins.end() ||
         It->second.Kind != LinuxKernelAPIKind::ErrorPointer)
       return;
-    if (!TestedPointers) {
-      TestedPointers.emplace();
-      collectTestedPointers(CurrentFunction->getBody(), *TestedPointers);
-    }
-    if (TestedPointers->count(VD) || !ReportedErrorDerefs.insert(VD).second)
+    if (getTestedPointers().count(VD) || !ReportedErrorDerefs.insert(VD).second)
       return;
     S.Diag(ME->getOperatorLoc(), diag::warn_linux_kernel_err_ptr_deref)
         << VD << It->second.Callee << ME->getSourceRange();
     noteInferred(It->second);
+  }
+
+  /// "p = kzalloc(...); p->member = ...": the result of an allocation is
+  /// dereferenced, and the function tests it nowhere.
+  void checkUncheckedAllocation(const MemberExpr *ME) {
+    if (!ME->isArrow() || !CurrentFunction)
+      return;
+    const VarDecl *VD =
+        getDirectLinuxVariable(ME->getBase()->IgnoreParenCasts());
+    if (!VD || !VD->hasLocalStorage() || isa<ParmVarDecl>(VD))
+      return;
+    auto It = VariableOrigins.find(VD);
+    if (It == VariableOrigins.end() || It->second.Inferred)
+      return;
+    switch (It->second.Kind) {
+    case LinuxKernelAPIKind::KmallocPointer:
+    case LinuxKernelAPIKind::VmallocPointer:
+    case LinuxKernelAPIKind::KvmallocPointer:
+    case LinuxKernelAPIKind::DevmPointer:
+      break;
+    default:
+      return;
+    }
+    if (AllocationsThatCannotFail.count(VD) || getTestedPointers().count(VD) ||
+        !ReportedErrorDerefs.insert(VD).second)
+      return;
+    S.Diag(ME->getOperatorLoc(), diag::warn_linux_kernel_unchecked_alloc)
+        << VD << It->second.Callee << ME->getSourceRange();
   }
 
   static const MemberExpr *findDeref(const Stmt *St, const VarDecl *VD) {
@@ -1706,11 +1807,8 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
       const MemberExpr *Deref = getParameterDeref(Callee, I);
       if (!Deref)
         continue;
-      if (!TestedPointers) {
-        TestedPointers.emplace();
-        collectTestedPointers(CurrentFunction->getBody(), *TestedPointers);
-      }
-      if (TestedPointers->count(VD) || !ReportedErrorDerefs.insert(VD).second)
+      if (getTestedPointers().count(VD) ||
+          !ReportedErrorDerefs.insert(VD).second)
         continue;
       LinuxKernelAPIOrigin Origin = It->second;
       S.Diag(Call->getArg(I)->getExprLoc(),
@@ -1845,6 +1943,591 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
     S.Diag(BO->getOperatorLoc(), diag::warn_linux_kernel_cleanup_escape)
         << VD << Cleanup << BO->getSourceRange();
     S.Diag(VD->getLocation(), diag::note_linux_kernel_cleanup_declared) << VD;
+  }
+
+  /// Whether a diagnostic was already given for the code spelled at \p Loc.
+  bool alreadyReportedAt(SourceLocation Loc) {
+    Loc = S.getSourceManager().getSpellingLoc(Loc);
+    if (llvm::is_contained(ReportedSpellings, Loc))
+      return true;
+    ReportedSpellings.push_back(Loc);
+    return false;
+  }
+
+  /// "x & ~mask" where x has more bits than the unsigned mask: the
+  /// complement is computed in the width of the mask and zero-extended, so
+  /// the upper bits of x are cleared along with the bits of the mask.
+  ///
+  ///   u64 features;
+  ///   features &= ~BIT(3);        /* on a 32-bit kernel: clears bits 63:32 */
+  void checkZeroExtendedComplement(const BinaryOperator *BO) {
+    if (BO->getOpcode() != BO_And && BO->getOpcode() != BO_AndAssign)
+      return;
+    ASTContext &Ctx = S.getASTContext();
+    bool IsAssign = BO->getOpcode() == BO_AndAssign;
+    if (!IsAssign && NarrowedAnds.count(BO))
+      return;
+    for (const Expr *Side : {BO->getLHS(), BO->getRHS()}) {
+      if (IsAssign && Side == BO->getLHS())
+        continue;
+      const Expr *Other = Side == BO->getLHS() ? BO->getRHS() : BO->getLHS();
+      const auto *ICE = dyn_cast<ImplicitCastExpr>(Side->IgnoreParens());
+      if (!ICE || ICE->getCastKind() != CK_IntegralCast)
+        continue;
+      const auto *Not = dyn_cast<UnaryOperator>(ICE->getSubExpr()->IgnoreParens());
+      if (!Not || Not->getOpcode() != UO_Not)
+        continue;
+      QualType Narrow = Not->getType();
+      QualType Wide = ICE->getType();
+      if (!Narrow->isUnsignedIntegerType() || Narrow->isBooleanType() ||
+          !Wide->isIntegerType())
+        continue;
+      unsigned From = Ctx.getIntWidth(Narrow);
+      unsigned To = Ctx.getIntWidth(Wide);
+      if (To <= From)
+        continue;
+      // The other operand fits into the width of the mask anyway if it was
+      // widened itself, or if it is a small constant.
+      const Expr *Value = Other->IgnoreParens();
+      if (const auto *OtherCast = dyn_cast<CastExpr>(Value);
+          OtherCast && OtherCast->getCastKind() == CK_IntegralCast &&
+          Ctx.getIntWidth(OtherCast->getSubExpr()->getType()) <= From)
+        continue;
+      if (!IsAssign && !Value->isValueDependent()) {
+        Expr::EvalResult R;
+        if (Value->EvaluateAsInt(R, Ctx) &&
+            R.Val.getInt().getActiveBits() <= From)
+          continue;
+      }
+      // "~0U" keeps every bit of the mask's width: the author says how many
+      // bits are meant.
+      if (!Not->getSubExpr()->isValueDependent()) {
+        Expr::EvalResult R;
+        if (Not->getSubExpr()->EvaluateAsInt(R, Ctx) && R.Val.getInt().isZero())
+          continue;
+      }
+      S.Diag(Not->getOperatorLoc(), diag::warn_zero_extended_complement)
+          << From << To << IsAssign << (To - From) << Not->getSourceRange()
+          << Other->getSourceRange();
+    }
+  }
+
+  /// The object whose address \p E is, under any casts: "(unsigned long *)&x"
+  /// gives x.  For a pointer or an array, the type it points to is in
+  /// \p Pointee instead.
+  static const Expr *getAddressedObject(const Expr *E, QualType &Pointee) {
+    E = E->IgnoreParenCasts();
+    if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
+      if (UO->getOpcode() == UO_AddrOf)
+        return UO->getSubExpr()->IgnoreParens();
+      return nullptr;
+    }
+    QualType T = E->getType();
+    if (T->isPointerType())
+      Pointee = T->getPointeeType();
+    else if (const ArrayType *AT = T->getAsArrayTypeUnsafe())
+      Pointee = AT->getElementType();
+    return nullptr;
+  }
+
+  /// set_bit(), test_bit(), find_first_bit(), bitmap_zero() and their
+  /// relatives work on arrays of unsigned long.  Handing them the address of
+  /// a narrower object makes them read and write past it, and on a
+  /// big-endian machine they see other bits than the code that uses the
+  /// object as a number:
+  ///
+  ///   u32 flags;
+  ///   set_bit(0, (unsigned long *)&flags);
+  void checkBitopsCast(const CallExpr *Call, StringRef Name) {
+    Name = Name.ltrim('_');
+    Name.consume_front("const");
+    Name = Name.ltrim('_');
+    Name.consume_front("arch_");
+    Name = Name.ltrim('_');
+    int Arg = llvm::StringSwitch<int>(Name)
+                  .Cases({"set_bit", "clear_bit", "change_bit", "test_bit",
+                          "assign_bit"},
+                         1)
+                  .Cases({"test_and_set_bit", "test_and_clear_bit",
+                          "test_and_change_bit", "test_bit_acquire",
+                          "clear_bit_unlock", "test_and_set_bit_lock"},
+                         1)
+                  .Cases({"find_first_bit", "find_next_bit",
+                          "find_first_zero_bit", "find_next_zero_bit",
+                          "find_last_bit"},
+                         0)
+                  .Cases({"bitmap_zero", "bitmap_fill", "bitmap_weight",
+                          "bitmap_empty", "bitmap_full", "bitmap_set",
+                          "bitmap_clear"},
+                         0)
+                  .Default(-1);
+    if (Arg < 0 || Call->getNumArgs() <= unsigned(Arg))
+      return;
+    ASTContext &Ctx = S.getASTContext();
+    const Expr *Address = Call->getArg(Arg);
+    // Only what a cast turned into a bitmap: the compiler checks the rest.
+    const Expr *Written = Address->IgnoreParenImpCasts();
+    if (!isa<CStyleCastExpr>(Written))
+      return;
+    QualType Pointee;
+    const Expr *Object = getAddressedObject(Written, Pointee);
+    if (!Object)
+      return;
+    QualType T = Object->getType();
+    if (!T->isIntegerType() || T->isBooleanType())
+      return;
+    unsigned Have = Ctx.getTypeSize(T);
+    unsigned Long = Ctx.getTypeSize(Ctx.UnsignedLongTy);
+    if (Have == Long || alreadyReportedAt(Written->getExprLoc()))
+      return;
+    if (Have < Long) {
+      S.Diag(Written->getExprLoc(), diag::warn_linux_kernel_bitops_cast)
+          << Name << getLinuxExprText(Object, S) << Long << Have
+          << /*big-endian*/ 1 << Written->getSourceRange();
+    } else if (Ctx.getTargetInfo().isBigEndian() && Have == 2 * Long) {
+      S.Diag(Written->getExprLoc(), diag::warn_linux_kernel_bitops_cast_order)
+          << Name << getLinuxExprText(Object, S) << Written->getSourceRange();
+    }
+  }
+
+  /// The number of bytes of \p T that belong to no member, or std::nullopt
+  /// if that cannot be told.  The first hole is described in \p After (the
+  /// member before it, null for padding at the end) and \p In.
+  std::optional<uint64_t> getPaddingBytes(QualType T, const FieldDecl *&After,
+                                          const RecordDecl *&In,
+                                          unsigned Depth = 0) const {
+    ASTContext &Ctx = S.getASTContext();
+    if (const ConstantArrayType *AT = Ctx.getAsConstantArrayType(T)) {
+      std::optional<uint64_t> Each =
+          getPaddingBytes(AT->getElementType(), After, In, Depth);
+      if (!Each)
+        return std::nullopt;
+      return *Each * AT->getZExtSize();
+    }
+    const RecordDecl *RD = T->getAsRecordDecl();
+    if (!RD)
+      return 0;
+    RD = RD->getDefinition();
+    if (!RD || RD->isUnion() || RD->isInvalidDecl() || Depth > 6 ||
+        RD->hasFlexibleArrayMember())
+      return std::nullopt;
+    const ASTRecordLayout &Layout = Ctx.getASTRecordLayout(RD);
+    uint64_t Bits = 0, End = 0;
+    const FieldDecl *Previous = nullptr;
+    auto Hole = [&](uint64_t Size) {
+      if (!Bits && Size >= 8 && !In) {
+        After = Previous;
+        In = RD;
+      }
+      Bits += Size;
+    };
+    for (const FieldDecl *FD : RD->fields()) {
+      uint64_t Offset = Layout.getFieldOffset(FD->getFieldIndex());
+      if (Offset > End)
+        Hole(Offset - End);
+      uint64_t Size;
+      if (FD->isBitField()) {
+        Size = FD->getBitWidthValue();
+      } else {
+        if (FD->getType()->isIncompleteType())
+          return std::nullopt;
+        Size = Ctx.getTypeSize(FD->getType());
+        const FieldDecl *InnerAfter = nullptr;
+        const RecordDecl *InnerIn = nullptr;
+        std::optional<uint64_t> Inner =
+            getPaddingBytes(FD->getType(), InnerAfter, InnerIn, Depth + 1);
+        if (!Inner)
+          return std::nullopt;
+        if (*Inner && !Bits && !In) {
+          After = InnerAfter;
+          In = InnerIn;
+        }
+        Bits += *Inner * 8;
+      }
+      End = std::max(End, Offset + Size);
+      Previous = FD;
+    }
+    uint64_t Total = Ctx.toBits(Layout.getSize());
+    if (Total > End)
+      Hole(Total - End);
+    return Bits / 8;
+  }
+
+  /// Whether a function with a body may set every byte of what its
+  /// parameter \p P points to: it stores a whole object through it, or
+  /// hands the pointer on.  A function that only sets members does not.
+  static bool mayFillWhole(const Stmt *St, const ParmVarDecl *P) {
+    if (!St)
+      return false;
+    if (const auto *BO = dyn_cast<BinaryOperator>(St)) {
+      if (BO->isAssignmentOp()) {
+        if (getDirectLinuxVariable(BO->getLHS()) == P)
+          return true;
+        const auto *UO =
+            dyn_cast<UnaryOperator>(BO->getLHS()->IgnoreParenCasts());
+        if (UO && UO->getOpcode() == UO_Deref &&
+            getDirectLinuxVariable(UO->getSubExpr()->IgnoreParenCasts()) == P)
+          return true;
+      }
+    } else if (const auto *CE = dyn_cast<CallExpr>(St)) {
+      for (const Expr *Arg : CE->arguments())
+        if (getDirectLinuxVariable(Arg->IgnoreParenCasts()) == P)
+          return true;
+    } else if (const auto *UO = dyn_cast<UnaryOperator>(St)) {
+      if (UO->getOpcode() == UO_AddrOf &&
+          getDirectLinuxVariable(UO->getSubExpr()) == P)
+        return true;
+    } else if (isa<GCCAsmStmt>(St)) {
+      return true;
+    }
+    for (const Stmt *Child : St->children())
+      if (mayFillWhole(Child, P))
+        return true;
+    return false;
+  }
+
+  /// Whether the function sets every byte of \p VD somewhere: with memset()
+  /// or one of its relatives, by assigning a whole structure, or by letting
+  /// a function fill it that this translation unit cannot look into.
+  bool isWhollyInitialized(const Stmt *St, const VarDecl *VD,
+                           const CallExpr *Sink) const {
+    if (!St)
+      return false;
+    if (const auto *BO = dyn_cast<BinaryOperator>(St)) {
+      if (BO->getOpcode() == BO_Assign &&
+          getDirectLinuxVariable(BO->getLHS()) == VD)
+        return true;
+    } else if (const auto *CE = dyn_cast<CallExpr>(St); CE && CE != Sink) {
+      const FunctionDecl *Callee = CE->getDirectCallee();
+      const FunctionDecl *Def = nullptr;
+      bool HasBody = Callee && Callee->hasBody(Def);
+      for (unsigned I = 0, E = CE->getNumArgs(); I != E; ++I) {
+        const auto *UO =
+            dyn_cast<UnaryOperator>(CE->getArg(I)->IgnoreParenCasts());
+        if (!UO || UO->getOpcode() != UO_AddrOf ||
+            getDirectLinuxVariable(UO->getSubExpr()) != VD)
+          continue;
+        if (!HasBody || I >= Def->getNumParams() ||
+            mayFillWhole(Def->getBody(), Def->getParamDecl(I)))
+          return true;
+      }
+    } else if (isa<GCCAsmStmt>(St)) {
+      return true;
+    }
+    for (const Stmt *Child : St->children())
+      if (isWhollyInitialized(Child, VD, Sink))
+        return true;
+    return false;
+  }
+
+  /// A local structure with padding is copied to user space as a whole, and
+  /// the function only ever set its members: the padding carries whatever
+  /// was on the stack.
+  void checkStructLeak(const CallExpr *Call, StringRef Name) {
+    unsigned From, Size;
+    if (Name.ends_with("copy_to_user")) {
+      From = 1;
+      Size = 2;
+    } else if (Name == "nla_put" || Name == "nla_put_nohdr") {
+      From = Name == "nla_put" ? 3 : 2;
+      Size = From - 1;
+    } else if (Name == "copy_to_iter" || Name == "_copy_to_iter") {
+      From = 0;
+      Size = 1;
+    } else {
+      return;
+    }
+    if (Call->getNumArgs() <= std::max(From, Size) || !CurrentFunction)
+      return;
+    ASTContext &Ctx = S.getASTContext();
+    const auto *UO =
+        dyn_cast<UnaryOperator>(Call->getArg(From)->IgnoreParenCasts());
+    const VarDecl *VD =
+        UO && UO->getOpcode() == UO_AddrOf
+            ? getDirectLinuxVariable(UO->getSubExpr())
+            : nullptr;
+    if (!VD || !VD->hasLocalStorage() || isa<ParmVarDecl>(VD) ||
+        VD->hasInit() || !VD->getType()->isRecordType())
+      return;
+    // The whole object has to go out.
+    Expr::EvalResult Bytes;
+    const Expr *SizeArg = Call->getArg(Size);
+    if (SizeArg->isValueDependent() || !SizeArg->EvaluateAsInt(Bytes, Ctx) ||
+        Bytes.Val.getInt() !=
+            Ctx.getTypeSizeInChars(VD->getType()).getQuantity())
+      return;
+    const FieldDecl *After = nullptr;
+    const RecordDecl *In = nullptr;
+    std::optional<uint64_t> Padding =
+        getPaddingBytes(VD->getType(), After, In);
+    if (!Padding || !*Padding || !In ||
+        isWhollyInitialized(CurrentFunction->getBody(), VD, Call))
+      return;
+    S.Diag(Call->getArg(From)->getExprLoc(),
+           diag::warn_linux_kernel_struct_leak)
+        << VD << Name << unsigned(*Padding)
+        << Call->getArg(From)->getSourceRange();
+    if (After)
+      S.Diag(After->getLocation(), diag::note_linux_kernel_struct_hole)
+          << Ctx.getCanonicalTagType(In) << After;
+    else
+      S.Diag(In->getLocation(), diag::note_linux_kernel_struct_tail)
+          << Ctx.getCanonicalTagType(In);
+    S.Diag(VD->getLocation(), diag::note_linux_kernel_declared_no_init) << VD;
+  }
+
+  /// snprintf() and its relatives are told how large the buffer is.  A size
+  /// that is larger than the array they write to lets them run past it:
+  ///
+  ///   char buf[128];
+  ///   len += scnprintf(buf + len, PAGE_SIZE - len, ...);
+  void checkBufferSize(const CallExpr *Call, StringRef Name) {
+    if (!llvm::StringSwitch<bool>(Name)
+             .Cases({"snprintf", "scnprintf", "vsnprintf", "vscnprintf"}, true)
+             .Default(false) ||
+        Call->getNumArgs() < 2)
+      return;
+    ASTContext &Ctx = S.getASTContext();
+    // The buffer: an array, or a position inside one.
+    const Expr *Buffer = Call->getArg(0)->IgnoreParenCasts();
+    if (const auto *BO = dyn_cast<BinaryOperator>(Buffer);
+        BO && BO->getOpcode() == BO_Add)
+      Buffer = BO->getLHS()->IgnoreParenCasts();
+    if (const auto *UO = dyn_cast<UnaryOperator>(Buffer);
+        UO && UO->getOpcode() == UO_AddrOf)
+      if (const auto *ASE =
+              dyn_cast<ArraySubscriptExpr>(UO->getSubExpr()->IgnoreParens()))
+        Buffer = ASE->getBase()->IgnoreParenCasts();
+    const ConstantArrayType *AT = Ctx.getAsConstantArrayType(Buffer->getType());
+    if (!AT || !isSimpleLinuxStorage(Buffer))
+      return;
+    uint64_t Have = Ctx.getTypeSizeInChars(Buffer->getType()).getQuantity();
+    // The size: a constant, or a constant minus what was written so far.
+    const Expr *SizeArg = Call->getArg(1)->IgnoreParenImpCasts();
+    if (const auto *BO = dyn_cast<BinaryOperator>(SizeArg);
+        BO && BO->getOpcode() == BO_Sub)
+      SizeArg = BO->getLHS()->IgnoreParenImpCasts();
+    Expr::EvalResult Given;
+    if (SizeArg->isValueDependent() || !SizeArg->EvaluateAsInt(Given, Ctx) ||
+        Given.Val.getInt().isNegative() ||
+        Given.Val.getInt().getActiveBits() > 63 ||
+        Given.Val.getInt().getZExtValue() <= Have)
+      return;
+    S.Diag(Call->getArg(1)->getExprLoc(), diag::warn_linux_kernel_buffer_size)
+        << Name << toString(Given.Val.getInt(), 10)
+        << getLinuxExprText(Buffer, S) << unsigned(Have)
+        << Call->getArg(1)->getSourceRange();
+  }
+
+  /// What "index > Bound" compares, if \p Cond is such a test.
+  struct BoundTest {
+    const VarDecl *Index = nullptr;
+    const Expr *Bound = nullptr;
+    const Expr *Test = nullptr;
+  };
+
+  void collectBoundTests(const Expr *Cond, bool WhenTrue,
+                         llvm::SmallVectorImpl<BoundTest> &Out) const {
+    bool Negated = false;
+    const Expr *E = stripLinuxCondition(Cond, Negated);
+    if (!E)
+      return;
+    bool Holds = WhenTrue != Negated;
+    const auto *BO = dyn_cast<BinaryOperator>(E->IgnoreParenImpCasts());
+    if (!BO)
+      return;
+    if (BO->isLogicalOp()) {
+      // "a || b" being false says that both are, "a && b" being true too.
+      if ((BO->getOpcode() == BO_LOr) != Holds) {
+        collectBoundTests(BO->getLHS(), Holds, Out);
+        collectBoundTests(BO->getRHS(), Holds, Out);
+      }
+      return;
+    }
+    // The region that is entered when "index > bound" is false, or when
+    // "index <= bound" is true, has index <= bound.
+    const VarDecl *Index = nullptr;
+    const Expr *Bound = nullptr;
+    BinaryOperatorKind Op = BO->getOpcode();
+    if ((Op == BO_GT && !Holds) || (Op == BO_LE && Holds)) {
+      Index = getDirectLinuxVariable(BO->getLHS());
+      Bound = BO->getRHS();
+    } else if ((Op == BO_LT && !Holds) || (Op == BO_GE && Holds)) {
+      Index = getDirectLinuxVariable(BO->getRHS());
+      Bound = BO->getLHS();
+    }
+    if (Index && Bound &&
+        !isWrittenInMacro(BO->getOperatorLoc(), S.getSourceManager()))
+      Out.push_back({Index, Bound->IgnoreParenImpCasts(), BO});
+  }
+
+  /// Whether \p Bound is the number of elements of the array \p Base: its
+  /// constant size, or the member that __counted_by() names for it.
+  bool isElementCount(const Expr *Bound, const Expr *Base,
+                      std::string &Count) const {
+    ASTContext &Ctx = S.getASTContext();
+    Base = Base->IgnoreParenImpCasts();
+    if (const ConstantArrayType *AT =
+            Ctx.getAsConstantArrayType(Base->getType())) {
+      Expr::EvalResult R;
+      if (Bound->isValueDependent() || !Bound->EvaluateAsInt(R, Ctx) ||
+          R.Val.getInt().getActiveBits() > 63 ||
+          R.Val.getInt().getZExtValue() != AT->getZExtSize() ||
+          AT->getZExtSize() < 2)
+        return false;
+      Count = std::to_string(AT->getZExtSize());
+      return true;
+    }
+    const auto *Array = dyn_cast<MemberExpr>(Base);
+    const auto *Counter = dyn_cast<MemberExpr>(Bound);
+    const auto *ArrayField =
+        Array ? dyn_cast<FieldDecl>(Array->getMemberDecl()) : nullptr;
+    if (!ArrayField || !Counter ||
+        Counter->getMemberDecl() != ArrayField->findCountedByField() ||
+        !isSameLinuxExpr(Ctx, Array->getBase(), Counter->getBase()))
+      return false;
+    Count = "'" + getLinuxExprText(Counter, S) + "'";
+    return true;
+  }
+
+  bool findOffByOne(const Stmt *St, const BoundTest &T) {
+    if (!St)
+      return false;
+    if (const auto *BO = dyn_cast<BinaryOperator>(St))
+      if (BO->isAssignmentOp() && getDirectLinuxVariable(BO->getLHS()) == T.Index)
+        return true; // the index changes: stop looking
+    if (const auto *UO = dyn_cast<UnaryOperator>(St))
+      if (UO->isIncrementDecrementOp() &&
+          getDirectLinuxVariable(UO->getSubExpr()) == T.Index)
+        return true;
+    if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(St)) {
+      std::string Count;
+      if (getDirectLinuxVariable(ASE->getIdx()) == T.Index &&
+          isElementCount(T.Bound, ASE->getBase(), Count)) {
+        S.Diag(ASE->getIdx()->getExprLoc(), diag::warn_linux_kernel_off_by_one)
+            << T.Index->getName() << Count
+            << getLinuxExprText(ASE->getBase()->IgnoreParenImpCasts(), S)
+            << ASE->getSourceRange();
+        S.Diag(T.Test->getExprLoc(), diag::note_linux_kernel_bounds_test_here)
+            << T.Test->getSourceRange();
+        return true;
+      }
+    }
+    for (const Stmt *Child : St->children())
+      if (findOffByOne(Child, T))
+        return true;
+    return false;
+  }
+
+  /// "if (i > ARRAY_SIZE(table)) return; ... table[i]": the test lets the
+  /// index be the number of elements, which is one past the last.
+  void checkOffByOne(const Expr *Cond, const Stmt *WhenTrue,
+                     const Stmt *WhenFalse, ArrayRef<const Stmt *> After) {
+    if (!Cond)
+      return;
+    for (bool Outcome : {true, false}) {
+      const Stmt *Region = Outcome ? WhenTrue : WhenFalse;
+      const Stmt *OtherRegion = Outcome ? WhenFalse : WhenTrue;
+      llvm::SmallVector<BoundTest, 2> Tests;
+      collectBoundTests(Cond, Outcome, Tests);
+      for (const BoundTest &T : Tests) {
+        if (Region && findOffByOne(Region, T))
+          continue;
+        // What follows the statement is reached with this outcome if the
+        // other branch leaves.
+        if (OtherRegion && leavesFunctionOrLoop(OtherRegion))
+          for (const Stmt *Next : After)
+            if (findOffByOne(Next, T))
+              break;
+      }
+    }
+  }
+
+  static bool leavesFunctionOrLoop(const Stmt *St) {
+    while (St) {
+      if (isa<ReturnStmt, GotoStmt, BreakStmt, ContinueStmt>(St))
+        return true;
+      if (const auto *CS = dyn_cast<CompoundStmt>(St))
+        St = CS->body_empty() ? nullptr : CS->body_back();
+      else if (const auto *AS = dyn_cast<AttributedStmt>(St))
+        St = AS->getSubStmt();
+      else
+        return false;
+    }
+    return false;
+  }
+
+  /// The line and the column at which a statement starts, if it is the
+  /// first thing on its line.  Tabs count as up to eight columns.
+  bool getStatementStart(const Stmt *St, FileID &File, unsigned &Line,
+                         unsigned &Column) const {
+    const SourceManager &SM = S.getSourceManager();
+    SourceLocation Loc = SM.getExpansionLoc(St->getBeginLoc());
+    if (Loc.isInvalid())
+      return false;
+    auto [FID, Offset] = SM.getDecomposedLoc(Loc);
+    bool Invalid = false;
+    StringRef Text = SM.getBufferData(FID, &Invalid);
+    if (Invalid || Offset > Text.size())
+      return false;
+    size_t Begin = Text.rfind('\n', Offset ? Offset - 1 : 0);
+    Begin = Begin == StringRef::npos || Offset == 0 ? 0 : Begin + 1;
+    if (Begin > Offset)
+      return false;
+    unsigned Col = 0;
+    for (char C : Text.substr(Begin, Offset - Begin)) {
+      if (C == '\t')
+        Col = (Col / 8 + 1) * 8;
+      else if (C == ' ')
+        ++Col;
+      else
+        return false; // something else comes first on the line
+    }
+    File = FID;
+    Line = SM.getLineNumber(FID, Offset);
+    Column = Col;
+    return true;
+  }
+
+  /// Two statements of one block that start in different columns.  The
+  /// second one was often meant to be under the "if" above it.
+  void checkIndentation(const CompoundStmt *CS) {
+    if (S.getDiagnostics().isIgnored(
+            diag::warn_linux_kernel_inconsistent_indent, CS->getLBracLoc()) ||
+        CS->getLBracLoc().isMacroID())
+      return;
+    const Stmt *Previous = nullptr;
+    FileID PrevFile;
+    unsigned PrevLine = 0, PrevColumn = 0;
+    for (const Stmt *Child : CS->body()) {
+      // The labels of a switch and of goto sit to the left by convention.
+      if (isa<SwitchCase, LabelStmt, NullStmt>(Child) ||
+          Child->getBeginLoc().isMacroID()) {
+        Previous = nullptr;
+        continue;
+      }
+      FileID File;
+      unsigned Line, Column;
+      if (!getStatementStart(Child, File, Line, Column)) {
+        Previous = nullptr;
+        continue;
+      }
+      if (Previous && File == PrevFile && Line > PrevLine &&
+          Column != PrevColumn) {
+        S.Diag(Child->getBeginLoc(),
+               diag::warn_linux_kernel_inconsistent_indent)
+            << Child->getSourceRange();
+        S.Diag(Previous->getBeginLoc(),
+               diag::note_linux_kernel_previous_statement);
+        // One report for a block: what follows is in line with one of the
+        // two again.
+        return;
+      }
+      Previous = Child;
+      PrevFile = File;
+      PrevLine = Line;
+      PrevColumn = Column;
+    }
   }
 
   void checkAllocatorRelease(const CallExpr *Call, StringRef Releaser) {
@@ -2245,6 +2928,7 @@ public:
 
   bool VisitMemberExpr(MemberExpr *ME) override {
     checkErrorPointerDeref(ME);
+    checkUncheckedAllocation(ME);
     return true;
   }
 
@@ -2286,6 +2970,9 @@ public:
   }
 
   bool TraverseConditionalOperator(ConditionalOperator *CO) override {
+    if (!S.getDiagnostics().isIgnored(diag::warn_linux_kernel_off_by_one,
+                                      CO->getQuestionLoc()))
+      checkOffByOne(CO->getCond(), CO->getTrueExpr(), CO->getFalseExpr(), {});
     ++ControlFlowDepth;
     bool Result = DynamicRecursiveASTVisitor::TraverseConditionalOperator(CO);
     --ControlFlowDepth;
@@ -2293,6 +2980,16 @@ public:
   }
 
   bool VisitCompoundStmt(CompoundStmt *CS) override {
+    checkIndentation(CS);
+    if (!S.getDiagnostics().isIgnored(diag::warn_linux_kernel_off_by_one,
+                                      CS->getLBracLoc())) {
+      ArrayRef<const Stmt *> Body(CS->body_begin(), CS->body_end());
+      for (unsigned I = 0, E = Body.size(); I != E; ++I)
+        if (const auto *IS = dyn_cast<IfStmt>(stripStatementLabels(Body[I])))
+          checkOffByOne(IS->getCond(), IS->getThen(), IS->getElse(),
+                        Body.drop_front(I + 1));
+    }
+
     const Stmt *Previous = nullptr;
     // The run of assignments that ends right before Previous.
     llvm::SmallVector<const Stmt *, 8> EarlierStores;
@@ -2310,12 +3007,23 @@ public:
     return true;
   }
 
+  /// An allocation with __GFP_NOFAIL does not return NULL.
+  void noteAllocationFlags(const VarDecl *VD, const Expr *Value) {
+    if (Value && getLinuxExprText(Value, S).find("__GFP_NOFAIL") !=
+                     std::string::npos)
+      AllocationsThatCannotFail.insert(VD);
+    else
+      AllocationsThatCannotFail.erase(VD);
+  }
+
   bool VisitVarDecl(VarDecl *VD) override {
     if (AssignmentTrackingDisabled || !VD->hasLocalStorage() || !VD->hasInit())
       return true;
     LinuxKernelAPIOrigin Origin = getOrigin(VD->getInit());
-    if (Origin)
+    if (Origin) {
       VariableOrigins[VD] = Origin;
+      noteAllocationFlags(VD, VD->getInit());
+    }
     return true;
   }
 
@@ -2372,6 +3080,9 @@ public:
       return true;
 
     StringRef CheckerName = Checker->getName();
+    checkBitopsCast(Call, CheckerName);
+    checkStructLeak(Call, CheckerName);
+    checkBufferSize(Call, CheckerName);
     if (CheckerName == "kfree" || CheckerName == "kfree_sensitive" ||
         CheckerName == "vfree" || CheckerName == "kvfree" ||
         CheckerName == "kvfree_sensitive" || CheckerName == "devm_kfree" ||
@@ -2427,6 +3138,20 @@ public:
     return true;
   }
 
+  bool VisitCastExpr(CastExpr *CE) override {
+    // "(u32)(x & ~mask)" and "u32 y = x & ~mask" do not care about the upper
+    // bits.  The cast is visited before the operator below it.
+    if (CE->getCastKind() == CK_IntegralCast) {
+      ASTContext &Ctx = S.getASTContext();
+      const Expr *Sub = CE->getSubExpr()->IgnoreParens();
+      if (const auto *BO = dyn_cast<BinaryOperator>(Sub);
+          BO && BO->getOpcode() == BO_And &&
+          Ctx.getIntWidth(CE->getType()) < Ctx.getIntWidth(Sub->getType()))
+        NarrowedAnds.insert(BO);
+    }
+    return true;
+  }
+
   bool VisitImplicitCastExpr(ImplicitCastExpr *ICE) override {
     if (ICE->getCastKind() != CK_IntegralToBoolean)
       return true;
@@ -2450,6 +3175,7 @@ public:
   bool VisitBinaryOperator(BinaryOperator *BO) override {
     recordCombinedErrorPointerGuard(BO);
     checkCleanupEscape(BO);
+    checkZeroExtendedComplement(BO);
 
     if (BO->isAssignmentOp()) {
       const auto *DRE =
@@ -2463,10 +3189,12 @@ public:
         LinuxKernelAPIOrigin Origin =
             CanTrack ? getOrigin(BO->getRHS()) : LinuxKernelAPIOrigin{};
         if (VD) {
-          if (Origin)
+          if (Origin) {
             VariableOrigins[VD] = Origin;
-          else
+            noteAllocationFlags(VD, BO->getRHS());
+          } else {
             VariableOrigins.erase(VD);
+          }
         }
         if (Field) {
           if (Origin)
@@ -3808,6 +4536,1976 @@ public:
   }
 };
 
+/// What a path knows about an integer or a pointer: whether it can still be
+/// negative, zero or positive, and the number itself once a test or an
+/// assignment has pinned it down.  For a pointer, negative stands for an
+/// ERR_PTR() value and positive for a valid address.
+struct LinuxPathValue {
+  enum : uint8_t { Neg = 1, Zero = 2, Pos = 4, Any = Neg | Zero | Pos };
+  uint8_t Mask = Any;
+  bool HasConst = false;
+  int64_t Const = 0;
+
+  static LinuxPathValue constant(int64_t V) {
+    LinuxPathValue R;
+    R.Mask = V < 0 ? Neg : V == 0 ? Zero : Pos;
+    R.HasConst = true;
+    R.Const = V;
+    return R;
+  }
+
+  static LinuxPathValue ofMask(uint8_t M) {
+    if (M == Zero)
+      return constant(0);
+    LinuxPathValue R;
+    R.Mask = M;
+    return R;
+  }
+
+  static LinuxPathValue join(const LinuxPathValue &A, const LinuxPathValue &B) {
+    return A == B ? A : ofMask(A.Mask | B.Mask);
+  }
+
+  bool isAny() const { return Mask == Any; }
+
+  bool operator==(const LinuxPathValue &O) const {
+    return Mask == O.Mask && HasConst == O.HasConst &&
+           (!HasConst || Const == O.Const);
+  }
+
+  /// The value as a condition, if it is decided.
+  std::optional<bool> truth() const {
+    if (Mask == Zero)
+      return false;
+    if (!(Mask & Zero))
+      return true;
+    return std::nullopt;
+  }
+};
+
+/// A bounded search over the paths of one function, for checks that need to
+/// know that a single path does something wrong: that it dereferences a
+/// pointer after a test has found it to be NULL, or that it returns an error
+/// while it still holds a resource.
+///
+/// The search starts at a point that the check chooses and walks the CFG
+/// forward.  Each path carries what it has learned on its way: the values of
+/// some locations, as far as assignments and branch conditions have pinned
+/// them down, and the outcome of some conditions without side effects.  A
+/// location is a local variable or a chain of members that starts at one
+/// ("dev->priv").  At a branch whose condition the path already decides,
+/// only the matching edge is followed, so that in
+///
+///   if (!p)
+///     ret = -ENODEV;
+///   if (ret)
+///     return ret;
+///   use(p->member);
+///
+/// no path arrives at the dereference with p being NULL.
+///
+/// To keep the number of states small, a path only keeps what can make a
+/// difference later: values of locations that some branch condition of the
+/// function reads, and outcomes of conditions that occur more than once.
+/// The search gives up when it exceeds its budget, and a check then reports
+/// nothing.
+class LinuxPathSearch {
+public:
+  using Value = LinuxPathValue;
+
+  struct State {
+    /// Sorted by location and by condition.  A location without an entry
+    /// can have any value.
+    llvm::SmallVector<std::pair<unsigned, Value>, 4> Vals;
+    llvm::SmallVector<std::pair<unsigned, bool>, 4> Preds;
+    /// For the check that runs the search.
+    uint32_t Client = 0;
+
+    bool operator==(const State &O) const {
+      return Client == O.Client && Vals == O.Vals && Preds == O.Preds;
+    }
+  };
+
+  class Client {
+  public:
+    virtual ~Client() = default;
+    /// The path executes \p S.  This is called before the statement changes
+    /// the state.  Returning false ends the path.
+    virtual bool statement(const Stmt *S, State &St) = 0;
+    /// The path leaves \p From for \p To.  Returning false ends the path.
+    virtual bool edge(const CFGBlock *From, const CFGBlock *To, State &St) {
+      return true;
+    }
+  };
+
+private:
+  static constexpr unsigned MaxLocations = 96;
+  static constexpr unsigned MaxConditions = 64;
+  static constexpr unsigned MaxStatesPerBlock = 16;
+  /// Budget for one search: block visits plus statements.
+  static constexpr unsigned MaxSteps = 20000;
+  /// Budget for all searches in one function.
+  static constexpr unsigned MaxFunctionSteps = 600000;
+
+  const CFG &Cfg;
+  ASTContext &Ctx;
+
+  struct Location {
+    const VarDecl *Root = nullptr;
+    /// The members from the root down.  Empty for the variable itself.
+    llvm::SmallVector<const FieldDecl *, 3> Path;
+    /// The number of branch conditions that read the location.
+    unsigned Sites = 0;
+    /// A check asked for the value to be kept.
+    bool Pinned = false;
+  };
+
+  struct Condition {
+    llvm::FoldingSetNodeID ID;
+    llvm::SmallVector<unsigned, 2> Locations;
+    bool ReadsMemory = false;
+    unsigned Sites = 0;
+  };
+
+  std::vector<Location> Locations;
+  std::vector<Condition> Conditions;
+  llvm::SmallPtrSet<const VarDecl *, 16> AddressTaken;
+  unsigned FunctionSteps = 0;
+  unsigned Steps = 0;
+  bool Stopped = false;
+  bool GaveUp = false;
+
+  /// Strip what does not change the value or the object that \p E names.
+  static const Expr *stripNoOps(const Expr *E) {
+    while (E) {
+      E = E->IgnoreParens();
+      const auto *ICE = dyn_cast<ImplicitCastExpr>(E);
+      if (!ICE || (ICE->getCastKind() != CK_LValueToRValue &&
+                   ICE->getCastKind() != CK_NoOp))
+        break;
+      E = ICE->getSubExpr();
+    }
+    return E;
+  }
+
+  static bool decompose(const Expr *E, const VarDecl *&Root,
+                        llvm::SmallVectorImpl<const FieldDecl *> &Path) {
+    E = stripNoOps(E);
+    if (!E)
+      return false;
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+      Root = dyn_cast<VarDecl>(DRE->getDecl());
+      return Root && Root->hasLocalStorage() &&
+             !Root->getType().isVolatileQualified();
+    }
+    const auto *ME = dyn_cast<MemberExpr>(E);
+    const auto *FD = ME ? dyn_cast<FieldDecl>(ME->getMemberDecl()) : nullptr;
+    if (!FD || FD->getType().isVolatileQualified() ||
+        !decompose(ME->getBase(), Root, Path) || Path.size() >= 4)
+      return false;
+    Path.push_back(FD);
+    return true;
+  }
+
+  static bool isTrackedType(QualType T) {
+    return !T.isVolatileQualified() &&
+           (T->isIntegralOrEnumerationType() || T->isPointerType());
+  }
+
+  void collectAddressTaken(const Stmt *St) {
+    if (!St)
+      return;
+    if (const auto *UO = dyn_cast<UnaryOperator>(St)) {
+      if (UO->getOpcode() == UO_AddrOf)
+        if (const VarDecl *VD = getDirectLinuxVariable(UO->getSubExpr()))
+          AddressTaken.insert(VD);
+    } else if (const auto *AS = dyn_cast<GCCAsmStmt>(St)) {
+      for (unsigned I = 0, E = AS->getNumOutputs(); I != E; ++I)
+        if (const VarDecl *VD = getDirectLinuxVariable(AS->getOutputExpr(I)))
+          AddressTaken.insert(VD);
+    }
+    for (const Stmt *Child : St->children())
+      collectAddressTaken(Child);
+  }
+
+  static bool mentions(const Stmt *St, const VarDecl *VD) {
+    if (!St)
+      return false;
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(St))
+      if (DRE->getDecl() == VD)
+        return true;
+    for (const Stmt *Child : St->children())
+      if (mentions(Child, VD))
+        return true;
+    return false;
+  }
+
+  /// Collect what a condition reads.  Returns false if evaluating it could
+  /// have a side effect.
+  bool scanCondition(const Stmt *St, Condition &C) {
+    if (!St)
+      return true;
+    if (const auto *E = dyn_cast<Expr>(St)) {
+      if (E->getType().isVolatileQualified())
+        return false;
+      int Loc = locate(E);
+      if (Loc >= 0) {
+        if (!llvm::is_contained(C.Locations, unsigned(Loc)))
+          C.Locations.push_back(Loc);
+        if (!Locations[Loc].Path.empty())
+          C.ReadsMemory = true;
+        return true;
+      }
+    }
+    switch (St->getStmtClass()) {
+    case Stmt::DeclRefExprClass:
+      if (isa<VarDecl>(cast<DeclRefExpr>(St)->getDecl()))
+        C.ReadsMemory = true;
+      return true;
+    case Stmt::MemberExprClass:
+    case Stmt::ArraySubscriptExprClass:
+      C.ReadsMemory = true;
+      break;
+    case Stmt::UnaryOperatorClass: {
+      const auto *UO = cast<UnaryOperator>(St);
+      if (UO->isIncrementDecrementOp())
+        return false;
+      if (UO->getOpcode() == UO_Deref)
+        C.ReadsMemory = true;
+      break;
+    }
+    case Stmt::BinaryOperatorClass:
+      if (cast<BinaryOperator>(St)->isAssignmentOp())
+        return false;
+      break;
+    case Stmt::CallExprClass: {
+      const auto *CE = cast<CallExpr>(St);
+      unsigned ID = CE->getBuiltinCallee();
+      if (ID != Builtin::BI__builtin_expect &&
+          ID != Builtin::BI__builtin_expect_with_probability &&
+          ID != Builtin::BI__builtin_constant_p) {
+        const FunctionDecl *FD = CE->getDirectCallee();
+        if (!FD || !(FD->hasAttr<ConstAttr>() || FD->hasAttr<PureAttr>() ||
+                     isErrorPointerHelper(FD)))
+          return false;
+        if (FD->hasAttr<PureAttr>())
+          C.ReadsMemory = true;
+      }
+      break;
+    }
+    case Stmt::CompoundAssignOperatorClass:
+    case Stmt::StmtExprClass:
+    case Stmt::VAArgExprClass:
+    case Stmt::AtomicExprClass:
+    case Stmt::ConditionalOperatorClass:
+    case Stmt::BinaryConditionalOperatorClass:
+      return false;
+    default:
+      break;
+    }
+    for (const Stmt *Child : St->children())
+      if (!scanCondition(Child, C))
+        return false;
+    return true;
+  }
+
+  /// The index of the condition \p E, which is already stripped, or -1 if
+  /// it has a side effect or there is no room for it.
+  int conditionIndex(const Expr *E, bool Create) {
+    llvm::FoldingSetNodeID ID;
+    E->Profile(ID, Ctx, /*Canonical=*/true);
+    for (unsigned I = 0, N = Conditions.size(); I != N; ++I)
+      if (Conditions[I].ID == ID)
+        return I;
+    if (!Create || Conditions.size() >= MaxConditions)
+      return -1;
+    Condition C;
+    if (!scanCondition(E, C))
+      return -1;
+    C.ID = ID;
+    Conditions.push_back(std::move(C));
+    return Conditions.size() - 1;
+  }
+
+  /// Count how often the function branches on each location and on each
+  /// condition.
+  void countSites() {
+    for (const CFGBlock *B : Cfg) {
+      const Expr *Cond = nullptr;
+      if (isConditionalBranch(B))
+        Cond = getBranchCondition(B);
+      else if (const auto *SS =
+                   dyn_cast_or_null<SwitchStmt>(B->getTerminatorStmt()))
+        Cond = SS->getCond();
+      if (!Cond)
+        continue;
+      bool Negated = false;
+      const Expr *E = stripLinuxCondition(Cond, Negated);
+      if (!E)
+        continue;
+      Condition Reads;
+      scanCondition(E, Reads);
+      for (unsigned Loc : Reads.Locations)
+        Locations[Loc].Sites += isa<SwitchStmt>(B->getTerminatorStmt()) ? 2 : 1;
+      if (isConditionalBranch(B) && locate(E) < 0) {
+        int I = conditionIndex(E, /*Create=*/true);
+        if (I >= 0)
+          ++Conditions[I].Sites;
+      }
+    }
+    // What the function returns says whether a path ends in an error.
+    for (const CFGBlock *B : Cfg)
+      for (const CFGElement &Elem : *B)
+        if (std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>())
+          if (const auto *RS = dyn_cast<ReturnStmt>(CS->getStmt())) {
+            int Loc = locate(RS->getRetValue());
+            if (Loc >= 0)
+              Locations[Loc].Pinned = true;
+          }
+  }
+
+  bool keeps(unsigned Loc) const {
+    return Locations[Loc].Pinned || Locations[Loc].Sites >= 1;
+  }
+
+  /// Whether \p L is the object that \p Root and \p Path name, or a member
+  /// chain that goes through it.
+  static bool isUnder(const Location &L, const VarDecl *Root,
+                      ArrayRef<const FieldDecl *> Path, bool Strictly) {
+    if (L.Root != Root || L.Path.size() < Path.size() ||
+        (Strictly && L.Path.size() == Path.size()))
+      return false;
+    return std::equal(Path.begin(), Path.end(), L.Path.begin());
+  }
+
+  /// The object that \p Root and \p Path name gets a new value: forget the
+  /// conditions that read it and the member chains that go through it.
+  void invalidate(const VarDecl *Root, ArrayRef<const FieldDecl *> Path,
+                  State &St) const {
+    llvm::erase_if(St.Preds, [&](const std::pair<unsigned, bool> &P) {
+      return llvm::any_of(Conditions[P.first].Locations, [&](unsigned L) {
+        return isUnder(Locations[L], Root, Path, /*Strictly=*/false);
+      });
+    });
+    llvm::erase_if(St.Vals, [&](const std::pair<unsigned, Value> &V) {
+      return isUnder(Locations[V.first], Root, Path, /*Strictly=*/true);
+    });
+  }
+
+  int find(const VarDecl *Root, ArrayRef<const FieldDecl *> Path) const {
+    for (unsigned I = 0, N = Locations.size(); I != N; ++I)
+      if (Locations[I].Root == Root && ArrayRef(Locations[I].Path) == Path)
+        return I;
+    return -1;
+  }
+
+  /// "LHS = ...": \p V is what the path knows about the new value.
+  void assign(const Expr *LHS, Value V, State &St) {
+    const VarDecl *Root = nullptr;
+    llvm::SmallVector<const FieldDecl *, 3> Path;
+    if (!decompose(LHS, Root, Path)) {
+      storeToMemory(LHS, St);
+      return;
+    }
+    invalidate(Root, Path, St);
+    if (!Path.empty()) {
+      // The same member of another object may be the same memory.
+      forgetMemoryConditions(St);
+      const FieldDecl *FD = Path.back();
+      llvm::erase_if(St.Vals, [&](const std::pair<unsigned, Value> &O) {
+        return llvm::is_contained(Locations[O.first].Path, FD);
+      });
+    }
+    int Loc = find(Root, Path);
+    if (Loc >= 0 && (Path.empty() ? !AddressTaken.count(Root) : true))
+      set(St, Loc, keeps(Loc) ? V : Value());
+  }
+
+  void forgetMemoryConditions(State &St) const {
+    llvm::erase_if(St.Preds, [&](const std::pair<unsigned, bool> &P) {
+      return Conditions[P.first].ReadsMemory;
+    });
+  }
+
+  /// A store to memory that is not a location of its own: it may hit any
+  /// member chain that ends in the same member or has the same type.
+  void storeToMemory(const Expr *LHS, State &St) const {
+    forgetMemoryConditions(St);
+    const auto *ME = dyn_cast<MemberExpr>(LHS->IgnoreParens());
+    const auto *FD = ME ? dyn_cast<FieldDecl>(ME->getMemberDecl()) : nullptr;
+    QualType T = LHS->getType().getCanonicalType().getUnqualifiedType();
+    llvm::erase_if(St.Vals, [&](const std::pair<unsigned, Value> &V) {
+      const Location &L = Locations[V.first];
+      if (L.Path.empty())
+        return false;
+      if (FD)
+        return llvm::is_contained(L.Path, FD);
+      return L.Path.back()->getType().getCanonicalType().getUnqualifiedType() ==
+             T;
+    });
+  }
+
+  /// A call can change every member chain whose root object it can reach
+  /// through its arguments.
+  void call(const CallExpr *CE, State &St) const {
+    unsigned ID = CE->getBuiltinCallee();
+    if (ID == Builtin::BI__builtin_expect ||
+        ID == Builtin::BI__builtin_expect_with_probability ||
+        ID == Builtin::BI__builtin_constant_p)
+      return;
+    const FunctionDecl *FD = CE->getDirectCallee();
+    if (FD && (FD->hasAttr<ConstAttr>() || FD->hasAttr<PureAttr>() ||
+               isErrorPointerHelper(FD) || onlyReadsArguments(FD)))
+      return;
+    forgetMemoryConditions(St);
+    llvm::erase_if(St.Vals, [&](const std::pair<unsigned, Value> &V) {
+      const Location &L = Locations[V.first];
+      if (L.Path.empty())
+        return false;
+      if (mentions(CE->getCallee(), L.Root))
+        return true;
+      for (const Expr *Arg : CE->arguments())
+        if (mentions(Arg, L.Root))
+          return true;
+      return false;
+    });
+  }
+
+  void transfer(const Stmt *Node, State &St) {
+    if (const auto *DS = dyn_cast<DeclStmt>(Node)) {
+      for (const Decl *D : DS->decls())
+        if (const auto *VD = dyn_cast<VarDecl>(D); VD && VD->hasLocalStorage())
+          if (int Loc = find(VD, {}); Loc >= 0)
+            store(Loc, VD->getInit() ? value(VD->getInit(), St) : Value(), St);
+    } else if (const auto *BO = dyn_cast<BinaryOperator>(Node)) {
+      if (BO->isAssignmentOp())
+        assign(BO->getLHS(),
+               BO->getOpcode() == BO_Assign ? value(BO->getRHS(), St) : Value(),
+               St);
+    } else if (const auto *UO = dyn_cast<UnaryOperator>(Node)) {
+      if (UO->isIncrementDecrementOp())
+        assign(UO->getSubExpr(), Value(), St);
+    } else if (const auto *CE = dyn_cast<CallExpr>(Node)) {
+      call(CE, St);
+    } else if (isa<GCCAsmStmt>(Node)) {
+      // Inline assembly can change whatever its operands reach.
+      St.Vals.clear();
+      St.Preds.clear();
+    }
+  }
+
+  /// Whether the switch \p SS, on a value known to be \p K, goes to \p Next.
+  bool switchSelects(const SwitchStmt *SS, const CFGBlock *Next,
+                     int64_t K) const {
+    auto Matches = [&](const CaseStmt *CS) {
+      llvm::APSInt Low = CS->getLHS()->EvaluateKnownConstInt(Ctx);
+      llvm::APSInt High =
+          CS->getRHS() ? CS->getRHS()->EvaluateKnownConstInt(Ctx) : Low;
+      llvm::APSInt V(llvm::APInt(64, uint64_t(K), /*isSigned=*/true),
+                     /*isUnsigned=*/false);
+      return llvm::APSInt::compareValues(Low, V) <= 0 &&
+             llvm::APSInt::compareValues(V, High) <= 0;
+    };
+    bool AnyCase = false;
+    for (const SwitchCase *SC = SS->getSwitchCaseList(); SC;
+         SC = SC->getNextSwitchCase())
+      if (const auto *CS = dyn_cast<CaseStmt>(SC))
+        AnyCase |= Matches(CS);
+    bool HasLabel = false;
+    for (const Stmt *L = Next->getLabel(); L && isa<SwitchCase>(L);
+         L = cast<SwitchCase>(L)->getSubStmt()) {
+      HasLabel = true;
+      if (const auto *CS = dyn_cast<CaseStmt>(L)) {
+        if (Matches(CS))
+          return true;
+      } else if (!AnyCase) {
+        return true; // the default label
+      }
+    }
+    // The statement after a switch without a default label.
+    return !HasLabel && !AnyCase;
+  }
+
+  bool push(const CFGBlock *B, const State &St,
+            llvm::DenseMap<unsigned, llvm::SmallVector<State, 2>> &Seen,
+            llvm::SmallVectorImpl<std::pair<const CFGBlock *, State>> &Work) {
+    llvm::SmallVectorImpl<State> &Set = Seen[B->getBlockID()];
+    if (llvm::is_contained(Set, St))
+      return false;
+    if (Set.size() >= MaxStatesPerBlock) {
+      GaveUp = true;
+      return false;
+    }
+    Set.push_back(St);
+    Work.push_back({B, St});
+    return true;
+  }
+
+public:
+  LinuxPathSearch(ASTContext &Ctx, const FunctionDecl *FD, const CFG &Cfg)
+      : Cfg(Cfg), Ctx(Ctx) {
+    collectAddressTaken(FD->getBody());
+    countSites();
+  }
+
+  /// A function that returns or tests an error pointer, or converts one:
+  /// these have no side effect and the search knows what they compute.
+  static bool isErrorPointerHelper(const FunctionDecl *FD) {
+    if (!FD->getIdentifier())
+      return false;
+    return llvm::StringSwitch<bool>(FD->getName())
+        .Cases({"IS_ERR", "IS_ERR_OR_NULL", "PTR_ERR", "ERR_PTR", "ERR_CAST",
+                "PTR_ERR_OR_ZERO"},
+               true)
+        .Default(false);
+  }
+
+  /// A function that prints or compares what it is given and stores
+  /// nothing through its arguments.
+  static bool onlyReadsArguments(const FunctionDecl *FD) {
+    if (!FD->getIdentifier())
+      return false;
+    StringRef Name = FD->getName();
+    if (llvm::StringSwitch<bool>(Name)
+            .Cases({"_printk", "printk", "_dev_printk", "dev_printk_emit",
+                    "dev_err_probe", "dev_warn_probe", "dump_stack"},
+                   true)
+            .Cases({"strlen", "strcmp", "strncmp", "strcasecmp", "memcmp",
+                    "strnlen", "strchr", "strrchr", "strstr"},
+                   true)
+            .Cases({"kfree", "kvfree", "vfree", "kfree_sensitive"}, true)
+            .Default(false))
+      return true;
+    return Name.starts_with("_dev_") || Name.starts_with("netdev_") ||
+           Name.starts_with("__dynamic_") || Name.starts_with("__warn") ||
+           Name.starts_with("trace_") || Name.starts_with("__trace");
+  }
+
+  /// The condition that decides which way \p B branches.  A block that ends
+  /// in "if (a && b)" evaluates only b.
+  static const Expr *getBranchCondition(const CFGBlock *B) {
+    const Expr *Cond = cast<Expr>(B->getTerminatorCondition());
+    for (;;) {
+      const auto *BO = dyn_cast<BinaryOperator>(Cond->IgnoreParens());
+      if (!BO || !BO->isLogicalOp())
+        return Cond;
+      Cond = BO->getRHS();
+    }
+  }
+
+  static bool isConditionalBranch(const CFGBlock *B) {
+    const Stmt *Term = B->getTerminatorStmt();
+    return Term && B->succ_size() == 2 && !isa<SwitchStmt>(Term) &&
+           !isa<GCCAsmStmt>(Term) &&
+           isa_and_nonnull<Expr>(B->getTerminatorCondition());
+  }
+
+  /// The pointer through which \p Node reads or writes memory, if it does.
+  /// Taking the address of a member is not an access.
+  static const Expr *accessedPointer(const Stmt *Node) {
+    const Expr *LV = nullptr;
+    if (const auto *ICE = dyn_cast<ImplicitCastExpr>(Node)) {
+      if (ICE->getCastKind() != CK_LValueToRValue)
+        return nullptr;
+      LV = ICE->getSubExpr();
+    } else if (const auto *BO = dyn_cast<BinaryOperator>(Node)) {
+      if (!BO->isAssignmentOp())
+        return nullptr;
+      LV = BO->getLHS();
+    } else if (const auto *UO = dyn_cast<UnaryOperator>(Node)) {
+      if (!UO->isIncrementDecrementOp())
+        return nullptr;
+      LV = UO->getSubExpr();
+    }
+    while (LV) {
+      LV = LV->IgnoreParens();
+      if (const auto *ME = dyn_cast<MemberExpr>(LV)) {
+        if (ME->isArrow())
+          return ME->getBase();
+        LV = ME->getBase();
+      } else if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(LV)) {
+        const Expr *Base = ASE->getBase()->IgnoreParens();
+        const auto *ICE = dyn_cast<ImplicitCastExpr>(Base);
+        if (!ICE || ICE->getCastKind() != CK_ArrayToPointerDecay)
+          return Base;
+        LV = ICE->getSubExpr();
+      } else if (const auto *UO = dyn_cast<UnaryOperator>(LV)) {
+        if (UO->getOpcode() != UO_Deref)
+          return nullptr;
+        // "*(T *)&lvalue" is how READ_ONCE() reads the lvalue.
+        const auto *Inner =
+            dyn_cast<UnaryOperator>(UO->getSubExpr()->IgnoreParenCasts());
+        if (!Inner || Inner->getOpcode() != UO_AddrOf)
+          return UO->getSubExpr();
+        LV = Inner->getSubExpr();
+      } else {
+        return nullptr;
+      }
+    }
+    return nullptr;
+  }
+
+  /// The location that \p E names, or -1.
+  int locate(const Expr *E, bool Create = true) {
+    const VarDecl *Root = nullptr;
+    llvm::SmallVector<const FieldDecl *, 3> Path;
+    if (!E || !isTrackedType(E->getType()) || !decompose(E, Root, Path))
+      return -1;
+    if (Path.empty() && AddressTaken.count(Root))
+      return -1;
+    if (int Loc = find(Root, Path); Loc >= 0)
+      return Loc;
+    if (!Create || Locations.size() >= MaxLocations)
+      return -1;
+    Location L;
+    L.Root = Root;
+    L.Path = std::move(Path);
+    Locations.push_back(std::move(L));
+    return Locations.size() - 1;
+  }
+
+  /// "dev->priv" for the location \p Loc.
+  std::string text(unsigned Loc) const {
+    const Location &L = Locations[Loc];
+    std::string Text = L.Root->getNameAsString();
+    QualType T = L.Root->getType();
+    for (const FieldDecl *FD : L.Path) {
+      if (!FD->isAnonymousStructOrUnion()) {
+        Text += T->isPointerType() ? "->" : ".";
+        Text += FD->getName();
+      }
+      T = FD->getType();
+    }
+    return Text;
+  }
+
+  const VarDecl *root(unsigned Loc) const { return Locations[Loc].Root; }
+  bool isVariable(unsigned Loc) const { return Locations[Loc].Path.empty(); }
+
+  /// Keep the value of \p Loc on every path, whether or not a branch
+  /// condition reads it.
+  void pin(unsigned Loc) { Locations[Loc].Pinned = true; }
+
+  static Value get(const State &St, unsigned Loc) {
+    for (const auto &[L, V] : St.Vals)
+      if (L == Loc)
+        return V;
+    return Value();
+  }
+
+  static void set(State &St, unsigned Loc, Value V) {
+    auto It = llvm::lower_bound(
+        St.Vals, Loc, [](const std::pair<unsigned, Value> &P, unsigned L) {
+          return P.first < L;
+        });
+    bool Found = It != St.Vals.end() && It->first == Loc;
+    if (V.isAny()) {
+      if (Found)
+        St.Vals.erase(It);
+    } else if (Found) {
+      It->second = V;
+    } else {
+      St.Vals.insert(It, {Loc, V});
+    }
+  }
+
+  /// The location \p Loc gets a new value.
+  void store(unsigned Loc, Value V, State &St) const {
+    invalidate(Locations[Loc].Root, Locations[Loc].Path, St);
+    set(St, Loc, keeps(Loc) ? V : Value());
+  }
+
+  /// What the path knows about the value of \p E.
+  Value value(const Expr *E, const State &St) {
+    if (!E)
+      return Value();
+    E = E->IgnoreParens();
+    QualType T = E->getType();
+    if (!T->isIntegralOrEnumerationType() && !T->isPointerType())
+      return Value();
+
+    if (int Loc = locate(E, /*Create=*/false); Loc >= 0) {
+      Value V = get(St, Loc);
+      if (!T->isPointerType() && T->isUnsignedIntegerOrEnumerationType() &&
+          (V.Mask & ~Value::Neg))
+        V.Mask &= ~Value::Neg;
+      return V;
+    }
+
+    if (const auto *CE = dyn_cast<CastExpr>(E)) {
+      const Expr *Sub = CE->getSubExpr();
+      switch (CE->getCastKind()) {
+      case CK_LValueToRValue:
+      case CK_NoOp:
+      case CK_BitCast:
+      case CK_IntegralToPointer:
+      case CK_PointerToIntegral:
+        return value(Sub, St);
+      case CK_NullToPointer:
+        return Value::constant(0);
+      case CK_ArrayToPointerDecay:
+      case CK_FunctionToPointerDecay:
+        return Value::ofMask(Value::Pos);
+      case CK_IntegralToBoolean:
+      case CK_PointerToBoolean: {
+        std::optional<bool> B = value(Sub, St).truth();
+        return B ? Value::constant(*B) : Value::ofMask(Value::Zero | Value::Pos);
+      }
+      case CK_IntegralCast: {
+        Value V = value(Sub, St);
+        unsigned From = Ctx.getIntWidth(Sub->getType());
+        unsigned To = Ctx.getIntWidth(T);
+        bool Unsigned = T->isUnsignedIntegerOrEnumerationType();
+        if (V.HasConst) {
+          llvm::APSInt K(llvm::APInt(64, uint64_t(V.Const), /*isSigned=*/true),
+                         /*isUnsigned=*/false);
+          K = K.extOrTrunc(To);
+          K.setIsUnsigned(Unsigned);
+          if (std::optional<int64_t> Fits = K.tryExtValue())
+            return Value::constant(*Fits);
+          return Value::ofMask(Value::Pos);
+        }
+        if (To < From)
+          return Value();
+        if (Unsigned && (V.Mask & Value::Neg))
+          V.Mask = (V.Mask & ~Value::Neg) | Value::Pos;
+        return Value::ofMask(V.Mask);
+      }
+      default:
+        return Value();
+      }
+    }
+
+    if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
+      switch (UO->getOpcode()) {
+      case UO_LNot: {
+        std::optional<bool> B = truth(UO->getSubExpr(), St);
+        return B ? Value::constant(!*B) : Value::ofMask(Value::Zero | Value::Pos);
+      }
+      case UO_Plus:
+        return value(UO->getSubExpr(), St);
+      case UO_Minus: {
+        Value V = value(UO->getSubExpr(), St);
+        if (V.HasConst)
+          return Value::constant(-V.Const);
+        uint8_t M = V.Mask & Value::Zero;
+        if (V.Mask & Value::Neg)
+          M |= Value::Pos;
+        if (V.Mask & Value::Pos)
+          M |= Value::Neg;
+        return Value::ofMask(M);
+      }
+      case UO_AddrOf:
+        return Value::ofMask(Value::Pos);
+      default:
+        return Value();
+      }
+    }
+
+    if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
+      if (BO->getOpcode() == BO_Comma || BO->getOpcode() == BO_Assign)
+        return value(BO->getRHS(), St);
+      if (BO->isLogicalOp()) {
+        bool IsAnd = BO->getOpcode() == BO_LAnd;
+        std::optional<bool> L = truth(BO->getLHS(), St);
+        std::optional<bool> R = truth(BO->getRHS(), St);
+        if ((L && *L != IsAnd) || (R && *R != IsAnd))
+          return Value::constant(!IsAnd);
+        if (L && R)
+          return Value::constant(IsAnd);
+        return Value::ofMask(Value::Zero | Value::Pos);
+      }
+      if (BO->isComparisonOp()) {
+        std::optional<bool> B = compare(BO, St);
+        return B ? Value::constant(*B) : Value::ofMask(Value::Zero | Value::Pos);
+      }
+      return Value();
+    }
+
+    if (const auto *CO = dyn_cast<AbstractConditionalOperator>(E)) {
+      std::optional<bool> B = truth(CO->getCond(), St);
+      if (B)
+        return value(*B ? CO->getTrueExpr() : CO->getFalseExpr(), St);
+      if (isa<BinaryConditionalOperator>(CO))
+        return Value::join(Value::ofMask(Value::Neg | Value::Pos),
+                           value(CO->getFalseExpr(), St));
+      return Value::join(value(CO->getTrueExpr(), St),
+                         value(CO->getFalseExpr(), St));
+    }
+
+    if (const auto *SE = dyn_cast<StmtExpr>(E)) {
+      const CompoundStmt *CS = SE->getSubStmt();
+      return CS->body_empty() ? Value()
+                              : value(dyn_cast<Expr>(CS->body_back()), St);
+    }
+    if (const auto *GSE = dyn_cast<GenericSelectionExpr>(E))
+      return GSE->isResultDependent() ? Value()
+                                      : value(GSE->getResultExpr(), St);
+    if (const auto *CE = dyn_cast<ChooseExpr>(E))
+      return CE->isConditionDependent() ? Value()
+                                        : value(CE->getChosenSubExpr(), St);
+
+    if (const auto *CE = dyn_cast<CallExpr>(E)) {
+      unsigned ID = CE->getBuiltinCallee();
+      if ((ID == Builtin::BI__builtin_expect ||
+           ID == Builtin::BI__builtin_expect_with_probability) &&
+          CE->getNumArgs() >= 1)
+        return value(CE->getArg(0), St);
+      const FunctionDecl *FD = CE->getDirectCallee();
+      if (!FD || !FD->getIdentifier() || CE->getNumArgs() != 1)
+        return Value();
+      StringRef Name = FD->getName();
+      if (!isErrorPointerHelper(FD))
+        return Value();
+      Value V = value(CE->getArg(0), St);
+      if (Name == "IS_ERR") {
+        if (!(V.Mask & Value::Neg))
+          return Value::constant(0);
+        return V.Mask == Value::Neg ? Value::constant(1)
+                                    : Value::ofMask(Value::Zero | Value::Pos);
+      }
+      if (Name == "IS_ERR_OR_NULL") {
+        if (V.Mask == Value::Pos)
+          return Value::constant(0);
+        return !(V.Mask & Value::Pos) ? Value::constant(1)
+                                      : Value::ofMask(Value::Zero | Value::Pos);
+      }
+      if (Name == "PTR_ERR_OR_ZERO") {
+        uint8_t M = V.Mask & Value::Neg;
+        if (V.Mask & (Value::Zero | Value::Pos))
+          M |= Value::Zero;
+        return Value::ofMask(M);
+      }
+      // ERR_PTR(), PTR_ERR() and ERR_CAST() keep the sign.
+      return V.HasConst ? Value::constant(V.Const) : Value::ofMask(V.Mask);
+    }
+
+    if (isa<IntegerLiteral, CharacterLiteral, UnaryExprOrTypeTraitExpr>(E) ||
+        (isa<DeclRefExpr>(E) &&
+         isa<EnumConstantDecl>(cast<DeclRefExpr>(E)->getDecl()))) {
+      Expr::EvalResult R;
+      if (!E->isValueDependent() && E->EvaluateAsInt(R, Ctx)) {
+        if (std::optional<int64_t> Fits = R.Val.getInt().tryExtValue())
+          return Value::constant(*Fits);
+        return Value::ofMask(Value::Pos);
+      }
+      return Value();
+    }
+    if (isa<StringLiteral>(E))
+      return Value::ofMask(Value::Pos);
+    return Value();
+  }
+
+  /// The outcome of the comparison \p BO, if the path decides it.
+  std::optional<bool> compare(const BinaryOperator *BO, const State &St) {
+    Value L = value(BO->getLHS(), St);
+    Value R = value(BO->getRHS(), St);
+    BinaryOperatorKind Op = BO->getOpcode();
+    if (L.HasConst && R.HasConst) {
+      switch (Op) {
+      case BO_LT: return L.Const < R.Const;
+      case BO_GT: return L.Const > R.Const;
+      case BO_LE: return L.Const <= R.Const;
+      case BO_GE: return L.Const >= R.Const;
+      case BO_EQ: return L.Const == R.Const;
+      case BO_NE: return L.Const != R.Const;
+      default: return std::nullopt;
+      }
+    }
+    // One side is a number: bring it to the right.
+    if (L.HasConst) {
+      std::swap(L, R);
+      switch (Op) {
+      case BO_LT: Op = BO_GT; break;
+      case BO_GT: Op = BO_LT; break;
+      case BO_LE: Op = BO_GE; break;
+      case BO_GE: Op = BO_LE; break;
+      default: break;
+      }
+    }
+    if (!R.HasConst)
+      return std::nullopt;
+    uint8_t M = L.Mask;
+    uint8_t Sign = R.Const < 0 ? Value::Neg
+                   : R.Const == 0 ? Value::Zero : Value::Pos;
+    // The values on each side of the number, and the number's own class.
+    uint8_t Below = R.Const < 0 ? Value::Neg
+                    : R.Const == 0 ? Value::Neg
+                    : Value::Neg | Value::Zero | Value::Pos;
+    uint8_t Above = R.Const > 0 ? Value::Pos
+                    : R.Const == 0 ? Value::Pos
+                    : Value::Neg | Value::Zero | Value::Pos;
+    bool Exact = R.Const == 0;
+    switch (Op) {
+    case BO_EQ:
+      if (!(M & Sign)) return false;
+      if (Exact && M == Value::Zero) return true;
+      return std::nullopt;
+    case BO_NE:
+      if (!(M & Sign)) return true;
+      if (Exact && M == Value::Zero) return false;
+      return std::nullopt;
+    case BO_LT:
+      if (!(M & Below)) return false;
+      if (Exact && M == Value::Neg) return true;
+      return std::nullopt;
+    case BO_GE:
+      if (!(M & Below)) return true;
+      if (Exact && M == Value::Neg) return false;
+      return std::nullopt;
+    case BO_GT:
+      if (!(M & Above)) return false;
+      if (Exact && M == Value::Pos) return true;
+      return std::nullopt;
+    case BO_LE:
+      if (!(M & Above)) return true;
+      if (Exact && M == Value::Pos) return false;
+      return std::nullopt;
+    default:
+      return std::nullopt;
+    }
+  }
+
+  /// Whether \p Cond holds, if the path decides it.
+  std::optional<bool> truth(const Expr *Cond, const State &St) {
+    bool Negated = false;
+    const Expr *E = stripLinuxCondition(Cond, Negated);
+    if (!E)
+      return std::nullopt;
+    if (std::optional<bool> B = value(E, St).truth())
+      return *B != Negated;
+    if (St.Preds.empty())
+      return std::nullopt;
+    int I = conditionIndex(E, /*Create=*/false);
+    if (I >= 0)
+      for (const auto &[C, Holds] : St.Preds)
+        if (C == unsigned(I))
+          return Holds != Negated;
+    return std::nullopt;
+  }
+
+  /// Narrow \p Loc to the values in \p Mask.  Returns false if none is left.
+  bool narrow(unsigned Loc, uint8_t Mask, State &St) const {
+    Value V = get(St, Loc);
+    uint8_t M = V.Mask & Mask;
+    if (!M)
+      return false;
+    if (M != V.Mask && (Locations[Loc].Pinned || Locations[Loc].Sites >= 2))
+      set(St, Loc, V.HasConst ? V : Value::ofMask(M));
+    return true;
+  }
+
+  /// The path takes the branch on which \p Cond is \p Outcome.  Returns
+  /// false if what the path knows rules that out.
+  bool assume(const Expr *Cond, bool Outcome, State &St) {
+    bool Negated = false;
+    const Expr *E = stripLinuxCondition(Cond, Negated);
+    if (!E)
+      return true;
+    if (Negated)
+      Outcome = !Outcome;
+    if (std::optional<bool> Known = value(E, St).truth())
+      return *Known == Outcome;
+
+    if (int Loc = locate(E, /*Create=*/false); Loc >= 0)
+      return narrow(Loc, Outcome ? uint8_t(Value::Neg | Value::Pos) : Value::Zero,
+                    St);
+
+    const Expr *Plain = E->IgnoreParenImpCasts();
+    if (const auto *BO = dyn_cast<BinaryOperator>(Plain)) {
+      if (BO->isLogicalOp()) {
+        // "a && b" is true only if both are, "a || b" false only if both
+        // are.  The other outcomes say too little.
+        if ((BO->getOpcode() == BO_LAnd) == Outcome)
+          return assume(BO->getLHS(), Outcome, St) &&
+                 assume(BO->getRHS(), Outcome, St);
+        return true;
+      }
+      if (BO->isComparisonOp()) {
+        const Expr *Side = BO->getLHS();
+        const Expr *Other = BO->getRHS();
+        BinaryOperatorKind Op = BO->getOpcode();
+        int Loc = locate(Side, /*Create=*/false);
+        if (Loc < 0) {
+          std::swap(Side, Other);
+          Loc = locate(Side, /*Create=*/false);
+          switch (Op) {
+          case BO_LT: Op = BO_GT; break;
+          case BO_GT: Op = BO_LT; break;
+          case BO_LE: Op = BO_GE; break;
+          case BO_GE: Op = BO_LE; break;
+          default: break;
+          }
+        }
+        Value K = Loc >= 0 ? value(Other, St) : Value();
+        if (Loc >= 0 && K.HasConst) {
+          // Turn the false outcome into the opposite comparison.
+          if (!Outcome)
+            switch (Op) {
+            case BO_LT: Op = BO_GE; break;
+            case BO_GE: Op = BO_LT; break;
+            case BO_GT: Op = BO_LE; break;
+            case BO_LE: Op = BO_GT; break;
+            case BO_EQ: Op = BO_NE; break;
+            case BO_NE: Op = BO_EQ; break;
+            default: break;
+            }
+          const uint8_t N = Value::Neg, Z = Value::Zero, P = Value::Pos;
+          uint8_t Mask = Value::Any;
+          int64_t C = K.Const;
+          switch (Op) {
+          case BO_EQ:
+            if (!narrow(Loc, C < 0 ? N : C == 0 ? Z : P, St))
+              return false;
+            if (Locations[Loc].Pinned || Locations[Loc].Sites >= 2)
+              set(St, Loc, Value::constant(C));
+            return true;
+          case BO_NE: Mask = C == 0 ? uint8_t(N | P) : Value::Any; break;
+          case BO_LT: Mask = C <= 0 ? N : Value::Any; break;
+          case BO_LE: Mask = C < 0 ? N : C == 0 ? uint8_t(N | Z) : Value::Any; break;
+          case BO_GT: Mask = C >= 0 ? P : Value::Any; break;
+          case BO_GE: Mask = C > 0 ? P : C == 0 ? uint8_t(Z | P) : Value::Any; break;
+          default: break;
+          }
+          if (Mask != Value::Any)
+            return narrow(Loc, Mask, St);
+        }
+      }
+    } else if (const auto *CE = dyn_cast<CallExpr>(Plain)) {
+      const FunctionDecl *FD = CE->getDirectCallee();
+      if (FD && FD->getIdentifier() && CE->getNumArgs() == 1) {
+        int Loc = locate(CE->getArg(0)->IgnoreParenCasts(), /*Create=*/false);
+        if (Loc >= 0 && FD->getName() == "IS_ERR")
+          return narrow(Loc,
+                        Outcome ? Value::Neg : uint8_t(Value::Zero | Value::Pos),
+                        St);
+        if (Loc >= 0 && FD->getName() == "IS_ERR_OR_NULL")
+          return narrow(Loc,
+                        Outcome ? uint8_t(Value::Neg | Value::Zero) : Value::Pos,
+                        St);
+      }
+    }
+
+    int I = conditionIndex(E, /*Create=*/false);
+    if (I >= 0 && Conditions[I].Sites >= 2) {
+      auto It = llvm::lower_bound(
+          St.Preds, unsigned(I),
+          [](const std::pair<unsigned, bool> &P, unsigned C) {
+            return P.first < C;
+          });
+      if (It != St.Preds.end() && It->first == unsigned(I))
+        It->second = Outcome;
+      else
+        St.Preds.insert(It, {unsigned(I), Outcome});
+    }
+    return true;
+  }
+
+  /// End the search: the check has what it was looking for.
+  void stop() { Stopped = true; }
+
+  /// Walk the paths that start at element \p First of \p Start in the state
+  /// \p Init.  Returns false if the search ran out of budget, in which case
+  /// it has not seen every path.
+  bool run(const CFGBlock *Start, unsigned First, const State &Init,
+           Client &C) {
+    Stopped = GaveUp = false;
+    Steps = 0;
+    if (FunctionSteps > MaxFunctionSteps)
+      return false;
+
+    llvm::DenseMap<unsigned, llvm::SmallVector<State, 2>> Seen;
+    llvm::SmallVector<std::pair<const CFGBlock *, State>, 16> Work;
+    Work.push_back({Start, Init});
+    bool AtStart = true;
+
+    while (!Work.empty() && !Stopped) {
+      auto [B, St] = Work.pop_back_val();
+      unsigned Skip = AtStart ? First : 0;
+      AtStart = false;
+      if (++Steps > MaxSteps)
+        break;
+
+      bool Alive = true;
+      unsigned Index = 0;
+      for (const CFGElement &Elem : *B) {
+        if (Index++ < Skip)
+          continue;
+        std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>();
+        if (!CS)
+          continue;
+        if (++Steps > MaxSteps || !C.statement(CS->getStmt(), St) || Stopped) {
+          Alive = false;
+          break;
+        }
+        transfer(CS->getStmt(), St);
+      }
+      if (!Alive)
+        continue;
+
+      const Stmt *Term = B->getTerminatorStmt();
+      if (const auto *AS = dyn_cast_or_null<GCCAsmStmt>(Term))
+        transfer(AS, St);
+
+      if (isConditionalBranch(B)) {
+        const Expr *Cond = getBranchCondition(B);
+        std::optional<bool> Known = truth(Cond, St);
+        unsigned SuccIndex = 0;
+        for (const CFGBlock::AdjacentBlock &Succ : B->succs()) {
+          bool Outcome = SuccIndex++ == 0;
+          const CFGBlock *Next = Succ.getReachableBlock();
+          if (!Next || (Known && *Known != Outcome))
+            continue;
+          State Refined = St;
+          if (!Known && !assume(Cond, Outcome, Refined))
+            continue;
+          if (C.edge(B, Next, Refined))
+            push(Next, Refined, Seen, Work);
+        }
+        continue;
+      }
+
+      const auto *SS = dyn_cast_or_null<SwitchStmt>(Term);
+      int Switched = SS ? locate(SS->getCond(), /*Create=*/false) : -1;
+      Value SwitchValue = SS ? value(SS->getCond(), St) : Value();
+      for (const CFGBlock::AdjacentBlock &Succ : B->succs()) {
+        const CFGBlock *Next = Succ.getReachableBlock();
+        if (!Next)
+          continue;
+        State Refined = St;
+        if (SS && SwitchValue.HasConst) {
+          if (!switchSelects(SS, Next, SwitchValue.Const))
+            continue;
+        } else if (Switched >= 0) {
+          // A single case label pins the value down.
+          const auto *CS = dyn_cast_or_null<CaseStmt>(Next->getLabel());
+          if (CS && !CS->getRHS() && !isa<SwitchCase>(CS->getSubStmt())) {
+            llvm::APSInt K = CS->getLHS()->EvaluateKnownConstInt(Ctx);
+            if (std::optional<int64_t> Fits = K.tryExtValue()) {
+              int64_t V = *Fits;
+              if (!narrow(Switched,
+                          V < 0 ? Value::Neg : V == 0 ? Value::Zero : Value::Pos,
+                          Refined))
+                continue;
+              if (keeps(Switched))
+                set(Refined, Switched, Value::constant(V));
+            }
+          }
+        }
+        if (C.edge(B, Next, Refined))
+          push(Next, Refined, Seen, Work);
+      }
+    }
+    FunctionSteps += Steps;
+    return Steps <= MaxSteps && !GaveUp;
+  }
+};
+
+/// Whether the experimental check \p Name was asked for with
+/// -flinux-kernel-experimental= and its warning group is on.
+static bool isLinuxExperimentEnabled(const Sema &S, StringRef Name,
+                                     SourceLocation Loc) {
+  const auto &Names = S.getLangOpts().LinuxKernelExperimentalChecks;
+  if (!llvm::is_contained(Names, Name) && !llvm::is_contained(Names, "all"))
+    return false;
+  return !S.getDiagnostics().isIgnored(diag::warn_linux_kernel_experimental,
+                                       Loc);
+}
+
+/// Where a function with a body reads or writes through its pointer
+/// parameter \p Index whenever it is called: in the code that runs before
+/// its first branch, directly or in a function that it hands the parameter
+/// to.  Null if it does not, or if it tests the parameter anywhere: a
+/// function that tests its argument is prepared for NULL.
+static const Expr *getUnconditionalParameterDeref(
+    const FunctionDecl *Callee, unsigned Index,
+    sema::LinuxKernelUnit::Impl &Unit, unsigned Depth = 0) {
+  const FunctionDecl *Def = nullptr;
+  if (!Callee->hasBody(Def) || Index >= Def->getNumParams())
+    return nullptr;
+  const ParmVarDecl *Param = Def->getParamDecl(Index);
+  if (!Param->getType()->isPointerType())
+    return nullptr;
+  auto Known = Unit.EntryDerefs.find(Param);
+  if (Known != Unit.EntryDerefs.end())
+    return Known->second;
+  // Also the answer while this is being worked out, for recursion.
+  Unit.EntryDerefs[Param] = nullptr;
+
+  // Is the parameter tested, or given another value, anywhere?
+  struct Scan {
+    const VarDecl *P;
+    bool Hit = false;
+    bool is(const Expr *E) const {
+      return E && getDirectLinuxVariable(E->IgnoreParenCasts()) == P;
+    }
+    void visit(const Stmt *St) {
+      if (!St || Hit)
+        return;
+      if (const auto *UO = dyn_cast<UnaryOperator>(St)) {
+        if (UO->getOpcode() == UO_LNot || UO->getOpcode() == UO_AddrOf ||
+            UO->isIncrementDecrementOp())
+          Hit |= is(UO->getSubExpr());
+      } else if (const auto *BO = dyn_cast<BinaryOperator>(St)) {
+        if (BO->isAssignmentOp())
+          Hit |= is(BO->getLHS());
+        else if (BO->isComparisonOp() || BO->isLogicalOp())
+          Hit |= is(BO->getLHS()) || is(BO->getRHS());
+      } else if (const auto *IS = dyn_cast<IfStmt>(St)) {
+        Hit |= is(IS->getCond());
+      } else if (const auto *WS = dyn_cast<WhileStmt>(St)) {
+        Hit |= is(WS->getCond());
+      } else if (const auto *DS = dyn_cast<DoStmt>(St)) {
+        Hit |= is(DS->getCond());
+      } else if (const auto *FS = dyn_cast<ForStmt>(St)) {
+        Hit |= is(FS->getCond());
+      } else if (const auto *CO = dyn_cast<AbstractConditionalOperator>(St)) {
+        Hit |= is(CO->getCond());
+      } else if (const auto *CE = dyn_cast<CallExpr>(St)) {
+        const FunctionDecl *F = CE->getDirectCallee();
+        if (F && F->getIdentifier() &&
+            (F->getName().contains("IS_ERR") ||
+             F->getName().contains("PTR_ERR") || F->getName() == "ERR_CAST"))
+          for (const Expr *Arg : CE->arguments())
+            Hit |= is(Arg);
+      } else if (isa<GCCAsmStmt>(St)) {
+        Hit = true;
+      }
+      for (const Stmt *Child : St->children())
+        visit(Child);
+    }
+  } Tested{Param};
+  Tested.visit(Def->getBody());
+  if (Tested.Hit)
+    return nullptr;
+
+  AnalysisDeclContext AC(/*ADCMgr=*/nullptr, Def);
+  AC.getCFGBuildOptions()
+      .setAlwaysAdd(Stmt::BinaryOperatorClass)
+      .setAlwaysAdd(Stmt::CompoundAssignOperatorClass)
+      .setAlwaysAdd(Stmt::ImplicitCastExprClass)
+      .setAlwaysAdd(Stmt::UnaryOperatorClass);
+  const CFG *Cfg = AC.getCFG();
+  if (!Cfg)
+    return nullptr;
+
+  const Expr *Result = nullptr;
+  const CFGBlock *B = &Cfg->getEntry();
+  for (unsigned Blocks = 0; B && !Result && Blocks < 16; ++Blocks) {
+    for (const CFGElement &Elem : *B) {
+      std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>();
+      if (!CS)
+        continue;
+      const Stmt *Node = CS->getStmt();
+      if (const Expr *Pointer = LinuxPathSearch::accessedPointer(Node)) {
+        if (getDirectLinuxVariable(Pointer->IgnoreParenCasts()) == Param) {
+          Result = Pointer;
+          break;
+        }
+      } else if (const auto *CE = dyn_cast<CallExpr>(Node)) {
+        const FunctionDecl *Next = CE->getDirectCallee();
+        if (!Next || Depth >= 2)
+          continue;
+        for (unsigned I = 0, E = CE->getNumArgs(); I != E && !Result; ++I)
+          if (getDirectLinuxVariable(CE->getArg(I)->IgnoreParenCasts()) ==
+                  Param &&
+              getUnconditionalParameterDeref(Next, I, Unit, Depth + 1))
+            Result = CE->getArg(I);
+        if (Result)
+          break;
+      }
+    }
+    if (B->succ_size() != 1)
+      break;
+    B = B->succ_begin()->getReachableBlock();
+  }
+  Unit.EntryDerefs[Param] = Result;
+  return Result;
+}
+
+/// Misuse of a value on a path where a test has just said what it is.
+/// Three rules share the machinery:
+///
+///   if (!dev->priv)                        a pointer that was found to be
+///           dev_warn(dev->parent, "...");  NULL is dereferenced
+///   ...
+///   dev->priv->count++;
+///
+///   if (IS_ERR(folio))                     PTR_ERR() of a pointer that was
+///           goto rollback;                 found not to be an error pointer
+///   if (cnt <= 0)
+///           goto rollback;
+///   ...
+///   rollback:
+///           return PTR_ERR(folio);
+///
+///   if (err)                               ERR_PTR() of an error code that
+///           goto out;                      was found to be zero, in a
+///   ...                                    function whose callers expect a
+///   out:                                   valid pointer or an error pointer
+///           return ERR_PTR(err);
+///
+/// For each such test that the author wrote, the checker walks the paths
+/// that leave through that outcome (see LinuxPathSearch) and reports the
+/// first place where one of them misuses the value.  For a pointer that is
+/// NULL this includes handing it to a function that dereferences its
+/// parameter before it does anything else.  A path ends when the value is
+/// assigned, when a call may have changed the member that holds it, and at a
+/// branch that it contradicts.
+///
+/// The test says what the author expects.  If the outcome cannot happen the
+/// test is what is wrong, and the report is still worth a look.
+class LinuxTestedValueChecker : LinuxPathSearch::Client {
+  using Value = LinuxPathValue;
+
+  Sema &S;
+  const FunctionDecl *FD;
+  const CFG &Cfg;
+  ASTContext &Ctx;
+  LinuxPathSearch &Search;
+  sema::LinuxKernelUnit::Impl &Unit;
+
+  enum Rule { DerefNull, DerefError, DerefNullOrError, PtrErrOfValid,
+              ErrPtrOfZero };
+
+  // Per search.
+  Rule Active = DerefNull;
+  unsigned Place = 0;
+  /// The path is followed for as long as the value stays within this mask.
+  uint8_t Within = Value::Zero;
+  const Expr *Misuse = nullptr;
+  const CallExpr *Call = nullptr;
+  const Expr *CalleeAccess = nullptr;
+
+  llvm::SmallVector<std::pair<unsigned, unsigned>, 8> Reported;
+  std::optional<bool> ReturnsValidPointer;
+
+  bool isPlace(const Expr *E) {
+    return E && Search.locate(E->IgnoreParenCasts(), /*Create=*/false) ==
+                    int(Place);
+  }
+
+  bool found(const Expr *At) {
+    Misuse = At;
+    Search.stop();
+    return false;
+  }
+
+  bool statement(const Stmt *Node, LinuxPathSearch::State &St) override {
+    // The path has given the location a new value, or a call may have.
+    if (LinuxPathSearch::get(St, Place).Mask & ~Within)
+      return false;
+
+    const auto *CE = dyn_cast<CallExpr>(Node);
+    const FunctionDecl *Callee = CE ? CE->getDirectCallee() : nullptr;
+    switch (Active) {
+    case DerefNull:
+    case DerefError:
+    case DerefNullOrError:
+      if (const Expr *Pointer = LinuxPathSearch::accessedPointer(Node)) {
+        if (isPlace(Pointer))
+          return found(Pointer);
+      } else if (Callee) {
+        for (unsigned I = 0, E = CE->getNumArgs(); I != E; ++I)
+          if (isPlace(CE->getArg(I)))
+            if (const Expr *Inner =
+                    getUnconditionalParameterDeref(Callee, I, Unit)) {
+              Call = CE;
+              CalleeAccess = Inner;
+              return found(CE->getArg(I));
+            }
+      }
+      break;
+    case PtrErrOfValid:
+      if (Callee && Callee->getIdentifier() && CE->getNumArgs() == 1 &&
+          (Callee->getName() == "PTR_ERR" || Callee->getName() == "ERR_CAST") &&
+          isPlace(CE->getArg(0)))
+        return found(CE);
+      break;
+    case ErrPtrOfZero:
+      if (Callee && Callee->getIdentifier() && CE->getNumArgs() == 1 &&
+          Callee->getName() == "ERR_PTR" && isPlace(CE->getArg(0)) &&
+          !isWrittenInMacro(CE->getExprLoc(), S.getSourceManager()))
+        return found(CE);
+      break;
+    }
+    return true;
+  }
+
+  /// Whether the function returns the address of something on some path
+  /// and a literal NULL on none: its callers then take what they get for a
+  /// valid pointer unless IS_ERR() says otherwise.
+  bool returnsValidPointer() {
+    if (!ReturnsValidPointer) {
+      bool Valid = false, Null = false;
+      struct Returns {
+        ASTContext &Ctx;
+        bool &Valid, &Null;
+        void visit(const Stmt *St) {
+          if (!St)
+            return;
+          if (const auto *RS = dyn_cast<ReturnStmt>(St)) {
+            const Expr *E = RS->getRetValue();
+            if (!E)
+              return;
+            if (E->IgnoreParenCasts()->isNullPointerConstant(
+                    Ctx, Expr::NPC_ValueDependentIsNotNull)) {
+              Null = true;
+              return;
+            }
+            const auto *CE = dyn_cast<CallExpr>(E->IgnoreParenCasts());
+            const FunctionDecl *F = CE ? CE->getDirectCallee() : nullptr;
+            if (!F || !F->getIdentifier() ||
+                !LinuxPathSearch::isErrorPointerHelper(F))
+              Valid = true;
+            return;
+          }
+          for (const Stmt *Child : St->children())
+            visit(Child);
+        }
+      } R{Ctx, Valid, Null};
+      R.visit(FD->getBody());
+      ReturnsValidPointer = Valid && !Null;
+    }
+    return *ReturnsValidPointer;
+  }
+
+  struct Test {
+    const Expr *Tested = nullptr;
+    Rule Kind = DerefNull;
+    unsigned Succ = 0;
+  };
+
+  /// What the branch at the end of \p B tests, with the rules to apply to
+  /// each of its outcomes.
+  void getTests(const CFGBlock *B, const Expr *&Cond,
+                llvm::SmallVectorImpl<Test> &Out) {
+    if (!LinuxPathSearch::isConditionalBranch(B))
+      return;
+    Cond = LinuxPathSearch::getBranchCondition(B);
+    bool Negated = false;
+    const Expr *E = stripLinuxCondition(Cond, Negated);
+    // A test inside a macro is not the author's statement about this
+    // value: dev_err(), kfree() and many others test whatever they get.
+    if (!E || isWrittenInMacro(E->getExprLoc(), S.getSourceManager()) ||
+        isLinuxBranchWrittenInMacro(B, S.getSourceManager()) ||
+        isLinuxAssertionMacroExpansion(Cond, S))
+      return;
+
+    // Successor 0 is taken when the whole condition is true.
+    auto SuccFor = [&](bool Outcome) { return (Outcome != Negated) ? 0u : 1u; };
+    const Expr *Plain = E->IgnoreParenImpCasts();
+    if (const auto *BO = dyn_cast<BinaryOperator>(Plain)) {
+      if (!BO->isEqualityOp())
+        return;
+      const Expr *Tested = nullptr;
+      const Expr *Other = nullptr;
+      if (Search.locate(BO->getLHS(), /*Create=*/false) >= 0 ||
+          Search.locate(BO->getLHS()) >= 0) {
+        Tested = BO->getLHS();
+        Other = BO->getRHS();
+      } else if (Search.locate(BO->getRHS()) >= 0) {
+        Tested = BO->getRHS();
+        Other = BO->getLHS();
+      }
+      if (!Tested)
+        return;
+      bool IsPointer = Tested->IgnoreParenImpCasts()->getType()->isPointerType();
+      bool IsZero =
+          IsPointer ? Other->isNullPointerConstant(
+                          Ctx, Expr::NPC_ValueDependentIsNotNull) !=
+                          Expr::NPCK_NotNull
+                    : [&] {
+                        std::optional<llvm::APSInt> K =
+                            Other->isValueDependent()
+                                ? std::nullopt
+                                : Other->getIntegerConstantExpr(Ctx);
+                        return K && K->isZero();
+                      }();
+      if (!IsZero)
+        return;
+      Out.push_back({Tested, IsPointer ? DerefNull : ErrPtrOfZero,
+                     SuccFor(BO->getOpcode() == BO_EQ)});
+    } else if (const auto *CE = dyn_cast<CallExpr>(Plain)) {
+      const FunctionDecl *Callee = CE->getDirectCallee();
+      if (!Callee || !Callee->getIdentifier() || CE->getNumArgs() != 1)
+        return;
+      const Expr *Tested = CE->getArg(0)->IgnoreParenCasts();
+      if (Callee->getName() == "IS_ERR") {
+        Out.push_back({Tested, DerefError, SuccFor(true)});
+        Out.push_back({Tested, PtrErrOfValid, SuccFor(false)});
+      } else if (Callee->getName() == "IS_ERR_OR_NULL") {
+        Out.push_back({Tested, DerefNullOrError, SuccFor(true)});
+      }
+    } else if (Plain->getType()->isPointerType()) {
+      Out.push_back({E, DerefNull, SuccFor(false)});
+    } else if (Plain->getType()->isIntegralOrEnumerationType()) {
+      Out.push_back({E, ErrPtrOfZero, SuccFor(false)});
+    }
+  }
+
+  bool enabled(Rule R, SourceLocation Loc) {
+    const DiagnosticsEngine &Diags = S.getDiagnostics();
+    switch (R) {
+    case DerefNull:
+    case DerefNullOrError:
+      return !Diags.isIgnored(diag::warn_linux_kernel_deref_after_check, Loc);
+    case DerefError:
+      return isLinuxExperimentEnabled(S, "error-deref-after-check", Loc);
+    case PtrErrOfValid:
+      return !Diags.isIgnored(diag::warn_linux_kernel_ptr_err_valid, Loc);
+    case ErrPtrOfZero:
+      return !Diags.isIgnored(diag::warn_linux_kernel_err_ptr_zero, Loc) &&
+             FD->getReturnType()->isPointerType() && returnsValidPointer();
+    }
+    return false;
+  }
+
+  void report(const Expr *Cond) {
+    std::string Text = Search.text(Place);
+    switch (Active) {
+    case DerefError: {
+      // No diagnostic of its own yet.
+      std::string Message =
+          "'" + Text +
+          "' is dereferenced here on a path where the earlier test found it "
+          "to be an error pointer";
+      S.Diag(Misuse->getExprLoc(), diag::warn_linux_kernel_experimental)
+          << Message << "error-deref-after-check" << Misuse->getSourceRange();
+      S.Diag(Cond->getExprLoc(), diag::note_linux_kernel_experimental)
+          << "the test is here" << Cond->getSourceRange();
+      return;
+    }
+    case DerefNull:
+    case DerefNullOrError:
+      if (Call) {
+        S.Diag(Misuse->getExprLoc(),
+               diag::warn_linux_kernel_deref_after_check_call)
+            << Text << Call->getDirectCallee() << Misuse->getSourceRange();
+        S.Diag(CalleeAccess->getExprLoc(),
+               diag::note_linux_kernel_dereferenced_here)
+            << CalleeAccess << CalleeAccess->getSourceRange();
+      } else {
+        S.Diag(Misuse->getExprLoc(), diag::warn_linux_kernel_deref_after_check)
+            << Text << Misuse->getSourceRange();
+      }
+      S.Diag(Cond->getExprLoc(), diag::note_linux_kernel_null_tested_here)
+          << Text << Cond->getSourceRange();
+      return;
+    case PtrErrOfValid:
+      S.Diag(Misuse->getExprLoc(), diag::warn_linux_kernel_ptr_err_valid)
+          << Text << Misuse->getSourceRange();
+      S.Diag(Cond->getExprLoc(), diag::note_linux_kernel_is_err_tested_here)
+          << Cond->getSourceRange();
+      return;
+    case ErrPtrOfZero:
+      S.Diag(Misuse->getExprLoc(), diag::warn_linux_kernel_err_ptr_zero)
+          << Search.root(Place) << Misuse->getSourceRange();
+      S.Diag(Cond->getExprLoc(), diag::note_linux_kernel_zero_known_here)
+          << Search.root(Place) << Cond->getSourceRange();
+      return;
+    }
+  }
+
+public:
+  LinuxTestedValueChecker(Sema &S, const FunctionDecl *FD, const CFG &Cfg,
+                          LinuxPathSearch &Search,
+                          sema::LinuxKernelUnit::Impl &Unit)
+      : S(S), FD(FD), Cfg(Cfg), Ctx(S.getASTContext()), Search(Search),
+        Unit(Unit) {}
+
+  static bool wanted(const Sema &S, SourceLocation Loc) {
+    const DiagnosticsEngine &Diags = S.getDiagnostics();
+    return !Diags.isIgnored(diag::warn_linux_kernel_deref_after_check, Loc) ||
+           !Diags.isIgnored(diag::warn_linux_kernel_ptr_err_valid, Loc) ||
+           !Diags.isIgnored(diag::warn_linux_kernel_err_ptr_zero, Loc) ||
+           isLinuxExperimentEnabled(S, "error-deref-after-check", Loc);
+  }
+
+  void run() {
+    SourceLocation Loc = FD->getBeginLoc();
+    for (const CFGBlock *B : Cfg) {
+      const Expr *Cond = nullptr;
+      llvm::SmallVector<Test, 2> Tests;
+      getTests(B, Cond, Tests);
+      for (const Test &T : Tests) {
+        if (!enabled(T.Kind, Loc))
+          continue;
+        int Where = Search.locate(T.Tested);
+        // ERR_PTR(0) is about error codes in local variables.
+        if (Where < 0 || (T.Kind == ErrPtrOfZero && !Search.isVariable(Where)))
+          continue;
+        unsigned Group = T.Kind <= DerefNullOrError ? 0 : unsigned(T.Kind);
+        if (llvm::is_contained(Reported, std::make_pair(unsigned(Where), Group)))
+          continue;
+        const CFGBlock *Next = (B->succ_begin() + T.Succ)->getReachableBlock();
+        if (!Next)
+          continue;
+
+        Active = T.Kind;
+        Place = Where;
+        Misuse = CalleeAccess = nullptr;
+        Call = nullptr;
+        switch (T.Kind) {
+        case DerefNull: Within = Value::Zero; break;
+        case DerefError: Within = Value::Neg; break;
+        case DerefNullOrError: Within = Value::Neg | Value::Zero; break;
+        case PtrErrOfValid: Within = Value::Zero | Value::Pos; break;
+        case ErrPtrOfZero: Within = Value::Zero; break;
+        }
+        Search.pin(Place);
+        LinuxPathSearch::State Init;
+        LinuxPathSearch::set(Init, Place, Value::ofMask(Within));
+        Search.run(Next, 0, Init, *this);
+        if (!Misuse)
+          continue;
+        Reported.push_back({Place, Group});
+        report(Cond);
+      }
+    }
+  }
+};
+
+/// A test whose outcome an earlier test has decided:
+///
+///   err = step_one();
+///   if (err)
+///           goto out;
+///   step_two();             /* "err =" is missing */
+///   if (err)
+///           goto out;
+///
+/// For each local integer or pointer that the function tests more than
+/// once, the checker follows through the CFG which of "negative", "zero"
+/// and "positive" the tests on every path have left possible, with the
+/// variable unchanged since.  A test that this decides is reported.  Either
+/// it is dead code or, more often, the assignment that was meant to come
+/// between the two tests is missing or went to another variable.
+///
+/// Only tests that the author wrote count, not those inside macros.  A test
+/// is not reported when the source has an assignment to the variable or a
+/// preprocessor conditional between the two tests: the assignment may be in
+/// code that this configuration does not compile.
+class DuplicateCheckChecker {
+  using Value = LinuxPathValue;
+
+  Sema &S;
+  const FunctionDecl *FD;
+  const CFG &Cfg;
+  ASTContext &Ctx;
+
+  struct Fact {
+    uint8_t Mask = Value::Any;
+    /// The test that narrowed the mask last.
+    const Expr *From = nullptr;
+  };
+  using Facts = llvm::SmallVector<Fact, 8>;
+
+  llvm::SmallVector<const VarDecl *, 8> Vars;
+  llvm::DenseMap<const VarDecl *, unsigned> Index;
+  llvm::SmallPtrSet<const VarDecl *, 8> AddressTaken;
+  llvm::DenseMap<const VarDecl *, llvm::SmallVector<SourceLocation, 4>>
+      Assignments;
+
+  static bool isCandidate(const VarDecl *VD) {
+    if (!VD || !VD->hasLocalStorage())
+      return false;
+    QualType T = VD->getType();
+    return !T.isVolatileQualified() &&
+           (T->isPointerType() || T->isIntegralOrEnumerationType());
+  }
+
+  void collect(const Stmt *St) {
+    if (!St)
+      return;
+    const VarDecl *Assigned = nullptr;
+    if (const auto *UO = dyn_cast<UnaryOperator>(St)) {
+      const VarDecl *VD = getDirectLinuxVariable(UO->getSubExpr());
+      if (UO->getOpcode() == UO_AddrOf && VD)
+        AddressTaken.insert(VD);
+      else if (UO->isIncrementDecrementOp())
+        Assigned = VD;
+    } else if (const auto *BO = dyn_cast<BinaryOperator>(St)) {
+      if (BO->isAssignmentOp())
+        Assigned = getDirectLinuxVariable(BO->getLHS());
+    } else if (const auto *AS = dyn_cast<GCCAsmStmt>(St)) {
+      for (unsigned I = 0, E = AS->getNumOutputs(); I != E; ++I)
+        if (const VarDecl *VD = getDirectLinuxVariable(AS->getOutputExpr(I)))
+          AddressTaken.insert(VD);
+    }
+    if (Assigned)
+      Assignments[Assigned].push_back(St->getBeginLoc());
+    for (const Stmt *Child : St->children())
+      collect(Child);
+  }
+
+  /// Whether the branch at the end of \p B tests a variable against zero,
+  /// and which values each outcome leaves.
+  const VarDecl *getTest(const CFGBlock *B, const Expr *Cond, uint8_t &OnTrue,
+                         uint8_t &OnFalse) const {
+    const uint8_t N = Value::Neg, Z = Value::Zero, P = Value::Pos;
+    bool Negated = false;
+    const Expr *E = stripLinuxCondition(Cond, Negated);
+    if (!E || isWrittenInMacro(E->getExprLoc(), S.getSourceManager()) ||
+        isLinuxBranchWrittenInMacro(B, S.getSourceManager()))
+      return nullptr;
+    const VarDecl *VD = nullptr;
+    uint8_t T = Value::Any, F = Value::Any;
+    const Expr *Plain = E->IgnoreParenImpCasts();
+    if (const VarDecl *Direct = getDirectLinuxVariable(E)) {
+      VD = Direct;
+      T = N | P;
+      F = Z;
+    } else if (const auto *BO = dyn_cast<BinaryOperator>(Plain)) {
+      if (!BO->isComparisonOp())
+        return nullptr;
+      const Expr *Other = BO->getRHS();
+      BinaryOperatorKind Op = BO->getOpcode();
+      VD = getDirectLinuxVariable(BO->getLHS());
+      if (!VD) {
+        VD = getDirectLinuxVariable(BO->getRHS());
+        Other = BO->getLHS();
+        switch (Op) {
+        case BO_LT: Op = BO_GT; break;
+        case BO_GT: Op = BO_LT; break;
+        case BO_LE: Op = BO_GE; break;
+        case BO_GE: Op = BO_LE; break;
+        default: break;
+        }
+      }
+      if (!VD)
+        return nullptr;
+      bool IsZero = false;
+      if (VD->getType()->isPointerType()) {
+        IsZero = Other->isNullPointerConstant(
+                     Ctx, Expr::NPC_ValueDependentIsNotNull) !=
+                 Expr::NPCK_NotNull;
+      } else if (!Other->isValueDependent()) {
+        std::optional<llvm::APSInt> K = Other->getIntegerConstantExpr(Ctx);
+        IsZero = K && K->isZero();
+      }
+      if (!IsZero)
+        return nullptr;
+      switch (Op) {
+      case BO_EQ: T = Z; F = N | P; break;
+      case BO_NE: T = N | P; F = Z; break;
+      case BO_LT: T = N; F = Z | P; break;
+      case BO_GE: T = Z | P; F = N; break;
+      case BO_GT: T = P; F = N | Z; break;
+      case BO_LE: T = N | Z; F = P; break;
+      default: return nullptr;
+      }
+      // The compiler has its own warning for "unsigned < 0".
+      if (!VD->getType()->isPointerType() &&
+          VD->getType()->isUnsignedIntegerOrEnumerationType() &&
+          Op != BO_EQ && Op != BO_NE)
+        return nullptr;
+    } else if (const auto *CE = dyn_cast<CallExpr>(Plain)) {
+      const FunctionDecl *Callee = CE->getDirectCallee();
+      if (!Callee || !Callee->getIdentifier() || CE->getNumArgs() != 1)
+        return nullptr;
+      VD = getDirectLinuxVariable(CE->getArg(0)->IgnoreParenCasts());
+      if (Callee->getName() == "IS_ERR") {
+        T = N;
+        F = Z | P;
+      } else if (Callee->getName() == "IS_ERR_OR_NULL") {
+        T = N | Z;
+        F = P;
+      } else {
+        return nullptr;
+      }
+    }
+    if (!VD)
+      return nullptr;
+    if (Negated)
+      std::swap(T, F);
+    OnTrue = T;
+    OnFalse = F;
+    return VD;
+  }
+
+  static bool isConditionalBranch(const CFGBlock *B) {
+    return LinuxPathSearch::isConditionalBranch(B);
+  }
+
+  void runBlock(const CFGBlock *B, Facts &St) const {
+    auto Forget = [&](const VarDecl *VD) {
+      if (auto It = Index.find(VD); It != Index.end())
+        St[It->second] = Fact();
+    };
+    for (const CFGElement &Elem : *B) {
+      std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>();
+      if (!CS)
+        continue;
+      const Stmt *Node = CS->getStmt();
+      if (const auto *DS = dyn_cast<DeclStmt>(Node)) {
+        for (const Decl *D : DS->decls())
+          Forget(dyn_cast<VarDecl>(D));
+      } else if (const auto *BO = dyn_cast<BinaryOperator>(Node)) {
+        if (BO->isAssignmentOp())
+          Forget(getDirectLinuxVariable(BO->getLHS()));
+      } else if (const auto *UO = dyn_cast<UnaryOperator>(Node)) {
+        if (UO->isIncrementDecrementOp())
+          Forget(getDirectLinuxVariable(UO->getSubExpr()));
+      }
+    }
+  }
+
+  /// Whether the source has something between the two tests that can make
+  /// the second one meaningful in another configuration.
+  bool mayChangeBetween(const VarDecl *VD, const Expr *First,
+                        const Expr *Second) const {
+    const SourceManager &SM = S.getSourceManager();
+    SourceLocation A = SM.getExpansionLoc(First->getExprLoc());
+    SourceLocation B = SM.getExpansionLoc(Second->getExprLoc());
+    if (!SM.isBeforeInTranslationUnit(A, B))
+      return true; // a loop: the first test comes later in the source
+    auto It = Assignments.find(VD);
+    if (It != Assignments.end())
+      for (SourceLocation Loc : It->second) {
+        Loc = SM.getExpansionLoc(Loc);
+        if (SM.isBeforeInTranslationUnit(A, Loc) &&
+            SM.isBeforeInTranslationUnit(Loc, B))
+          return true;
+      }
+    auto [FileA, OffA] = SM.getDecomposedLoc(A);
+    auto [FileB, OffB] = SM.getDecomposedLoc(B);
+    if (FileA != FileB)
+      return true;
+    bool Invalid = false;
+    StringRef Text = SM.getBufferData(FileA, &Invalid);
+    if (Invalid || OffB > Text.size())
+      return true;
+    Text = Text.substr(OffA, OffB - OffA);
+    while (!Text.empty()) {
+      StringRef Line;
+      std::tie(Line, Text) = Text.split('\n');
+      Line = Line.ltrim();
+      if (Line.consume_front("#")) {
+        Line = Line.ltrim();
+        if (Line.starts_with("if") || Line.starts_with("el") ||
+            Line.starts_with("endif"))
+          return true;
+      }
+    }
+    return false;
+  }
+
+public:
+  DuplicateCheckChecker(Sema &S, const FunctionDecl *FD, const CFG &Cfg)
+      : S(S), FD(FD), Cfg(Cfg), Ctx(S.getASTContext()) {}
+
+  void run() {
+    collect(FD->getBody());
+
+    // The variables that are tested at least twice.
+    llvm::DenseMap<const VarDecl *, unsigned> Tests;
+    for (const CFGBlock *B : Cfg) {
+      if (!isConditionalBranch(B))
+        continue;
+      uint8_t T, F;
+      const VarDecl *VD =
+          getTest(B, LinuxPathSearch::getBranchCondition(B), T, F);
+      if (isCandidate(VD) && !AddressTaken.count(VD) && ++Tests[VD] == 2 &&
+          Vars.size() < 32) {
+        Index[VD] = Vars.size();
+        Vars.push_back(VD);
+      }
+    }
+    if (Vars.empty())
+      return;
+
+    std::vector<Facts> In(Cfg.getNumBlockIDs());
+    llvm::BitVector Reached(Cfg.getNumBlockIDs());
+    In[Cfg.getEntry().getBlockID()].assign(Vars.size(), Fact());
+    Reached.set(Cfg.getEntry().getBlockID());
+    bool Changed = true;
+    unsigned Rounds = 0;
+    while (Changed && ++Rounds < 64) {
+      Changed = false;
+      for (const CFGBlock *B : Cfg) {
+        if (!Reached.test(B->getBlockID()))
+          continue;
+        Facts Out = In[B->getBlockID()];
+        runBlock(B, Out);
+
+        const Expr *Cond = nullptr;
+        const VarDecl *Tested = nullptr;
+        uint8_t OnTrue = Value::Any, OnFalse = Value::Any;
+        if (isConditionalBranch(B)) {
+          Cond = LinuxPathSearch::getBranchCondition(B);
+          Tested = getTest(B, Cond, OnTrue, OnFalse);
+        }
+        auto TestedIndex = Tested ? Index.find(Tested) : Index.end();
+
+        unsigned SuccIndex = 0;
+        for (const CFGBlock::AdjacentBlock &Succ : B->succs()) {
+          unsigned This = SuccIndex++;
+          const CFGBlock *Next = Succ.getReachableBlock();
+          if (!Next)
+            continue;
+          Facts Edge = Out;
+          if (TestedIndex != Index.end()) {
+            Fact &F = Edge[TestedIndex->second];
+            uint8_t Narrowed = F.Mask & (This == 0 ? OnTrue : OnFalse);
+            // The outcome that the earlier test excludes is not a path.
+            if (!Narrowed)
+              continue;
+            if (Narrowed != F.Mask) {
+              F.Mask = Narrowed;
+              F.From = Cond;
+            }
+          }
+          unsigned ID = Next->getBlockID();
+          if (!Reached.test(ID)) {
+            Reached.set(ID);
+            In[ID] = Edge;
+            Changed = true;
+            continue;
+          }
+          for (unsigned I = 0, E = Vars.size(); I != E; ++I) {
+            Fact &Have = In[ID][I];
+            uint8_t Joined = Have.Mask | Edge[I].Mask;
+            if (Joined != Have.Mask) {
+              Have.Mask = Joined;
+              Changed = true;
+            }
+            if (!Have.From)
+              Have.From = Edge[I].From;
+          }
+        }
+      }
+    }
+
+    for (const CFGBlock *B : Cfg) {
+      if (!Reached.test(B->getBlockID()) || !isConditionalBranch(B))
+        continue;
+      const Expr *Cond = LinuxPathSearch::getBranchCondition(B);
+      uint8_t OnTrue = Value::Any, OnFalse = Value::Any;
+      const VarDecl *VD = getTest(B, Cond, OnTrue, OnFalse);
+      auto It = VD ? Index.find(VD) : Index.end();
+      if (It == Index.end())
+        continue;
+      Facts Out = In[B->getBlockID()];
+      runBlock(B, Out);
+      const Fact &F = Out[It->second];
+      if (F.Mask == Value::Any || !F.From || F.From == Cond)
+        continue;
+      bool NeverTrue = !(F.Mask & OnTrue);
+      bool NeverFalse = !(F.Mask & OnFalse);
+      if (NeverTrue == NeverFalse || mayChangeBetween(VD, F.From, Cond))
+        continue;
+      // "Not negative" has no wording yet: only zero and not zero.
+      if (F.Mask != Value::Zero && (F.Mask & Value::Zero))
+        continue;
+      S.Diag(Cond->getExprLoc(), diag::warn_linux_kernel_duplicate_check)
+          << VD << !(F.Mask & Value::Zero) << Cond->getSourceRange();
+      S.Diag(F.From->getExprLoc(), diag::note_linux_kernel_previous_test)
+          << F.From->getSourceRange();
+    }
+  }
+};
+
 static bool shouldRunLinuxKernelWarnings(const Sema &S, SourceLocation Loc) {
   const DiagnosticsEngine &Diags = S.getDiagnostics();
   return !Diags.isIgnored(diag::warn_linux_kernel_bool_negative_return, Loc) ||
@@ -3834,7 +6532,15 @@ static bool shouldRunLinuxKernelWarnings(const Sema &S, SourceLocation Loc) {
          !Diags.isIgnored(diag::warn_linux_kernel_cleanup_escape, Loc) ||
          !Diags.isIgnored(diag::warn_linux_kernel_err_ptr_deref, Loc) ||
          !Diags.isIgnored(diag::warn_linux_kernel_ptr_err_null, Loc) ||
-         !Diags.isIgnored(diag::warn_linux_kernel_ptr_err_other, Loc);
+         !Diags.isIgnored(diag::warn_linux_kernel_ptr_err_other, Loc) ||
+         !Diags.isIgnored(diag::warn_linux_kernel_unchecked_alloc, Loc) ||
+         !Diags.isIgnored(diag::warn_linux_kernel_bitops_cast, Loc) ||
+         !Diags.isIgnored(diag::warn_linux_kernel_bitops_cast_order, Loc) ||
+         !Diags.isIgnored(diag::warn_linux_kernel_struct_leak, Loc) ||
+         !Diags.isIgnored(diag::warn_linux_kernel_buffer_size, Loc) ||
+         !Diags.isIgnored(diag::warn_linux_kernel_off_by_one, Loc) ||
+         !Diags.isIgnored(diag::warn_linux_kernel_inconsistent_indent, Loc) ||
+         !Diags.isIgnored(diag::warn_zero_extended_complement, Loc);
 }
 
 } // namespace
@@ -3865,11 +6571,17 @@ bool clang::sema::wantsLinuxKernelFlowWarnings(Sema &S,
          !Diags.isIgnored(diag::warn_linux_kernel_missing_error_code, Loc) ||
          !Diags.isIgnored(diag::warn_linux_kernel_counted_by_order, Loc) ||
          !Diags.isIgnored(diag::warn_linux_kernel_counted_by_never_set, Loc) ||
-         !Diags.isIgnored(diag::warn_linux_kernel_deref_before_check, Loc);
+         !Diags.isIgnored(diag::warn_linux_kernel_deref_before_check, Loc) ||
+         !Diags.isIgnored(diag::warn_linux_kernel_deref_after_check, Loc) ||
+         !Diags.isIgnored(diag::warn_linux_kernel_ptr_err_valid, Loc) ||
+         !Diags.isIgnored(diag::warn_linux_kernel_err_ptr_zero, Loc) ||
+         !Diags.isIgnored(diag::warn_linux_kernel_duplicate_check, Loc) ||
+         !Diags.isIgnored(diag::warn_linux_kernel_experimental, Loc);
 }
 
 void clang::sema::IssueLinuxKernelFlowWarnings(Sema &S, const FunctionDecl *FD,
-                                               AnalysisDeclContext &AC) {
+                                               AnalysisDeclContext &AC,
+                                               LinuxKernelUnit &Unit) {
   if (!wantsLinuxKernelFlowWarnings(S, FD) || !FD->getBody())
     return;
   const CFG *Cfg = AC.getCFG();
@@ -3886,4 +6598,15 @@ void clang::sema::IssueLinuxKernelFlowWarnings(Sema &S, const FunctionDecl *FD,
     CountedByOrderChecker(S, FD, *Cfg).run();
   if (!Diags.isIgnored(diag::warn_linux_kernel_deref_before_check, Loc))
     DerefBeforeCheckChecker(S, FD, *Cfg).run();
+
+  if (!Diags.isIgnored(diag::warn_linux_kernel_duplicate_check, Loc))
+    DuplicateCheckChecker(S, FD, *Cfg).run();
+
+  // The checks that follow single paths share one search.
+  bool WantTestedValue = LinuxTestedValueChecker::wanted(S, Loc);
+  if (!WantTestedValue)
+    return;
+  LinuxPathSearch Search(S.getASTContext(), FD, *Cfg);
+  if (WantTestedValue)
+    LinuxTestedValueChecker(S, FD, *Cfg, Search, *Unit.State).run();
 }

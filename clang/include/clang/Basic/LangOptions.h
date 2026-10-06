@@ -534,6 +534,10 @@ public:
   /// unit are appended, as input for inferring such contracts.
   std::string LinuxKernelFactsFile;
 
+  /// The experimental Linux kernel checks to run, by name.  They report in
+  /// the group -Wlinux-kernel-experimental.
+  std::vector<std::string> LinuxKernelExperimentalChecks;
+
   /// The module currently being compiled as specified by -fmodule-name.
   std::string ModuleName;
 

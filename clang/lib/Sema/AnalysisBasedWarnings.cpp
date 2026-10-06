@@ -3318,7 +3318,7 @@ void clang::sema::AnalysisBasedWarnings::IssueWarnings(
   }
 
   if (const auto *FD = dyn_cast<FunctionDecl>(D))
-    IssueLinuxKernelFlowWarnings(S, FD, AC);
+    IssueLinuxKernelFlowWarnings(S, FD, AC, IPData->LinuxKernel);
 
   if (!Diags.isIgnored(diag::warn_uninit_var, D->getBeginLoc()) ||
       !Diags.isIgnored(diag::warn_sometimes_uninit_var, D->getBeginLoc()) ||

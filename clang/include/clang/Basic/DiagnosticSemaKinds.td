@@ -694,6 +694,102 @@ def warn_linux_kernel_deref_before_check : Warning<
   "it">,
   InGroup<LinuxKernelDerefBeforeCheck>, DefaultIgnore;
 def note_linux_kernel_dereferenced_here : Note<"%0 is dereferenced here">;
+def warn_linux_kernel_deref_after_check : Warning<
+  "'%0' is dereferenced here on a path where the earlier test found it to be "
+  "NULL">,
+  InGroup<LinuxKernelDerefAfterCheck>, DefaultIgnore;
+def warn_linux_kernel_deref_after_check_call : Warning<
+  "'%0' is passed to %1, which dereferences it, on a path where the earlier "
+  "test found it to be NULL">,
+  InGroup<LinuxKernelDerefAfterCheck>, DefaultIgnore;
+def note_linux_kernel_null_tested_here : Note<
+  "'%0' is tested here and the path goes on with it being NULL">;
+def warn_linux_kernel_unchecked_alloc : Warning<
+  "%0 holds the result of %1, which is NULL when the allocation fails, and is "
+  "dereferenced here without a test">,
+  InGroup<LinuxKernelUncheckedAllocation>, DefaultIgnore;
+def warn_linux_kernel_missing_unwind : Warning<
+  "'%0' was acquired with %1() and this error path returns without %2(), "
+  "which other paths call">,
+  InGroup<LinuxKernelMissingUnwind>, DefaultIgnore;
+def note_linux_kernel_acquired_here : Note<"acquired here">;
+def note_linux_kernel_released_here : Note<"another path releases it here">;
+def warn_linux_kernel_memory_leak : Warning<
+  "%0 holds memory from %1() that is neither freed nor stored when the "
+  "function returns here">,
+  InGroup<LinuxKernelMemoryLeak>, DefaultIgnore;
+def note_linux_kernel_allocated_here : Note<"allocated here">;
+def warn_linux_kernel_double_free : Warning<
+  "'%0' is freed again here, and every path to this call has already freed "
+  "it">,
+  InGroup<LinuxKernelUseAfterFree>, DefaultIgnore;
+def warn_linux_kernel_use_after_free : Warning<
+  "'%0' is dereferenced here, and every path to this point has freed it">,
+  InGroup<LinuxKernelUseAfterFree>, DefaultIgnore;
+def note_linux_kernel_freed_here : Note<"freed here">;
+def warn_linux_kernel_err_ptr_zero : Warning<
+  "%0 is zero on every path to this call, so ERR_PTR() returns NULL instead "
+  "of an error pointer">,
+  InGroup<LinuxKernelErrorPointerZero>, DefaultIgnore;
+def note_linux_kernel_zero_known_here : Note<"%0 is found to be zero here">;
+def warn_linux_kernel_ptr_err_valid : Warning<
+  "'%0' is passed to PTR_ERR(), but the IS_ERR() test has shown that it is "
+  "not an error pointer on this path">,
+  InGroup<LinuxKernelPtrErrValid>, DefaultIgnore;
+def note_linux_kernel_is_err_tested_here : Note<"tested here">;
+def warn_linux_kernel_duplicate_check : Warning<
+  "%0 is always %select{zero|nonzero}1 here: every path has tested it and it "
+  "has not changed since">,
+  InGroup<LinuxKernelDuplicateCheck>, DefaultIgnore;
+def note_linux_kernel_previous_test : Note<"previous test is here">;
+def warn_linux_kernel_uninit_output : Warning<
+  "%0 may be uninitialized here: %1 does not set it when it fails, and this "
+  "path does not leave on that failure">,
+  InGroup<LinuxKernelUninitializedOutput>, DefaultIgnore;
+def note_linux_kernel_output_passed_here : Note<
+  "the address of %0 is passed to %1 here">;
+def note_linux_kernel_output_not_set : Note<
+  "%0 returns here without having stored through %1">;
+def warn_linux_kernel_bitops_cast : Warning<
+  "%0() works on unsigned long, which has %2 bits, but '%1' has %3: the "
+  "access runs past the object%select{|, and a big-endian machine numbers "
+  "the bits differently}4">,
+  InGroup<LinuxKernelBitopsCast>, DefaultIgnore;
+def warn_linux_kernel_bitops_cast_order : Warning<
+  "%0() takes '%1' for an array of two unsigned long, which this big-endian "
+  "target stores in the other order">,
+  InGroup<LinuxKernelBitopsCast>, DefaultIgnore;
+def warn_linux_kernel_struct_leak : Warning<
+  "%0 is copied out by %1() with %2 %plural{1:byte|:bytes}2 of padding that "
+  "this function never initializes">,
+  InGroup<LinuxKernelStructLeak>, DefaultIgnore;
+def note_linux_kernel_struct_hole : Note<"%0 has padding after member %1">;
+def note_linux_kernel_struct_tail : Note<"%0 has padding at its end">;
+def note_linux_kernel_declared_no_init : Note<
+  "%0 is declared here without an initializer">;
+def warn_linux_kernel_buffer_size : Warning<
+  "%0() is given a size of %1 for '%2', which has %3 bytes">,
+  InGroup<LinuxKernelBufferSize>, DefaultIgnore;
+def warn_linux_kernel_off_by_one : Warning<
+  "'%0' can be %1 here, the number of elements of '%2': the bounds test uses "
+  "'>' where '>=' is needed">,
+  InGroup<LinuxKernelOffByOne>, DefaultIgnore;
+def note_linux_kernel_bounds_test_here : Note<"bounds test is here">;
+def warn_linux_kernel_inconsistent_indent : Warning<
+  "this statement is indented differently from the statement before it in "
+  "the same block">,
+  InGroup<LinuxKernelIndent>, DefaultIgnore;
+def note_linux_kernel_previous_statement : Note<
+  "previous statement is here">;
+def warn_linux_kernel_experimental : Warning<
+  "%0 (experimental check '%1')">,
+  InGroup<LinuxKernelExperimental>, DefaultIgnore;
+def note_linux_kernel_experimental : Note<"%0">;
+def warn_zero_extended_complement : Warning<
+  "'~' is applied to a %0-bit unsigned value and the result is zero-extended "
+  "to %1 bits, so this %select{'&'|'&='}2 clears the upper %3 bits of the "
+  "other operand">,
+  InGroup<ZeroExtendedComplement>, DefaultIgnore;
 def note_linux_kernel_contract_inferred : Note<
   "the return convention of %0 was inferred from its definition">;
 def err_linux_kernel_contracts_file : Error<

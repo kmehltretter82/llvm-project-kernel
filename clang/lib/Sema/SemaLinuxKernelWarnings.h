@@ -41,7 +41,8 @@ bool wantsLinuxKernelFlowWarnings(Sema &S, const FunctionDecl *FD);
 
 /// Run the CFG-based Linux kernel checks.
 void IssueLinuxKernelFlowWarnings(Sema &S, const FunctionDecl *FD,
-                                  AnalysisDeclContext &AC);
+                                  AnalysisDeclContext &AC,
+                                  LinuxKernelUnit &Unit);
 
 /// Called once at the end of the translation unit.  Appends the facts about
 /// its functions to the file named by -flinux-kernel-emit-facts=.

@@ -1235,6 +1235,51 @@ def LinuxKernelPtrErrZero : DiagGroup<"linux-kernel-ptr-err-zero">;
 // the test is dead or the dereference is unsafe.
 def LinuxKernelDerefBeforeCheck :
   DiagGroup<"linux-kernel-deref-before-check">;
+// A pointer that is dereferenced on a path where a test has found it to be
+// NULL.
+def LinuxKernelDerefAfterCheck :
+  DiagGroup<"linux-kernel-deref-after-check">;
+// The result of an allocation that is dereferenced without a NULL test.
+def LinuxKernelUncheckedAllocation :
+  DiagGroup<"linux-kernel-unchecked-allocation">;
+// A resource or a lock that one error path keeps although other paths of the
+// function release it.
+def LinuxKernelMissingUnwind : DiagGroup<"linux-kernel-missing-unwind">;
+// A local allocation that is neither freed nor stored when the function
+// returns.
+def LinuxKernelMemoryLeak : DiagGroup<"linux-kernel-memory-leak">;
+// A free or a use of memory that every path has already freed.
+def LinuxKernelUseAfterFree : DiagGroup<"linux-kernel-use-after-free">;
+// ERR_PTR() of an error code that is zero on every path to the call.
+def LinuxKernelErrorPointerZero :
+  DiagGroup<"linux-kernel-error-pointer-zero">;
+// PTR_ERR() of a pointer that an IS_ERR() test has shown to be valid.
+def LinuxKernelPtrErrValid : DiagGroup<"linux-kernel-ptr-err-valid">;
+// A test whose outcome an earlier test of the same variable has decided.
+// The assignment that was meant to come between the two is often missing.
+def LinuxKernelDuplicateCheck : DiagGroup<"linux-kernel-duplicate-check">;
+// A variable that a function was to set through a pointer, read on a path
+// where that function failed without setting it.
+def LinuxKernelUninitializedOutput :
+  DiagGroup<"linux-kernel-uninitialized-output">;
+// A bitmap function that is given the address of something narrower than
+// unsigned long, or of a 64-bit value on a 32-bit big-endian machine.
+def LinuxKernelBitopsCast : DiagGroup<"linux-kernel-bitops-cast">;
+// A structure with padding that is copied to user space and that the
+// function never cleared as a whole.
+def LinuxKernelStructLeak : DiagGroup<"linux-kernel-struct-leak">;
+// A size that is larger than the array it is given for, and an index that a
+// bounds test lets through one too far.
+def LinuxKernelBufferSize : DiagGroup<"linux-kernel-buffer-size">;
+def LinuxKernelOffByOne : DiagGroup<"linux-kernel-off-by-one">;
+// Two statements of one block that start in different columns.
+def LinuxKernelIndent : DiagGroup<"linux-kernel-indent">;
+// Checks that are being tried out.  -flinux-kernel-experimental= names the
+// ones to run.
+def LinuxKernelExperimental : DiagGroup<"linux-kernel-experimental">;
+// "x & ~mask" with a 64-bit x and a 32-bit unsigned mask: the complement is
+// zero-extended and clears the upper half of x.  Not specific to the kernel.
+def ZeroExtendedComplement : DiagGroup<"zero-extended-complement">;
 def LinuxKernel : DiagGroup<"linux-kernel", [LinuxKernelBoolReturn,
                                              LinuxKernelUsercopy,
                                              LinuxKernelErrorPointer,

@@ -8226,6 +8226,7 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
 
   Args.AddLastArg(CmdArgs, options::OPT_flinux_kernel_contracts_EQ);
   Args.AddLastArg(CmdArgs, options::OPT_flinux_kernel_emit_facts_EQ);
+  Args.AddAllArgs(CmdArgs, options::OPT_flinux_kernel_experimental_EQ);
   Args.addOptInFlag(CmdArgs, options::OPT_flinux_kernel_lenient_asm,
                     options::OPT_fno_linux_kernel_lenient_asm);
 
