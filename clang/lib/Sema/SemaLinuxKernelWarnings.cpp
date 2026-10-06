@@ -18,6 +18,7 @@
 #include "clang/AST/Expr.h"
 #include "clang/AST/RecordLayout.h"
 #include "clang/AST/Stmt.h"
+#include "clang/Analysis/Analyses/Dominators.h"
 #include "clang/Analysis/AnalysisDeclContext.h"
 #include "clang/Analysis/CFG.h"
 #include "clang/Basic/Builtins.h"
@@ -4913,12 +4914,15 @@ public:
     /// Pairs of locations of which one was assigned to the other and that
     /// have held the same value since: "meta = cpu->meta".
     llvm::SmallVector<std::pair<unsigned, unsigned>, 2> Same;
+    /// Outcomes of conditions that the check takes for granted for the
+    /// whole search, whatever the path does.
+    llvm::SmallVector<std::pair<unsigned, bool>, 2> Fixed;
     /// For the check that runs the search.
     uint32_t Client = 0;
 
     bool operator==(const State &O) const {
       return Client == O.Client && Vals == O.Vals && Preds == O.Preds &&
-             Same == O.Same;
+             Same == O.Same && Fixed == O.Fixed;
     }
   };
 
@@ -5844,14 +5848,31 @@ public:
       return std::nullopt;
     if (std::optional<bool> B = value(E, St).truth())
       return *B != Negated;
-    if (St.Preds.empty())
+    if (St.Preds.empty() && St.Fixed.empty())
       return std::nullopt;
     int I = conditionIndex(E, /*Create=*/false);
-    if (I >= 0)
-      for (const auto &[C, Holds] : St.Preds)
-        if (C == unsigned(I))
-          return Holds != Negated;
+    if (I < 0)
+      return std::nullopt;
+    for (const auto &[C, Holds] : St.Fixed)
+      if (C == unsigned(I))
+        return Holds != Negated;
+    for (const auto &[C, Holds] : St.Preds)
+      if (C == unsigned(I))
+        return Holds != Negated;
     return std::nullopt;
+  }
+
+  /// Take the outcome \p Outcome of \p Cond for granted in \p St and in
+  /// every state that comes from it.  This is for a condition that the code
+  /// itself relies on not to change: "if (c) lock(); ... if (c) unlock();".
+  void fix(const Expr *Cond, bool Outcome, State &St) {
+    bool Negated = false;
+    const Expr *E = stripLinuxCondition(Cond, Negated);
+    if (!E || St.Fixed.size() >= 4)
+      return;
+    int I = conditionIndex(E, /*Create=*/true);
+    if (I >= 0)
+      St.Fixed.push_back({unsigned(I), Outcome != Negated});
   }
 
   /// Narrow \p Loc to the values in \p Mask, and with it the locations that
@@ -6771,7 +6792,6 @@ static bool getLinuxResourceKind(const FunctionDecl *Callee,
       {"down_read_nested", R::Always, 0, false, false, 0, {"up_read"}},
       {"down_write", R::Always, 0, false, false, 0, {"up_write"}},
       {"down_write_nested", R::Always, 0, false, false, 0, {"up_write"}},
-      {"rcu_read_lock", R::Always, -2, false, false, -2, {"rcu_read_unlock"}},
       // Mappings and handles that the result names.
       {"ioremap", R::Pointer, -1, false, false, 0, {"iounmap"}},
       {"ioremap_wc", R::Pointer, -1, false, false, 0, {"iounmap"}},
@@ -7056,6 +7076,7 @@ class LinuxUnwindChecker : LinuxPathSearch::Client {
   /// an error, and no other release in the function is needed.
   bool Local = false;
   const ReturnStmt *Found = nullptr;
+  std::unique_ptr<CFGDomTree> DomTree;
 
   enum : uint32_t { StatusOpen = 1 };
 
@@ -7370,6 +7391,74 @@ class LinuxUnwindChecker : LinuxPathSearch::Client {
     return (TakenWhenTrue != Negated) != TrueIsFailure;
   }
 
+  static bool isLockRelease(StringRef Name) {
+    return Name.contains("unlock") || Name == "up" || Name == "up_read" ||
+           Name == "up_write";
+  }
+
+  /// Whether the acquisition takes back what the function has released
+  /// before: a release of the same resource in the block of the
+  /// acquisition or in one that dominates it, with no other acquisition in
+  /// between.  The function is then entered with the resource held, as one
+  /// is that drops its caller's lock around a call that sleeps, and
+  /// returning with it held is what its caller expects.
+  bool retakesAfterRelease(const CFGBlock *AcquireBlock) {
+    const FunctionDecl *AcquireCallee = Acquire->getDirectCallee();
+    if (!DomTree)
+      DomTree = std::make_unique<CFGDomTree>(const_cast<CFG *>(&Cfg));
+    bool BeforeAcquire = false;
+    const CFGBlock *B = AcquireBlock;
+    for (unsigned Depth = 0; B && Depth < 64; ++Depth) {
+      for (auto It = B->rbegin(), End = B->rend(); It != End; ++It) {
+        std::optional<CFGStmt> CS = It->getAs<CFGStmt>();
+        const auto *CE = CS ? dyn_cast<CallExpr>(CS->getStmt()) : nullptr;
+        if (CE == Acquire) {
+          BeforeAcquire = true;
+          continue;
+        }
+        if (B == AcquireBlock && !BeforeAcquire)
+          continue;
+        const FunctionDecl *Callee = CE ? CE->getDirectCallee() : nullptr;
+        if (!Callee || !Callee->getIdentifier())
+          continue;
+        if (isReleaseOf(CE, Kind))
+          return true;
+        // Any way of unlocking this lock: up_read() before down_write().
+        if (Kind.Result != LinuxResourceKind::Pointer &&
+            isLockRelease(Callee->getName()) && CE->getNumArgs() >= 1 &&
+            isHandle(CE->getArg(0)))
+          return true;
+        if (Callee == AcquireCallee && Kind.HandleArg >= 0 &&
+            CE->getNumArgs() > unsigned(Kind.HandleArg) &&
+            isHandle(CE->getArg(Kind.HandleArg)))
+          return false;
+      }
+      DomTreeNode *N = DomTree->getBase().getNode(const_cast<CFGBlock *>(B));
+      DomTreeNode *IDom = N ? N->getIDom() : nullptr;
+      B = IDom ? IDom->getBlock() : nullptr;
+    }
+    return false;
+  }
+
+  /// The conditions under which the acquisition happens: the branches that
+  /// lead to its block and to nothing else.  "if (c) get(); ... if (c)
+  /// put();" relies on c not changing, and so does the search.
+  void fixGuards(const CFGBlock *B, LinuxPathSearch::State &St) {
+    for (unsigned Depth = 0; Depth < 4 && B->pred_size() == 1; ++Depth) {
+      const CFGBlock *Pred = B->pred_begin()->getReachableBlock();
+      if (!Pred)
+        break;
+      if (LinuxPathSearch::isConditionalBranch(Pred)) {
+        const CFGBlock *OnTrue = Pred->succ_begin()->getReachableBlock();
+        const CFGBlock *OnFalse = (Pred->succ_begin() + 1)->getReachableBlock();
+        if (OnTrue != OnFalse)
+          Search.fix(LinuxPathSearch::getBranchCondition(Pred), OnTrue == B,
+                     St);
+      }
+      B = Pred;
+    }
+  }
+
   /// Set up the handle of the acquisition \p CE in \p B.  Returns the index
   /// of the CFG element behind it, or 0 if there is nothing to follow.
   unsigned prepare(const CFGBlock *B, unsigned Index, const CallExpr *CE) {
@@ -7505,11 +7594,13 @@ public:
         const CallExpr *Release = findRelease(FD->getBody());
         if (Local ? !WantLeak : (!WantUnwind || !Release))
           continue;
-        // A local allocation that some path frees is covered by the rule
-        // for any resource as well: report it once, as a leak.
+        if (!Local && retakesAfterRelease(B))
+          continue;
         if (++Searches > 24)
           return;
-        Search.run(B, First, LinuxPathSearch::State(), *this);
+        LinuxPathSearch::State Init;
+        fixGuards(B, Init);
+        Search.run(B, First, Init, *this);
         if (!Found)
           continue;
         std::string Text = HandleVar ? HandleVar->getNameAsString()
@@ -7532,6 +7623,254 @@ public:
         }
       }
     }
+  }
+};
+
+/// Memory that is used after every path has freed it:
+///
+///   list_for_each_entry(item, &head, list) {
+///           list_del(&item->list);
+///           kfree(item);                  /* the loop reads item->list.next */
+///   }
+///
+/// and memory that is freed a second time.  For each variable or member
+/// chain that the function hands to kfree() or one of its relatives, the
+/// checker follows one fact through the CFG: whether every path has freed
+/// it since it was last assigned.  A dereference or another free in that
+/// state is reported.
+class UseAfterFreeChecker {
+  Sema &S;
+  const FunctionDecl *FD;
+  const CFG &Cfg;
+  ASTContext &Ctx;
+
+  struct Place {
+    const VarDecl *Root = nullptr;
+    llvm::SmallVector<const FieldDecl *, 3> Path;
+    /// The first call in the source that frees it, and its argument.
+    const CallExpr *FirstFree = nullptr;
+    const Expr *Freed = nullptr;
+    bool Reported = false;
+  };
+  llvm::SmallVector<Place, 8> Places;
+  llvm::SmallPtrSet<const VarDecl *, 8> AddressTaken;
+
+  static bool decompose(const Expr *E, const VarDecl *&Root,
+                        llvm::SmallVectorImpl<const FieldDecl *> &Path) {
+    E = E ? E->IgnoreParenCasts() : nullptr;
+    if (!E)
+      return false;
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+      Root = dyn_cast<VarDecl>(DRE->getDecl());
+      return Root && Root->hasLocalStorage();
+    }
+    const auto *ME = dyn_cast<MemberExpr>(E);
+    const auto *Field = ME ? dyn_cast<FieldDecl>(ME->getMemberDecl()) : nullptr;
+    if (!Field || !decompose(ME->getBase(), Root, Path) || Path.size() >= 4)
+      return false;
+    Path.push_back(Field);
+    return true;
+  }
+
+  int find(const Expr *E) const {
+    const VarDecl *Root = nullptr;
+    llvm::SmallVector<const FieldDecl *, 3> Path;
+    if (!decompose(E, Root, Path))
+      return -1;
+    for (unsigned I = 0, N = Places.size(); I != N; ++I)
+      if (Places[I].Root == Root && Places[I].Path == Path)
+        return I;
+    return -1;
+  }
+
+  /// The argument that \p CE frees, if it is a call of a function that
+  /// frees memory at once.
+  static const Expr *getFreed(const CallExpr *CE) {
+    const FunctionDecl *Callee = CE->getDirectCallee();
+    if (!Callee || !Callee->getIdentifier())
+      return nullptr;
+    int Arg = llvm::StringSwitch<int>(Callee->getName())
+                  .Cases({"kfree", "kfree_sensitive", "kvfree",
+                          "kvfree_sensitive", "vfree", "kfree_const"},
+                         0)
+                  .Cases({"kmem_cache_free", "devm_kfree"}, 1)
+                  .Cases({"mempool_free", "free_netdev"}, 0)
+                  .Cases({"kfree_skb", "consume_skb", "dev_kfree_skb",
+                          "dev_kfree_skb_any", "dev_kfree_skb_irq",
+                          "dev_consume_skb_any", "__kfree_skb",
+                          "kfree_skb_reason"},
+                         0)
+                  .Default(-1);
+    if (Arg < 0 || CE->getNumArgs() <= unsigned(Arg))
+      return nullptr;
+    return CE->getArg(Arg);
+  }
+
+  void collect(const Stmt *St) {
+    if (!St)
+      return;
+    if (const auto *UO = dyn_cast<UnaryOperator>(St)) {
+      if (UO->getOpcode() == UO_AddrOf)
+        if (const VarDecl *VD = getDirectLinuxVariable(UO->getSubExpr()))
+          AddressTaken.insert(VD);
+    } else if (const auto *CE = dyn_cast<CallExpr>(St)) {
+      if (const Expr *Freed = getFreed(CE)) {
+        Place P;
+        if (decompose(Freed, P.Root, P.Path) && find(Freed) < 0 &&
+            Places.size() < 16 &&
+            !isWrittenInMacro(CE->getExprLoc(), S.getSourceManager())) {
+          P.FirstFree = CE;
+          P.Freed = Freed;
+          Places.push_back(std::move(P));
+        }
+      }
+    }
+    for (const Stmt *Child : St->children())
+      collect(Child);
+  }
+
+  static bool mentions(const Stmt *St, const VarDecl *VD) {
+    if (!St)
+      return false;
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(St))
+      if (DRE->getDecl() == VD)
+        return true;
+    for (const Stmt *Child : St->children())
+      if (mentions(Child, VD))
+        return true;
+    return false;
+  }
+
+  /// The object that \p Target names gets a new value: so does every place
+  /// that goes through it.
+  void assigned(const Expr *Target, llvm::SmallBitVector &St) const {
+    const VarDecl *Root = nullptr;
+    llvm::SmallVector<const FieldDecl *, 3> Path;
+    bool Known = decompose(Target, Root, Path);
+    const auto *ME = dyn_cast<MemberExpr>(Target->IgnoreParens());
+    const auto *Field = ME ? dyn_cast<FieldDecl>(ME->getMemberDecl()) : nullptr;
+    for (unsigned I = 0, N = Places.size(); I != N; ++I) {
+      const Place &P = Places[I];
+      if (Known && P.Root == Root && P.Path.size() >= Path.size() &&
+          std::equal(Path.begin(), Path.end(), P.Path.begin()))
+        St.reset(I);
+      // The same member of another object may be the same memory.
+      else if (Field && llvm::is_contained(P.Path, Field))
+        St.reset(I);
+    }
+  }
+
+  void runBlock(const CFGBlock *B, llvm::SmallBitVector &St, bool Report) {
+    for (const CFGElement &Elem : *B) {
+      std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>();
+      if (!CS)
+        continue;
+      const Stmt *Node = CS->getStmt();
+      if (const Expr *Pointer = LinuxPathSearch::accessedPointer(Node)) {
+        int I = find(Pointer);
+        if (Report && I >= 0 && St.test(I) && !Places[I].Reported) {
+          Places[I].Reported = true;
+          S.Diag(Pointer->getExprLoc(), diag::warn_linux_kernel_use_after_free)
+              << getLinuxExprText(Places[I].Freed, S)
+              << Pointer->getSourceRange();
+          S.Diag(Places[I].FirstFree->getExprLoc(),
+                 diag::note_linux_kernel_freed_here)
+              << Places[I].FirstFree->getSourceRange();
+        }
+      }
+      if (const auto *DS = dyn_cast<DeclStmt>(Node)) {
+        for (const Decl *D : DS->decls())
+          for (unsigned I = 0, N = Places.size(); I != N; ++I)
+            if (Places[I].Root == D)
+              St.reset(I);
+      } else if (const auto *BO = dyn_cast<BinaryOperator>(Node)) {
+        if (BO->isAssignmentOp())
+          assigned(BO->getLHS(), St);
+      } else if (const auto *UO = dyn_cast<UnaryOperator>(Node)) {
+        if (UO->isIncrementDecrementOp())
+          assigned(UO->getSubExpr(), St);
+      } else if (const auto *CE = dyn_cast<CallExpr>(Node)) {
+        const Expr *Freed = getFreed(CE);
+        int I = Freed ? find(Freed) : -1;
+        if (I >= 0) {
+          if (Report && St.test(I) && !Places[I].Reported &&
+              CE != Places[I].FirstFree) {
+            Places[I].Reported = true;
+            S.Diag(CE->getExprLoc(), diag::warn_linux_kernel_double_free)
+                << getLinuxExprText(Freed, S) << CE->getSourceRange();
+            S.Diag(Places[I].FirstFree->getExprLoc(),
+                   diag::note_linux_kernel_freed_here)
+                << Places[I].FirstFree->getSourceRange();
+          }
+          St.set(I);
+          continue;
+        }
+        // Another call may have put something new into a member.
+        const FunctionDecl *Callee = CE->getDirectCallee();
+        if (Callee && isLinuxReadOnlyCallee(Callee))
+          continue;
+        for (unsigned P = 0, N = Places.size(); P != N; ++P) {
+          if (Places[P].Path.empty() || !St.test(P))
+            continue;
+          for (const Expr *Arg : CE->arguments())
+            if (mentions(Arg, Places[P].Root)) {
+              St.reset(P);
+              break;
+            }
+        }
+      } else if (isa<GCCAsmStmt>(Node)) {
+        St.reset();
+      }
+    }
+  }
+
+public:
+  UseAfterFreeChecker(Sema &S, const FunctionDecl *FD, const CFG &Cfg)
+      : S(S), FD(FD), Cfg(Cfg), Ctx(S.getASTContext()) {}
+
+  void run() {
+    collect(FD->getBody());
+    llvm::erase_if(Places, [&](const Place &P) {
+      return P.Path.empty() && AddressTaken.count(P.Root);
+    });
+    if (Places.empty())
+      return;
+
+    // In[B]: the places that every path to B has freed.
+    std::vector<llvm::SmallBitVector> In(Cfg.getNumBlockIDs());
+    llvm::BitVector Reached(Cfg.getNumBlockIDs());
+    In[Cfg.getEntry().getBlockID()].resize(Places.size());
+    Reached.set(Cfg.getEntry().getBlockID());
+    bool Changed = true;
+    unsigned Rounds = 0;
+    while (Changed && ++Rounds < 64) {
+      Changed = false;
+      for (const CFGBlock *B : Cfg) {
+        if (!Reached.test(B->getBlockID()))
+          continue;
+        llvm::SmallBitVector Out = In[B->getBlockID()];
+        runBlock(B, Out, /*Report=*/false);
+        for (const CFGBlock::AdjacentBlock &Succ : B->succs()) {
+          const CFGBlock *Next = Succ.getReachableBlock();
+          if (!Next)
+            continue;
+          unsigned ID = Next->getBlockID();
+          if (!Reached.test(ID)) {
+            Reached.set(ID);
+            In[ID] = Out;
+            Changed = true;
+          } else if ((In[ID] & Out) != In[ID]) {
+            In[ID] &= Out;
+            Changed = true;
+          }
+        }
+      }
+    }
+    for (const CFGBlock *B : Cfg)
+      if (Reached.test(B->getBlockID())) {
+        llvm::SmallBitVector Out = In[B->getBlockID()];
+        runBlock(B, Out, /*Report=*/true);
+      }
   }
 };
 
@@ -7947,6 +8286,8 @@ bool clang::sema::wantsLinuxKernelFlowWarnings(Sema &S,
          !Diags.isIgnored(diag::warn_linux_kernel_duplicate_check, Loc) ||
          !Diags.isIgnored(diag::warn_linux_kernel_missing_unwind, Loc) ||
          !Diags.isIgnored(diag::warn_linux_kernel_memory_leak, Loc) ||
+         !Diags.isIgnored(diag::warn_linux_kernel_double_free, Loc) ||
+         !Diags.isIgnored(diag::warn_linux_kernel_use_after_free, Loc) ||
          !Diags.isIgnored(diag::warn_linux_kernel_experimental, Loc);
 }
 
@@ -7972,6 +8313,9 @@ void clang::sema::IssueLinuxKernelFlowWarnings(Sema &S, const FunctionDecl *FD,
 
   if (!Diags.isIgnored(diag::warn_linux_kernel_duplicate_check, Loc))
     DuplicateCheckChecker(S, FD, *Cfg).run();
+  if (!Diags.isIgnored(diag::warn_linux_kernel_double_free, Loc) ||
+      !Diags.isIgnored(diag::warn_linux_kernel_use_after_free, Loc))
+    UseAfterFreeChecker(S, FD, *Cfg).run();
 
   // The checks that follow single paths share one search.
   bool WantTestedValue = LinuxTestedValueChecker::wanted(S, Loc);

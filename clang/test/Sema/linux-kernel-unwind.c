@@ -201,6 +201,55 @@ out:
   return ret;
 }
 
+// A lock that the caller holds is dropped for a while: returning with it is
+// what the caller expects.
+
+int drop_and_retake(struct priv *p) {
+  int ret;
+
+  mutex_unlock(&p->lock);
+  ret = setup(p->dev);
+  mutex_lock(&p->lock);
+  if (ret)
+    return ret;
+  p->value++;
+  return 0;
+}
+
+// Taken and released under one condition, which the code relies on not to
+// change in between.
+
+int conditional(struct priv *p) {
+  int ret;
+
+  if (!p->value)
+    clk_prepare_enable(p->clk);
+  ret = setup(p->dev);
+  if (ret) {
+    if (!p->value)
+      clk_disable_unprepare(p->clk);
+    return ret;
+  }
+  return 0;
+}
+
+int conditional_missing(struct priv *p) {
+  int ret;
+
+  if (!p->value)
+    clk_prepare_enable(p->clk); // unwind-note {{acquired here}}
+  ret = setup(p->dev);
+  if (ret)
+    return ret; // unwind-warning {{'p->clk' was acquired with clk_prepare_enable()}}
+  ret = setup(p->dev);
+  if (ret) {
+    if (!p->value)
+      clk_disable_unprepare(p->clk); // unwind-note {{another path releases it here}}
+    return ret;
+  }
+  return 0;
+}
+
 // A mapping that the result names.
 
 int mapping(struct priv *p) {
