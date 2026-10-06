@@ -458,6 +458,14 @@ group of its own once a kernel scan has shown what it finds. The names:
   count as a test, because the error code is a large number there, and a
   comparison with a limit does. Which functions can return a negative
   number is inferred, see below.
+- `positive-errno-test`: `err == ERESTARTSYS`, a comparison with an error
+  number that lacks its minus sign, where the function treats the variable
+  as a kernel error code somewhere: it passes it to `ERR_PTR()` or
+  `dev_err_probe()`, assigns it `PTR_ERR()` or a negative error number, or
+  compares it with one. Left alone: a function that keeps positive numbers
+  in the variable anywhere (it assigns one, or negates the variable, as in
+  `return -ret;`), and a variable that is compared with the same error
+  number in both forms, `ret == -EAGAIN || ret == EAGAIN`.
 
 Some names change how the path checks work and are not part of `all`.
 `path-notes` adds a note for each branch between the test and the misuse,

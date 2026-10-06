@@ -504,6 +504,16 @@ static bool isLinuxErrnoName(StringRef Name) {
       .Cases({"EOWNERDEAD", "ENOTRECOVERABLE", "ERFKILL", "EHWPOISON", "EFTYPE",
               "EPROBE_DEFER"},
              true)
+      // <linux/errno.h>: never seen by user programs.
+      .Cases({"ERESTARTSYS", "ERESTARTNOINTR", "ERESTARTNOHAND",
+              "ENOIOCTLCMD", "ERESTART_RESTARTBLOCK", "EOPENSTALE"},
+             true)
+      .Cases({"ENOPARAM", "EBADHANDLE", "ENOTSYNC", "EBADCOOKIE", "ENOTSUPP",
+              "ETOOSMALL"},
+             true)
+      .Cases({"ESERVERFAULT", "EBADTYPE", "EJUKEBOX", "EIOCBQUEUED",
+              "ERECALLCONFLICT", "ENOGRACE"},
+             true)
       .Default(false);
 }
 
@@ -4071,6 +4081,151 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
           << "the result is stored here";
   }
 
+  /// What the function does with a variable that holds error codes.
+  struct ErrnoUse {
+    /// Where it is treated as a kernel error code, which is negative: it
+    /// goes to ERR_PTR(), is assigned PTR_ERR() or "-ENOMEM", or is
+    /// compared with "-EAGAIN".
+    SourceLocation Negative;
+    /// It is assigned a positive error number or is negated somewhere:
+    /// the function keeps positive numbers in it, at least for a while.
+    bool Positive = false;
+    /// The error numbers that it is compared with in negative form.
+    llvm::SmallVector<StringRef, 4> NegatedNames;
+  };
+  std::optional<llvm::DenseMap<const VarDecl *, ErrnoUse>> ErrnoUses;
+
+  /// The sign of the errno macro that \p E is written with: -1, 1, or 0
+  /// if it is none.
+  int getErrnoSign(const Expr *E, StringRef &Name) const {
+    Name = getLinuxErrnoMacroName(E, S);
+    Expr::EvalResult R;
+    if (Name.empty() || E->isValueDependent() ||
+        !E->EvaluateAsInt(R, S.getASTContext()))
+      return 0;
+    return R.Val.getInt().isNegative() ? -1 : R.Val.getInt().isZero() ? 0 : 1;
+  }
+
+  void collectErrnoUses(const Stmt *St) {
+    if (!St)
+      return;
+    auto Variable = [](const Expr *E) -> const VarDecl * {
+      const VarDecl *VD = E ? getDirectVariable(E->IgnoreParenCasts()) : nullptr;
+      return VD && VD->hasLocalStorage() ? VD : nullptr;
+    };
+    auto Negative = [&](const VarDecl *VD, SourceLocation Loc) {
+      ErrnoUse &U = (*ErrnoUses)[VD];
+      if (U.Negative.isInvalid())
+        U.Negative = Loc;
+    };
+    auto Assigned = [&](const VarDecl *VD, const Expr *RHS) {
+      if (!VD || !RHS)
+        return;
+      StringRef Name;
+      int Sign = getErrnoSign(RHS, Name);
+      if (Sign < 0) {
+        Negative(VD, RHS->getExprLoc());
+        return;
+      }
+      if (Sign > 0) {
+        (*ErrnoUses)[VD].Positive = true;
+        return;
+      }
+      const Expr *E = RHS->IgnoreParenCasts();
+      if (const auto *CE = dyn_cast<CallExpr>(E)) {
+        const FunctionDecl *Callee = CE->getDirectCallee();
+        if (Callee && Callee->getIdentifier() &&
+            (Callee->getName() == "PTR_ERR" ||
+             Callee->getName() == "PTR_ERR_OR_ZERO"))
+          Negative(VD, RHS->getExprLoc());
+      }
+    };
+    if (const auto *CE = dyn_cast<CallExpr>(St)) {
+      const FunctionDecl *Callee = CE->getDirectCallee();
+      if (Callee && Callee->getIdentifier()) {
+        StringRef Name = Callee->getName();
+        unsigned Arg = Name == "ERR_PTR" ? 0
+                       : (Name == "dev_err_probe" || Name == "dev_warn_probe")
+                           ? 1
+                           : ~0u;
+        if (Arg < CE->getNumArgs())
+          if (const VarDecl *VD = Variable(CE->getArg(Arg)))
+            Negative(VD, CE->getArg(Arg)->getExprLoc());
+      }
+    } else if (const auto *BO = dyn_cast<BinaryOperator>(St)) {
+      if (BO->getOpcode() == BO_Assign) {
+        Assigned(Variable(BO->getLHS()), BO->getRHS());
+      } else if (BO->isEqualityOp()) {
+        for (bool Swap : {false, true}) {
+          const VarDecl *VD = Variable(Swap ? BO->getRHS() : BO->getLHS());
+          StringRef Name;
+          if (VD && getErrnoSign(Swap ? BO->getLHS() : BO->getRHS(), Name) < 0) {
+            Negative(VD, BO->getOperatorLoc());
+            (*ErrnoUses)[VD].NegatedNames.push_back(Name);
+          }
+        }
+      }
+    } else if (const auto *UO = dyn_cast<UnaryOperator>(St)) {
+      // "return -ret;", "err = -err;".
+      if (UO->getOpcode() == UO_Minus)
+        if (const VarDecl *VD = Variable(UO->getSubExpr()))
+          (*ErrnoUses)[VD].Positive = true;
+    } else if (const auto *DS = dyn_cast<DeclStmt>(St)) {
+      for (const Decl *D : DS->decls())
+        if (const auto *VD = dyn_cast<VarDecl>(D);
+            VD && VD->hasLocalStorage())
+          Assigned(VD, VD->getInit());
+    }
+    for (const Stmt *Child : St->children())
+      collectErrnoUses(Child);
+  }
+
+  /// "if (err != -EINTR && err != ERESTARTSYS)": a variable that the
+  /// function treats as a kernel error code is compared with an error
+  /// number that lacks its minus sign.  A function that keeps positive
+  /// numbers in the variable anywhere is left alone, and so is "ret ==
+  /// -EAGAIN || ret == EAGAIN", which is ready for both.
+  void checkPositiveErrnoTest(const BinaryOperator *BO) {
+    if (!BO->isEqualityOp() ||
+        !isLinuxExperimentEnabled(S, "positive-errno-test",
+                                  BO->getOperatorLoc()))
+      return;
+    for (bool Swap : {false, true}) {
+      const Expr *Side = Swap ? BO->getRHS() : BO->getLHS();
+      const Expr *Other = Swap ? BO->getLHS() : BO->getRHS();
+      const VarDecl *VD = getDirectVariable(Side->IgnoreParenCasts());
+      StringRef Name;
+      if (!VD || !VD->hasLocalStorage() || getErrnoSign(Other, Name) <= 0)
+        continue;
+      if (!ErrnoUses) {
+        ErrnoUses.emplace();
+        collectErrnoUses(CurrentFunction->getBody());
+      }
+      auto It = ErrnoUses->find(VD);
+      if (It == ErrnoUses->end() || It->second.Negative.isInvalid() ||
+          It->second.Positive ||
+          llvm::is_contained(It->second.NegatedNames, Name))
+        continue;
+      // An argument that a macro expands twice is one place.
+      SourceLocation Spelling =
+          S.getSourceManager().getSpellingLoc(BO->getOperatorLoc());
+      if (llvm::is_contained(ReportedSpellings, Spelling))
+        return;
+      ReportedSpellings.push_back(Spelling);
+      std::string Text;
+      llvm::raw_string_ostream OS(Text);
+      OS << "'" << VD->getName() << "' is compared with " << Name
+         << ", which is positive, but this function treats '" << VD->getName()
+         << "' as a kernel error code, and those are negative: '-" << Name
+         << "' was probably meant";
+      S.Diag(BO->getOperatorLoc(), diag::warn_linux_kernel_experimental)
+          << Text << "positive-errno-test" << BO->getSourceRange();
+      S.Diag(It->second.Negative, diag::note_linux_kernel_experimental)
+          << "it is used as a negative error code here";
+      return;
+    }
+  }
+
   void checkUnsignedErrorTest(const StoredValue &Stored, const Expr *Cond) {
     const FunctionDecl *Callee = getSignedResultCallee(Stored.Source);
     if (Callee && isPlainUnsignedType(Stored.getType()))
@@ -4502,6 +4657,7 @@ public:
     checkIRQComparison(BO);
     checkInlineUnsignedErrorTest(BO);
     checkUnsignedErrorCompare(BO);
+    checkPositiveErrnoTest(BO);
     return true;
   }
 
@@ -13848,7 +14004,8 @@ static bool shouldRunLinuxKernelWarnings(const Sema &S, SourceLocation Loc) {
          !Diags.isIgnored(diag::warn_linux_kernel_inconsistent_indent, Loc) ||
          !Diags.isIgnored(diag::warn_zero_extended_complement, Loc) ||
          isLinuxExperimentEnabled(S, "unsigned-error-test", Loc) ||
-         isLinuxExperimentEnabled(S, "error-code-as-size", Loc);
+         isLinuxExperimentEnabled(S, "error-code-as-size", Loc) ||
+         isLinuxExperimentEnabled(S, "positive-errno-test", Loc);
 }
 
 } // namespace
