@@ -377,7 +377,11 @@ group of its own once a kernel scan has shown what it finds. The names:
   `read(&val); use(val);` is not if `read()` can fail before it writes.
   Where the function returns a constant without writing, the caller's paths
   are followed for that value alone, so `if (index == -1) return;` deals
-  with a `return -1;`. Several things are taken on trust to keep the check
+  with a `return -1;`. Where it writes for one error code and for no other,
+  `if (err == -ENOSPC && filled) *filled = done; return err;`, the paths
+  for the other errors carry the knowledge that the value is not that one,
+  and `if (err && err != -ENOSPC) return err;` in the caller deals with
+  them. Several things are taken on trust to keep the check
   quiet: a loop that fills the buffer runs, a size or count parameter is
   what the caller needs unless the call passes a constant, an assertion
   (`if (WARN_ON(...)) return;`) does not fire, a path that writes another
@@ -539,6 +543,10 @@ more than one place, and a comparison counts as the same condition however
 it is written: `a != b` is the negation of `a == b`, `a >= b` that of `a <
 b`, and `b > a` is `a < b`. `if (status == DONE) break;` in a loop and `if
 (status != DONE) return;` behind it are one question.
+
+Of a variable a search knows the sign, the number if there is one, and one
+number that it is not: after `if (err == -ENOSPC)` has failed, `err` is not
+-ENOSPC until it is assigned again.
 
 A search does not carry everything it has learned along a path to the end
 of the function. What it knows about a variable is dropped at the first

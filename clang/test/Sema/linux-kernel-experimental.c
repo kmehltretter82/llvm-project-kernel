@@ -1577,3 +1577,100 @@ struct gphy_ops {
 const struct gphy_ops gphy_ops = { .init = gphy_init, .exit = gphy_exit };
 const struct gphy_ops gphy_bare_ops = { .init = gphy_init_bare, .exit = gphy_exit };
 
+// ---------------------------------------------------------------------------
+// uninit-output: the function writes for one error code and for no other,
+// and the caller reads for that one alone.
+
+#define ENOSPC 28
+int try_fill(int n);
+
+static int fill_some(int want, int *filled) {
+  int err = 0, done = 0;
+
+  if (want < 0) {
+    err = -EINVAL;
+    goto out;
+  }
+  while (done < want) {
+    err = try_fill(done);
+    if (err < 0)
+      goto out;
+    done++;
+  }
+  return 0;
+out:
+  if (err == -ENOSPC && filled)
+    *filled = done;
+  return err;
+}
+
+static int fill_wrapped(int want, int *filled) {
+  return fill_some(want, filled); // expected-note {{'fill_wrapped' returns here without having written through 'filled'}}
+}
+
+int fill_and_use(int want) {
+  int filled, err;
+
+  err = fill_wrapped(want, &filled);
+  if (err && err != -ENOSPC)
+    return err;
+  if (!err)
+    return want;
+  return filled;
+}
+
+// Read for the other errors.
+int fill_and_misuse(int want) {
+  int filled, err;
+
+  err = fill_wrapped(want, &filled); // expected-note {{the address of 'filled' is passed to 'fill_wrapped' here}}
+  if (!err)
+    return want;
+  if (err == -ENOSPC)
+    return 0;
+  return filled; // expected-warning {{'filled' is read here, but on this path 'fill_wrapped' has failed and has not written to it (experimental check 'uninit-output')}}
+}
+
+// ---------------------------------------------------------------------------
+// unwind-far: devm_add_action_or_reset() is a macro in the kernel, and the
+// function behind it has another name.
+
+struct regulator;
+int regulator_enable(struct regulator *r);
+int regulator_disable(struct regulator *r);
+int __devm_add_action_or_reset(void *dev, void (*action)(void *), void *data,
+                               const char *name);
+#define devm_add_action_or_reset(dev, action, data) \
+  __devm_add_action_or_reset(dev, action, data, #action)
+
+struct fan {
+  struct regulator *power;
+  void *dev;
+};
+
+static void fan_power_off(void *data) {
+  regulator_disable(data);
+}
+
+static int fan_probe(struct fan *fan) {
+  int ret;
+
+  ret = regulator_enable(fan->power);
+  if (ret)
+    return ret;
+  ret = devm_add_action_or_reset(fan->dev, fan_power_off, fan->power);
+  if (ret)
+    return ret;
+  return 0;
+}
+
+static int fan_suspend(struct fan *fan) {
+  return regulator_disable(fan->power);
+}
+
+struct fan_ops {
+  int (*probe)(struct fan *);
+  int (*suspend)(struct fan *);
+};
+const struct fan_ops fan_ops = { .probe = fan_probe, .suspend = fan_suspend };
+

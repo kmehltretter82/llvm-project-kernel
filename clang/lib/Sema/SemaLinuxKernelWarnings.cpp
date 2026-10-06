@@ -147,6 +147,13 @@ struct sema::LinuxKernelUnit::Impl {
         M |= K < 0 ? 1 : K == 0 ? 2 : 4;
       return M;
     }
+    /// A number that none of the paths in Mask returns: "if (err ==
+    /// -ENOSPC && filled) *filled = n; return err;" leaves the parameter
+    /// unwritten for every error but that one.  NotOpen until the first
+    /// such path is seen, NotNone once two paths disagree.
+    enum : uint8_t { NotOpen, NotOne, NotNone };
+    uint8_t NotState = NotOpen;
+    int64_t Not = 0;
     /// Where one such path returns: one that reports a failure, and one
     /// that does not.
     SourceLocation Failure, Success;
@@ -6131,6 +6138,23 @@ struct LinuxPathValue {
   uint8_t Mask = Any;
   bool HasConst = false;
   int64_t Const = 0;
+  /// One number that the value is known not to be: "err != -ENOSPC" has
+  /// held.  A function that writes its result for that error code alone
+  /// and a caller that reads it for that one alone agree through this.
+  bool HasNot = false;
+  int64_t Not = 0;
+
+  static uint8_t classOf(int64_t V) { return V < 0 ? Neg : V == 0 ? Zero : Pos; }
+
+  /// The value with \p K ruled out, if that says something about it.
+  LinuxPathValue without(int64_t K) const {
+    LinuxPathValue R = *this;
+    if (!R.HasConst && (R.Mask & classOf(K)) && K != 0) {
+      R.HasNot = true;
+      R.Not = K;
+    }
+    return R;
+  }
 
   static LinuxPathValue constant(int64_t V) {
     LinuxPathValue R;
@@ -6152,11 +6176,12 @@ struct LinuxPathValue {
     return A == B ? A : ofMask(A.Mask | B.Mask);
   }
 
-  bool isAny() const { return Mask == Any; }
+  bool isAny() const { return Mask == Any && !HasNot; }
 
   bool operator==(const LinuxPathValue &O) const {
     return Mask == O.Mask && HasConst == O.HasConst &&
-           (!HasConst || Const == O.Const);
+           (!HasConst || Const == O.Const) && HasNot == O.HasNot &&
+           (!HasNot || Not == O.Not);
   }
 
   /// The value as a condition, if it is decided.
@@ -7708,6 +7733,9 @@ public:
     }
     if (!R.HasConst)
       return std::nullopt;
+    // The one number that the value is known not to be.
+    if (L.HasNot && L.Not == R.Const && (Op == BO_EQ || Op == BO_NE))
+      return Op == BO_NE;
     uint8_t M = L.Mask;
     uint8_t Sign = R.Const < 0 ? Value::Neg
                    : R.Const == 0 ? Value::Zero : Value::Pos;
@@ -7794,8 +7822,12 @@ public:
     uint8_t M = V.Mask & Mask;
     if (!M)
       return false;
-    if (M != V.Mask && (Locations[Loc].Pinned || Locations[Loc].Sites >= 2))
-      set(St, Loc, V.HasConst ? V : Value::ofMask(M));
+    if (M != V.Mask && (Locations[Loc].Pinned || Locations[Loc].Sites >= 2)) {
+      Value Narrowed = V.HasConst ? V : Value::ofMask(M);
+      if (V.HasNot)
+        Narrowed = Narrowed.without(V.Not);
+      set(St, Loc, Narrowed);
+    }
     for (auto [A, B] : St.Same) {
       if (A != Loc && B != Loc)
         continue;
@@ -7830,6 +7862,8 @@ public:
     uint8_t Mask = Value::Any;
     switch (Op) {
     case BO_EQ:
+      if (Value V = get(St, Loc); V.HasNot && V.Not == C)
+        return false;
       if (!narrow(Loc, C < 0 ? N : C == 0 ? Z : P, St))
         return false;
       if (Locations[Loc].Pinned || Locations[Loc].Sites >= 2)
@@ -7840,6 +7874,10 @@ public:
       Value V = get(St, Loc);
       if (V.HasConst)
         return V.Const != C;
+      // One number that it is not is remembered.
+      if (!V.HasNot &&
+          (Locations[Loc].Pinned || Locations[Loc].Sites >= 2))
+        set(St, Loc, V.without(C));
       Mask = C == 0 ? uint8_t(N | P) : Value::Any;
       break;
     }
@@ -8785,7 +8823,8 @@ class LinuxOutputSummarizer : LinuxPathSearch::Client {
   /// The classes of return values for which the callee of \p CE leaves the
   /// argument that is the parameter itself unwritten.  Zero if it writes it,
   /// or if the call does not hand the parameter on like that.
-  uint8_t forwarded(const CallExpr *CE) const {
+  uint8_t forwarded(const CallExpr *CE,
+                    std::optional<int64_t> *Not = nullptr) const {
     const FunctionDecl *Callee = CE->getDirectCallee();
     const FunctionDecl *CalleeDef = nullptr;
     if (!Callee || Depth >= 2)
@@ -8800,7 +8839,13 @@ class LinuxOutputSummarizer : LinuxPathSearch::Client {
         return getLinuxOutputContract(Callee, I, Unit);
       if (I >= CalleeDef->getNumParams())
         return 0;
-      return getLinuxOutputSummary(CalleeDef, I, Unit, Depth + 1).classes();
+      const Summary &Inner =
+          getLinuxOutputSummary(CalleeDef, I, Unit, Depth + 1);
+      if (Not && Inner.NotState == Summary::NotOne &&
+          llvm::none_of(Inner.Consts,
+                        [&](int64_t K) { return K == Inner.Not; }))
+        *Not = Inner.Not;
+      return Inner.classes();
     }
     return 0;
   }
@@ -8994,10 +9039,12 @@ class LinuxOutputSummarizer : LinuxPathSearch::Client {
 
   std::optional<Value> callValue(const CallExpr *CE,
                                  const LinuxPathSearch::State &St) override {
-    uint8_t Inner = forwarded(CE);
+    std::optional<int64_t> Not;
+    uint8_t Inner = forwarded(CE, &Not);
     if (!(Inner & Value::Any))
       return std::nullopt;
-    return Value::ofMask(Inner & Value::Any);
+    Value V = Value::ofMask(Inner & Value::Any);
+    return Not ? V.without(*Not) : V;
   }
 
   /// The value that "return E;" returns on this path.  "return PTR_ERR(p);",
@@ -9033,7 +9080,7 @@ class LinuxOutputSummarizer : LinuxPathSearch::Client {
     QualType RT = Def->getReturnType();
     uint8_t Class = Summary::NoValue;
     uint8_t Success = Summary::NoValue;
-    std::optional<int64_t> Constant;
+    std::optional<int64_t> Constant, Excluded;
     if (!RT->isVoidType()) {
       const Expr *E = RS ? RS->getRetValue() : nullptr;
       if (!E) {
@@ -9053,6 +9100,8 @@ class LinuxOutputSummarizer : LinuxPathSearch::Client {
       Class = V.Mask;
       if (V.HasConst)
         Constant = V.Const;
+      else
+        Excluded = V.HasNot ? std::optional<int64_t>(V.Not) : std::nullopt;
       bool Status = RT->isSignedIntegerType() && !RT->isBooleanType();
       // A status that a test found not to be zero is an error code, whatever
       // else the tests on the way have compared it with.
@@ -9073,6 +9122,14 @@ class LinuxOutputSummarizer : LinuxPathSearch::Client {
         Result.Consts.push_back(*Constant);
     } else {
       Result.Mask |= Class;
+      // The number that every path of unknown value rules out.
+      if (!Excluded || Constant ||
+          (Result.NotState == Summary::NotOne && Result.Not != *Excluded)) {
+        Result.NotState = Summary::NotNone;
+      } else if (Result.NotState == Summary::NotOpen) {
+        Result.NotState = Summary::NotOne;
+        Result.Not = *Excluded;
+      }
     }
     SourceLocation Where =
         RS ? RS->getBeginLoc() : Def->getBody()->getEndLoc();
@@ -10528,8 +10585,9 @@ class LinuxUnwindChecker : LinuxPathSearch::Client {
     }
     if (!GivenHandle && !GivenRoot)
       return true;
-    // devres releases it from here on.
-    if (Name.starts_with("devm_"))
+    // devres releases it from here on.  devm_add_action_or_reset() is a
+    // macro around __devm_add_action_or_reset().
+    if (Name.ltrim('_').starts_with("devm_"))
       return false;
 
     if (Kind.Owned && HandleVar) {
@@ -12321,9 +12379,15 @@ public:
       llvm::SmallVector<std::optional<Value>, 8> Values;
       for (int64_t K : Sum.Consts)
         Values.push_back(Value::constant(K));
+      // The paths of unknown value never return one number, if the
+      // function writes for that one: "if (err != -ENOSPC) return err;" in
+      // the caller then deals with all of them.
+      bool HasNot = Sum.NotState == Summary::NotOne &&
+                    !llvm::is_contained(Sum.Consts, Sum.Not);
       for (uint8_t Class : {Value::Neg, Value::Zero, Value::Pos})
         if (Sum.Mask & Class)
-          Values.push_back(Value::ofMask(Class));
+          Values.push_back(HasNot ? Value::ofMask(Class).without(Sum.Not)
+                                  : Value::ofMask(Class));
       if (Sum.Mask & Summary::NoValue)
         Values.push_back(std::nullopt);
       Read = nullptr;
