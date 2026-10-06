@@ -63,9 +63,8 @@ public:
     return TargetInfo::VoidPtrBuiltinVaList;
   }
 
-  llvm::SmallVector<Builtin::InfosShard> getTargetBuiltins() const override {
-    return {};
-  }
+  /// GCC's builtin functions for Alpha, which the kernel headers use.
+  llvm::SmallVector<Builtin::InfosShard> getTargetBuiltins() const override;
 
   /// Register names are not checked: what is written in a clobber list, in
   /// an explicit register variable or in a constraint is taken as it is.

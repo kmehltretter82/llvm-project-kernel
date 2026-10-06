@@ -1,0 +1,63 @@
+//===--- BuiltinsAlpha.def - Alpha builtin functions ------------*- C++ -*-===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// The builtin functions that GCC has for Alpha, for the frontend-only target
+// in ParseOnly.cpp.  They work on 64-bit quantities, which GCC declares as
+// unsigned long.
+//
+//===----------------------------------------------------------------------===//
+
+// The format of this database matches clang/Basic/Builtins.def.
+
+BUILTIN(__builtin_alpha_implver, "ULi", "nc")
+BUILTIN(__builtin_alpha_rpcc, "ULi", "n")
+BUILTIN(__builtin_alpha_amask, "ULiULi", "nc")
+BUILTIN(__builtin_alpha_cttz, "ULiULi", "nc")
+BUILTIN(__builtin_alpha_ctlz, "ULiULi", "nc")
+BUILTIN(__builtin_alpha_ctpop, "ULiULi", "nc")
+BUILTIN(__builtin_alpha_pklb, "ULiULi", "nc")
+BUILTIN(__builtin_alpha_pkwb, "ULiULi", "nc")
+BUILTIN(__builtin_alpha_unpkbl, "ULiULi", "nc")
+BUILTIN(__builtin_alpha_unpkbw, "ULiULi", "nc")
+BUILTIN(__builtin_alpha_cmpbge, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_extbl, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_extwl, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_extll, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_extql, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_extwh, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_extlh, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_extqh, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_insbl, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_inswl, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_insll, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_insql, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_inswh, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_inslh, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_insqh, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_mskbl, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_mskwl, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_mskll, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_mskql, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_mskwh, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_msklh, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_mskqh, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_umulh, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_zap, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_zapnot, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_minub8, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_minsb8, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_minuw4, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_minsw4, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_maxub8, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_maxsb8, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_maxuw4, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_maxsw4, "ULiULiULi", "nc")
+BUILTIN(__builtin_alpha_perr, "ULiULiULi", "nc")
+BUILTIN(__builtin_set_thread_pointer, "vv*", "n")
+
+#undef BUILTIN

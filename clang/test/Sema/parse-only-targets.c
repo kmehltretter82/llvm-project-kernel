@@ -74,6 +74,15 @@ unsigned long constraints(unsigned long a) {
   return r + current_stack_pointer;
 }
 
+#if defined(__alpha__)
+// GCC's Alpha builtins, which the kernel's bit and string functions use.
+unsigned long builtins(unsigned long a, unsigned long b) {
+  return __builtin_alpha_cmpbge(a, b) + __builtin_alpha_extbl(a, 3) +
+         __builtin_alpha_zapnot(a, 15) + __builtin_alpha_cttz(b) +
+         __builtin_alpha_rpcc();
+}
+#endif
+
 int printf(const char *, ...);
 
 void formats(__SIZE_TYPE__ n, __PTRDIFF_TYPE__ d) {

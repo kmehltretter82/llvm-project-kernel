@@ -11,12 +11,46 @@
 //===----------------------------------------------------------------------===//
 
 #include "ParseOnly.h"
+#include "clang/Basic/Builtins.h"
 #include "clang/Basic/MacroBuilder.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSwitch.h"
 
 using namespace clang;
 using namespace clang::targets;
+
+// The Alpha builtins are only declared: nothing outside this file needs
+// their numbers.
+namespace {
+enum {
+  LastTIBuiltin = Builtin::FirstTSBuiltin - 1,
+#define BUILTIN(ID, TYPE, ATTRS) BI##ID,
+#include "BuiltinsAlpha.def"
+  LastAlphaBuiltin
+};
+} // namespace
+
+static constexpr int NumAlphaBuiltins =
+    LastAlphaBuiltin - Builtin::FirstTSBuiltin;
+
+static constexpr llvm::StringTable AlphaBuiltinStrings =
+    CLANG_BUILTIN_STR_TABLE_START
+#define BUILTIN CLANG_BUILTIN_STR_TABLE
+#include "BuiltinsAlpha.def"
+    ;
+
+static constexpr auto AlphaBuiltinInfos =
+    Builtin::MakeInfos<NumAlphaBuiltins>({
+#define BUILTIN CLANG_BUILTIN_ENTRY
+#include "BuiltinsAlpha.def"
+    });
+
+llvm::SmallVector<Builtin::InfosShard>
+ParseOnlyTargetInfo::getTargetBuiltins() const {
+  if (Arch == Alpha)
+    return {{&AlphaBuiltinStrings, AlphaBuiltinInfos}};
+  return {};
+}
 
 std::optional<ParseOnlyTargetInfo::ArchKind>
 ParseOnlyTargetInfo::getArchKind(const llvm::Triple &Triple) {
