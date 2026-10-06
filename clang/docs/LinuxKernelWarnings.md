@@ -157,6 +157,213 @@ these diagnostics, including many functions whose positive return values are
 intentional status codes. The check is therefore too broad for the umbrella
 until it can identify errno-returning functions more accurately.
 
+### Checks that follow a path
+
+The groups in this section are available separately. They are not part of
+the umbrella yet.
+
+Three of them walk single paths through a function. A dataflow over facts
+that hold on every path cannot find a pointer that is NULL on one path to a
+dereference and fine on the others. The search starts where a test or a
+call establishes something and follows each path with what assignments and
+branches have pinned down on the way: the sign and, where known, the value
+of local variables and of member chains such as `dev->priv`, and the
+outcome of conditions without side effects that occur more than once. A
+branch that the path already decides is followed in one direction only. A
+candidate is confirmed by a second search from the entry of the function,
+so that what the code before the test establishes counts as well:
+
+```c
+int n = 0;
+
+if (p)
+        n = p->count;
+for (i = 0; i < n; i++)         /* not entered when p is NULL */
+        sum += p->item[i];
+```
+
+A call makes the search forget the members of an object that the callee may
+change. If the body of the callee is in the translation unit, that is the
+members it or its callees store to. Otherwise it is every member of an
+object that the call is given. The search stops at a fixed budget and
+reports nothing then.
+
+- `-Wlinux-kernel-deref-after-check` diagnoses a pointer that is read or
+  written through on a path that left a NULL test through the outcome "is
+  NULL":
+
+  ```c
+  if (!dev->priv)
+          dev_warn(dev->parent, "no private data\n");
+  dev->priv->count++;
+  ```
+
+  The pointer can be a local variable, a parameter or a member chain. The
+  dereference can also be in a function that is handed the pointer and reads
+  or writes through its parameter before its first branch. Tests inside
+  macros do not count: `dev_err()`, `kfree()` and many others test whatever
+  they get. The test says that the author expects NULL. If NULL cannot
+  happen there, the test is what is wrong.
+- `-Wlinux-kernel-ptr-err-valid` diagnoses `PTR_ERR(p)` on a path where
+  `IS_ERR(p)` was false. This is what a shared error label does when one of
+  the jumps to it comes from another failure than that of `p`.
+- `-Wlinux-kernel-error-pointer-zero` diagnoses `ERR_PTR(err)` on a path
+  where a test found `err` to be zero, in a function that returns objects
+  on other paths and NULL nowhere. Its callers test the result with
+  `IS_ERR()` and take NULL for an object.
+- `-Wlinux-kernel-missing-unwind` diagnoses an error return that keeps a
+  resource which the function releases on another path behind the
+  acquisition:
+
+  ```c
+  ret = clk_prepare_enable(priv->clk);
+  if (ret)
+          return ret;
+  ret = setup(priv);
+  if (ret)
+          return ret;             /* the clock stays enabled */
+  ...
+  err:
+          clk_disable_unprepare(priv->clk);
+          return ret;
+  ```
+
+  About sixty pairs are known: clocks, regulators, runtime PM, PHYs,
+  interrupts, PCI devices and regions, firmware, mutexes, spinlocks and
+  semaphores, `ioremap()`, workqueues, crypto transforms, device tree nodes
+  and the allocators. A path ends where the acquisition has failed, where
+  the resource is released, at a `devm_` call that is given the object, and
+  at a call that is given the object and cleans up, by its name or because
+  its body releases a resource of that kind. A function that never releases
+  the resource itself is left alone: a remove callback or devres does that
+  for it. So is an acquisition that takes back what the function released
+  before (`unlock(); ...; lock();`), and the branches that lead to the
+  acquisition alone are taken to hold for the rest of the function
+  (`if (c) get(); ... if (c) put();`).
+- `-Wlinux-kernel-memory-leak` diagnoses a return at which a local variable
+  still holds the result of `kmalloc()` or one of its relatives, and the
+  path has neither freed the memory nor stored the pointer nor handed it to
+  a function that may keep it. Whether a function may keep a pointer is
+  taken from its body where the translation unit has it, and from a list of
+  kernel functions that only read or fill a buffer. Every other call that
+  is given the pointer ends the path.
+
+Three more are dataflow checks over the control flow graph:
+
+- `-Wlinux-kernel-duplicate-check` diagnoses a test of a local variable
+  against zero whose outcome an earlier test has decided on every path,
+  with the variable unchanged since:
+
+  ```c
+  err = step_one();
+  if (err)
+          goto out;
+  step_two();                     /* "err =" is missing */
+  if (err)
+          goto out;
+  ```
+
+  It is not given when the source has an assignment to the variable or a
+  preprocessor conditional between the two tests, because the assignment
+  may be in code that this configuration does not compile, and not for
+  `else if` chains and repeated tests within one condition.
+- `-Wlinux-kernel-use-after-free` diagnoses a dereference, or a second
+  free, of a variable or member chain that every path has handed to
+  `kfree()` or one of its relatives since it was last assigned. A loop that
+  frees the element it stands on is the common case:
+
+  ```c
+  list_for_each_entry(item, &head, list)
+          kfree(item);            /* the loop reads item->list.next */
+  ```
+
+The rest look at single expressions and calls:
+
+- `-Wzero-extended-complement` is not specific to the kernel. It diagnoses
+  `x & ~mask` and `x &= ~mask` where `x` has more bits than the unsigned
+  `mask`. The complement is computed in the width of the mask and then
+  zero-extended, which clears the upper bits of `x` along with the bits of
+  the mask. On a 32-bit kernel `BIT()` and `~0UL` are such masks:
+
+  ```c
+  u64 ts;
+
+  ts &= ~(BIT(8) - 1);            /* 32-bit: clears bits 63 to 32 as well */
+  ```
+
+  It is not given when the result is converted back to the width of the
+  mask, when the other operand was itself widened from that width, or for
+  `~0U`, which says how many bits are meant.
+- `-Wlinux-kernel-bitops-cast` diagnoses `set_bit()`, `test_bit()`,
+  `find_first_bit()`, `bitmap_zero()` and their relatives when a cast hands
+  them the address of an integer that is narrower than `unsigned long`. The
+  functions read and write a whole `unsigned long`, and on a big-endian
+  machine they see other bits than the code that uses the integer as a
+  number. On a 32-bit big-endian target it also diagnoses the address of a
+  64-bit integer, whose two halves are in the other order there.
+- `-Wlinux-kernel-struct-leak` diagnoses `copy_to_user(to, &s, sizeof(s))`,
+  `nla_put()` and `copy_to_iter()` of a local structure that has padding
+  and that the function only ever fills member by member. The padding goes
+  out with what was on the stack. The structure counts as cleared when it
+  has an initializer, when it is assigned as a whole, and when its address
+  is given to `memset()` or to any function that the translation unit has
+  no body of. The layout is that of the target, so a hole that only one ABI
+  has is found when that ABI is compiled for.
+- `-Wlinux-kernel-buffer-size` diagnoses `snprintf()`, `scnprintf()` and
+  their `v` variants when the size is a constant, or a constant minus what
+  was written so far, that is larger than the array the buffer argument
+  points into.
+- `-Wlinux-kernel-off-by-one` diagnoses `a[i]` where the bounds test on the
+  way lets `i` be the number of elements: `if (i > ARRAY_SIZE(a)) return;`,
+  or the same against the member that `__counted_by()` names for a flexible
+  array.
+- `-Wlinux-kernel-unchecked-allocation` diagnoses `p->member` where `p` was
+  given the result of `kmalloc()` or one of its relatives directly and the
+  function tests `p` nowhere. An allocation with `__GFP_NOFAIL` is left
+  alone.
+- `-Wlinux-kernel-indent` diagnoses a statement that starts in another
+  column than the statement before it in the same block. The second one was
+  often meant to be under the `if` above it.
+
+`-Wlinux-kernel-experimental` is the group of checks that are being tried
+out. `-flinux-kernel-experimental=<name>,...` selects them, and `all`
+selects every one. At present there is `error-deref-after-check`, the
+dereference rule for a pointer that `IS_ERR()` found to be an error
+pointer. Two more names change how the path checks work and are not part of
+`all`: `path-notes` adds a note for each branch between the test and the
+misuse, and `unconfirmed-paths` reports candidates without the second
+search from the function entry.
+
+## Architectures without a code generator
+
+The kernel supports architectures that LLVM has no backend for. Their code
+can still be checked: the frontend only needs the C data model of the
+target. The triples `alpha`, `hppa`, `hppa64`, `sh4` (and the other `sh`
+names, with `eb` for big-endian), `microblaze`, `microblazeel`, `nios2` and
+`or1k` select a target description that knows the sizes and alignments of
+the types as GCC has them, the byte order and the predefined macros that
+kernel headers test, and GCC's builtin functions for Alpha. Register names
+and machine-specific constraint letters in inline assembly are accepted as
+written.
+
+```console
+$ clang --target=sh4-linux-gnu -fsyntax-only ...
+```
+
+Anything that needs code generation fails with "unable to create target".
+
+`-flinux-kernel-lenient-asm` does the same for the inline assembly of a
+target that clang does know but describes incompletely: an unknown
+constraint letter is taken for a register class, unknown register names
+are accepted, and an operand escape that only the target's assembler
+output knows (`%@` on m68k) no longer stops the compilation.
+
+A kernel build for such a target has to be configured and prepared by
+another compiler, because Kbuild probes the compiler and generates headers
+by compiling. `scan-cc-host` in the scan tooling does that: a cross GCC
+answers everything that has to produce output, and the `.c` to `.o`
+compiles are replayed with this compiler and `-fsyntax-only`.
+
 Each kernel-specific subgroup can be enabled or disabled independently. For
 example:
 
