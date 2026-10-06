@@ -1629,6 +1629,14 @@ void Clang::RenderTargetOptions(const llvm::Triple &EffectiveTriple,
   case llvm::Triple::ve:
     AddVETargetArgs(Args, CmdArgs);
     break;
+
+  case llvm::Triple::xtensa:
+    // The calling convention, "call0" or "windowed".
+    if (Arg *A = Args.getLastArg(options::OPT_mabi_EQ)) {
+      CmdArgs.push_back("-target-abi");
+      CmdArgs.push_back(A->getValue());
+    }
+    break;
   }
 }
 

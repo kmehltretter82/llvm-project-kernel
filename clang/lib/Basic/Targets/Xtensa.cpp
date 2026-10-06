@@ -27,6 +27,10 @@ void XtensaTargetInfo::getTargetDefines(const LangOptions &Opts,
     Builder.defineMacro("__XTENSA_EB__");
   else
     Builder.defineMacro("__XTENSA_EL__");
+  // GCC defines one of these two, and code that saves registers or walks the
+  // stack, such as the Linux kernel, refuses to build without.
+  Builder.defineMacro(ABI == "windowed" ? "__XTENSA_WINDOWED_ABI__"
+                                        : "__XTENSA_CALL0_ABI__");
   Builder.defineMacro("__XCHAL_HAVE_BE", BigEndian ? "1" : "0");
   Builder.defineMacro("__XCHAL_HAVE_ABS");  // core arch
   Builder.defineMacro("__XCHAL_HAVE_ADDX"); // core arch

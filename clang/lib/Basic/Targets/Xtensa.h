@@ -33,6 +33,9 @@ class LLVM_LIBRARY_VISIBILITY XtensaTargetInfo : public TargetInfo {
 
 protected:
   std::string CPU;
+  /// The calling convention: "call0", which is what the code generator
+  /// implements, or "windowed".
+  std::string ABI = "call0";
 
 public:
   XtensaTargetInfo(const llvm::Triple &Triple, const TargetOptions &)
@@ -55,6 +58,15 @@ public:
 
   void getTargetDefines(const LangOptions &Opts,
                         MacroBuilder &Builder) const override;
+
+  StringRef getABI() const override { return ABI; }
+
+  bool setABI(const std::string &Name) override {
+    if (Name != "call0" && Name != "windowed")
+      return false;
+    ABI = Name;
+    return true;
+  }
 
   llvm::SmallVector<Builtin::InfosShard> getTargetBuiltins() const override {
     return {};
