@@ -79,7 +79,7 @@ int early_return(struct priv *p, struct device_node *parent) {
     ret = of_property_read_u32(child, "reg", &v);
     if (ret)
       return ret;
-// expected-warning@-1 {{the function returns here from inside the loop over nodes, with the reference to 'child' that of_get_next_child() took for this pass: of_node_put(child) is missing on this path (experimental check 'iterator-ref-leak')}}
+// expected-warning@-1 {{the function returns here from inside the loop, with the reference to 'child' that of_get_next_child() took for this pass: of_node_put(child) is missing on this path (experimental check 'iterator-ref-leak')}}
     p->val[0] = v;
   }
   return 0;
@@ -93,7 +93,7 @@ int early_return_matching(struct priv *p) {
       continue;
     if (setup(p, 0))
       return -EINVAL;
-// expected-warning@-1 {{the function returns here from inside the loop over nodes, with the reference to 'np' that of_find_compatible_node() took for this pass: of_node_put(np) is missing on this path (experimental check 'iterator-ref-leak')}}
+// expected-warning@-1 {{the function returns here from inside the loop, with the reference to 'np' that of_find_compatible_node() took for this pass: of_node_put(np) is missing on this path (experimental check 'iterator-ref-leak')}}
   }
   return 0;
 }
@@ -104,7 +104,7 @@ int while_form(struct priv *p) {
   while ((np = of_find_compatible_node(np, NULL, "vendor,device"))) { // expected-note {{the next pass drops the reference here, a pass that leaves the function does not get there}}
     if (setup(p, 1))
       return -ENODEV;
-// expected-warning@-1 {{the function returns here from inside the loop over nodes, with the reference to 'np' that of_find_compatible_node() took for this pass: of_node_put(np) is missing on this path (experimental check 'iterator-ref-leak')}}
+// expected-warning@-1 {{the function returns here from inside the loop, with the reference to 'np' that of_find_compatible_node() took for this pass: of_node_put(np) is missing on this path (experimental check 'iterator-ref-leak')}}
   }
   return 0;
 }
@@ -116,7 +116,7 @@ int fwnode_loop(struct priv *p, struct fwnode_handle *parent) {
   fwnode_for_each_child_node(parent, child) { // expected-note {{the next pass drops the reference here, a pass that leaves the function does not get there}}
     if (fwnode_property_read_u32(child, "reg", &v))
       return -EINVAL;
-// expected-warning@-1 {{the function returns here from inside the loop over nodes, with the reference to 'child' that fwnode_get_next_child_node() took for this pass: fwnode_handle_put(child) is missing on this path (experimental check 'iterator-ref-leak')}}
+// expected-warning@-1 {{the function returns here from inside the loop, with the reference to 'child' that fwnode_get_next_child_node() took for this pass: fwnode_handle_put(child) is missing on this path (experimental check 'iterator-ref-leak')}}
     p->val[1] = v;
   }
   return 0;
@@ -133,7 +133,7 @@ int found_and_forgotten(struct priv *p, struct device_node *parent) {
   if (!child)
     return -ENODEV;
   return setup(p, v);
-// expected-warning@-1 {{the function returns here from inside the loop over nodes, with the reference to 'child' that of_get_next_child() took for this pass: of_node_put(child) is missing on this path (experimental check 'iterator-ref-leak')}}
+// expected-warning@-1 {{the function returns here from inside the loop, with the reference to 'child' that of_get_next_child() took for this pass: of_node_put(child) is missing on this path (experimental check 'iterator-ref-leak')}}
 }
 
 // The handle inside the node is no other reference.
@@ -144,9 +144,65 @@ int handle_passed(struct priv *p, struct device_node *parent) {
   for_each_child_of_node(parent, child) { // expected-note {{the next pass drops the reference here, a pass that leaves the function does not get there}}
     if (fwnode_property_read_u32(of_fwnode_handle(child), "reg", &v))
       return -EINVAL;
-// expected-warning@-1 {{the function returns here from inside the loop over nodes, with the reference to 'child' that of_get_next_child() took for this pass: of_node_put(child) is missing on this path (experimental check 'iterator-ref-leak')}}
+// expected-warning@-1 {{the function returns here from inside the loop, with the reference to 'child' that of_get_next_child() took for this pass: of_node_put(child) is missing on this path (experimental check 'iterator-ref-leak')}}
   }
   return 0;
+}
+
+// ---------------------------------------------------------------------------
+// The same for the devices that pci_get_device() walks.
+
+struct pci_dev {
+  unsigned short vendor, device;
+};
+#define PCI_ANY_ID (~0)
+struct pci_dev *pci_get_device(unsigned int vendor, unsigned int device,
+                               struct pci_dev *from);
+void pci_dev_put(struct pci_dev *dev);
+int pci_read_config_word(const struct pci_dev *dev, int where,
+                         unsigned short *val);
+#define for_each_pci_dev(d) \
+  while ((d = pci_get_device(PCI_ANY_ID, PCI_ANY_ID, d)) != NULL)
+
+struct host {
+  struct pci_dev *bridge;
+};
+
+int find_bridge(unsigned short *val) {
+  struct pci_dev *pdev = NULL;
+
+  for_each_pci_dev(pdev) { // expected-note {{the next pass drops the reference here, a pass that leaves the function does not get there}}
+    if (pdev->vendor == 0x8086)
+      return pci_read_config_word(pdev, 0, val);
+// expected-warning@-1 {{the function returns here from inside the loop, with the reference to 'pdev' that pci_get_device() took for this pass: pci_dev_put(pdev) is missing on this path (experimental check 'iterator-ref-leak')}}
+  }
+  return -ENODEV;
+}
+
+int find_bridge_and_put(unsigned short *val) {
+  struct pci_dev *pdev = NULL;
+  int ret = -ENODEV;
+
+  for_each_pci_dev(pdev) {
+    if (pdev->vendor == 0x8086) {
+      ret = pci_read_config_word(pdev, 0, val);
+      pci_dev_put(pdev);
+      break;
+    }
+  }
+  return ret;
+}
+
+int keep_bridge(struct host *h) {
+  struct pci_dev *pdev = NULL;
+
+  for_each_pci_dev(pdev) {
+    if (pdev->vendor == 0x8086) {
+      h->bridge = pdev;
+      return 0;
+    }
+  }
+  return -ENODEV;
 }
 
 // ---------------------------------------------------------------------------

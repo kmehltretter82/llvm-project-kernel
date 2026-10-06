@@ -483,14 +483,17 @@ group of its own once a kernel scan has shown what it finds. The names:
   in the variable anywhere (it assigns one, or negates the variable, as in
   `return -ret;`), and a variable that is compared with the same error
   number in both forms, `ret == -EAGAIN || ret == EAGAIN`.
-- `iterator-ref-leak`: a pass of a loop over device tree or firmware nodes
-  leaves the function with the reference that the iterator took for it:
-  `for_each_child_of_node(parent, child) { if (err) return err; }`. The
-  loop is known by its advance, `child = of_get_next_child(parent, child)`
-  or one of the other functions that drop the node they are given and
-  return the next one, so `while ((np = of_find_compatible_node(np, ...)))`
-  is one too. A path ends where the reference is dropped (`of_node_put()`,
-  `fwnode_handle_put()`, the iterator itself) and where the pointer is
+- `iterator-ref-leak`: a pass of a loop over device tree or firmware
+  nodes, or over PCI or ACPI devices, leaves the function with the
+  reference that the iterator took for it: `for_each_child_of_node(parent,
+  child) { if (err) return err; }`, `for_each_pci_dev(pdev) { if (match)
+  break; }` without `pci_dev_put()` afterwards. The loop is known by its
+  advance, `child = of_get_next_child(parent, child)` or one of the other
+  functions that drop what they are given and return the next one, so
+  `while ((np = of_find_compatible_node(np, ...)))` is one too. A path
+  ends where the reference is dropped (`of_node_put()`,
+  `fwnode_handle_put()`, `pci_dev_put()`, `acpi_dev_put()`, the iterator
+  itself) and where the pointer is
   kept: assigned to something, returned, or given another reference with
   `of_node_get()`. A function that is only passed the node does not take
   the reference over, by the convention that whoever keeps a node takes a

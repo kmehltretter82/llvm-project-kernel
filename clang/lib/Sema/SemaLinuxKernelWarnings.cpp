@@ -14072,8 +14072,9 @@ public:
   }
 };
 
-/// A loop over device tree nodes holds a reference to the node of each
-/// pass, which the next call of the iterator drops:
+/// A loop over device tree nodes, and one over PCI or ACPI devices, holds a
+/// reference to the node of each pass, which the next call of the iterator
+/// drops:
 ///
 ///   for_each_child_of_node(parent, child) {
 ///           ret = setup(child);
@@ -14156,19 +14157,42 @@ class LinuxIteratorRefChecker : LinuxPathSearch::Client {
                 "device_get_next_child_node", "fwnode_get_next_parent",
                 "fwnode_graph_get_next_endpoint"},
                true)
+        // The same for devices: for_each_pci_dev() and its relatives, and
+        // the ACPI devices that match an ID or use a supplier.
+        .Cases({"pci_get_device", "pci_get_device_reverse", "pci_get_subsys",
+                "pci_get_class", "pci_get_base_class"},
+               true)
+        .Cases({"acpi_dev_get_next_match_dev",
+                "acpi_dev_get_next_consumer_dev"},
+               true)
         .Default(false);
+  }
+
+  /// The function that drops the reference which \p Next takes.
+  static StringRef getPutName(const FunctionDecl *Next) {
+    StringRef Name = Next->getName();
+    return Name.starts_with("of_")     ? "of_node_put"
+           : Name.starts_with("pci_")  ? "pci_dev_put"
+           : Name.starts_with("acpi_") ? "acpi_dev_put"
+                                       : "fwnode_handle_put";
   }
 
   static bool isPut(const FunctionDecl *Callee) {
     return Callee && Callee->getIdentifier() &&
-           (Callee->getName() == "of_node_put" ||
-            Callee->getName() == "fwnode_handle_put");
+           llvm::StringSwitch<bool>(Callee->getName())
+               .Cases({"of_node_put", "fwnode_handle_put", "pci_dev_put",
+                       "acpi_dev_put"},
+                      true)
+               .Default(false);
   }
 
   static bool isGet(const FunctionDecl *Callee) {
     return Callee && Callee->getIdentifier() &&
-           (Callee->getName() == "of_node_get" ||
-            Callee->getName() == "fwnode_handle_get");
+           llvm::StringSwitch<bool>(Callee->getName())
+               .Cases({"of_node_get", "fwnode_handle_get", "pci_dev_get",
+                       "acpi_dev_get"},
+                      true)
+               .Default(false);
   }
 
   /// Whether \p St stores the pointer in \p VD in memory: it assigns it
@@ -14406,13 +14430,11 @@ class LinuxIteratorRefChecker : LinuxPathSearch::Client {
     SourceLocation Loc =
         RS ? RS->getBeginLoc() : FD->getBody()->getEndLoc();
     const FunctionDecl *Next = C.Next->getDirectCallee();
-    StringRef Put =
-        Next->getName().starts_with("of_") ? "of_node_put"
-                                           : "fwnode_handle_put";
+    StringRef Put = getPutName(Next);
     std::string Text;
     llvm::raw_string_ostream OS(Text);
-    OS << "the function returns here from inside the loop over nodes, with "
-          "the reference to '"
+    OS << "the function returns here from inside the loop, with the "
+          "reference to '"
        << C.Var->getName() << "' that " << Next->getName()
        << "() took for this pass: " << Put << "(" << C.Var->getName()
        << ") is missing on this path";
