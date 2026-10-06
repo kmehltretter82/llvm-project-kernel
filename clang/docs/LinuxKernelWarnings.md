@@ -432,6 +432,13 @@ and say so under this switch if one of them ends without a fixpoint.
 `wide-search` multiplies the limits of a search by four. It costs time in
 the functions that reach them and none elsewhere.
 
+A search does not carry everything it has learned along a path to the end
+of the function. What it knows about a variable is dropped at the first
+block from which nothing mentions the variable any more, so that paths
+which differ only in that come together again. `keep-dead-facts` turns
+this off, for a comparison: the reports are the same, and more paths are
+dropped at the limit of states.
+
 ## Architectures without a code generator
 
 The kernel supports architectures that LLVM has no backend for. Their code

@@ -5251,6 +5251,11 @@ private:
   std::vector<Location> Locations;
   std::vector<Condition> Conditions;
   llvm::SmallPtrSet<const VarDecl *, 16> AddressTaken;
+  /// For each block, the local variables that it or a block behind it
+  /// mentions, by their number in VarIndex.
+  llvm::DenseMap<const VarDecl *, unsigned> VarIndex;
+  std::vector<llvm::SmallBitVector> LiveVars;
+  bool KeepDeadFacts = false;
   unsigned FunctionSteps = 0;
   unsigned Steps = 0;
   bool Stopped = false;
@@ -5461,6 +5466,84 @@ private:
     C.ID = ID;
     Conditions.push_back(std::move(C));
     return Conditions.size() - 1;
+  }
+
+  void collectMentions(const Stmt *St, llvm::SmallBitVector &Out) {
+    if (!St)
+      return;
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(St))
+      if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))
+        if (VD->hasLocalStorage()) {
+          unsigned I = VarIndex.try_emplace(VD, VarIndex.size()).first->second;
+          if (Out.size() <= I)
+            Out.resize(I + 1);
+          Out.set(I);
+        }
+    for (const Stmt *Child : St->children())
+      collectMentions(Child, Out);
+  }
+
+  /// Work out which variables are still of interest at each block: those
+  /// that the block or a block behind it mentions.  What a state says about
+  /// any other variable changes nothing from there on, neither which way a
+  /// path goes nor what a check sees, and two states that differ in nothing
+  /// else are one state (see forget()).  Without this a function that tests
+  /// one flag after the other comes to the later blocks in a number of
+  /// states that doubles with each flag, and the search has to drop paths.
+  void computeLiveness() {
+    LiveVars.resize(Cfg.getNumBlockIDs());
+    for (const CFGBlock *B : Cfg) {
+      llvm::SmallBitVector &Live = LiveVars[B->getBlockID()];
+      for (const CFGElement &Elem : *B)
+        if (std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>())
+          collectMentions(CS->getStmt(), Live);
+      collectMentions(B->getTerminatorCondition(), Live);
+    }
+    for (llvm::SmallBitVector &Live : LiveVars)
+      Live.resize(VarIndex.size());
+    // The CFG lists its blocks from the exit to the entry, which is the
+    // order for a fact that moves backwards.
+    for (bool Changed = true; Changed;) {
+      Changed = false;
+      for (const CFGBlock *B : Cfg) {
+        llvm::SmallBitVector &Live = LiveVars[B->getBlockID()];
+        for (const CFGBlock::AdjacentBlock &Succ : B->succs()) {
+          const CFGBlock *Next = Succ.getReachableBlock();
+          if (!Next || Next == B)
+            continue;
+          const llvm::SmallBitVector &Behind = LiveVars[Next->getBlockID()];
+          if (Behind.test(Live)) { // a bit that Live lacks
+            Live |= Behind;
+            Changed = true;
+          }
+        }
+      }
+    }
+  }
+
+  /// Drop from \p St what nothing from \p B on can ask for: the value of a
+  /// location whose variable is not mentioned any more, unless a check
+  /// asked for it to be kept, and the outcome of a condition that reads
+  /// such a location and so cannot come up again.
+  void forget(const CFGBlock *B, State &St) const {
+    if (KeepDeadFacts)
+      return;
+    const llvm::SmallBitVector &Live = LiveVars[B->getBlockID()];
+    auto Dead = [&](unsigned Loc) {
+      if (Locations[Loc].Pinned)
+        return false;
+      auto It = VarIndex.find(Locations[Loc].Root);
+      return It != VarIndex.end() && !Live.test(It->second);
+    };
+    llvm::erase_if(St.Vals, [&](const std::pair<unsigned, Value> &P) {
+      return Dead(P.first);
+    });
+    llvm::erase_if(St.Same, [&](const std::pair<unsigned, unsigned> &P) {
+      return Dead(P.first) || Dead(P.second);
+    });
+    llvm::erase_if(St.Preds, [&](const std::pair<unsigned, bool> &P) {
+      return llvm::any_of(Conditions[P.first].Locations, Dead);
+    });
   }
 
   /// Count how often the function branches on each location and on each
@@ -5756,9 +5839,10 @@ private:
     return !HasLabel && !AnyCase;
   }
 
-  bool push(const CFGBlock *B, const State &St,
+  bool push(const CFGBlock *B, State St,
             llvm::DenseMap<unsigned, llvm::SmallVector<State, 2>> &Seen,
             llvm::SmallVectorImpl<Item> &Work) {
+    forget(B, St);
     llvm::SmallVectorImpl<State> &Set = Seen[B->getBlockID()];
     if (llvm::is_contained(Set, St))
       return false;
@@ -5768,7 +5852,7 @@ private:
     }
     Set.push_back(St);
     Trail.push_back({B, Current});
-    Work.push_back({B, St, int(Trail.size()) - 1});
+    Work.push_back({B, std::move(St), int(Trail.size()) - 1});
     return true;
   }
 
@@ -5778,14 +5862,17 @@ public:
       : Cfg(Cfg), Ctx(Ctx), Unit(Unit) {
     // The switch "wide-search" trades time for the paths that the budgets
     // cut off.  The switch "statistics" says how many those are.
-    if (llvm::is_contained(Ctx.getLangOpts().LinuxKernelExperimentalChecks,
-                           "wide-search")) {
+    const auto &Switches = Ctx.getLangOpts().LinuxKernelExperimentalChecks;
+    if (llvm::is_contained(Switches, "wide-search")) {
       MaxStatesPerBlock *= 4;
       MaxSteps *= 4;
       MaxFunctionSteps *= 4;
     }
+    // For a comparison with the search as it was.
+    KeepDeadFacts = llvm::is_contained(Switches, "keep-dead-facts");
     collectAddressTaken(FD->getBody());
     countSites();
+    computeLiveness();
   }
 
   static bool isErrorPointerHelper(const FunctionDecl *FD) {

@@ -4,10 +4,15 @@
 //
 // RUN: %clang_cc1 -fsyntax-only -ffreestanding -Wlinux-kernel-missing-unwind \
 // RUN:   -Wlinux-kernel-experimental -flinux-kernel-experimental=statistics \
-// RUN:   -verify %s
+// RUN:   -verify=expected,live %s
 // RUN: %clang_cc1 -fsyntax-only -ffreestanding -Wlinux-kernel-missing-unwind \
 // RUN:   -Wlinux-kernel-experimental \
-// RUN:   -flinux-kernel-experimental=statistics,wide-search -verify %s
+// RUN:   -flinux-kernel-experimental=statistics,wide-search \
+// RUN:   -verify=expected,live %s
+// RUN: %clang_cc1 -fsyntax-only -ffreestanding -Wlinux-kernel-missing-unwind \
+// RUN:   -Wlinux-kernel-experimental \
+// RUN:   -flinux-kernel-experimental=statistics,keep-dead-facts \
+// RUN:   -verify=expected,dead %s
 // RUN: %clang_cc1 -fsyntax-only -ffreestanding -Wlinux-kernel-missing-unwind \
 // RUN:   -Wlinux-kernel-experimental -flinux-kernel-experimental=all \
 // RUN:   -verify=off %s
@@ -15,7 +20,8 @@
 // off-no-diagnostics
 
 // The line for the translation unit is at the start of the file.
-// expected-warning@1 {{statistics for this file: functions 2, path searches 25, out of steps 0, dropped paths 0, not run 0, checks stopped early 1 (experimental check 'statistics')}}
+// live-warning@1 {{statistics for this file: functions 3, path searches 26, out of steps 0, dropped paths 0, not run 0, checks stopped early 1 (experimental check 'statistics')}}
+// dead-warning@1 {{statistics for this file: functions 3, path searches 26, out of steps 0, dropped paths 1, not run 0, checks stopped early 1 (experimental check 'statistics')}}
 
 #define EIO 5
 
@@ -57,6 +63,7 @@ struct priv {
 void mutex_lock(struct mutex *lock);
 void mutex_unlock(struct mutex *lock);
 int setup(struct device *dev);
+void note(int n);
 
 int few(struct priv *p) {
   mutex_lock(&p->lock);
@@ -228,4 +235,38 @@ int many(struct priv *p) { // expected-warning {{statistics for 'many': path sea
   }
   mutex_unlock(&p->l25);
   return 0;
+}
+
+// Each flag is tested twice, so the search keeps what the first test found
+// out.  Behind the second test nothing mentions the flag any more, and what
+// is known about it is dropped: the paths come to the end of the function
+// in one state.  With "keep-dead-facts" they come in thirty-two, which is
+// more than the search keeps for one block.
+int flags(struct priv *p, int a, int b, int c, int d, int e) { // dead-warning {{statistics for 'flags': path searches 1, out of steps 0, dropped paths 1, not run 0, checks stopped early 0 (experimental check 'statistics')}}
+  int ret;
+
+  mutex_lock(&p->lock);
+  if (a)
+    note(1);
+  if (a)
+    note(2);
+  if (b)
+    note(3);
+  if (b)
+    note(4);
+  if (c)
+    note(5);
+  if (c)
+    note(6);
+  if (d)
+    note(7);
+  if (d)
+    note(8);
+  if (e)
+    note(9);
+  if (e)
+    note(10);
+  ret = setup(p->dev);
+  mutex_unlock(&p->lock);
+  return ret;
 }
