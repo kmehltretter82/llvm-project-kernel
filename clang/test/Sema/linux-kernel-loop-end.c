@@ -106,10 +106,10 @@ int search(int id) {
 int search_while(int id) {
   unsigned int i = 0;
 
-  while (i < ARRAY_SIZE(rates) && rates[i].id != id) // expected-note {{the test is here}}
+  while (i < ARRAY_SIZE(rates) && rates[i].id != id) // expected-note {{the loop ends here if nothing has left it before}}
     i++;
   return rates[i].value;
-// expected-warning@-1 {{'i' is the index into 'rates' here, but on this path a test has found 'i' not to be below 4, the number of elements (experimental check 'index-past-end')}}
+// expected-warning@-1 {{'i' is the index into 'rates' here, but on this path the loop has run to its end, which leaves 'i' at 4, the number of elements (experimental check 'index-past-end')}}
 }
 
 // Every pass goes on to the next one: the loop always runs to its end.
@@ -335,6 +335,48 @@ int climb_untested(int *slots) {
   return levels[0];
 }
 
+// The test is part of a condition whose value is used as a whole.
+int get_checked(unsigned int i) {
+  if (unlikely(i >= ARRAY_SIZE(rates) || !rates[i].id))
+    return -EINVAL;
+  return rates[i].value;
+}
+
+// The loop goes on while the index is in range: its body is not behind
+// the test that fails.
+int collect(void) {
+  int vals[4];
+  int i = 0, v;
+
+  do {
+    v = get();
+    if (v > 0) {
+      vals[i] = v;
+      i++;
+    }
+  } while (v && i < 4 && v != 7);
+  return vals[0];
+}
+
+// The test guards one use.  What comes behind the "if" is not what it is
+// about.
+static int pairs[ARRAY_SIZE(rates) * 2];
+
+int guarded_use(unsigned int i, unsigned int j) {
+  if (i < ARRAY_SIZE(rates) && j < 2)
+    note(pairs[i * 2 + j]);
+  return rates[i].value;
+}
+
+// The value of the test is kept, as WARN_ON() does.
+int kept_value(unsigned int i) {
+  int bad = !!(i >= ARRAY_SIZE(rates));
+
+  if (unlikely(bad))
+    return -EINVAL;
+  return rates[i].value;
+}
+
 // The address of the element behind the last one is a pointer like others.
 const struct rate *end_of_rates(void) {
   int i;
@@ -528,6 +570,35 @@ int search_status(int id) {
   if (status != 5)
     return -ENOENT;
   return rates[i].value;
+}
+
+// A ring of items: the head of the list is in an item itself.
+int ring(struct item *first, int id) {
+  struct item *pos;
+
+  list_for_each_entry(pos, &first->list, list)
+    if (pos->id == id)
+      break;
+  return pos->value;
+}
+
+// The item that was found is kept in another variable, which is not NULL
+// then.
+int lookup_kept(struct list_head *head, int id) {
+  struct item *pos, *found = NULL;
+  int old = 0;
+
+  list_for_each_entry(pos, head, list) {
+    if (pos->id == id) {
+      old = pos->value;
+      found = pos;
+    }
+    if (found)
+      break;
+  }
+  if (old)
+    return pos->value;
+  return 0;
 }
 
 // What the function does with the item is not known.

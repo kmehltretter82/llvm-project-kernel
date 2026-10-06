@@ -297,6 +297,51 @@ int *alloc_either(struct dev *d, int given) {
   return kcalloc(n, sizeof(int), 0);
 }
 
+// The error value is tested for by its name.
+#define INVALID_INDEX (-1)
+static int find_index(struct dev *d) {
+  if (!d->table)
+    return INVALID_INDEX;
+  return d->id;
+}
+
+int use_index(struct dev *d, int *map) {
+  unsigned int idx = find_index(d);
+
+  if (idx == INVALID_INDEX)
+    return 0;
+  return map[idx];
+}
+
+// Another result of the same call says whether the index counts.
+static int find_page(struct dev *d, int **page) {
+  if (!d->table)
+    return -1;
+  *page = d->table;
+  return d->id;
+}
+
+int use_page(struct dev *d) {
+  int *page = NULL;
+  int idx;
+
+  idx = find_page(d, &page);
+  if (page)
+    return page[idx];
+  return 0;
+}
+
+// The test is on a copy.
+int use_copy(struct dev *d, int *map) {
+  int vers, err;
+
+  vers = local_count(d);
+  err = vers;
+  if (err < 0)
+    return err;
+  return map[vers];
+}
+
 // A function that is asked about the number.
 bool count_ok(int n);
 

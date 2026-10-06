@@ -429,7 +429,13 @@ group of its own once a kernel scan has shown what it finds. The names:
   below the number of elements of `a`, which is its constant size or the
   member that `__counted_by()` names. The usual case is a loop that looks
   for an entry and runs to its end: `for (i = 0; i < ARRAY_SIZE(t); i++)
-  if (t[i].id == id) break; use(t[i]);`. The path ends where `i` is
+  if (t[i].id == id) break; use(t[i]);`. Outside a loop condition a test
+  counts as the condition of an `if`, and only for the branch that is
+  taken because the index is out of range, as in `if (i >= n)
+  pr_err(...);` without a return, or `if (i >= n && !wide) continue;` with
+  a use behind it. `if (i < 4 && j < 2) use(m[i * 2 + j]);` guards one use
+  and says nothing about what follows, and a test whose value is stored,
+  which is what `WARN_ON()` does with it, decides nothing by itself. The path ends where `i` is
   assigned or compared again, or where a variable that the bound is read
   from is assigned. A flag that the loop sets where it leaves is known to
   be clear on the path, so `if (!found) return;` deals with it. Where the
@@ -448,7 +454,9 @@ group of its own once a kernel scan has shown what it finds. The names:
   function also tests with `list_empty()`, because a loop that takes its
   entries off the list leaves an empty list when it runs to its end, and
   one that has no branch on the cursor, because a loop that counts to the
-  entry with a given number relies on the list having that many.
+  entry with a given number relies on the list having that many. A list
+  whose head is in an object of the type of its entries is a ring of such
+  objects, and its cursor always points to one.
 - `unsigned-error-test`: `x <= 0` or `x > 0` where `x` is unsigned and the
   one assignment that the test sees gives it the result of a function that
   can return a negative number. `-Wlinux-kernel-unsigned-error-check` has
@@ -460,8 +468,13 @@ group of its own once a kernel scan has shown what it finds. The names:
   the size of `memcpy()`, `memmove()` or `memset()`, and the function tests
   it nowhere. For an unsigned variable a comparison with zero does not
   count as a test, because the error code is a large number there, and a
-  comparison with a limit does. Which functions can return a negative
-  number is inferred, see below.
+  comparison with a limit does, as does a comparison with a constant that
+  is written as a negative number (`idx == INVALID_INDEX`). A test of a
+  copy counts (`err = n; if (err < 0)`), a function that is given the
+  variable in a condition does (`if (!valid_id(id))`), and so does a test
+  of another variable whose address went to the same call (`idx = find(c,
+  &page); if (page)`). Which functions can return a negative number is
+  inferred, see below.
 - `positive-errno-test`: `err == ERESTARTSYS`, a comparison with an error
   number that lacks its minus sign, where the function treats the variable
   as a kernel error code somewhere: it passes it to `ERR_PTR()` or
@@ -539,8 +552,9 @@ and say so under this switch if one of them ends without a fixpoint.
 the functions that reach them and none elsewhere.
 
 A search remembers the outcome of a condition that the function tests in
-more than one place, and a comparison counts as the same condition however
-it is written: `a != b` is the negation of `a == b`, `a >= b` that of `a <
+more than one place, or that a check starts from, also where the test has
+told it the sign of a variable: "i >= 4" says more than "i is positive".
+A comparison counts as the same condition however it is written: `a != b` is the negation of `a == b`, `a >= b` that of `a <
 b`, and `b > a` is `a < b`. `if (status == DONE) break;` in a loop and `if
 (status != DONE) return;` behind it are one question.
 

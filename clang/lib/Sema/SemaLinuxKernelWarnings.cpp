@@ -3961,6 +3961,9 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
     RangeTest = 2,
   };
   std::optional<llvm::DenseMap<const VarDecl *, unsigned>> IntegerTests;
+  /// "err = n;": a test of the first is a test of the second.
+  llvm::SmallVector<std::pair<const VarDecl *, const VarDecl *>, 4>
+      IntegerCopies;
 
   static bool isSizeType(QualType T) {
     // "typedef size_t foo_t;" is not looked through: only what is declared
@@ -4031,6 +4034,15 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
               : E->getIntegerConstantExpr(S.getASTContext());
       return K && K->isZero();
     };
+    // "idx == INVALID_INDEX" with a constant that is written as a negative
+    // number: a test for the very thing.
+    auto IsNegative = [&](const Expr *E) {
+      E = E->IgnoreParenImpCasts();
+      Expr::EvalResult R;
+      return !E->isValueDependent() &&
+             E->EvaluateAsInt(R, S.getASTContext()) &&
+             R.Val.getInt().isSigned() && R.Val.getInt().isNegative();
+    };
     // "if (!is_valid_id(id)) return -EINVAL;": a function that is asked
     // about the variable in a condition is a test of it.
     auto NoteCondition = [&](const Expr *Cond) {
@@ -4041,9 +4053,21 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
       if (BO->isComparisonOp()) {
         bool Range = BO->isRelationalOp();
         Note(BO->getLHS(),
-             AnyTest | (Range && !IsZero(BO->getRHS()) ? RangeTest : 0));
+             AnyTest | ((Range && !IsZero(BO->getRHS())) ||
+                                IsNegative(BO->getRHS())
+                            ? RangeTest
+                            : 0));
         Note(BO->getRHS(),
-             AnyTest | (Range && !IsZero(BO->getLHS()) ? RangeTest : 0));
+             AnyTest | ((Range && !IsZero(BO->getLHS())) ||
+                                IsNegative(BO->getLHS())
+                            ? RangeTest
+                            : 0));
+      } else if (BO->getOpcode() == BO_Assign) {
+        const VarDecl *To = getDirectVariable(BO->getLHS());
+        const VarDecl *From =
+            getDirectVariable(BO->getRHS()->IgnoreParenCasts());
+        if (To && From)
+          IntegerCopies.push_back({To, From});
       } else if (BO->isLogicalOp()) {
         NoteCondition(BO->getLHS());
         NoteCondition(BO->getRHS());
@@ -4065,6 +4089,12 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
       NoteCondition(CO->getCond());
     } else if (const auto *SS = dyn_cast<SwitchStmt>(St)) {
       Note(SS->getCond(), AnyTest | RangeTest);
+    } else if (const auto *DS = dyn_cast<DeclStmt>(St)) {
+      for (const Decl *D : DS->decls())
+        if (const auto *To = dyn_cast<VarDecl>(D); To && To->getInit())
+          if (const VarDecl *From =
+                  getDirectVariable(To->getInit()->IgnoreParenCasts()))
+            IntegerCopies.push_back({To, From});
     }
     for (const Stmt *Child : St->children())
       collectIntegerTests(Child);
@@ -4075,19 +4105,26 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
       IntegerTests.emplace();
       collectIntegerTests(CurrentFunction->getBody());
     }
-    return IntegerTests->lookup(VD);
+    unsigned Tests = IntegerTests->lookup(VD);
+    for (auto [To, From] : IntegerCopies)
+      if (From == VD)
+        Tests |= IntegerTests->lookup(To);
+    return Tests;
   }
 
   /// The function whose result \p Use holds, if that is the one assignment
   /// that the use sees and the function can return a negative number.
   const FunctionDecl *getNegativeSource(const Expr *Use,
-                                        SourceLocation &Stored) {
+                                        SourceLocation &Stored,
+                                        const CallExpr **Call = nullptr) {
     const LinuxReachingDefs::Def *D = Reaching ? Reaching->unique(Use) : nullptr;
     const FunctionDecl *Callee =
         D && D->Value ? getSignedResultCallee(D->Value) : nullptr;
     if (!Callee || !mayLinuxReturnNegative(Callee, UnitState))
       return nullptr;
     Stored = D->Loc;
+    if (Call)
+      *Call = cast<CallExpr>(D->Value->IgnoreParenImpCasts());
     return Callee;
   }
 
@@ -4156,7 +4193,8 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
         T->isAnyCharacterType())
       return;
     SourceLocation Stored;
-    const FunctionDecl *Callee = getNegativeSource(DRE, Stored);
+    const CallExpr *Call = nullptr;
+    const FunctionDecl *Callee = getNegativeSource(DRE, Stored, &Call);
     if (!Callee)
       return;
     // An error code in an unsigned variable is a large number, which a
@@ -4165,6 +4203,14 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
     unsigned Tests = getIntegerTests(VD);
     if (Tests & (T->isUnsignedIntegerType() ? RangeTest : AnyTest))
       return;
+    // "idx = find(c, slot, &page); if (page) use(page->slots[idx]);":
+    // another result of the same call says whether this one counts.
+    for (const Expr *Arg : Call->arguments())
+      if (const auto *UO = dyn_cast<UnaryOperator>(Arg->IgnoreParenCasts());
+          UO && UO->getOpcode() == UO_AddrOf)
+        if (const VarDecl *Other = getDirectVariable(UO->getSubExpr());
+            Other && (getIntegerTests(Other) & AnyTest))
+          return;
     ReportedErrorSizes.insert(VD);
     std::string Text;
     llvm::raw_string_ostream OS(Text);
@@ -7406,6 +7452,21 @@ public:
   /// condition reads it.
   void pin(unsigned Loc) { Locations[Loc].Pinned = true; }
 
+  /// Keep the outcome of \p Cond along a path although the function
+  /// branches on it in one place only.  A check that starts from that
+  /// outcome needs it where the value of the condition was stored, or is
+  /// branched on again: "if (unlikely(i >= n || !tab[i]))" and "do ...
+  /// while (more && i < n)".
+  void remember(const Expr *Cond) {
+    bool Negated = false;
+    const Expr *E = stripLinuxCondition(Cond, Negated);
+    if (!E)
+      return;
+    int I = conditionIndex(E, /*Create=*/true, /*Always=*/true);
+    if (I >= 0 && Conditions[I].Sites < 2)
+      Conditions[I].Sites = 2;
+  }
+
   bool isAddressTaken(const VarDecl *VD) const {
     return AddressTaken.count(VD);
   }
@@ -7938,8 +7999,10 @@ public:
         if (Loc >= 0 && K.HasConst) {
           std::optional<bool> Narrowed = assumeCompared(Loc, Op, K.Const,
                                                         Outcome, St);
-          if (Narrowed)
-            return *Narrowed;
+          // The sign that "i >= 4" leaves says less than the test did.  Its
+          // outcome is remembered below as that of any other condition.
+          if (Narrowed && !*Narrowed)
+            return false;
         }
       }
     } else if (const auto *CE = dyn_cast<CallExpr>(Plain)) {
@@ -10587,8 +10650,23 @@ class LinuxUnwindChecker : LinuxPathSearch::Client {
       return true;
     // devres releases it from here on.  devm_add_action_or_reset() is a
     // macro around __devm_add_action_or_reset().
-    if (Name.ltrim('_').starts_with("devm_"))
-      return false;
+    if (StringRef Plain = Name.ltrim('_'); Plain.starts_with("devm_")) {
+      if (!Plain.starts_with("devm_add_action") || CE->getNumArgs() < 2)
+        return false;
+      // An action is what its function does.  "devm_add_action_or_reset(dev,
+      // foo_reset_assert, foo);" is given the structure and does nothing
+      // for the regulator in it.
+      const auto *DRE =
+          dyn_cast<DeclRefExpr>(CE->getArg(1)->IgnoreParenCasts());
+      const auto *Action =
+          DRE ? dyn_cast<FunctionDecl>(DRE->getDecl()) : nullptr;
+      const FunctionDecl *ActionDef = nullptr;
+      if (!Action || !Action->getIdentifier() ||
+          Kind.isRelease(Action->getName()) || !Action->hasBody(ActionDef) ||
+          releasesInside(ActionDef->getBody(), 0))
+        return false;
+      return true;
+    }
 
     if (Kind.Owned && HandleVar) {
       // Memory: whoever gets the pointer may keep it.
@@ -13213,11 +13291,20 @@ public:
 /// A loop over a list that the function also tests with list_empty() is
 /// left alone: such a loop often takes its entries off the list, and then
 /// the list is empty when the loop has run to its end.  So is a loop that
-/// does not look at its entries, but counts them to stop at one.
+/// does not look at its entries, but counts them to stop at one, and a
+/// list whose head is in an object of the type of its entries.
+///
+/// A test outside a loop condition counts only as the condition of an "if"
+/// and only for the branch that is taken because the index is out of
+/// range: "if (i >= n) pr_err(...);" without a return.  "if (i < 4 && j <
+/// 2) use(masks[i * 2 + j]);" guards one use and says nothing about the
+/// code behind it, and a test whose value is stored, as WARN_ON() does,
+/// decides nothing by itself.
 class LinuxLoopEndChecker : LinuxPathSearch::Client {
   Sema &S;
   const FunctionDecl *FD;
   const CFG &Cfg;
+  const ParentMap &Parents;
   ASTContext &Ctx;
   LinuxPathSearch &Search;
   sema::LinuxKernelUnit::Impl &Unit;
@@ -13239,6 +13326,8 @@ class LinuxLoopEndChecker : LinuxPathSearch::Client {
 
   // Per search.
   const Candidate *Active = nullptr;
+  /// Where the search keeps the value of a list cursor, or -1.
+  int CursorLoc = -1;
   bool FromEntry = false;
   llvm::BitVector ReachesTest;
   const Expr *Misuse = nullptr;
@@ -13255,9 +13344,62 @@ class LinuxLoopEndChecker : LinuxPathSearch::Client {
     AtMost = 4,
   };
 
-  static const Stmt *getLoop(const CFGBlock *B) {
-    const Stmt *Term = B->getTerminatorStmt();
-    return Term && isa<ForStmt, WhileStmt, DoStmt>(Term) ? Term : nullptr;
+  /// What the outcome of a test decides.
+  enum Context {
+    /// Whether a loop goes on.
+    InLoop,
+    /// Which branch of an "if" or of a conditional operator is taken.
+    InBranch,
+    /// Nothing by itself: the value is stored or passed on, as in
+    /// WARN_ON(), which keeps it in a variable.
+    AsValue,
+  };
+
+  /// The statement that \p Cond is the condition of, or part of the
+  /// condition of.
+  Context getContext(const Expr *Cond, const Stmt *&Owner) const {
+    const Stmt *Child = Cond;
+    for (unsigned Depth = 0; Depth < 24; ++Depth) {
+      const Stmt *P = Parents.getParent(Child);
+      if (!P)
+        return AsValue;
+      if (const auto *IS = dyn_cast<IfStmt>(P)) {
+        Owner = P;
+        return IS->getCond() == Child ? InBranch : AsValue;
+      }
+      if (const auto *CO = dyn_cast<AbstractConditionalOperator>(P)) {
+        Owner = P;
+        return CO->getCond() == Child ? InBranch : AsValue;
+      }
+      const Expr *LoopCond = nullptr;
+      if (const auto *For = dyn_cast<ForStmt>(P))
+        LoopCond = For->getCond();
+      else if (const auto *While = dyn_cast<WhileStmt>(P))
+        LoopCond = While->getCond();
+      else if (const auto *Do = dyn_cast<DoStmt>(P))
+        LoopCond = Do->getCond();
+      if (isa<ForStmt, WhileStmt, DoStmt>(P)) {
+        Owner = P;
+        return LoopCond == Child ? InLoop : AsValue;
+      }
+      // What a condition is made of.
+      bool Through = isa<ParenExpr, ImplicitCastExpr>(P);
+      if (const auto *UO = dyn_cast<UnaryOperator>(P))
+        Through = UO->getOpcode() == UO_LNot;
+      else if (const auto *BO = dyn_cast<BinaryOperator>(P))
+        Through = BO->isLogicalOp() ||
+                  (BO->getOpcode() == BO_Comma && BO->getRHS() == Child);
+      else if (const auto *CE = dyn_cast<CallExpr>(P)) {
+        unsigned ID = CE->getBuiltinCallee();
+        Through = (ID == Builtin::BI__builtin_expect ||
+                   ID == Builtin::BI__builtin_expect_with_probability) &&
+                  CE->getNumArgs() >= 1 && CE->getArg(0) == Child;
+      }
+      if (!Through)
+        return AsValue;
+      Child = P;
+    }
+    return AsValue;
   }
 
   static bool assigns(const Stmt *St, const VarDecl *VD) {
@@ -13539,6 +13681,25 @@ class LinuxLoopEndChecker : LinuxPathSearch::Client {
     return isMemberAddress(BO->getLHS(), Var, Member);
   }
 
+  /// "list_for_each_entry(pos, &first->node, node)" with a first of the
+  /// type of pos: the list is a ring of such objects, and its head is one
+  /// of them.
+  bool headIsEntry(const Candidate &C) const {
+    const auto *UO = dyn_cast<UnaryOperator>(C.Head->IgnoreParenImpCasts());
+    const auto *ME =
+        UO && UO->getOpcode() == UO_AddrOf
+            ? dyn_cast<MemberExpr>(UO->getSubExpr()->IgnoreParens())
+            : nullptr;
+    if (!ME || ME->getMemberDecl() != C.Member)
+      return false;
+    QualType Owner = ME->getBase()->IgnoreParenImpCasts()->getType();
+    if (ME->isArrow())
+      Owner = Owner->getPointeeType();
+    QualType Entry = C.Var->getType()->getPointeeType();
+    return !Owner.isNull() && !Entry.isNull() &&
+           Ctx.hasSameUnqualifiedType(Owner, Entry);
+  }
+
   /// Whether the function asks if the list \p Head is empty.
   bool testsEmptiness(const Stmt *St, const Expr *Head) const {
     if (!St)
@@ -13573,19 +13734,29 @@ class LinuxLoopEndChecker : LinuxPathSearch::Client {
       Candidate C;
       C.Block = B;
       C.Cond = Cond;
-      C.IsLoop = getLoop(B);
+      // A test whose value goes somewhere else decides nothing here.
+      const Stmt *Owner = nullptr;
+      Context Where = getContext(E, Owner);
+      if (Where == AsValue)
+        continue;
+      C.IsLoop = Where == InLoop;
       bool When = false;
       BinaryOperatorKind Op = BO_EQ;
       if (WantIndex && isBoundTest(E, C.Var, C.Bound, Op)) {
         C.Member = nullptr;
         When = isPast(Op);
+        // "if (i < 4 && j < 2) use(masks[i * 2 + j]);" guards one use, and
+        // says nothing about the code behind it.  The branch that is
+        // taken because the index is out of range is another matter.
+        if (Where == InBranch && (When != Negated) != true)
+          continue;
       } else if (WantCursor &&
                  isHeadTest(E, C.Var, C.Member, C.Head, When)) {
         // The variable that the loop moves along the list.  The same
         // comparison is written with the owner of a list in the place of
         // the entry: "next == &dev->children".
-        const Stmt *Loop = getLoop(B);
-        if (!Loop || Search.isAddressTaken(C.Var))
+        const Stmt *Loop = Where == InLoop ? Owner : nullptr;
+        if (!Loop || Search.isAddressTaken(C.Var) || headIsEntry(C))
           continue;
         const auto *For = dyn_cast<ForStmt>(Loop);
         const Stmt *Body = For ? For->getBody()
@@ -13734,9 +13905,15 @@ class LinuxLoopEndChecker : LinuxPathSearch::Client {
       return true;
     if (!applyTest(From, To, St.Client))
       return false;
-    if (From == Active->Block)
+    if (From == Active->Block) {
       St.Client = To == Active->Past ? (St.Client | Armed)
                                      : (St.Client & ~Armed);
+      // In the loop the cursor is an entry, and no NULL: "found = pos;"
+      // makes a pointer that "if (found)" takes for one.
+      if (To != Active->Past && CursorLoc >= 0)
+        LinuxPathSearch::set(St, CursorLoc,
+                             LinuxPathValue::ofMask(LinuxPathValue::Pos));
+    }
     return (St.Client & Armed) || ReachesTest.test(To->getBlockID());
   }
 
@@ -13843,10 +14020,10 @@ class LinuxLoopEndChecker : LinuxPathSearch::Client {
 
 public:
   LinuxLoopEndChecker(Sema &S, const FunctionDecl *FD, const CFG &Cfg,
-                      LinuxPathSearch &Search,
+                      const ParentMap &Parents, LinuxPathSearch &Search,
                       sema::LinuxKernelUnit::Impl &Unit)
-      : S(S), FD(FD), Cfg(Cfg), Ctx(S.getASTContext()), Search(Search),
-        Unit(Unit) {}
+      : S(S), FD(FD), Cfg(Cfg), Parents(Parents), Ctx(S.getASTContext()),
+        Search(Search), Unit(Unit) {}
 
   static bool wanted(const Sema &S, SourceLocation Loc) {
     return isLinuxExperimentEnabled(S, "index-past-end", Loc) ||
@@ -13861,6 +14038,12 @@ public:
       Active = &C;
       if (!hasMisuseBehind())
         continue;
+      // The search has to know the outcome of the test where its value is
+      // used a second time.
+      Search.remember(LinuxPathSearch::getBranchCondition(C.Block));
+      CursorLoc = C.Bound ? -1 : Search.locate(C.Var);
+      if (CursorLoc >= 0)
+        Search.pin(CursorLoc);
       // First from the test on, which is cheap.
       Misuse = nullptr;
       FromEntry = false;
@@ -14705,7 +14888,8 @@ void clang::sema::IssueLinuxKernelFlowWarnings(Sema &S, const FunctionDecl *FD,
                             *Unit.State)
         .run();
   if (WantLoopEnd)
-    LinuxLoopEndChecker(S, FD, *Cfg, Search, *Unit.State).run();
+    LinuxLoopEndChecker(S, FD, *Cfg, AC.getParentMap(), Search, *Unit.State)
+        .run();
   if (WantIterator)
     LinuxIteratorRefChecker(S, FD, *Cfg, Search).run();
 }

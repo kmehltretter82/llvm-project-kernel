@@ -1674,3 +1674,40 @@ struct fan_ops {
 };
 const struct fan_ops fan_ops = { .probe = fan_probe, .suspend = fan_suspend };
 
+// The action that is registered does something else.  The regulator is
+// still on when the registration fails.
+struct amp {
+  struct regulator *vdd;
+  void *dev;
+  int reset;
+};
+
+static void amp_reset_assert(void *data) {
+  struct amp *amp = data;
+
+  amp->reset = 1;
+}
+
+static int amp_probe(struct amp *amp) {
+  int ret;
+
+  ret = regulator_enable(amp->vdd); // expected-note {{acquired here}}
+  if (ret)
+    return ret;
+  ret = devm_add_action_or_reset(amp->dev, amp_reset_assert, amp);
+  if (ret)
+    return ret;
+// expected-warning@-1 {{'amp->vdd' was acquired with regulator_enable() and this error path returns without regulator_disable(), which 'amp_suspend' calls for it (experimental check 'unwind-far')}}
+  return 0;
+}
+
+static int amp_suspend(struct amp *amp) {
+  return regulator_disable(amp->vdd); // expected-note {{another path releases it here}}
+}
+
+struct amp_ops {
+  int (*probe)(struct amp *);
+  int (*suspend)(struct amp *);
+};
+const struct amp_ops amp_ops = { .probe = amp_probe, .suspend = amp_suspend };
+
