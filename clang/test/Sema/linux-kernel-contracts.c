@@ -117,6 +117,21 @@ struct item *ext_optional(struct ctx *c) {
   return i;
 }
 
+// The error does not leave the function, which tries again.
+void relax(void);
+// FACTS-DAG: fn{{	}}ext_retry{{	.*}}x:ext_far
+struct item *ext_retry(struct ctx *c) {
+  struct item *i;
+
+again:
+  i = ext_far(c);
+  if (IS_ERR(i)) {
+    relax();
+    goto again;
+  }
+  return i;
+}
+
 struct ops {
   struct item *(*make)(struct ctx *c);
   struct item *cached;
@@ -177,6 +192,7 @@ void ext_hint(struct ctx *c, int atomic) {
 // CONTRACTS-NOT: {{^(err_ptr|null|sleeps)	}}ext_branch
 // CONTRACTS-NOT: {{^(err_ptr|null|sleeps)	}}ext_optional
 // CONTRACTS-NOT: {{^(err_ptr|null|sleeps)	}}ext_untested
+// CONTRACTS-NOT: {{^(err_ptr|null)	}}ext_retry
 
 #else
 
@@ -219,6 +235,49 @@ int use_make(struct ctx *c) {
 
   if (!i) // expected-warning {{make_item returns an encoded error pointer on failure, which a NULL test does not detect; use IS_ERR()}} \
           // expected-note@#make_item {{the return convention of 'make_item' was inferred from its definition}}
+    return -ENOMEM;
+  return 0;
+}
+
+// The error does not leave the function, which tries again: what it
+// returns has passed the test, and the NULL test of the caller is odd but
+// no mix of conventions.
+void relax(void);
+
+static struct item *make_item_retry(struct ctx *c) {
+  struct item *i;
+
+again:
+  i = make_item(c);
+  if (IS_ERR(i)) {
+    relax();
+    goto again;
+  }
+  return i;
+}
+
+int use_retry(struct ctx *c) {
+  struct item *i = make_item_retry(c);
+
+  if (!i)
+    return -ENOMEM;
+  return 0;
+}
+
+// An error that becomes NULL on its way out.
+static struct item *make_item_or_null(struct ctx *c) { // #make_item_or_null
+  struct item *i = make_item(c);
+
+  if (IS_ERR(i))
+    return NULL;
+  return i;
+}
+
+int use_or_null(struct ctx *c) {
+  struct item *i = make_item_or_null(c);
+
+  if (IS_ERR(i)) // expected-warning {{make_item_or_null returns NULL on failure, which IS_ERR does not detect; test the pointer for NULL}} \
+                 // expected-note@#make_item_or_null {{the return convention of 'make_item_or_null' was inferred from its definition}}
     return -ENOMEM;
   return 0;
 }

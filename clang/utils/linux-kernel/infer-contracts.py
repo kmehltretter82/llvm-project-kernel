@@ -22,8 +22,11 @@ The return sources are letters: E (ERR_PTR), e (the result of an error
 pointer function), N (NULL), n (the untested result of a function that
 returns NULL on failure), V (valid), M (read from memory), O (opaque).
 ",c:<name>" follows for a function of another translation unit whose result
-is returned, ",k:<name>" if that result was tested for NULL first, and
-",t:<name>" if it was only tested with IS_ERR().
+is returned, ",k:<name>" if that result was tested for NULL first,
+",t:<name>" if it was only tested with IS_ERR(), and ",x:<name>" if the
+function leaves where IS_ERR() finds an error pointer and does not return
+the result there ("if (IS_ERR(p)) goto retry;"), so that what it returns of
+it is no error pointer.
 
 A result that the caller tests counts as valid once the test has passed,
 also where nothing is known about the function it comes from: the test is
@@ -87,7 +90,8 @@ SLEEPS = {
 def parse(paths):
     """name -> list of (file, flags, [(callee, test)], calls) per definition.
 
-    test is "c" (untested), "k" (tested for NULL) or "t" (tested with IS_ERR()).
+    test is "c" (untested), "k" (tested for NULL), "t" (tested with
+    IS_ERR()) or "x" (tested with IS_ERR(), and an error is not returned).
     """
     defs = collections.defaultdict(list)
     seen = set()
@@ -264,7 +268,7 @@ def conventions(defs):
                 for callee, test in callees:
                     kind = result.get(callee, UNKNOWN)
                     if kind == ERR:
-                        flags.add("e")
+                        flags.add("V" if test == "x" else "e")
                     elif kind == NULL:
                         flags.add("V" if test == "k" else "n")
                     else:

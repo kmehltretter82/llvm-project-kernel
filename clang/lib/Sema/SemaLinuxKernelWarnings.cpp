@@ -71,7 +71,10 @@ struct sema::LinuxKernelUnit::Impl {
     /// Functions without a body in this translation unit that the answer
     /// depends on, and what their result was tested for before it was
     /// returned.
-    enum : uint8_t { NullTested = 1, ErrorTested = 2 };
+    /// ErrorChecked: the function leaves where IS_ERR() finds the result
+    /// to be an error pointer, and does not return it there.  What it
+    /// returns of that result has passed the test.
+    enum : uint8_t { NullTested = 1, ErrorTested = 2, ErrorChecked = 4 };
     llvm::SmallVector<std::pair<const FunctionDecl *, uint8_t>, 2> External;
 
     /// A function that only ever returns ERR_PTR(), or only NULL, stands in
@@ -798,7 +801,45 @@ class LinuxKernelInference {
     /// The function tests the variable with IS_ERR() or takes its PTR_ERR(),
     /// so it may hold an error pointer wherever it came from.
     bool ErrorTested = false;
+    /// The function leaves where IS_ERR() finds the variable to be an
+    /// error pointer, without returning it: "if (IS_ERR(p)) goto retry;".
+    /// The tests that do this are in Handled, with the PTR_ERR() calls of
+    /// their branches.
+    bool ErrorChecked = false;
+    llvm::SmallPtrSet<const CallExpr *, 4> Handled;
   };
+
+  /// IS_ERR() and PTR_ERR() calls on \p V in \p St.
+  static void collectErrorCalls(const Stmt *St, const VarDecl *V,
+                                llvm::SmallPtrSetImpl<const CallExpr *> &Out) {
+    if (!St)
+      return;
+    if (const auto *CE = dyn_cast<CallExpr>(St)) {
+      const FunctionDecl *Callee = CE->getDirectCallee();
+      if (Callee && Callee->getIdentifier() && CE->getNumArgs() == 1 &&
+          (Callee->getName() == "IS_ERR" ||
+           Callee->getName().starts_with("PTR_ERR")) &&
+          getDirectLinuxVariable(CE->getArg(0)->IgnoreParenCasts()) == V)
+        Out.insert(CE);
+    }
+    for (const Stmt *Child : St->children())
+      collectErrorCalls(Child, V, Out);
+  }
+
+  /// 1 if \p Cond being true means that \p V is an error pointer, 2 if it
+  /// means that it is none, and 0 if it says neither.
+  static int errorTest(const Expr *Cond, const VarDecl *V) {
+    bool Negated = false;
+    const Expr *E = stripLinuxCondition(Cond, Negated);
+    const auto *CE =
+        dyn_cast_or_null<CallExpr>(E ? E->IgnoreParenImpCasts() : nullptr);
+    const FunctionDecl *Callee = CE ? CE->getDirectCallee() : nullptr;
+    if (!Callee || !Callee->getIdentifier() || CE->getNumArgs() != 1 ||
+        Callee->getName() != "IS_ERR" ||
+        getDirectLinuxVariable(CE->getArg(0)->IgnoreParenCasts()) != V)
+      return 0;
+    return Negated ? 2 : 1;
+  }
 
   static bool leaves(const Stmt *St) {
     while (St) {
@@ -896,13 +937,28 @@ class LinuxKernelInference {
       // caller: it is what the function returns there.
       if (NullBranch && leaves(NullBranch) && !returnsVariable(NullBranch, V))
         Out.NullChecked = true;
+      // The same for an error pointer: "if (IS_ERR(p)) { cond_resched();
+      // goto repeat; }" and "if (IS_ERR(p)) { ret = PTR_ERR(p); goto err;
+      // }" do not return p there.  An error that the second one returns is
+      // a return statement of its own.
+      int Error = errorTest(IS->getCond(), V);
+      const Stmt *ErrorBranch = Error == 1   ? IS->getThen()
+                                : Error == 2 ? IS->getElse()
+                                             : nullptr;
+      if (ErrorBranch && leaves(ErrorBranch) &&
+          !returnsVariable(ErrorBranch, V)) {
+        Out.ErrorChecked = true;
+        collectErrorCalls(IS->getCond(), V, Out.Handled);
+        collectErrorCalls(ErrorBranch, V, Out.Handled);
+      }
     } else if (const auto *CE = dyn_cast<CallExpr>(St)) {
       const FunctionDecl *Callee = CE->getDirectCallee();
       // IS_ERR_OR_NULL() is a NULL test, which the "if" above deals with.
       if (Callee && Callee->getIdentifier() && CE->getNumArgs() == 1 &&
           (Callee->getName() == "IS_ERR" ||
            Callee->getName().starts_with("PTR_ERR")) &&
-          getDirectLinuxVariable(CE->getArg(0)->IgnoreParenCasts()) == V)
+          getDirectLinuxVariable(CE->getArg(0)->IgnoreParenCasts()) == V &&
+          !Out.Handled.count(CE))
         Out.ErrorTested = true;
     }
     for (const Stmt *Child : St->children())
@@ -914,8 +970,13 @@ class LinuxKernelInference {
   static void merge(Sources &R, const Sources &Callee, uint8_t Tests) {
     bool Stub = Callee.isStub();
     bool NullChecked = Tests & Sources::NullTested;
-    if (Callee.ErrDirect || Callee.ErrCallee)
-      (Stub ? R.ErrDirect : R.ErrCallee) = true;
+    if (Callee.ErrDirect || Callee.ErrCallee) {
+      // An error that the caller does not hand on is gone.
+      if (Tests & Sources::ErrorChecked)
+        R.Valid = true;
+      else
+        (Stub ? R.ErrDirect : R.ErrCallee) = true;
+    }
     if (Callee.NullDirect || Callee.NullCallee) {
       if (NullChecked)
         R.Valid = true;
@@ -934,8 +995,10 @@ class LinuxKernelInference {
       R.External.push_back({F, uint8_t(Earlier | Tests)});
   }
 
+  /// \p ErrorTested has the bits Sources::ErrorTested and
+  /// Sources::ErrorChecked.
   void addCall(const CallExpr *Call, Sources &R, bool NullChecked,
-               bool ErrorTested, unsigned Depth) {
+               uint8_t ErrorTested, unsigned Depth) {
     const FunctionDecl *Callee = Call->getDirectCallee();
     if (!Callee || !Callee->getIdentifier()) {
       // An indirect call.  What the function tests the result for is what
@@ -944,8 +1007,7 @@ class LinuxKernelInference {
       (NullChecked || ErrorTested ? R.Valid : R.Opaque) = true;
       return;
     }
-    uint8_t Tests = (NullChecked ? Sources::NullTested : 0) |
-                    (ErrorTested ? Sources::ErrorTested : 0);
+    uint8_t Tests = (NullChecked ? Sources::NullTested : 0) | ErrorTested;
     StringRef Name = Callee->getName();
     if (Name == "ERR_PTR" || Name == "ERR_CAST") {
       // ERR_PTR(0) is NULL.
@@ -957,7 +1019,7 @@ class LinuxKernelInference {
     }
     LinuxKernelAPIKind Kind = classifyLinuxKernelCallee(Callee);
     if (Kind == LinuxKernelAPIKind::ErrorPointer) {
-      R.ErrCallee = true;
+      (ErrorTested & Sources::ErrorChecked ? R.Valid : R.ErrCallee) = true;
     } else if (isNullReturningKind(Kind)) {
       (NullChecked ? R.Valid : R.NullCallee) = true;
     } else if (Kind != LinuxKernelAPIKind::None ||
@@ -976,7 +1038,7 @@ class LinuxKernelInference {
   /// comes from.
   void addValue(const Expr *E, Sources &R, const Stmt *Body, bool NullChecked,
                 llvm::SmallPtrSetImpl<const VarDecl *> &Seen, unsigned Depth,
-                bool ErrorTested = false) {
+                uint8_t ErrorTested = 0) {
     if (!E || Depth > 12) {
       R.Opaque = true;
       return;
@@ -1050,7 +1112,14 @@ class LinuxKernelInference {
         return;
       }
       bool Checked = NullChecked || Info.NullChecked;
-      bool Tested = ErrorTested || Info.ErrorTested;
+      uint8_t Tested = ErrorTested;
+      if (Info.ErrorTested)
+        Tested |= Sources::ErrorTested;
+      // Every test of the variable for an error leaves the function or
+      // the pass, and none returns the variable: what is returned of it has
+      // passed one.
+      else if (Info.ErrorChecked)
+        Tested |= Sources::ErrorTested | Sources::ErrorChecked;
       if (IsParameter)
         (Checked || Tested ? R.Valid : R.Memory) = true;
       if (Info.ErrorTested)
@@ -1256,7 +1325,7 @@ public:
     for (auto [F, Tests] : R.External) {
       switch (fileContract(F)) {
       case LinuxKernelReturnConvention::ErrorPointer:
-        R.ErrCallee = true;
+        (Tests & Sources::ErrorChecked ? R.Valid : R.ErrCallee) = true;
         break;
       case LinuxKernelReturnConvention::NullOnFailure:
         (Tests & Sources::NullTested ? R.Valid : R.NullCallee) = true;
@@ -1324,9 +1393,10 @@ public:
         if (R.Opaque) Returns += 'O';
         std::vector<std::string> Callees;
         for (auto [F, Tests] : R.External)
-          Callees.push_back((Tests & Sources::NullTested ? "k:"
-                             : Tests                     ? "t:"
-                                                         : "c:") +
+          Callees.push_back((Tests & Sources::ErrorChecked  ? "x:"
+                             : Tests & Sources::NullTested ? "k:"
+                             : Tests                       ? "t:"
+                                                           : "c:") +
                             F->getName().str());
         llvm::sort(Callees);
         Callees.erase(llvm::unique(Callees), Callees.end());
