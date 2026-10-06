@@ -2915,9 +2915,29 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
       if (!ICE || ICE->getCastKind() != CK_IntegralCast)
         continue;
       const auto *Not = dyn_cast<UnaryOperator>(ICE->getSubExpr()->IgnoreParens());
-      if (!Not || Not->getOpcode() != UO_Not)
-        continue;
-      QualType Narrow = Not->getType();
+      QualType Narrow;
+      // "unsigned long mask = ~(size - 1); ... addr &= mask;": the variable
+      // holds the complement, in its own width.
+      const DeclRefExpr *Mask = nullptr;
+      if (Not && Not->getOpcode() == UO_Not) {
+        Narrow = Not->getType();
+      } else {
+        Mask = dyn_cast<DeclRefExpr>(ICE->getSubExpr()->IgnoreParenImpCasts());
+        const LinuxReachingDefs::Def *D =
+            Mask && Reaching ? Reaching->unique(Mask) : nullptr;
+        Not = D && D->Value ? dyn_cast<UnaryOperator>(
+                                  D->Value->IgnoreParenCasts())
+                            : nullptr;
+        if (!Not || Not->getOpcode() != UO_Not)
+          continue;
+        Narrow = Mask->getType();
+        // Only "unsigned long", which has another width on another
+        // machine.  A mask that is declared with 32 bits says how many
+        // are meant, as "~0U" does.
+        if (!Narrow.getCanonicalType()->isSpecificBuiltinType(
+                BuiltinType::ULong))
+          continue;
+      }
       QualType Wide = ICE->getType();
       if (!Narrow->isUnsignedIntegerType() || Narrow->isBooleanType() ||
           !Wide->isIntegerType())
@@ -2945,6 +2965,16 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
         Expr::EvalResult R;
         if (Not->getSubExpr()->EvaluateAsInt(R, Ctx) && R.Val.getInt().isZero())
           continue;
+      }
+      if (Mask) {
+        S.Diag(Mask->getExprLoc(), diag::warn_zero_extended_complement)
+            << From << To << IsAssign << (To - From) << Mask->getSourceRange()
+            << Other->getSourceRange();
+        S.Diag(Not->getOperatorLoc(), diag::note_linux_kernel_experimental)
+            << ("'" + Mask->getDecl()->getNameAsString() +
+                "' gets the complement here")
+            << Not->getSourceRange();
+        continue;
       }
       S.Diag(Not->getOperatorLoc(), diag::warn_zero_extended_complement)
           << From << To << IsAssign << (To - From) << Not->getSourceRange()

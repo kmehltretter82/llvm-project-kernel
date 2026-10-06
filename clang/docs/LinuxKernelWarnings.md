@@ -308,6 +308,18 @@ The rest look at single expressions and calls:
   It is not given when the result is converted back to the width of the
   mask, when the other operand was itself widened from that width, or for
   `~0U`, which says how many bits are meant.
+
+  The complement can also be in a local variable of type `unsigned long`
+  that is narrower than `x`. The use is reported if the one assignment that
+  reaches it is a complement, with a note there. A variable that is
+  declared with 32 bits (`u32 mask`) says how many bits are meant and is
+  not reported:
+
+  ```c
+  const unsigned long mask = ~(line_size - 1);
+
+  paddr &= mask;                  /* a 64-bit phys_addr_t on a 32-bit kernel */
+  ```
 - `-Wlinux-kernel-bitops-cast` diagnoses `set_bit()`, `test_bit()`,
   `find_first_bit()`, `bitmap_zero()` and their relatives when a cast hands
   them the address of an integer that is narrower than `unsigned long`. The

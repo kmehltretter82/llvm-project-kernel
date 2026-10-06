@@ -58,3 +58,42 @@ u64 fine_constant(u32 mask) { return 0xffULL & ~mask; }
 
 // "~0U" says that 32 bits are meant.
 u64 low_half(u64 v) { return v & ~0U; }
+
+// The complement is kept in a variable: it is computed in the width of the
+// variable, and the '&' widens what the variable holds.  Only for
+// "unsigned long", whose width depends on the machine.
+u64 mask_in_long(u64 addr, unsigned long size) {
+  unsigned long mask = ~(size - 1); // ilp32-note {{'mask' gets the complement here}}
+
+  return addr & mask; // ilp32-warning {{'~' is applied to a 32-bit unsigned value and the result is zero-extended to 64 bits, so this '&' clears the upper 32 bits of the other operand}}
+}
+
+void mask_in_long_assign(u64 *addr, unsigned long size) {
+  const unsigned long mask = ~(size - 1); // ilp32-note {{'mask' gets the complement here}}
+
+  *addr &= mask; // ilp32-warning {{'~' is applied to a 32-bit unsigned value and the result is zero-extended to 64 bits, so this '&=' clears the upper 32 bits of the other operand}}
+}
+
+// A variable of exactly 32 bits says how many bits are meant.
+u64 mask_in_u32(u64 val, u32 shift) {
+  u32 mask = ~(0xffu << shift);
+
+  val &= mask;
+  return val;
+}
+
+// One of two values: nothing is known about the variable.
+u64 mask_one_of_two(u64 addr, u32 size, int aligned) {
+  u32 mask = 0xff;
+
+  if (aligned)
+    mask = ~(size - 1);
+  return addr & mask;
+}
+
+// The variable is wide enough.
+u64 fine_mask_variable(u64 addr, u32 size) {
+  u64 mask = ~(u64)(size - 1);
+
+  return addr & mask;
+}
