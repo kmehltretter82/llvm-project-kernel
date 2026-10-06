@@ -1339,6 +1339,298 @@ public:
   }
 };
 
+/// The blocks of a function in the order in which a forward dataflow has to
+/// visit them: reverse post-order, where a block comes after its
+/// predecessors unless a back edge leads to it.  One pass in that order
+/// carries a fact from the entry to the exit, and a loop costs one more
+/// pass.
+///
+/// The CFG lists its blocks the other way round, from the exit to the entry.
+/// A pass in that order moves a fact by a single block, so a dataflow with a
+/// bounded number of passes never gets to the end of a long function, and
+/// what it knows about the blocks that it did get to lacks the paths that
+/// had not arrived yet.
+class LinuxForwardOrder {
+  std::vector<const CFGBlock *> Blocks;
+
+public:
+  explicit LinuxForwardOrder(const CFG &Cfg) {
+    PostOrderCFGView View(&Cfg);
+    Blocks.assign(View.begin(), View.end());
+  }
+
+  /// The number of passes after which a dataflow gives up.  It is not
+  /// reached by code that a person wrote, and a dataflow that stops there
+  /// has no fixpoint to report from.
+  static constexpr unsigned MaxPasses = 64;
+
+  auto begin() const { return Blocks.begin(); }
+  auto end() const { return Blocks.end(); }
+};
+
+/// Which assignment a use of a local variable, or of a member that is
+/// reached through one ("priv->clk"), sees.
+///
+/// The visitor below walks the syntax tree and remembers what was assigned
+/// to a variable, but only for an assignment at the top level of the
+/// function and before the first goto: under a condition the assignment may
+/// or may not have happened where the walk goes on, and a goto takes away
+/// what the order of the source says about the order of execution.  Most
+/// kernel code is inside a condition or a loop, or behind a goto.
+///
+/// This class answers the question from the CFG, with reaching definitions.
+/// A use sees an assignment if that assignment is the only definition of
+/// the place that reaches it.  Where two meet the answer is "none", which
+/// is what the walk says behind a branch.  A member has a value before the
+/// function runs, and that counts as a definition: "if (c) p->m = get();"
+/// leaves two.  As in the walk, a call does not count as one for a member.
+class LinuxReachingDefs {
+public:
+  /// A variable, or a member of what a variable is or points to.
+  using Place = std::pair<const VarDecl *, const FieldDecl *>;
+
+  struct Def {
+    Place Where;
+    /// What is assigned.  Null where the place changes in a way that
+    /// leaves nothing to go by: its value at function entry, "x++",
+    /// "x += n", "&x", an output of inline assembly, a declaration without
+    /// an initializer, and for a member an assignment to the variable that
+    /// it is reached through.
+    const Expr *Value = nullptr;
+    SourceLocation Loc;
+  };
+
+private:
+  ParentMap &Parents;
+  std::vector<Def> Defs;
+  llvm::DenseMap<Place, llvm::SmallVector<unsigned, 4>> DefsOf;
+  /// The members that are assigned somewhere, by the variable that they
+  /// are reached through.
+  llvm::DenseMap<const VarDecl *, llvm::SmallVector<const FieldDecl *, 2>>
+      Members;
+  /// The definitions that a CFG element or an "asm goto" at the end of a
+  /// block makes.
+  llvm::DenseMap<const Stmt *, llvm::SmallVector<unsigned, 1>> Made;
+  /// Block and index of each statement that is a CFG element.
+  llvm::DenseMap<const Stmt *, std::pair<unsigned, unsigned>> Position;
+  std::vector<const CFGBlock *> Blocks;
+  /// For each block, the definitions that reach its first element.
+  std::vector<llvm::BitVector> In;
+  bool Valid = false;
+
+  static bool isTrackedType(QualType T) {
+    return T->isPointerType() || T->isIntegralOrEnumerationType();
+  }
+
+  /// The place that \p E names: a local variable, or a member of one or
+  /// of what one points to.
+  static std::optional<Place> getPlace(const Expr *E) {
+    E = E ? E->IgnoreParenImpCasts() : nullptr;
+    if (!E)
+      return std::nullopt;
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+      const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
+      if (!VD || !VD->hasLocalStorage() || !isTrackedType(VD->getType()))
+        return std::nullopt;
+      return Place{VD, nullptr};
+    }
+    const auto *ME = dyn_cast<MemberExpr>(E);
+    const auto *Field = ME ? dyn_cast<FieldDecl>(ME->getMemberDecl()) : nullptr;
+    if (!Field || !isTrackedType(Field->getType()))
+      return std::nullopt;
+    const Expr *Base = ME->getBase()->IgnoreParenImpCasts();
+    if (!ME->isArrow())
+      if (const auto *UO = dyn_cast<UnaryOperator>(Base))
+        if (UO->getOpcode() == UO_Deref)
+          Base = UO->getSubExpr()->IgnoreParenImpCasts();
+    const auto *DRE = dyn_cast<DeclRefExpr>(Base);
+    const auto *VD = DRE ? dyn_cast<VarDecl>(DRE->getDecl()) : nullptr;
+    if (!VD || !VD->hasLocalStorage())
+      return std::nullopt;
+    return Place{VD, Field};
+  }
+
+  unsigned add(Place Where, const Expr *Value, SourceLocation Loc) {
+    Defs.push_back({Where, Value, Loc});
+    DefsOf[Where].push_back(Defs.size() - 1);
+    return Defs.size() - 1;
+  }
+
+  /// \p At gives \p Where a new value.  With the variable, the members
+  /// that are reached through it are other objects from here on.
+  void define(const Stmt *At, Place Where, const Expr *Value,
+              SourceLocation Loc) {
+    Made[At].push_back(add(Where, Value, Loc));
+    if (Where.second)
+      return;
+    auto It = Members.find(Where.first);
+    if (It != Members.end())
+      for (const FieldDecl *Field : It->second)
+        Made[At].push_back(add({Where.first, Field}, nullptr, Loc));
+  }
+
+  /// Call \p Fn for each place that \p St gives a new value itself, not
+  /// through its operands, with what is assigned.
+  template <typename Callback> static void forEachDef(const Stmt *St, Callback Fn) {
+    if (const auto *DS = dyn_cast<DeclStmt>(St)) {
+      for (const Decl *D : DS->decls())
+        if (const auto *VD = dyn_cast<VarDecl>(D))
+          if (VD->hasLocalStorage() && isTrackedType(VD->getType()))
+            Fn(Place{VD, nullptr}, VD->getInit(), VD->getLocation());
+    } else if (const auto *BO = dyn_cast<BinaryOperator>(St)) {
+      if (BO->isAssignmentOp())
+        if (std::optional<Place> Where = getPlace(BO->getLHS()))
+          Fn(*Where, BO->getOpcode() == BO_Assign ? BO->getRHS() : nullptr,
+             BO->getOperatorLoc());
+    } else if (const auto *UO = dyn_cast<UnaryOperator>(St)) {
+      if (UO->getOpcode() == UO_AddrOf || UO->isIncrementDecrementOp())
+        if (std::optional<Place> Where = getPlace(UO->getSubExpr()))
+          Fn(*Where, nullptr, UO->getOperatorLoc());
+    } else if (const auto *AS = dyn_cast<GCCAsmStmt>(St)) {
+      for (unsigned I = 0, E = AS->getNumOutputs(); I != E; ++I)
+        if (std::optional<Place> Where = getPlace(AS->getOutputExpr(I)))
+          Fn(*Where, nullptr, AS->getAsmLoc());
+    }
+  }
+
+  void make(const Stmt *St, llvm::BitVector &State) const {
+    auto It = Made.find(St);
+    if (It == Made.end())
+      return;
+    for (unsigned D : It->second) {
+      for (unsigned Other : DefsOf.find(Defs[D].Where)->second)
+        State.reset(Other);
+      State.set(D);
+    }
+  }
+
+  /// The statements of \p B that can define something: its elements, and
+  /// an "asm goto" at its end, whose outputs are written when it ends.
+  template <typename Callback>
+  void forEachStmt(const CFGBlock *B, Callback Fn) const {
+    unsigned Index = 0;
+    for (const CFGElement &Elem : *B) {
+      unsigned This = Index++;
+      if (std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>())
+        Fn(CS->getStmt(), This);
+    }
+    const Stmt *Term = B->getTerminatorStmt();
+    if (isa_and_nonnull<GCCAsmStmt>(Term) && !Position.count(Term))
+      Fn(Term, Index);
+  }
+
+public:
+  LinuxReachingDefs(const CFG &Cfg, ParentMap &Parents, const FunctionDecl *FD)
+      : Parents(Parents) {
+    Blocks.resize(Cfg.getNumBlockIDs());
+    for (const CFGBlock *B : Cfg) {
+      Blocks[B->getBlockID()] = B;
+      unsigned Index = 0;
+      for (const CFGElement &Elem : *B) {
+        unsigned This = Index++;
+        if (std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>())
+          Position.try_emplace(CS->getStmt(), B->getBlockID(), This);
+      }
+    }
+    // The members first: an assignment to a variable is a definition of
+    // each of them.
+    llvm::SmallPtrSet<const Stmt *, 32> Scanned;
+    for (const CFGBlock *B : Cfg)
+      forEachStmt(B, [&](const Stmt *St, unsigned) {
+        forEachDef(St, [&](Place Where, const Expr *, SourceLocation) {
+          if (!Where.second)
+            return;
+          auto &Fields = Members[Where.first];
+          if (!llvm::is_contained(Fields, Where.second))
+            Fields.push_back(Where.second);
+        });
+      });
+    // What is there when the function starts.
+    llvm::SmallVector<unsigned, 8> AtEntry;
+    for (const ParmVarDecl *P : FD->parameters())
+      if (isTrackedType(P->getType()))
+        AtEntry.push_back(add({P, nullptr}, nullptr, P->getLocation()));
+    for (const auto &[Base, Fields] : Members)
+      for (const FieldDecl *Field : Fields)
+        AtEntry.push_back(add({Base, Field}, nullptr, Base->getLocation()));
+    for (const CFGBlock *B : Cfg)
+      forEachStmt(B, [&](const Stmt *St, unsigned) {
+        if (!Scanned.insert(St).second)
+          return;
+        forEachDef(St, [&](Place Where, const Expr *Value, SourceLocation Loc) {
+          define(St, Where, Value, Loc);
+        });
+      });
+
+    In.assign(Cfg.getNumBlockIDs(), llvm::BitVector(Defs.size()));
+    for (unsigned D : AtEntry)
+      In[Cfg.getEntry().getBlockID()].set(D);
+    LinuxForwardOrder Order(Cfg);
+    bool Changed = true;
+    unsigned Passes = 0;
+    while (Changed && ++Passes < LinuxForwardOrder::MaxPasses) {
+      Changed = false;
+      for (const CFGBlock *B : Order) {
+        llvm::BitVector State = In[B->getBlockID()];
+        forEachStmt(B, [&](const Stmt *St, unsigned) { make(St, State); });
+        for (const CFGBlock::AdjacentBlock &Succ : B->succs()) {
+          const CFGBlock *Next = Succ.getReachableBlock();
+          if (!Next)
+            continue;
+          llvm::BitVector &Target = In[Next->getBlockID()];
+          if (State.test(Target)) { // a bit that Target lacks
+            Target |= State;
+            Changed = true;
+          }
+        }
+      }
+    }
+    Valid = !Changed;
+  }
+
+  /// The definition of its place that \p Use sees, if every path to the
+  /// use comes from the same one.  \p Use reads a variable or a member.
+  const Def *unique(const Expr *Use) const {
+    if (!Valid || !Use)
+      return nullptr;
+    std::optional<Place> Where = getPlace(Use);
+    auto Of = Where ? DefsOf.find(*Where) : DefsOf.end();
+    if (Of == DefsOf.end())
+      return nullptr;
+    // An operand that is no CFG element is evaluated with the expression
+    // around it.
+    const Stmt *At = Use->IgnoreParenImpCasts();
+    auto Pos = Position.find(At);
+    for (unsigned Depth = 0; Pos == Position.end() && Depth < 32; ++Depth) {
+      At = Parents.getParent(At);
+      if (!At)
+        return nullptr;
+      Pos = Position.find(At);
+    }
+    if (Pos == Position.end())
+      return nullptr;
+    const CFGBlock *B = Blocks[Pos->second.first];
+    // The last definition before the use in its own block.
+    for (unsigned I = Pos->second.second; I-- > 0;) {
+      std::optional<CFGStmt> CS = (*B)[I].getAs<CFGStmt>();
+      auto It = CS ? Made.find(CS->getStmt()) : Made.end();
+      if (It == Made.end())
+        continue;
+      for (unsigned D : llvm::reverse(It->second))
+        if (Defs[D].Where == *Where)
+          return &Defs[D];
+    }
+    const Def *Found = nullptr;
+    for (unsigned D : Of->second)
+      if (In[B->getBlockID()].test(D)) {
+        if (Found)
+          return nullptr;
+        Found = &Defs[D];
+      }
+    return Found;
+  }
+};
+
 class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
   using DirectField = std::pair<const VarDecl *, const FieldDecl *>;
 
@@ -1380,6 +1672,13 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
   llvm::SmallPtrSet<const VarDecl *, 4> AllocationsThatCannotFail;
   unsigned ControlFlowDepth = 0;
   bool AssignmentTrackingDisabled = false;
+  /// What the CFG says about the assignment that a use sees, for the uses
+  /// that the walk has nothing for.  Null if there is no CFG.
+  const LinuxReachingDefs *Reaching = nullptr;
+  /// Assignments whose value was released or otherwise given up further
+  /// on: nothing is said about a use that sees one of them.
+  llvm::SmallPtrSet<const LinuxReachingDefs::Def *, 8> ForgottenDefs;
+  mutable unsigned ReachingDepth = 0;
 
   static const VarDecl *getDirectVariable(const Expr *E) {
     return getDirectLinuxVariable(E);
@@ -1413,6 +1712,9 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
     }
     if (std::optional<DirectField> Field = getDirectField(E))
       FieldOrigins.erase(*Field);
+    if (Reaching)
+      if (const LinuxReachingDefs::Def *D = Reaching->unique(E))
+        ForgottenDefs.insert(D);
   }
 
   bool referToSameDirectValue(const Expr *LHS, const Expr *RHS) const {
@@ -1559,7 +1861,9 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
       if (!VD || !SeenVariables.insert(VD).second)
         return {};
       auto It = VariableOrigins.find(VD);
-      return It == VariableOrigins.end() ? LinuxKernelAPIOrigin{} : It->second;
+      if (It != VariableOrigins.end())
+        return It->second;
+      return getReachingOrigin(DRE, SeenVariables);
     }
 
     if (const auto *ME = dyn_cast<MemberExpr>(E)) {
@@ -1568,7 +1872,9 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
       if (!Field)
         return {};
       auto It = FieldOrigins.find(*Field);
-      return It == FieldOrigins.end() ? LinuxKernelAPIOrigin{} : It->second;
+      if (It != FieldOrigins.end())
+        return It->second;
+      return getReachingOrigin(ME, SeenVariables);
     }
 
     if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
@@ -1640,6 +1946,42 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
   LinuxKernelAPIOrigin getOrigin(const Expr *E) const {
     llvm::SmallPtrSet<const VarDecl *, 8> SeenVariables;
     return getOrigin(E, SeenVariables);
+  }
+
+  /// The origin of what the one assignment assigns that \p Use sees, for a
+  /// use inside a branch or a loop or behind a goto, where the walk does
+  /// not follow assignments.  \p Value is set to what was assigned.
+  LinuxKernelAPIOrigin
+  getReachingOrigin(const Expr *Use,
+                    llvm::SmallPtrSetImpl<const VarDecl *> &SeenVariables,
+                    const Expr **Value = nullptr) const {
+    // What is assigned can be read from another assignment in turn.
+    if (!Reaching || !Use || ReachingDepth >= 6)
+      return {};
+    const LinuxReachingDefs::Def *D = Reaching->unique(Use);
+    if (!D || !D->Value || ForgottenDefs.count(D))
+      return {};
+    ++ReachingDepth;
+    LinuxKernelAPIOrigin Origin = getOrigin(D->Value, SeenVariables);
+    --ReachingDepth;
+    if (Origin) {
+      Origin.Assigned = D->Loc;
+      Origin.Copied = isa<DeclRefExpr, MemberExpr>(D->Value->IgnoreParenCasts());
+      if (Value)
+        *Value = D->Value;
+    }
+    return Origin;
+  }
+
+  /// The origin of the local variable \p VD where \p Use reads it.
+  LinuxKernelAPIOrigin originAt(const VarDecl *VD, const Expr *Use,
+                                const Expr **Value = nullptr) const {
+    auto It = VariableOrigins.find(VD);
+    if (It != VariableOrigins.end())
+      return It->second;
+    llvm::SmallPtrSet<const VarDecl *, 8> SeenVariables;
+    SeenVariables.insert(VD);
+    return getReachingOrigin(Use, SeenVariables, Value);
   }
 
   static BinaryOperatorKind reverseComparison(BinaryOperatorKind Opcode) {
@@ -1947,18 +2289,40 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
 
   using PointerCopies =
       llvm::SmallVector<std::pair<const VarDecl *, const VarDecl *>, 8>;
+  /// The members that a function tests, whatever object they are members
+  /// of, and the variables that are given the value of a member.
+  struct TestedMembers {
+    llvm::SmallPtrSet<const FieldDecl *, 8> Tested;
+    llvm::SmallVector<std::pair<const VarDecl *, const FieldDecl *>, 8> Copies;
+  };
 
   /// The pointers that \p St tests, and the pairs of pointers of which one
   /// is a plain copy of the other.
   static void collectTestedPointers(
       const Stmt *St, llvm::SmallPtrSetImpl<const VarDecl *> &Out,
-      PointerCopies *Copies = nullptr) {
+      PointerCopies *Copies = nullptr, TestedMembers *Members = nullptr) {
     if (!St)
       return;
+    auto Member = [](const Expr *E) -> const FieldDecl * {
+      const auto *ME =
+          dyn_cast_or_null<MemberExpr>(E ? E->IgnoreParenCasts() : nullptr);
+      return ME ? dyn_cast<FieldDecl>(ME->getMemberDecl()) : nullptr;
+    };
     auto Add = [&](const Expr *E) {
-      if (const VarDecl *VD =
-              getDirectLinuxVariable(E ? E->IgnoreParenCasts() : nullptr))
+      // "if (!(p = *slot = get()))" tests what was assigned.
+      for (E = E ? E->IgnoreParenCasts() : nullptr; E;
+           E = E->IgnoreParenCasts()) {
+        const auto *BO = dyn_cast<BinaryOperator>(E);
+        if (!BO || BO->getOpcode() != BO_Assign)
+          break;
+        if (const VarDecl *VD = getDirectLinuxVariable(BO->getLHS()))
+          Out.insert(VD);
+        E = BO->getRHS();
+      }
+      if (const VarDecl *VD = getDirectLinuxVariable(E))
         Out.insert(VD);
+      if (const FieldDecl *Field = Members ? Member(E) : nullptr)
+        Members->Tested.insert(Field);
     };
     auto AddCopy = [&](const VarDecl *To, const Expr *From) {
       const VarDecl *Source =
@@ -1966,6 +2330,9 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
       if (Copies && To && Source && To != Source &&
           To->getType()->isPointerType() && Source->getType()->isPointerType())
         Copies->push_back({To, Source});
+      // "chan = data->chan;" after "if (IS_ERR(data->chan))".
+      if (const FieldDecl *Field = Members && To ? Member(From) : nullptr)
+        Members->Copies.push_back({To, Field});
     };
     if (const auto *DS = dyn_cast<DeclStmt>(St)) {
       for (const Decl *D : DS->decls())
@@ -1999,7 +2366,7 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
       Add(CO->getCond());
     }
     for (const Stmt *Child : St->children())
-      collectTestedPointers(Child, Out, Copies);
+      collectTestedPointers(Child, Out, Copies, Members);
   }
 
   /// The pointers that the function tests somewhere.  A test of a copy
@@ -2010,8 +2377,12 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
     if (!TestedPointers) {
       TestedPointers.emplace();
       PointerCopies Copies;
+      TestedMembers Members;
       collectTestedPointers(CurrentFunction->getBody(), *TestedPointers,
-                            &Copies);
+                            &Copies, &Members);
+      for (auto [To, Field] : Members.Copies)
+        if (Members.Tested.count(Field))
+          TestedPointers->insert(To);
       for (bool Changed = true; Changed;) {
         Changed = false;
         for (auto [To, From] : Copies)
@@ -2034,15 +2405,15 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
         getDirectLinuxVariable(ME->getBase()->IgnoreParenCasts());
     if (!VD || !VD->hasLocalStorage() || isa<ParmVarDecl>(VD))
       return;
-    auto It = VariableOrigins.find(VD);
-    if (It == VariableOrigins.end() ||
-        It->second.Kind != LinuxKernelAPIKind::ErrorPointer)
+    LinuxKernelAPIOrigin Origin =
+        originAt(VD, ME->getBase()->IgnoreParenCasts());
+    if (Origin.Kind != LinuxKernelAPIKind::ErrorPointer)
       return;
     if (getTestedPointers().count(VD) || !ReportedErrorDerefs.insert(VD).second)
       return;
     S.Diag(ME->getOperatorLoc(), diag::warn_linux_kernel_err_ptr_deref)
-        << VD << It->second.Callee << ME->getSourceRange();
-    noteInferred(It->second);
+        << VD << Origin.Callee << ME->getSourceRange();
+    noteInferred(Origin);
   }
 
   /// "p = kzalloc(...); p->member = ...": the result of an allocation is
@@ -2054,11 +2425,12 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
         getDirectLinuxVariable(ME->getBase()->IgnoreParenCasts());
     if (!VD || !VD->hasLocalStorage() || isa<ParmVarDecl>(VD))
       return;
-    auto It = VariableOrigins.find(VD);
-    if (It == VariableOrigins.end() || It->second.Inferred ||
-        It->second.Copied)
+    const Expr *Value = nullptr;
+    LinuxKernelAPIOrigin Origin =
+        originAt(VD, ME->getBase()->IgnoreParenCasts(), &Value);
+    if (!Origin || Origin.Inferred || Origin.Copied)
       return;
-    switch (It->second.Kind) {
+    switch (Origin.Kind) {
     case LinuxKernelAPIKind::KmallocPointer:
     case LinuxKernelAPIKind::VmallocPointer:
     case LinuxKernelAPIKind::KvmallocPointer:
@@ -2067,11 +2439,15 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
     default:
       return;
     }
+    // An origin that the CFG gave: the allocation is in hand.
+    if (Value &&
+        getLinuxExprText(Value, S).find("__GFP_NOFAIL") != std::string::npos)
+      return;
     if (AllocationsThatCannotFail.count(VD) || getTestedPointers().count(VD) ||
         !ReportedErrorDerefs.insert(VD).second)
       return;
     S.Diag(ME->getOperatorLoc(), diag::warn_linux_kernel_unchecked_alloc)
-        << VD << It->second.Callee << ME->getSourceRange();
+        << VD << Origin.Callee << ME->getSourceRange();
   }
 
   static const MemberExpr *findDeref(const Stmt *St, const VarDecl *VD) {
@@ -2119,9 +2495,9 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
           getDirectLinuxVariable(Call->getArg(I)->IgnoreParenCasts());
       if (!VD || !VD->hasLocalStorage() || isa<ParmVarDecl>(VD))
         continue;
-      auto It = VariableOrigins.find(VD);
-      if (It == VariableOrigins.end() ||
-          It->second.Kind != LinuxKernelAPIKind::ErrorPointer)
+      LinuxKernelAPIOrigin Origin =
+          originAt(VD, Call->getArg(I)->IgnoreParenCasts());
+      if (Origin.Kind != LinuxKernelAPIKind::ErrorPointer)
         continue;
       const MemberExpr *Deref = getParameterDeref(Callee, I);
       if (!Deref)
@@ -2129,7 +2505,6 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
       if (getTestedPointers().count(VD) ||
           !ReportedErrorDerefs.insert(VD).second)
         continue;
-      LinuxKernelAPIOrigin Origin = It->second;
       S.Diag(Call->getArg(I)->getExprLoc(),
              diag::warn_linux_kernel_err_ptr_deref)
           << VD << Origin.Callee << Call->getArg(I)->getSourceRange();
@@ -3276,9 +3651,11 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
 
 public:
   LinuxKernelWarningsVisitor(Sema &S, const FunctionDecl *FD,
-                             sema::LinuxKernelUnit &Unit)
+                             sema::LinuxKernelUnit &Unit,
+                             const LinuxReachingDefs *Reaching = nullptr)
       : S(S), CurrentFunction(FD), Inference(S, Unit) {
     ShouldVisitImplicitCode = false;
+    this->Reaching = Reaching;
   }
 
   bool VisitMemberExpr(MemberExpr *ME) override {
@@ -3587,35 +3964,6 @@ public:
     FieldOrigins.clear();
     return true;
   }
-};
-
-/// The blocks of a function in the order in which a forward dataflow has to
-/// visit them: reverse post-order, where a block comes after its
-/// predecessors unless a back edge leads to it.  One pass in that order
-/// carries a fact from the entry to the exit, and a loop costs one more
-/// pass.
-///
-/// The CFG lists its blocks the other way round, from the exit to the entry.
-/// A pass in that order moves a fact by a single block, so a dataflow with a
-/// bounded number of passes never gets to the end of a long function, and
-/// what it knows about the blocks that it did get to lacks the paths that
-/// had not arrived yet.
-class LinuxForwardOrder {
-  std::vector<const CFGBlock *> Blocks;
-
-public:
-  explicit LinuxForwardOrder(const CFG &Cfg) {
-    PostOrderCFGView View(&Cfg);
-    Blocks.assign(View.begin(), View.end());
-  }
-
-  /// The number of passes after which a dataflow gives up.  It is not
-  /// reached by code that a person wrote, and a dataflow that stops there
-  /// has no fixpoint to report from.
-  static constexpr unsigned MaxPasses = 64;
-
-  auto begin() const { return Blocks.begin(); }
-  auto end() const { return Blocks.end(); }
 };
 
 /// Finds returns that report success on a path that has just reported a
@@ -11655,13 +12003,23 @@ static bool shouldRunLinuxKernelWarnings(const Sema &S, SourceLocation Loc) {
 } // namespace
 
 void clang::sema::IssueLinuxKernelWarnings(Sema &S, const FunctionDecl *FD,
+                                           AnalysisDeclContext &AC,
                                            LinuxKernelUnit &Unit) {
   if (!FD || S.getLangOpts().CPlusPlus ||
       !shouldRunLinuxKernelWarnings(S, FD->getBeginLoc()))
     return;
 
   LinuxKernelInference(S, Unit).ensureContracts();
-  LinuxKernelWarningsVisitor(S, FD, Unit).TraverseStmt(FD->getBody());
+  // The switch "walk-origins" gives the checks as they were, for a
+  // comparison: what a variable holds is then known only at the top level
+  // of the function and before the first goto.
+  std::optional<LinuxReachingDefs> Reaching;
+  if (!llvm::is_contained(S.getLangOpts().LinuxKernelExperimentalChecks,
+                          "walk-origins"))
+    if (const CFG *Cfg = FD->getBody() ? AC.getCFG() : nullptr)
+      Reaching.emplace(*Cfg, AC.getParentMap(), FD);
+  LinuxKernelWarningsVisitor(S, FD, Unit, Reaching ? &*Reaching : nullptr)
+      .TraverseStmt(FD->getBody());
 }
 
 void clang::sema::FinishLinuxKernelWarnings(Sema &S, LinuxKernelUnit &Unit) {

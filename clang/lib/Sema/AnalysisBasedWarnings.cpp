@@ -3215,9 +3215,6 @@ void clang::sema::AnalysisBasedWarnings::IssueWarnings(
   const Stmt *Body = D->getBody();
   assert(Body);
 
-  if (const auto *FD = dyn_cast<FunctionDecl>(D))
-    IssueLinuxKernelWarnings(S, FD, IPData->LinuxKernel);
-
   // Construct the analysis context with the specified CFG build options.
   AnalysisDeclContext AC(/* AnalysisDeclContextManager */ nullptr, D);
 
@@ -3317,8 +3314,10 @@ void clang::sema::AnalysisBasedWarnings::IssueWarnings(
     Analyzer.run(AC);
   }
 
-  if (const auto *FD = dyn_cast<FunctionDecl>(D))
+  if (const auto *FD = dyn_cast<FunctionDecl>(D)) {
+    IssueLinuxKernelWarnings(S, FD, AC, IPData->LinuxKernel);
     IssueLinuxKernelFlowWarnings(S, FD, AC, IPData->LinuxKernel);
+  }
 
   if (!Diags.isIgnored(diag::warn_uninit_var, D->getBeginLoc()) ||
       !Diags.isIgnored(diag::warn_sometimes_uninit_var, D->getBeginLoc()) ||

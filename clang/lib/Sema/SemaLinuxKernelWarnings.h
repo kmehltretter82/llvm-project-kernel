@@ -33,8 +33,10 @@ public:
   std::unique_ptr<Impl> State;
 };
 
+/// Run the Linux kernel checks that walk the syntax tree.  They ask the CFG
+/// of \p AC what a variable holds where the walk alone cannot tell.
 void IssueLinuxKernelWarnings(Sema &S, const FunctionDecl *FD,
-                              LinuxKernelUnit &Unit);
+                              AnalysisDeclContext &AC, LinuxKernelUnit &Unit);
 
 /// Whether any of the checks that need the function's CFG is enabled.
 bool wantsLinuxKernelFlowWarnings(Sema &S, const FunctionDecl *FD);

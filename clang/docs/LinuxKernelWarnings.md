@@ -635,13 +635,37 @@ annotation says instead of both ways.
 
 The API checks follow values through direct calls, local initializers, simple
 assignments to locals and direct structure fields, casts, GNU statement
-expressions, `_Generic`, and `__builtin_choose_expr`. Taking the address of a
-tracked local, writing it from inline assembly, or assigning it on
-control-flow-dependent paths clears the inferred contract. This keeps the
-diagnostics conservative when a value may have changed through a path the
-analysis cannot model. The supported cases cover allocation macro expansions
-used by current kernels and older stable kernels without requiring changes to
-kernel headers.
+expressions, `_Generic`, and `__builtin_choose_expr`. The supported cases
+cover allocation macro expansions used by current kernels and older stable
+kernels without requiring changes to kernel headers.
+
+What a variable or a member such as `priv->clk` holds at a use is decided
+from the control flow graph: the use sees an assignment if that assignment
+is the only definition that reaches it. That holds inside a branch, in a
+loop and behind a `goto`:
+
+```c
+for (i = 0; i < n; i++) {
+        clk = devm_clk_get(dev, names[i]);
+        if (!clk)                       /* reported */
+                return -ENODEV;
+}
+```
+
+Where two definitions meet, nothing is known and nothing is reported: after
+`if (c) p = get();`, after `p = a(); ... retry: ...; p = b(); goto retry;`
+at the label, and for a member that an assignment under a condition may or
+may not have replaced. Taking the address of a tracked local, counting it
+up or down, writing it from inline assembly and releasing it end what the
+assignment before says. A member is taken to keep its value over a call.
+`-flinux-kernel-experimental=walk-origins` gives the older and narrower
+rule, for a comparison: assignments count only at the top level of a
+function and before its first `goto`.
+
+A function that tests a pointer anywhere is not reported for dereferencing
+it without a test. The test can be of a copy, of the assignment itself
+(`if (!(p = get()))`), or of the member that the pointer was read from
+(`if (IS_ERR(d->chan)) ...; chan = d->chan;`).
 
 A negative NULL test next to an `IS_ERR()` or `IS_ERR_OR_NULL()` test of the
 same variable is treated as one combined guard. This avoids diagnosing the
