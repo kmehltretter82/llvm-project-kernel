@@ -227,6 +227,9 @@ getClobberConflictLocation(MultiExprArg Exprs, Expr **Constraints,
     // clobbers
     if (Clobber == "cc" || Clobber == "memory" || Clobber == "unwind")
       continue;
+    // -flinux-kernel-lenient-asm lets unknown register names through.
+    if (!Target.isValidGCCRegisterName(Clobber))
+      continue;
     Clobber = Target.getNormalizedGCCRegisterName(Clobber, true);
     // Go over the output's registers we collected
     if (InOutVars.count(Clobber))
@@ -315,10 +318,15 @@ StmtResult Sema::ActOnGCCAsmStmt(SourceLocation AsmLoc, bool IsSimple,
     TargetInfo::ConstraintInfo Info(ConstraintStr, OutputName);
     if (!Context.getTargetInfo().validateOutputConstraint(Info) &&
         !(LangOpts.HIPStdPar && LangOpts.CUDAIsDevice)) {
-      targetDiag(Constraint->getBeginLoc(),
-                 diag::err_asm_invalid_output_constraint)
-          << Info.getConstraintStr();
-      return CreateGCCAsmStmt();
+      if (!LangOpts.LinuxKernelLenientAsm) {
+        targetDiag(Constraint->getBeginLoc(),
+                   diag::err_asm_invalid_output_constraint)
+            << Info.getConstraintStr();
+        return CreateGCCAsmStmt();
+      }
+      // A constraint that the target description does not know is taken for
+      // a register class, which most machine-specific ones are.
+      Info.setAllowsRegister();
     }
 
     ExprResult ER = CheckPlaceholderExpr(Exprs[i]);
@@ -411,10 +419,13 @@ StmtResult Sema::ActOnGCCAsmStmt(SourceLocation AsmLoc, bool IsSimple,
     TargetInfo::ConstraintInfo Info(ConstraintStr, InputName);
     if (!Context.getTargetInfo().validateInputConstraint(OutputConstraintInfos,
                                                          Info)) {
-      targetDiag(Constraint->getBeginLoc(),
-                 diag::err_asm_invalid_input_constraint)
-          << Info.getConstraintStr();
-      return CreateGCCAsmStmt();
+      if (!LangOpts.LinuxKernelLenientAsm) {
+        targetDiag(Constraint->getBeginLoc(),
+                   diag::err_asm_invalid_input_constraint)
+            << Info.getConstraintStr();
+        return CreateGCCAsmStmt();
+      }
+      Info.setAllowsRegister();
     }
 
     ExprResult ER = CheckPlaceholderExpr(Exprs[i]);
@@ -521,7 +532,8 @@ StmtResult Sema::ActOnGCCAsmStmt(SourceLocation AsmLoc, bool IsSimple,
       return CreateGCCAsmStmt();
     }
 
-    if (!Context.getTargetInfo().isValidClobber(Clobber)) {
+    if (!Context.getTargetInfo().isValidClobber(Clobber) &&
+        !LangOpts.LinuxKernelLenientAsm) {
       targetDiag(ClobberExpr->getBeginLoc(),
                  diag::err_asm_unknown_register_name)
           << Clobber;
@@ -555,8 +567,12 @@ StmtResult Sema::ActOnGCCAsmStmt(SourceLocation AsmLoc, bool IsSimple,
   SmallVector<GCCAsmStmt::AsmStringPiece, 8> Pieces;
   unsigned DiagOffs;
   if (unsigned DiagID = NS->AnalyzeAsmString(Pieces, Context, DiagOffs)) {
-    targetDiag(GetLocation(asmString, DiagOffs), DiagID)
-        << asmString->getSourceRange();
+    // An operand escape that only the real assembler output routine of the
+    // target knows, such as "%@" on m68k.  The operands cannot be matched
+    // with the string then, so their modifiers stay unchecked.
+    if (!LangOpts.LinuxKernelLenientAsm)
+      targetDiag(GetLocation(asmString, DiagOffs), DiagID)
+          << asmString->getSourceRange();
     return NS;
   }
 

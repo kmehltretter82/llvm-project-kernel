@@ -2285,6 +2285,15 @@ def flinux_kernel_emit_facts_EQ : Joined<["-"], "flinux-kernel-emit-facts=">,
            "unit to <file>, as input for inferring Linux kernel API "
            "contracts">,
   MarshallingInfoString<LangOpts<"LinuxKernelFactsFile">>;
+defm linux_kernel_lenient_asm : BoolFOption<"linux-kernel-lenient-asm",
+  LangOpts<"LinuxKernelLenientAsm">, DefaultFalse,
+  PosFlag<SetTrue, [], [ClangOption], "Accept">,
+  NegFlag<SetFalse, [], [ClangOption], "Reject">,
+  BothFlags<[], [ClangOption, CC1Option],
+          " constraints, register names and operand escapes of GNU inline "
+          "assembly that the target description does not know. For checking "
+          "code with -fsyntax-only for a target whose description is "
+          "incomplete">>;
 def fconstant_array_class_EQ : Joined<["-"], "fconstant-array-class=">, Group<f_Group>,
   Visibility<[ClangOption, CC1Option]>,
   MarshallingInfoString<LangOpts<"ObjCConstantArrayClass">>;

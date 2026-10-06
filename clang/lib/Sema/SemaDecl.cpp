@@ -7782,6 +7782,7 @@ void Sema::CheckAsmLabel(Scope *S, Expr *E, StorageClass SC,
     case SC_Register:
       // Local Named register
       if (!Context.getTargetInfo().isValidGCCRegisterName(Label) &&
+          !getLangOpts().LinuxKernelLenientAsm &&
           DeclAttrsMatchCUDAMode(getLangOpts(), getCurFunctionDecl()))
         Diag(E->getExprLoc(), diag::err_asm_unknown_register_name) << Label;
       break;
@@ -7792,7 +7793,8 @@ void Sema::CheckAsmLabel(Scope *S, Expr *E, StorageClass SC,
     }
   } else if (SC == SC_Register) {
     // Global Named register
-    if (DeclAttrsMatchCUDAMode(getLangOpts(), NewVD)) {
+    if (DeclAttrsMatchCUDAMode(getLangOpts(), NewVD) &&
+        !getLangOpts().LinuxKernelLenientAsm) {
       const auto &TI = Context.getTargetInfo();
       bool HasSizeMismatch;
 

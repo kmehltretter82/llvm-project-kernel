@@ -145,6 +145,7 @@ LANGOPT(PointerAuthBlockDescriptorPointers, 1, 0, NotCompatible, "enable signed 
 
 LANGOPT(DoubleSquareBracketAttributes, 1, 0, NotCompatible, "'[[]]' attributes extension for all language standard modes")
 LANGOPT(ExperimentalLateParseAttributes, 1, 0, NotCompatible, "experimental late parsing of attributes")
+LANGOPT(LinuxKernelLenientAsm, 1, 0, NotCompatible, "accept GNU inline assembly that the target description does not know")
 
 LANGOPT(RecoveryAST, 1, 1, Compatible, "Preserve expressions in AST when encountering errors")
 LANGOPT(RecoveryASTType, 1, 1, Compatible, "Preserve the type in recovery expressions")
