@@ -63,6 +63,11 @@ static bool isTrackedVar(const VarDecl *vd, const DeclContext *dc) {
   if (vd->isLocalVarDecl() && !vd->hasGlobalStorage() &&
       !vd->isExceptionVariable() && !vd->isInitCapture() && !vd->isImplicit() &&
       vd->getDeclContext() == dc) {
+    // "register unsigned long sp asm("r30");" names a machine register.
+    // Reading the variable reads the register, which is how code for GCC
+    // gets at the stack pointer or the global pointer.
+    if (vd->getStorageClass() == SC_Register && vd->hasAttr<AsmLabelAttr>())
+      return false;
     QualType ty = vd->getType();
     if (const auto *RD = ty->getAsRecordDecl())
       return recordIsNotEmpty(RD);
