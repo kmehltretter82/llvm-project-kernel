@@ -1099,6 +1099,9 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
   /// or NULL, which the cleanup functions of <linux/cleanup.h> leave alone.
   llvm::SmallPtrSet<const ReturnStmt *, 4> NothingToRelease;
   llvm::SmallPtrSet<const VarDecl *, 4> ReportedErrorDerefs;
+  /// For each parameter of a function with a body: where the function
+  /// dereferences it without a test, or null.
+  llvm::DenseMap<const ParmVarDecl *, const MemberExpr *> ParameterDerefs;
   llvm::DenseMap<const VarDecl *, LinuxKernelAPIOrigin> VariableOrigins;
   llvm::DenseMap<DirectField, LinuxKernelAPIOrigin> FieldOrigins;
   llvm::SmallPtrSet<const Expr *, 4> CoveredNullTests;
@@ -1649,6 +1652,75 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
     S.Diag(ME->getOperatorLoc(), diag::warn_linux_kernel_err_ptr_deref)
         << VD << It->second.Callee << ME->getSourceRange();
     noteInferred(It->second);
+  }
+
+  static const MemberExpr *findDeref(const Stmt *St, const VarDecl *VD) {
+    if (!St || isa<UnaryExprOrTypeTraitExpr>(St))
+      return nullptr;
+    if (const auto *ME = dyn_cast<MemberExpr>(St))
+      if (ME->isArrow() &&
+          getDirectLinuxVariable(ME->getBase()->IgnoreParenCasts()) == VD)
+        return ME;
+    for (const Stmt *Child : St->children())
+      if (const MemberExpr *ME = findDeref(Child, VD))
+        return ME;
+    return nullptr;
+  }
+
+  /// Where a function with a body dereferences its parameter \p Index
+  /// without testing it first, or null.
+  const MemberExpr *getParameterDeref(const FunctionDecl *Callee,
+                                      unsigned Index) {
+    const FunctionDecl *Def = nullptr;
+    if (!Callee->hasBody(Def) || Index >= Def->getNumParams())
+      return nullptr;
+    const ParmVarDecl *Param = Def->getParamDecl(Index);
+    auto [It, New] = ParameterDerefs.try_emplace(Param, nullptr);
+    if (New) {
+      llvm::SmallPtrSet<const VarDecl *, 16> Tested;
+      collectTestedPointers(Def->getBody(), Tested);
+      const MemberExpr *Deref =
+          Tested.count(Param) ? nullptr : findDeref(Def->getBody(), Param);
+      // The map may have grown: look the entry up again.
+      ParameterDerefs[Param] = Deref;
+      return Deref;
+    }
+    return It->second;
+  }
+
+  /// "p = get(); use(p);" where use() dereferences its argument and neither
+  /// function tests the pointer.
+  void checkErrorPointerArgument(const CallExpr *Call) {
+    const FunctionDecl *Callee = Call->getDirectCallee();
+    if (!Callee || !CurrentFunction)
+      return;
+    for (unsigned I = 0, E = Call->getNumArgs(); I != E; ++I) {
+      const VarDecl *VD =
+          getDirectLinuxVariable(Call->getArg(I)->IgnoreParenCasts());
+      if (!VD || !VD->hasLocalStorage() || isa<ParmVarDecl>(VD))
+        continue;
+      auto It = VariableOrigins.find(VD);
+      if (It == VariableOrigins.end() ||
+          It->second.Kind != LinuxKernelAPIKind::ErrorPointer)
+        continue;
+      const MemberExpr *Deref = getParameterDeref(Callee, I);
+      if (!Deref)
+        continue;
+      if (!TestedPointers) {
+        TestedPointers.emplace();
+        collectTestedPointers(CurrentFunction->getBody(), *TestedPointers);
+      }
+      if (TestedPointers->count(VD) || !ReportedErrorDerefs.insert(VD).second)
+        continue;
+      LinuxKernelAPIOrigin Origin = It->second;
+      S.Diag(Call->getArg(I)->getExprLoc(),
+             diag::warn_linux_kernel_err_ptr_deref)
+          << VD << Origin.Callee << Call->getArg(I)->getSourceRange();
+      S.Diag(Deref->getOperatorLoc(),
+             diag::note_linux_kernel_dereferenced_here)
+          << Deref->getBase()->IgnoreParenCasts() << Deref->getSourceRange();
+      noteInferred(Origin);
+    }
   }
 
   /// The cleanup function of a pointer that was declared with __free().
@@ -2294,6 +2366,7 @@ public:
   }
 
   bool VisitCallExpr(CallExpr *Call) override {
+    checkErrorPointerArgument(Call);
     const FunctionDecl *Checker = Call->getDirectCallee();
     if (!Checker || !Checker->getIdentifier() || Call->getNumArgs() == 0)
       return true;

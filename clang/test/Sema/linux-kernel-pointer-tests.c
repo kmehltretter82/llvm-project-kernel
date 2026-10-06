@@ -212,3 +212,35 @@ int macro_test(struct thing *t) {
   check_and_warn(t);
   return id;
 }
+
+// Handed untested to a function that dereferences it.
+
+static int thing_id(struct thing *t) {
+  return t->id; // deref-note {{'t' is dereferenced here}}
+}
+
+static int thing_id_checked(struct thing *t) {
+  if (IS_ERR(t))
+    return -EINVAL;
+  return t->id;
+}
+
+int untested_argument(struct holder *h) {
+  struct thing *t = get_thing(h);
+
+  return thing_id(t); // deref-warning {{'t' holds an encoded error pointer if 'get_thing' failed, and is dereferenced here without an IS_ERR() test}} \
+                      // deref-note@#get_thing {{the return convention of 'get_thing' was inferred from its definition}}
+}
+
+int argument_tested_by_callee(struct holder *h) {
+  struct thing *t = get_thing(h);
+
+  return thing_id_checked(t);
+}
+
+int argument_only_passed_on(struct holder *h) {
+  struct thing *t = get_thing(h);
+
+  use(t);
+  return 0;
+}
