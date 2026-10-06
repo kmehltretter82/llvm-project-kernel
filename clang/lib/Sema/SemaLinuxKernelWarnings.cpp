@@ -2353,6 +2353,19 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
     return false;
   }
 
+  static bool takesAddressOf(const Stmt *St, const VarDecl *VD) {
+    if (!St)
+      return false;
+    if (const auto *UO = dyn_cast<UnaryOperator>(St))
+      if (UO->getOpcode() == UO_AddrOf &&
+          getDirectLinuxVariable(UO->getSubExpr()) == VD)
+        return true;
+    for (const Stmt *Child : St->children())
+      if (takesAddressOf(Child, VD))
+        return true;
+    return false;
+  }
+
   /// Whether the function sets every byte of \p VD somewhere: with memset()
   /// or one of its relatives, by assigning a whole structure, or by letting
   /// a function fill it that this translation unit cannot look into.
@@ -2369,10 +2382,8 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
       const FunctionDecl *Def = nullptr;
       bool HasBody = Callee && Callee->hasBody(Def);
       for (unsigned I = 0, E = CE->getNumArgs(); I != E; ++I) {
-        const auto *UO =
-            dyn_cast<UnaryOperator>(CE->getArg(I)->IgnoreParenCasts());
-        if (!UO || UO->getOpcode() != UO_AddrOf ||
-            getDirectLinuxVariable(UO->getSubExpr()) != VD)
+        // Also "cond ? &var : NULL".
+        if (!takesAddressOf(CE->getArg(I), VD))
           continue;
         if (!HasBody || I >= Def->getNumParams() ||
             mayFillWhole(Def->getBody(), Def->getParamDecl(I)))
@@ -2471,12 +2482,18 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
     uint64_t Have = Ctx.getTypeSizeInChars(Buffer->getType()).getQuantity();
     // The size: a constant, or a constant minus what was written so far.
     const Expr *SizeArg = Call->getArg(1)->IgnoreParenImpCasts();
-    if (const auto *BO = dyn_cast<BinaryOperator>(SizeArg);
-        BO && BO->getOpcode() == BO_Sub)
-      SizeArg = BO->getLHS()->IgnoreParenImpCasts();
     Expr::EvalResult Given;
-    if (SizeArg->isValueDependent() || !SizeArg->EvaluateAsInt(Given, Ctx) ||
-        Given.Val.getInt().isNegative() ||
+    if (SizeArg->isValueDependent())
+      return;
+    if (!SizeArg->EvaluateAsInt(Given, Ctx)) {
+      const auto *BO = dyn_cast<BinaryOperator>(SizeArg);
+      if (!BO || BO->getOpcode() != BO_Sub)
+        return;
+      SizeArg = BO->getLHS()->IgnoreParenImpCasts();
+      if (SizeArg->isValueDependent() || !SizeArg->EvaluateAsInt(Given, Ctx))
+        return;
+    }
+    if (Given.Val.getInt().isNegative() ||
         Given.Val.getInt().getActiveBits() > 63 ||
         Given.Val.getInt().getZExtValue() <= Have)
       return;
@@ -5201,11 +5218,15 @@ private:
   /// conditions that read it and the member chains that go through it.
   void invalidate(const VarDecl *Root, ArrayRef<const FieldDecl *> Path,
                   State &St) const {
-    llvm::erase_if(St.Preds, [&](const std::pair<unsigned, bool> &P) {
+    // An outcome that was taken for granted holds against calls, not
+    // against an assignment to what the condition reads.
+    auto Reads = [&](const std::pair<unsigned, bool> &P) {
       return llvm::any_of(Conditions[P.first].Locations, [&](unsigned L) {
         return isUnder(Locations[L], Root, Path, /*Strictly=*/false);
       });
-    });
+    };
+    llvm::erase_if(St.Preds, Reads);
+    llvm::erase_if(St.Fixed, Reads);
     llvm::erase_if(St.Vals, [&](const std::pair<unsigned, Value> &V) {
       return isUnder(Locations[V.first], Root, Path, /*Strictly=*/true);
     });
@@ -6322,8 +6343,37 @@ class LinuxTestedValueChecker : LinuxPathSearch::Client {
     Misuse = At;
     FoundPath.clear();
     Search.getPath(FoundPath);
+    // "if (!err) note(); return ERR_PTR(err);" returns NULL on purpose.  A
+    // zero that comes in through a label from elsewhere is the accident.
+    if (Active == ErrPtrOfZero && !pathPassesLabel()) {
+      Misuse = nullptr;
+      return false;
+    }
     Search.stop();
     return false;
+  }
+
+  bool pathPassesLabel() const {
+    bool Past = !FromEntry;
+    for (const CFGBlock *B : FoundPath) {
+      if (Past && isa_and_nonnull<LabelStmt>(B->getLabel()))
+        return true;
+      Past |= B == TestBlock;
+    }
+    return false;
+  }
+
+  bool assignsPlace(const Stmt *Node) {
+    const Expr *Target = nullptr;
+    if (const auto *BO = dyn_cast<BinaryOperator>(Node)) {
+      if (BO->isAssignmentOp())
+        Target = BO->getLHS();
+    } else if (const auto *UO = dyn_cast<UnaryOperator>(Node)) {
+      if (UO->isIncrementDecrementOp())
+        Target = UO->getSubExpr();
+    }
+    return Target &&
+           Search.locate(Target, /*Create=*/false) == int(Place);
   }
 
   bool edge(const CFGBlock *From, const CFGBlock *To,
@@ -6346,7 +6396,8 @@ class LinuxTestedValueChecker : LinuxPathSearch::Client {
     if (FromEntry && !(St.Client & PastTest))
       return true;
     // The path has given the location a new value, or a call may have.
-    if (LinuxPathSearch::get(St, Place).Mask & ~Within) {
+    // "p = NULL;" behind the test says that the author knows.
+    if ((LinuxPathSearch::get(St, Place).Mask & ~Within) || assignsPlace(Node)) {
       if (!FromEntry)
         return false;
       St.Client &= ~uint32_t(PastTest);
@@ -7278,6 +7329,10 @@ class LinuxUnwindChecker : LinuxPathSearch::Client {
     if (!FD->getReturnType()->isSignedIntegerType() ||
         FD->getReturnType()->isBooleanType())
       return false;
+    // "return 1;" is an answer, not an error.  A variable that a test has
+    // found not to be zero is taken for an error code.
+    if (V.HasConst)
+      return V.Const < 0;
     return !(V.Mask & Value::Zero);
   }
 
@@ -7364,11 +7419,52 @@ class LinuxUnwindChecker : LinuxPathSearch::Client {
     return true;
   }
 
+  /// A test of a pointer that names the resource: the outcome "NULL" or
+  /// "error pointer" is where the acquisition has failed.  The search knows
+  /// that by itself for a variable whose value it follows.  This is for the
+  /// others, such as a variable whose address is taken somewhere.
+  bool failedPointerEdge(const CFGBlock *From, const CFGBlock *To) const {
+    bool Negated = false;
+    const Expr *E =
+        stripLinuxCondition(LinuxPathSearch::getBranchCondition(From), Negated);
+    if (!E)
+      return false;
+    const Expr *Plain = E->IgnoreParenImpCasts();
+    bool TrueIsFailure = false;
+    if (const auto *BO = dyn_cast<BinaryOperator>(Plain)) {
+      if (!BO->isEqualityOp())
+        return false;
+      const Expr *Tested = nullptr;
+      if (BO->getRHS()->isNullPointerConstant(
+              Ctx, Expr::NPC_ValueDependentIsNotNull))
+        Tested = BO->getLHS();
+      else if (BO->getLHS()->isNullPointerConstant(
+                   Ctx, Expr::NPC_ValueDependentIsNotNull))
+        Tested = BO->getRHS();
+      if (!isHandle(Tested))
+        return false;
+      TrueIsFailure = BO->getOpcode() == BO_EQ;
+    } else if (const auto *CE = dyn_cast<CallExpr>(Plain)) {
+      const FunctionDecl *Callee = CE->getDirectCallee();
+      if (!Callee || !Callee->getIdentifier() || CE->getNumArgs() != 1 ||
+          !Callee->getName().starts_with("IS_ERR") || !isHandle(CE->getArg(0)))
+        return false;
+      TrueIsFailure = true;
+    } else if (!isHandle(E)) {
+      return false;
+    }
+    bool TakenWhenTrue = From->succ_begin()->getReachableBlock() == To;
+    return (TakenWhenTrue != Negated) == TrueIsFailure;
+  }
+
   /// A branch on the call itself: "if (clk_prepare_enable(clk)) return ...".
   bool edge(const CFGBlock *From, const CFGBlock *To,
             LinuxPathSearch::State &St) override {
-    if (Kind.Result != LinuxResourceKind::Status ||
-        !LinuxPathSearch::isConditionalBranch(From))
+    if (!LinuxPathSearch::isConditionalBranch(From))
+      return true;
+    if (Kind.Result == LinuxResourceKind::Pointer)
+      return !failedPointerEdge(From, To);
+    if (Kind.Result != LinuxResourceKind::Status)
       return true;
     bool Negated = false;
     const Expr *E =
@@ -7608,6 +7704,12 @@ public:
           return;
         LinuxPathSearch::State Init;
         fixGuards(B, Init);
+        // "spin_lock(&parent->lock)": there is a parent.
+        if (Root && Root != HandleVar && Root->getType()->isPointerType())
+          if (int RootLoc = Search.locate(Root); RootLoc >= 0) {
+            Search.pin(RootLoc);
+            LinuxPathSearch::set(Init, RootLoc, Value::ofMask(Value::Pos));
+          }
         Search.run(B, First, Init, *this);
         if (!Found)
           continue;

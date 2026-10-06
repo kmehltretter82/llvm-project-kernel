@@ -388,6 +388,19 @@ long retested(struct thing *t, int count) {
   return -EINVAL;
 }
 
+// Cleared behind the test: PTR_ERR() is meant to give 0.
+long cleared(struct thing *t) {
+  int n = 0;
+
+  if (!IS_ERR(t)) {
+    n = t->id;
+    t = NULL;
+  }
+  if (n)
+    _printk("%d\n", n);
+  return PTR_ERR(t);
+}
+
 // ERR_PTR() of an error code that is zero.
 
 int prepare(int n);
@@ -421,6 +434,20 @@ struct thing *make_ok(int n) {
 out:
   finish();
   return ERR_PTR(err);
+}
+
+// Zero is dealt with right at the test: NULL is what is meant.
+struct thing *revalidate(struct thing *t, int n) {
+  if (t) {
+    int err = prepare(n);
+
+    if (err <= 0) {
+      if (!err)
+        finish();
+      return ERR_PTR(err);
+    }
+  }
+  return t;
 }
 
 // NULL for success is what this function returns: it never hands out an

@@ -170,6 +170,20 @@ int filled_by_members(void *user) {
                                                           // leak32-warning {{'p' is copied out by copy_to_user() with 3 bytes of padding}}
 }
 
+static void fill_whole(struct padded *p) {
+  if (p) {
+    memset(p, 0, sizeof(*p));
+    p->kind = 1;
+  }
+}
+
+int filled_conditionally(void *user) {
+  struct padded p;
+
+  fill_whole(user ? &p : NULL);
+  return user && copy_to_user(user, &p, sizeof(p)) ? -EFAULT : 0;
+}
+
 int assigned_whole(void *user, const struct padded *from) {
   struct padded p;
 
@@ -211,6 +225,14 @@ struct line {
 
 int show_member(struct line *l) {
   return scnprintf(l->text, 32, "x"); // size-warning {{scnprintf() is given a size of 32 for 'l->text', which has 16 bytes}}
+}
+
+#define NAME_LEN (64 - sizeof(unsigned long))
+
+int show_name(void) {
+  char name[NAME_LEN];
+
+  return scnprintf(name, NAME_LEN, "x");
 }
 
 int show_ok(char *page) {

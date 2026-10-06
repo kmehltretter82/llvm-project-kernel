@@ -348,3 +348,71 @@ int through_keeper(int n) {
   keep(buf);
   return n;
 }
+
+// A second allocation into the same variable, under a test of it.
+void *kvmalloc(unsigned long size, unsigned int flags);
+
+char *fallback(unsigned long n) {
+  char *buf;
+
+  buf = kzalloc(n, 0);
+  if (!buf) {
+    buf = kvmalloc(n, 0);
+    if (!buf)
+      return NULL;
+    buf[0] = 1;
+  }
+  return buf;
+}
+
+// The pointer is tested for NULL, but its address is taken further down, so
+// that its value cannot be followed.
+void fill_pointer(char **p);
+
+int address_taken(unsigned long n) {
+  char *buf = kzalloc(n, 0);
+
+  if (!buf)
+    return -ENOMEM;
+  kfree(buf);
+  fill_pointer(&buf);
+  return 0;
+}
+
+// A lock in an object that a pointer names: the pointer is not NULL.
+struct node {
+  struct mutex lock;
+  int count;
+};
+
+struct node *lock_parent(struct node *child, struct node *parent, int root) {
+  if (!root)
+    mutex_lock(&parent->lock);
+  child->count++;
+  if (parent && --parent->count) {
+    mutex_unlock(&parent->lock);
+    return NULL;
+  }
+  return parent;
+}
+
+// "return 1;" is an answer.
+int try_remove(struct priv *p, int busy) {
+  mutex_lock(&p->lock);
+  if (busy)
+    goto cannot;
+  p->value = 0;
+  mutex_unlock(&p->lock);
+  return 1;
+cannot:
+  mutex_unlock(&p->lock);
+  return 0;
+}
+
+int claim(struct priv *p, int busy) {
+  mutex_lock(&p->lock);
+  if (!busy)
+    return 1;
+  mutex_unlock(&p->lock);
+  return 0;
+}
