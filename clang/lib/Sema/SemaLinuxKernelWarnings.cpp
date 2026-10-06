@@ -11275,6 +11275,50 @@ public:
   }
 };
 
+/// The lines that asm-offsets.c and its relatives send through the
+/// compiler, for a target without a code generator.
+///
+///   #define DEFINE(sym, val) \
+///           asm volatile("\n.ascii \"->" #sym " %0 " #val "\"" : : "i" (val))
+///
+/// Kbuild compiles such a file with -S and picks the lines out of the
+/// assembly: that is how the offsets of structure members get into
+/// <generated/asm-offsets.h> for the assembly sources.  The values are
+/// constants that the frontend knows.  With the switch "asm-offsets" each
+/// such statement is printed as a diagnostic, with the value in place of the
+/// operand, and a wrapper script writes the lines to the file that Kbuild
+/// expects (scan-20261003/v5/scan-cc-solo in the workspace of the fork).  A
+/// kernel tree can then be prepared with nothing but this compiler.
+static void emitLinuxAsmOffsets(Sema &S, const Stmt *St) {
+  if (!St)
+    return;
+  if (const auto *AS = dyn_cast<GCCAsmStmt>(St)) {
+    std::string Text = AS->getAsmString();
+    size_t Start = Text.find(".ascii \"->");
+    if (Start == std::string::npos)
+      return;
+    Text = Text.substr(Start);
+    if (AS->getNumInputs() >= 1) {
+      Expr::EvalResult R;
+      const Expr *Value = AS->getInputExpr(0);
+      size_t Operand = Text.find("%0");
+      if (Operand == std::string::npos || Value->isValueDependent() ||
+          !Value->EvaluateAsInt(R, S.getASTContext())) {
+        S.Diag(AS->getAsmLoc(), diag::warn_linux_kernel_experimental)
+            << "the operand of this statement is not an integer constant"
+            << "asm-offsets" << AS->getSourceRange();
+        return;
+      }
+      Text.replace(Operand, 2, llvm::toString(R.Val.getInt(), 10));
+    }
+    S.Diag(AS->getAsmLoc(), diag::warn_linux_kernel_experimental)
+        << Text << "asm-offsets";
+    return;
+  }
+  for (const Stmt *Child : St->children())
+    emitLinuxAsmOffsets(S, Child);
+}
+
 static bool shouldRunLinuxKernelWarnings(const Sema &S, SourceLocation Loc) {
   const DiagnosticsEngine &Diags = S.getDiagnostics();
   return !Diags.isIgnored(diag::warn_linux_kernel_bool_negative_return, Loc) ||
@@ -11361,6 +11405,9 @@ void clang::sema::IssueLinuxKernelFlowWarnings(Sema &S, const FunctionDecl *FD,
                                                LinuxKernelUnit &Unit) {
   if (!wantsLinuxKernelFlowWarnings(S, FD) || !FD->getBody())
     return;
+  if (isLinuxExperimentEnabled(S, "asm-offsets", FD->getBeginLoc(),
+                               /*IsCheck=*/false))
+    emitLinuxAsmOffsets(S, FD->getBody());
   const CFG *Cfg = AC.getCFG();
   if (!Cfg)
     return;

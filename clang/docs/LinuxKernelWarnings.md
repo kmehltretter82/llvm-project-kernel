@@ -435,6 +435,29 @@ by compiling. `scan-cc-host` in the scan tooling does that: a cross GCC
 answers everything that has to produce output, and the `.c` to `.o`
 compiles are replayed with this compiler and `-fsyntax-only`.
 
+Where no such compiler is at hand, this one can prepare the tree alone.
+What "make prepare" needs from a code generator is little: the
+`.ascii "->SYMBOL value"` lines that `asm-offsets.c`, `bounds.c` and
+`devicetable-offsets.c` send through the compiler with `-S`. The values are
+constants that the frontend knows.
+`-flinux-kernel-experimental=asm-offsets` prints each of those statements
+as a diagnostic with the value filled in:
+
+```console
+$ clang --target=or1k-linux -fsyntax-only -Wlinux-kernel-experimental \
+    -flinux-kernel-experimental=asm-offsets arch/openrisc/kernel/asm-offsets.c
+warning: .ascii "->TASK_FLAGS 5916 offsetof(struct task_struct, flags)"
+      (experimental check 'asm-offsets')
+warning: .ascii "->TASK_PTRACE 5912 offsetof(struct task_struct, ptrace)"
+      (experimental check 'asm-offsets')
+```
+
+(The values are those of an OpenRISC allmodconfig of Linux 7.3-rc5.)
+
+`scan-cc-solo` in the scan tooling turns that back into the file that Kbuild
+reads, answers the option probes with the frontend, and hands every `.c` to
+`.o` compile to the replay. `all` does not include this switch.
+
 Each kernel-specific subgroup can be enabled or disabled independently. For
 example:
 
