@@ -824,9 +824,13 @@ class CorrelatedUninitPruner {
   /// The condition that decides which way \p B branches.  A block that ends
   /// in "if (a && b)" evaluates only b: a is the condition of an earlier
   /// block, and this block is reached with the outcome of a that leaves the
-  /// result open.
+  /// result open.  The condition of "do ... while (a && b)" is computed like
+  /// the value of any other expression, and the block that ends the loop
+  /// branches on the whole of it.
   static const Expr *getBranchCondition(const CFGBlock *B) {
     const Expr *Cond = cast<Expr>(B->getTerminatorCondition());
+    if (B->getLastCondition() == Cond->IgnoreParens())
+      return Cond;
     for (;;) {
       const auto *BO = dyn_cast<BinaryOperator>(Cond->IgnoreParens());
       if (!BO || !BO->isLogicalOp())

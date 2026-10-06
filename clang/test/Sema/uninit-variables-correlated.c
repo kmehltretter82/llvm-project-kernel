@@ -325,3 +325,30 @@ void access_through_null(struct node *n, int a) {
   if (a)
     use(x); // corr-warning {{variable 'x' is uninitialized when used here only on paths that an earlier condition excludes}}
 }
+
+// The condition of a do-while loop is computed as a whole.  When the loop
+// ends because 'a' is false, nothing is known about "n < b".
+void do_while_condition(int a, int b, int c) {
+  int n = 0;
+  int x; // maybe-note {{initialize the variable 'x' to silence this warning}}
+  if (c)
+    x = f();
+  do {
+    n++;
+  } while (a && n < b);
+  if (n < b)
+    use(x); // maybe-warning {{variable 'x' may be uninitialized when used here}}
+}
+
+// The same test in a while loop is split into one branch for each operand,
+// and the same holds there.
+void while_condition(int a, int b, int c) {
+  int n = 0;
+  int x; // maybe-note {{initialize the variable 'x' to silence this warning}}
+  if (c)
+    x = f();
+  while (a && n < b)
+    n++;
+  if (n < b)
+    use(x); // maybe-warning {{variable 'x' may be uninitialized when used here}}
+}
