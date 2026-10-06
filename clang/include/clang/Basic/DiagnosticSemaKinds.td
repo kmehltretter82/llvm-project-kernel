@@ -653,6 +653,51 @@ def warn_linux_kernel_error_probe_zero : Warning<
   "%0 can be zero here, so dev_err_probe() returns success">,
   InGroup<LinuxKernelErrorPathSuccess>, DefaultIgnore;
 def note_linux_kernel_failure_reported : Note<"failure reported here">;
+def warn_linux_kernel_missing_error_code : Warning<
+  "%0 is zero when this failure path leaves, so the function returns "
+  "success">,
+  InGroup<LinuxKernelMissingErrorCode>, DefaultIgnore;
+def note_linux_kernel_returned_here : Note<"%0 is returned here">;
+def warn_linux_kernel_cleanup_return : Warning<
+  "%0 is returned, but its cleanup function %1 releases it at this return">,
+  InGroup<LinuxKernelCleanupReturn>, DefaultIgnore;
+def warn_linux_kernel_cleanup_escape : Warning<
+  "%0 is stored here, but its cleanup function %1 releases it when the "
+  "variable goes out of scope">,
+  InGroup<LinuxKernelCleanupEscape>, DefaultIgnore;
+def note_linux_kernel_cleanup_declared : Note<
+  "%0 is declared with a cleanup function here; no_free_ptr() or "
+  "return_ptr() passes the ownership on">;
+def warn_linux_kernel_counted_by_order : Warning<
+  "flexible array %0 is used before its counter %1 is set">,
+  InGroup<LinuxKernelCountedByOrder>, DefaultIgnore;
+def warn_linux_kernel_counted_by_never_set : Warning<
+  "flexible array %0 is used, but its counter %1 is not set in this "
+  "function">,
+  InGroup<LinuxKernelCountedByOrder>, DefaultIgnore;
+def note_linux_kernel_counted_by_set_here : Note<"%0 is set here">;
+def note_linux_kernel_counted_by_allocated_here : Note<
+  "the object is allocated here">;
+def warn_linux_kernel_err_ptr_deref : Warning<
+  "%0 holds an encoded error pointer if %1 failed, and is dereferenced here "
+  "without an IS_ERR() test">,
+  InGroup<LinuxKernelErrorPointerDeref>, DefaultIgnore;
+def warn_linux_kernel_ptr_err_null : Warning<
+  "%0 is %select{NULL on this path|NULL or an error pointer here}1, and "
+  "PTR_ERR() of NULL is 0; the failure becomes success">,
+  InGroup<LinuxKernelPtrErrZero>, DefaultIgnore;
+def warn_linux_kernel_ptr_err_other : Warning<
+  "error code is taken from %0, but the error test is on %1">,
+  InGroup<LinuxKernelWrongCheck>, DefaultIgnore;
+def warn_linux_kernel_deref_before_check : Warning<
+  "%0 is tested for NULL here, but every path to this test has dereferenced "
+  "it">,
+  InGroup<LinuxKernelDerefBeforeCheck>, DefaultIgnore;
+def note_linux_kernel_dereferenced_here : Note<"%0 is dereferenced here">;
+def note_linux_kernel_contract_inferred : Note<
+  "the return convention of %0 was inferred from its definition">;
+def err_linux_kernel_contracts_file : Error<
+  "cannot open Linux kernel contracts or facts file '%0': %1">;
 def warn_return_value_udt: Warning<
   "%0 has C-linkage specified, but returns user-defined type %1 which is "
   "incompatible with C">, InGroup<ReturnTypeCLinkage>;

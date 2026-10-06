@@ -2827,6 +2827,10 @@ public:
   // It is important to analyze blocks within functions because it's a very
   // common pattern to capture completion handler parameters by blocks.
   CalledOnceInterProceduralData CalledOnceData;
+
+  // Contracts of Linux kernel functions, read from a file and inferred from
+  // the bodies seen so far.
+  LinuxKernelUnit LinuxKernel;
 };
 
 template <typename... Ts>
@@ -3107,6 +3111,8 @@ void clang::sema::AnalysisBasedWarnings::IssueWarnings(
   if (!TU)
     return; // This is unexpected, give up quietly.
 
+  FinishLinuxKernelWarnings(S, IPData->LinuxKernel);
+
   DiagnosticsEngine &Diags = S.getDiagnostics();
 
   if (S.hasUncompilableErrorOccurred() || Diags.getIgnoreAllWarnings())
@@ -3210,7 +3216,7 @@ void clang::sema::AnalysisBasedWarnings::IssueWarnings(
   assert(Body);
 
   if (const auto *FD = dyn_cast<FunctionDecl>(D))
-    IssueLinuxKernelWarnings(S, FD);
+    IssueLinuxKernelWarnings(S, FD, IPData->LinuxKernel);
 
   // Construct the analysis context with the specified CFG build options.
   AnalysisDeclContext AC(/* AnalysisDeclContextManager */ nullptr, D);

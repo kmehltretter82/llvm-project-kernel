@@ -2274,6 +2274,17 @@ defm objc_constant_literals : BoolFOption<"objc-constant-literals",
   PosFlag<SetTrue, [], [CC1Option], "Enable">,
   NegFlag<SetFalse, [], [], "Disable">,
   BothFlags<[NoArgumentUnused], [ClangOption], " compile-time constant ObjC literals">>;
+def flinux_kernel_contracts_EQ : Joined<["-"], "flinux-kernel-contracts=">,
+  Group<f_Group>, Visibility<[ClangOption, CC1Option]>, MetaVarName<"<file>">,
+  HelpText<"Read Linux kernel API contracts for the -Wlinux-kernel checks "
+           "from <file>">,
+  MarshallingInfoString<LangOpts<"LinuxKernelContractsFile">>;
+def flinux_kernel_emit_facts_EQ : Joined<["-"], "flinux-kernel-emit-facts=">,
+  Group<f_Group>, Visibility<[ClangOption, CC1Option]>, MetaVarName<"<file>">,
+  HelpText<"Append facts about the functions defined in this translation "
+           "unit to <file>, as input for inferring Linux kernel API "
+           "contracts">,
+  MarshallingInfoString<LangOpts<"LinuxKernelFactsFile">>;
 def fconstant_array_class_EQ : Joined<["-"], "fconstant-array-class=">, Group<f_Group>,
   Visibility<[ClangOption, CC1Option]>,
   MarshallingInfoString<LangOpts<"ObjCConstantArrayClass">>;

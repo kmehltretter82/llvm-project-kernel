@@ -451,3 +451,9 @@ out:
     return error;
   return 0;
 }
+
+// ERR_PTR(0) that one macro passes on to another is still the macro's own.
+#define LINUX_KERNEL_LOG_INNER(dev, err) linux_kernel_log(dev, err)
+#define LINUX_KERNEL_LOG_INFO(dev) LINUX_KERNEL_LOG_INNER(dev, ERR_PTR(0))
+void linux_kernel_log(void *dev, void *err);
+void log_through_nested_macros(void *dev) { LINUX_KERNEL_LOG_INFO(dev); }

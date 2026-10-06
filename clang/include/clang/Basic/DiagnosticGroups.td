@@ -1215,6 +1215,26 @@ def LinuxKernelUnsignedErrorCheck :
 def LinuxKernelWrongCheck : DiagGroup<"linux-kernel-wrong-check">;
 def LinuxKernelErrorPathSuccess :
   DiagGroup<"linux-kernel-error-path-success">;
+// A failure path without a message that returns a zero error code.  Zero can
+// be what the author wants there, so this stays out of the umbrella.
+def LinuxKernelMissingErrorCode :
+  DiagGroup<"linux-kernel-missing-error-code">;
+// <linux/cleanup.h>: a __free() pointer that leaves the function while its
+// cleanup function still releases it.
+def LinuxKernelCleanupReturn : DiagGroup<"linux-kernel-cleanup-return">;
+def LinuxKernelCleanupEscape : DiagGroup<"linux-kernel-cleanup-escape">;
+// A __counted_by flexible array used before the counter is set.
+def LinuxKernelCountedByOrder : DiagGroup<"linux-kernel-counted-by-order">;
+// The result of an error pointer function that is dereferenced without any
+// IS_ERR() test.  The function may be known not to fail at that call.
+def LinuxKernelErrorPointerDeref :
+  DiagGroup<"linux-kernel-error-pointer-deref">;
+// PTR_ERR() of a pointer that is NULL, which is 0.
+def LinuxKernelPtrErrZero : DiagGroup<"linux-kernel-ptr-err-zero">;
+// A NULL test of a pointer that every path has dereferenced already.  Either
+// the test is dead or the dereference is unsafe.
+def LinuxKernelDerefBeforeCheck :
+  DiagGroup<"linux-kernel-deref-before-check">;
 def LinuxKernel : DiagGroup<"linux-kernel", [LinuxKernelBoolReturn,
                                              LinuxKernelUsercopy,
                                              LinuxKernelErrorPointer,
@@ -1224,6 +1244,9 @@ def LinuxKernel : DiagGroup<"linux-kernel", [LinuxKernelBoolReturn,
                                              LinuxKernelUnsignedErrorCheck,
                                              LinuxKernelWrongCheck,
                                              LinuxKernelErrorPathSuccess,
+                                             LinuxKernelCleanupReturn,
+                                             LinuxKernelCountedByOrder,
+                                             UninitializedCleanup,
                                              UninitializedMaybe]>;
 def IgnoredPragmaIntrinsic : DiagGroup<"ignored-pragma-intrinsic">;
 // #pragma optimize is often used to avoid to work around MSVC codegen bugs or

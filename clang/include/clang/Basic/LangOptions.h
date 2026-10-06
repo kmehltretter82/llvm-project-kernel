@@ -525,6 +525,15 @@ public:
   /// If none is specified, abort (GCC-compatible behaviour).
   std::string OverflowHandler;
 
+  /// File with Linux kernel API contracts that an earlier pass inferred from
+  /// the function definitions.  The -Wlinux-kernel checks consult it for
+  /// functions that neither their built-in table nor an annotation covers.
+  std::string LinuxKernelContractsFile;
+
+  /// File to which facts about the functions defined in this translation
+  /// unit are appended, as input for inferring such contracts.
+  std::string LinuxKernelFactsFile;
+
   /// The module currently being compiled as specified by -fmodule-name.
   std::string ModuleName;
 
