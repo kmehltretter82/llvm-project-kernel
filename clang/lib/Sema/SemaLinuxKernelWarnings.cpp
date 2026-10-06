@@ -138,6 +138,9 @@ struct LinuxKernelAPIOrigin {
   bool Inferred = false;
   /// Where a variable was given the value, if it is held by one.
   SourceLocation Assigned = SourceLocation();
+  /// The variable was given the value of another variable or of a member,
+  /// which the function may have tested under that name.
+  bool Copied = false;
 
   explicit operator bool() const { return Kind != LinuxKernelAPIKind::None; }
 
@@ -1888,7 +1891,8 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
     if (!VD || !VD->hasLocalStorage() || isa<ParmVarDecl>(VD))
       return;
     auto It = VariableOrigins.find(VD);
-    if (It == VariableOrigins.end() || It->second.Inferred)
+    if (It == VariableOrigins.end() || It->second.Inferred ||
+        It->second.Copied)
       return;
     switch (It->second.Kind) {
     case LinuxKernelAPIKind::KmallocPointer:
@@ -3185,6 +3189,8 @@ public:
     LinuxKernelAPIOrigin Origin = getOrigin(VD->getInit());
     if (Origin) {
       Origin.Assigned = VD->getLocation();
+      Origin.Copied =
+          isa<DeclRefExpr, MemberExpr>(VD->getInit()->IgnoreParenCasts());
       VariableOrigins[VD] = Origin;
       noteAllocationFlags(VD, VD->getInit());
     }
@@ -3355,6 +3361,8 @@ public:
         if (VD) {
           if (Origin) {
             Origin.Assigned = BO->getOperatorLoc();
+            Origin.Copied =
+                isa<DeclRefExpr, MemberExpr>(BO->getRHS()->IgnoreParenCasts());
             VariableOrigins[VD] = Origin;
             noteAllocationFlags(VD, BO->getRHS());
           } else {
@@ -7904,10 +7912,40 @@ class DuplicateCheckChecker {
 
   struct Fact {
     uint8_t Mask = Value::Any;
-    /// The test that narrowed the mask last.
+    /// The test that narrowed the mask last, and the statement that
+    /// branches on it.
     const Expr *From = nullptr;
+    const Stmt *FromBranch = nullptr;
   };
   using Facts = llvm::SmallVector<Fact, 8>;
+
+  static bool contains(const Stmt *St, const Stmt *Inner) {
+    if (!St)
+      return false;
+    if (St == Inner)
+      return true;
+    for (const Stmt *Child : St->children())
+      if (contains(Child, Inner))
+        return true;
+    return false;
+  }
+
+  /// Whether the second test only spells out what the first one leaves:
+  /// "if (c <= 0) ... else if (c > 0) ...", or a test of the same variable
+  /// further on in one condition, as in "!p || (q && p && ...)".  Both are
+  /// a matter of style.
+  static bool spellsOutTheRest(const Stmt *FirstBranch, const CFGBlock *B,
+                               const Expr *Cond) {
+    if (!FirstBranch)
+      return false;
+    if (const auto *First = dyn_cast<IfStmt>(FirstBranch)) {
+      const Stmt *Else = First->getElse();
+      while (const auto *CS = dyn_cast_or_null<CompoundStmt>(Else))
+        Else = CS->size() == 1 ? CS->body_front() : nullptr;
+      return Else && Else == B->getTerminatorStmt();
+    }
+    return isa<Expr>(FirstBranch) && contains(FirstBranch, Cond);
+  }
 
   llvm::SmallVector<const VarDecl *, 8> Vars;
   llvm::DenseMap<const VarDecl *, unsigned> Index;
@@ -8162,6 +8200,7 @@ public:
             if (Narrowed != F.Mask) {
               F.Mask = Narrowed;
               F.From = Cond;
+              F.FromBranch = B->getTerminatorStmt();
             }
           }
           unsigned ID = Next->getBlockID();
@@ -8178,8 +8217,10 @@ public:
               Have.Mask = Joined;
               Changed = true;
             }
-            if (!Have.From)
+            if (!Have.From) {
               Have.From = Edge[I].From;
+              Have.FromBranch = Edge[I].FromBranch;
+            }
           }
         }
       }
@@ -8201,7 +8242,8 @@ public:
         continue;
       bool NeverTrue = !(F.Mask & OnTrue);
       bool NeverFalse = !(F.Mask & OnFalse);
-      if (NeverTrue == NeverFalse || mayChangeBetween(VD, F.From, Cond))
+      if (NeverTrue == NeverFalse || mayChangeBetween(VD, F.From, Cond) ||
+          spellsOutTheRest(F.FromBranch, B, Cond))
         continue;
       // "Not negative" has no wording yet: only zero and not zero.
       if (F.Mask != Value::Zero && (F.Mask & Value::Zero))

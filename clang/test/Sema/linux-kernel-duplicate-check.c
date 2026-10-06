@@ -119,6 +119,20 @@ int disabled_branch(void) {
   return 0;
 }
 
+// Spelling out what the first test leaves is a matter of style.
+
+int else_if(int c) {
+  if (c <= 0)
+    return -1;
+  else if (c > 0)
+    return 1;
+  return 0;
+}
+
+int same_condition(const struct thing *a, const struct thing *b) {
+  return !a || (b && a && a->id == b->id);
+}
+
 // A test in a macro is not the author's.
 
 #define CHECK(x)                                                               \

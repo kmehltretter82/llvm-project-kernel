@@ -303,3 +303,19 @@ int checked_copy(void) {
   t->id = 1;
   return 0;
 }
+
+struct owner {
+  struct thing *thing;
+};
+
+// The member was tested before the variable got its value.
+int checked_member(struct owner *o) {
+  struct thing *t;
+
+  o->thing = kzalloc(sizeof(*t), GFP_KERNEL);
+  if (o->thing == NULL)
+    return -ENOMEM;
+  t = o->thing;
+  t->id = 1;
+  return 0;
+}
