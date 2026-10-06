@@ -458,6 +458,46 @@ u32 out_assigned_in_condition(struct dev *d) {
   return val;
 }
 
+// The function that is given the variable is given the pointer as well that
+// is NULL when the variable was not written.
+static struct dev *ref_lock(struct dev *d, unsigned long *flags) {
+  if (!d->cached)
+    return NULL;
+  *flags = d->cache;
+  return d;
+}
+
+void unlock_deref(struct dev *d, unsigned long flags);
+
+void out_with_its_pointer(struct dev *d) {
+  unsigned long flags;
+  struct dev *o = ref_lock(d, &flags);
+
+  if (o)
+    consume(o->cache);
+  unlock_deref(o, flags);
+}
+
+// "err ? ERR_PTR(err) : NULL" is an error or nothing, whatever the sign of
+// err.
+static struct dev *search(struct dev *d, u32 *val) {
+  int err = use(1);
+
+  if (err || !d->cached)
+    return err ? ERR_PTR(err) : NULL;
+  *val = d->cache;
+  return d;
+}
+
+u32 out_err_ptr_or_null(struct dev *d) {
+  u32 val;
+  struct dev *o = search(d, &val);
+
+  if (IS_ERR_OR_NULL(o))
+    return 0;
+  return val;
+}
+
 // bool: false is the failure.
 static bool parse(const char *s, int *out) {
   if (!s[0])

@@ -7956,6 +7956,28 @@ class LinuxOutputSummarizer : LinuxPathSearch::Client {
     return Value::ofMask(Inner & Value::Any);
   }
 
+  /// The value that "return E;" returns on this path.  "return PTR_ERR(p);",
+  /// "return dev_err_probe(...);" and "return err ? ERR_PTR(err) : NULL;"
+  /// say that it is an error, whatever the path knows about the operand.
+  Value returned(const Expr *E, const LinuxPathSearch::State &St) {
+    E = E->IgnoreParenCasts();
+    if (const auto *CO = dyn_cast<ConditionalOperator>(E)) {
+      if (std::optional<bool> Known = Search->truth(CO->getCond(), St))
+        return returned(*Known ? CO->getTrueExpr() : CO->getFalseExpr(), St);
+      return Value::join(returned(CO->getTrueExpr(), St),
+                         returned(CO->getFalseExpr(), St));
+    }
+    if (const auto *CE = dyn_cast<CallExpr>(E)) {
+      const FunctionDecl *F = CE->getDirectCallee();
+      if (F && F->getIdentifier() &&
+          llvm::StringSwitch<bool>(F->getName())
+              .Cases({"PTR_ERR", "ERR_PTR", "ERR_CAST", "dev_err_probe"}, true)
+              .Default(false))
+        return Value::ofMask(Value::Neg);
+    }
+    return Search->value(E, St);
+  }
+
   /// A path without a write leaves the function from \p From.
   void record(const CFGBlock *From, const LinuxPathSearch::State &St) {
     const ReturnStmt *RS = nullptr;
@@ -7975,17 +7997,7 @@ class LinuxOutputSummarizer : LinuxPathSearch::Client {
         Search->stop();
         return;
       }
-      Value V = Search->value(E, St);
-      // "return PTR_ERR(p);" and "return dev_err_probe(...);" say it.
-      if (const auto *CE = dyn_cast<CallExpr>(E->IgnoreParenCasts())) {
-        const FunctionDecl *F = CE->getDirectCallee();
-        if (F && F->getIdentifier() &&
-            llvm::StringSwitch<bool>(F->getName())
-                .Cases({"PTR_ERR", "ERR_PTR", "ERR_CAST", "dev_err_probe"},
-                       true)
-                .Default(false))
-          V = Value::ofMask(Value::Neg);
-      }
+      Value V = returned(E, St);
       // A value that may or may not be zero does not tell the caller which
       // path it was.
       if (V.isAny() ||
@@ -11070,6 +11082,17 @@ class LinuxOutputParamChecker : LinuxPathSearch::Client {
       if (ICE->getCastKind() != CK_LValueToRValue || !DRE ||
           DRE->getDecl() != Var)
         return true;
+      // "port = uart_port_ref_lock(state, &flags); ...
+      // uart_port_unlock_deref(port, flags);": the function that gets the
+      // variable gets the pointer that is NULL on this path as well, and
+      // can tell.
+      if (const auto *CE =
+              dyn_cast_or_null<CallExpr>(PM.getParentIgnoreParenCasts(ICE)))
+        for (const Expr *Arg : CE->arguments())
+          if (Arg->getType()->isPointerType() &&
+              Arg->IgnoreParenCasts() != DRE &&
+              Search.value(Arg, St).Mask == Value::Zero)
+            return true;
       Read = DRE;
     } else {
       return true;
