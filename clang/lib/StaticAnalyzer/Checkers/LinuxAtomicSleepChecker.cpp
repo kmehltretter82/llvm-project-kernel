@@ -32,8 +32,11 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "LinuxKernelModeling.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Decl.h"
+#include "clang/Basic/FileManager.h"
+#include "clang/Basic/SourceManager.h"
 #include "clang/StaticAnalyzer/Checkers/BuiltinCheckerRegistration.h"
 #include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
 #include "clang/StaticAnalyzer/Core/Checker.h"
@@ -42,7 +45,10 @@
 #include "clang/StaticAnalyzer/Core/PathSensitive/CheckerHelpers.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/StringSwitch.h"
+#include "llvm/Support/LineIterator.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include <optional>
 
 using namespace clang;
@@ -182,7 +188,7 @@ static CallRole classify(StringRef Name) {
 namespace {
 
 class LinuxAtomicSleepChecker
-    : public Checker<check::PreCall, check::PostCall, eval::Call> {
+    : public Checker<check::PreCall, check::PostCall> {
   const BugType SleepBug{this, "Sleeping call in atomic context",
                          "Linux kernel"};
 
@@ -205,7 +211,10 @@ class LinuxAtomicSleepChecker
 public:
   void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
   void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
-  bool evalCall(const CallEvent &Call, CheckerContext &C) const;
+
+  /// Functions that the -flinux-kernel-contracts= file says always sleep.
+  llvm::StringSet<> Sleepers;
+  void loadSleepers(CheckerManager &Mgr);
 };
 
 } // namespace
@@ -215,31 +224,6 @@ static const FunctionDecl *getCallee(const CallEvent &Call) {
   if (!FD || !FD->getIdentifier() || !FD->getDeclContext()->isFileContext())
     return nullptr;
   return FD;
-}
-
-/// Out-of-line lock and unlock functions.  They change nothing but the lock,
-/// so they are evaluated here instead of conservatively.  Otherwise a call
-/// such as spin_lock(&dev->lock) makes the analyzer forget every field of
-/// *dev, and with it conditions like "if (dev->flags & ATOMIC)" that decide
-/// between a spinlock and a mutex and later between a busy wait and a sleep.
-static bool isLockOperation(StringRef Name) {
-  switch (classify(Name).R) {
-  case Role::Enter:
-  case Role::TryEnter:
-  case Role::Leave:
-    return true;
-  default:
-    break;
-  }
-  return llvm::StringSwitch<bool>(Name)
-      .Cases({"mutex_lock", "mutex_lock_nested", "mutex_lock_interruptible",
-              "mutex_lock_interruptible_nested", "mutex_lock_killable",
-              "mutex_lock_killable_nested", "mutex_trylock", "mutex_unlock"},
-             true)
-      .Cases({"down_read", "down_read_nested", "down_write",
-              "down_write_nested", "up_read", "up_write"},
-             true)
-      .Default(false);
 }
 
 /// Functions that take gfp flags and are meant to be called with a spinlock
@@ -428,6 +412,12 @@ void LinuxAtomicSleepChecker::checkPreCall(const CallEvent &Call,
       reportSleep(
           Call, ("Call to '" + Name + "' with gfp flags that may sleep").str(),
           C);
+    else if (!FD->hasBody() && Sleepers.contains(Name))
+      reportSleep(Call,
+                  ("Call to '" + Name +
+                   "' (always sleeps, according to its definition)")
+                      .str(),
+                  C);
     return;
   default:
     return;
@@ -522,24 +512,28 @@ void LinuxAtomicSleepChecker::checkPostCall(const CallEvent &Call,
     C.addTransition(State->set<AtomicSections>(Factory.getEmptyList()));
 }
 
-bool LinuxAtomicSleepChecker::evalCall(const CallEvent &Call,
-                                       CheckerContext &C) const {
-  const FunctionDecl *FD = getCallee(Call);
-  const Expr *Origin = Call.getOriginExpr();
-  if (!FD || FD->hasBody() || !Origin || !isLockOperation(FD->getName()))
-    return false;
-
-  ProgramStateRef State = C.getState();
-  if (!Call.getResultType()->isVoidType())
-    State = State->BindExpr(
-        Origin, C.getStackFrame(),
-        C.getSValBuilder().conjureSymbolVal(Call, C.blockCount()));
-  C.addTransition(State);
-  return true;
+/// The contracts file has one "sleeps <name>" line for each function that
+/// was found to sleep whenever it runs, in whatever translation unit it is
+/// defined.  That is what the analyzer cannot see from here.
+void LinuxAtomicSleepChecker::loadSleepers(CheckerManager &Mgr) {
+  const std::string &Path = Mgr.getLangOpts().LinuxKernelContractsFile;
+  if (Path.empty())
+    return;
+  auto Buffer = Mgr.getASTContext().getSourceManager().getFileManager()
+                    .getBufferForFile(Path);
+  if (!Buffer)
+    return;
+  for (llvm::line_iterator Line(**Buffer, /*SkipBlanks=*/true, '#');
+       !Line.is_at_end(); ++Line) {
+    auto [Kind, Name] = Line->split('\t');
+    if (Kind == "sleeps" && !Name.trim().empty())
+      Sleepers.insert(Name.trim());
+  }
 }
 
 void ento::registerLinuxAtomicSleepChecker(CheckerManager &Mgr) {
-  Mgr.registerChecker<LinuxAtomicSleepChecker>();
+  Mgr.registerChecker<LinuxAtomicSleepChecker>()->loadSleepers(Mgr);
+  linuxkernel::addInterest(Mgr, linuxkernel::AtomicSections);
 }
 
 bool ento::shouldRegisterLinuxAtomicSleepChecker(const CheckerManager &Mgr) {

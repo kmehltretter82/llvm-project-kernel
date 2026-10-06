@@ -8,6 +8,8 @@
 // CHECK-NEXT: alpha.clone.CloneChecker:MinimumCloneComplexity = 50
 // CHECK-NEXT: alpha.clone.CloneChecker:ReportNormalClones = true
 // CHECK-NEXT: alpha.cplusplus.STLAlgorithmModeling:AggressiveStdFindModeling = false
+// CHECK-NEXT: alpha.linux.KernelModel:LikelyStaticBranches = false
+// CHECK-NEXT: alpha.linux.KernelModel:SkipIrrelevant = false
 // CHECK-NEXT: alpha.osx.cocoa.DirectIvarAssignment:AnnotatedFunctions = false
 // CHECK-NEXT: alpha.unix.PthreadLock:WarnOnLockOrderReversal = false
 // CHECK-NEXT: apply-fixits = false

@@ -60,6 +60,9 @@ add_clang_library(clangStaticAnalyzerCheckers
   LifetimeModeling.cpp
   LLVMConventionsChecker.cpp
   LinuxAtomicSleepChecker.cpp
+  LinuxKernelModelChecker.cpp
+  LinuxLockBalanceChecker.cpp
+  LinuxNodeRefChecker.cpp
   LocalizationChecker.cpp
   MacOSKeychainAPIChecker.cpp
   MacOSXAPIChecker.cpp

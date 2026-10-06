@@ -641,10 +641,48 @@ def SimpleStreamChecker : Checker<"SimpleStream">,
 
 let ParentPackage = LinuxAlpha in {
 
+def LinuxKernelModelChecker : Checker<"KernelModel">,
+  HelpText<"The base of the Linux kernel checkers. It reports nothing. It "
+           "models the kernel's lock functions and can leave out what the "
+           "enabled checkers have no use for.">,
+  CheckerOptions<[
+    CmdLineOption<Boolean,
+                  "SkipIrrelevant",
+                  "Do not analyze a function in which no enabled Linux "
+                  "kernel checker can have anything to report: one that "
+                  "takes no lock, enters no atomic section and looks up no "
+                  "device tree node, as far as the bodies in the translation "
+                  "unit show.",
+                  "false",
+                  InAlpha>,
+    CmdLineOption<Boolean,
+                  "LikelyStaticBranches",
+                  "Take a static branch the way its likely() or unlikely() "
+                  "annotation says instead of both ways.",
+                  "false",
+                  InAlpha>
+  ]>,
+  Documentation<NotDocumented>,
+  Hidden;
+
 def LinuxAtomicSleepChecker : Checker<"AtomicSleep">,
   HelpText<"Check for calls that may sleep while a Linux kernel spinlock is "
            "held, inside an RCU read-side critical section, or with "
            "preemption or bottom halves disabled">,
+  Dependencies<[LinuxKernelModelChecker]>,
+  Documentation<NotDocumented>;
+
+def LinuxLockBalanceChecker : Checker<"LockBalance">,
+  HelpText<"Check for a Linux kernel spinlock, mutex or rwsem that a "
+           "function still holds on one return path and releases on "
+           "another">,
+  Dependencies<[LinuxKernelModelChecker]>,
+  Documentation<NotDocumented>;
+
+def LinuxNodeRefChecker : Checker<"NodeRef">,
+  HelpText<"Check for a device tree node that a function looked up and "
+           "does not release with of_node_put()">,
+  Dependencies<[LinuxKernelModelChecker]>,
   Documentation<NotDocumented>;
 
 } // end "alpha.linux"
