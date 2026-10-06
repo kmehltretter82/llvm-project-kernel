@@ -30,6 +30,7 @@
 #include "Targets/NVPTX.h"
 #include "Targets/OSTargets.h"
 #include "Targets/PPC.h"
+#include "Targets/ParseOnly.h"
 #include "Targets/RISCV.h"
 #include "Targets/SPIR.h"
 #include "Targets/Sparc.h"
@@ -114,6 +115,14 @@ std::unique_ptr<TargetInfo> AllocateTarget(const llvm::Triple &Triple,
 
   switch (Triple.getArch()) {
   default:
+    // Architectures that LLVM does not know and the Linux kernel supports.
+    // The frontend can parse and check code for them.
+    if (ParseOnlyTargetInfo::getArchKind(Triple)) {
+      if (os == llvm::Triple::Linux)
+        return std::make_unique<LinuxTargetInfo<ParseOnlyTargetInfo>>(Triple,
+                                                                      Opts);
+      return std::make_unique<ParseOnlyTargetInfo>(Triple, Opts);
+    }
     return nullptr;
 
   case llvm::Triple::arc:
