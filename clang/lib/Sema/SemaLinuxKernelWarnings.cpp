@@ -647,6 +647,35 @@ static std::string getLinuxExprText(const Expr *E, const Sema &S) {
   return Text.empty() ? std::string("the value") : Text.str();
 }
 
+/// Whether \p Bound is the number of elements of the array \p Base: its
+/// constant size, or the member that __counted_by() names for it.
+static bool isLinuxElementCount(const Sema &S, const Expr *Bound,
+                                const Expr *Base, std::string &Count) {
+  ASTContext &Ctx = S.getASTContext();
+  Base = Base->IgnoreParenImpCasts();
+  if (const ConstantArrayType *AT =
+          Ctx.getAsConstantArrayType(Base->getType())) {
+    Expr::EvalResult R;
+    if (Bound->isValueDependent() || !Bound->EvaluateAsInt(R, Ctx) ||
+        R.Val.getInt().getActiveBits() > 63 ||
+        R.Val.getInt().getZExtValue() != AT->getZExtSize() ||
+        AT->getZExtSize() < 2)
+      return false;
+    Count = std::to_string(AT->getZExtSize());
+    return true;
+  }
+  const auto *Array = dyn_cast<MemberExpr>(Base);
+  const auto *Counter = dyn_cast<MemberExpr>(Bound->IgnoreParenImpCasts());
+  const auto *ArrayField =
+      Array ? dyn_cast<FieldDecl>(Array->getMemberDecl()) : nullptr;
+  if (!ArrayField || !Counter ||
+      Counter->getMemberDecl() != ArrayField->findCountedByField() ||
+      !isSameLinuxExpr(Ctx, Array->getBase(), Counter->getBase()))
+    return false;
+  Count = "'" + getLinuxExprText(Counter, S) + "'";
+  return true;
+}
+
 enum class LinuxKernelReturnConvention { Unknown, ErrorPointer, NullOnFailure };
 
 /// Infers what the table above lists by hand: how a function reports failure
@@ -3348,33 +3377,9 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
       Out.push_back({Index, Bound->IgnoreParenImpCasts(), BO});
   }
 
-  /// Whether \p Bound is the number of elements of the array \p Base: its
-  /// constant size, or the member that __counted_by() names for it.
   bool isElementCount(const Expr *Bound, const Expr *Base,
                       std::string &Count) const {
-    ASTContext &Ctx = S.getASTContext();
-    Base = Base->IgnoreParenImpCasts();
-    if (const ConstantArrayType *AT =
-            Ctx.getAsConstantArrayType(Base->getType())) {
-      Expr::EvalResult R;
-      if (Bound->isValueDependent() || !Bound->EvaluateAsInt(R, Ctx) ||
-          R.Val.getInt().getActiveBits() > 63 ||
-          R.Val.getInt().getZExtValue() != AT->getZExtSize() ||
-          AT->getZExtSize() < 2)
-        return false;
-      Count = std::to_string(AT->getZExtSize());
-      return true;
-    }
-    const auto *Array = dyn_cast<MemberExpr>(Base);
-    const auto *Counter = dyn_cast<MemberExpr>(Bound);
-    const auto *ArrayField =
-        Array ? dyn_cast<FieldDecl>(Array->getMemberDecl()) : nullptr;
-    if (!ArrayField || !Counter ||
-        Counter->getMemberDecl() != ArrayField->findCountedByField() ||
-        !isSameLinuxExpr(Ctx, Array->getBase(), Counter->getBase()))
-      return false;
-    Count = "'" + getLinuxExprText(Counter, S) + "'";
-    return true;
+    return isLinuxElementCount(S, Bound, Base, Count);
   }
 
   bool findOffByOne(const Stmt *St, const BoundTest &T) {
@@ -6843,6 +6848,10 @@ public:
   /// Keep the value of \p Loc on every path, whether or not a branch
   /// condition reads it.
   void pin(unsigned Loc) { Locations[Loc].Pinned = true; }
+
+  bool isAddressTaken(const VarDecl *VD) const {
+    return AddressTaken.count(VD);
+  }
 
   static Value get(const State &St, unsigned Loc) {
     for (const auto &[L, V] : St.Vals)
@@ -12327,6 +12336,713 @@ public:
   }
 };
 
+/// A loop that looks for something leaves its counter or its cursor where
+/// nothing is, if it runs to its end:
+///
+///   for (i = 0; i < ARRAY_SIZE(table); i++)
+///           if (table[i].id == id)
+///                   break;
+///   return table[i].value;          /* table[ARRAY_SIZE(table)] */
+///
+///   list_for_each_entry(pos, &head, list)
+///           if (pos->id == id)
+///                   break;
+///   return pos->value;              /* the head, taken for an entry */
+///
+/// The checker follows the paths that leave such a test with the variable
+/// past the end, to a use of the index for an array with that many elements
+/// or to a dereference of the cursor.  The path ends where the variable is
+/// assigned or tested again.  Like the other path checks it looks from the
+/// test on first, and then from the entry of the function, so that what the
+/// code before the loop establishes is known: a flag that says whether the
+/// loop found something is clear on these paths, because "found = true;
+/// break;" is not on them.
+///
+/// On the way from the entry the checker keeps count of where the index is
+/// relative to the bound, as far as tests and steps by one say: below it, or
+/// at most equal to it.  "level++; if (level == MAX) goto done; continue;"
+/// comes back to the test "level < MAX" with an index that is below, and
+/// the path that leaves the loop there does not exist.
+///
+/// A loop over a list that the function also tests with list_empty() is
+/// left alone: such a loop often takes its entries off the list, and then
+/// the list is empty when the loop has run to its end.  So is a loop that
+/// does not look at its entries, but counts them to stop at one.
+class LinuxLoopEndChecker : LinuxPathSearch::Client {
+  Sema &S;
+  const FunctionDecl *FD;
+  const CFG &Cfg;
+  ASTContext &Ctx;
+  LinuxPathSearch &Search;
+  sema::LinuxKernelUnit::Impl &Unit;
+
+  struct Candidate {
+    const CFGBlock *Block = nullptr;
+    /// The successor on which the variable is past the end.
+    const CFGBlock *Past = nullptr;
+    const VarDecl *Var = nullptr;
+    const Expr *Cond = nullptr;
+    /// For an index: what it was compared with.
+    const Expr *Bound = nullptr;
+    /// For a cursor: the member that links the entries, and the head.
+    const FieldDecl *Member = nullptr;
+    const Expr *Head = nullptr;
+    bool IsLoop = false;
+  };
+  llvm::SmallVector<Candidate, 4> Candidates;
+
+  // Per search.
+  const Candidate *Active = nullptr;
+  bool FromEntry = false;
+  llvm::BitVector ReachesTest;
+  const Expr *Misuse = nullptr;
+  const CallExpr *Call = nullptr;
+  std::string Count;
+  llvm::SmallVector<const CFGBlock *, 16> FoundPath;
+  llvm::SmallPtrSet<const Expr *, 4> Reported;
+
+  enum : uint32_t {
+    /// The variable is past the end on this path.
+    Armed = 1,
+    /// The index is below the bound, or at most equal to it.
+    Below = 2,
+    AtMost = 4,
+  };
+
+  static const Stmt *getLoop(const CFGBlock *B) {
+    const Stmt *Term = B->getTerminatorStmt();
+    return Term && isa<ForStmt, WhileStmt, DoStmt>(Term) ? Term : nullptr;
+  }
+
+  static bool assigns(const Stmt *St, const VarDecl *VD) {
+    if (!St)
+      return false;
+    if (const auto *BO = dyn_cast<BinaryOperator>(St))
+      if (BO->isAssignmentOp() && getDirectLinuxVariable(BO->getLHS()) == VD)
+        return true;
+    for (const Stmt *Child : St->children())
+      if (assigns(Child, VD))
+        return true;
+    return false;
+  }
+
+  static bool mentions(const Stmt *St, const VarDecl *VD) {
+    if (!St)
+      return false;
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(St))
+      if (DRE->getDecl() == VD)
+        return true;
+    for (const Stmt *Child : St->children())
+      if (mentions(Child, VD))
+        return true;
+    return false;
+  }
+
+  /// Whether the loop looks at its entries to decide something: a branch
+  /// in \p St whose condition reads the cursor.  "if (!n--) break;" walks
+  /// to the entry with a number, and its author knows that there are that
+  /// many.
+  static bool branchesOn(const Stmt *St, const VarDecl *VD) {
+    if (!St)
+      return false;
+    const Expr *Cond = nullptr;
+    if (const auto *IS = dyn_cast<IfStmt>(St))
+      Cond = IS->getCond();
+    else if (const auto *CO = dyn_cast<AbstractConditionalOperator>(St))
+      Cond = CO->getCond();
+    else if (const auto *BO = dyn_cast<BinaryOperator>(St);
+             BO && BO->isLogicalOp())
+      Cond = BO->getLHS();
+    else if (const auto *SS = dyn_cast<SwitchStmt>(St))
+      Cond = SS->getCond();
+    if (Cond && mentions(Cond, VD))
+      return true;
+    for (const Stmt *Child : St->children())
+      if (branchesOn(Child, VD))
+        return true;
+    return false;
+  }
+
+  /// The condition without what does not change its outcome: "(void)0, c"
+  /// and "bit = find_next_bit(...), bit < size" are decided by c.
+  static const Expr *stripCondition(const Expr *Cond, bool &Negated) {
+    for (;;) {
+      const Expr *E = stripLinuxCondition(Cond, Negated);
+      const auto *BO =
+          dyn_cast_or_null<BinaryOperator>(E ? E->IgnoreParens() : nullptr);
+      if (!BO || BO->getOpcode() != BO_Comma)
+        return E;
+      Cond = BO->getRHS();
+    }
+  }
+
+  bool isIndexVariable(const VarDecl *VD) const {
+    QualType T = VD->getType();
+    return VD->hasLocalStorage() && T->isIntegerType() &&
+           !T->isBooleanType() && !T->isEnumeralType() &&
+           !T.isVolatileQualified() && !Search.isAddressTaken(VD);
+  }
+
+  static BinaryOperatorKind negate(BinaryOperatorKind Op) {
+    switch (Op) {
+    case BO_LT: return BO_GE;
+    case BO_GE: return BO_LT;
+    case BO_LE: return BO_GT;
+    case BO_GT: return BO_LE;
+    case BO_EQ: return BO_NE;
+    default: return BO_EQ;
+    }
+  }
+
+  /// "Var < Bound" and its relatives.  \p Op is the comparison with the
+  /// variable on the left.
+  bool isBoundTest(const Expr *E, const VarDecl *&Var, const Expr *&Bound,
+                   BinaryOperatorKind &Op) const {
+    const auto *BO = dyn_cast<BinaryOperator>(E->IgnoreParenImpCasts());
+    if (!BO || !BO->isComparisonOp())
+      return false;
+    Op = BO->getOpcode();
+    Var = getDirectLinuxVariable(BO->getLHS());
+    Bound = BO->getRHS();
+    if (!Var || !isIndexVariable(Var)) {
+      Var = getDirectLinuxVariable(BO->getRHS());
+      Bound = BO->getLHS();
+      if (!Var || !isIndexVariable(Var))
+        return false;
+      switch (Op) {
+      case BO_LT: Op = BO_GT; break;
+      case BO_GT: Op = BO_LT; break;
+      case BO_LE: Op = BO_GE; break;
+      case BO_GE: Op = BO_LE; break;
+      default: break;
+      }
+    }
+    if (Op == BO_Cmp)
+      return false;
+    Bound = Bound->IgnoreParenImpCasts();
+    return true;
+  }
+
+  /// Whether the index is not below the bound where the comparison \p Op
+  /// holds.  "i <= bound" lets the index be the bound itself, which the
+  /// check for a bounds test that is off by one reports.
+  static bool isPast(BinaryOperatorKind Op) {
+    return Op == BO_GE || Op == BO_GT || Op == BO_EQ;
+  }
+
+  bool isSameBound(const Expr *A, const Expr *B) const {
+    if (isSameLinuxExpr(Ctx, A, B))
+      return true;
+    Expr::EvalResult RA, RB;
+    return !A->isValueDependent() && !B->isValueDependent() &&
+           A->EvaluateAsInt(RA, Ctx) && B->EvaluateAsInt(RB, Ctx) &&
+           llvm::APSInt::isSameValue(RA.Val.getInt(), RB.Val.getInt());
+  }
+
+  /// The path leaves \p From for \p To.  If that is a test of the index
+  /// against the bound, take what it says into \p Bits.  Returns false if
+  /// the path cannot go that way.
+  bool applyTest(const CFGBlock *From, const CFGBlock *To,
+                 uint32_t &Bits) const {
+    if (!Active->Bound || !LinuxPathSearch::isConditionalBranch(From))
+      return true;
+    const CFGBlock *True = From->succ_begin()->getReachableBlock();
+    const CFGBlock *False = (From->succ_begin() + 1)->getReachableBlock();
+    if (True == False)
+      return true;
+    bool Negated = false;
+    const Expr *E =
+        stripCondition(LinuxPathSearch::getBranchCondition(From), Negated);
+    const VarDecl *Var = nullptr;
+    const Expr *Bound = nullptr;
+    BinaryOperatorKind Op = BO_EQ;
+    if (!E || !isBoundTest(E, Var, Bound, Op) || Var != Active->Var ||
+        !isSameBound(Bound, Active->Bound))
+      return true;
+    if ((To == True) == Negated)
+      Op = negate(Op);
+    switch (Op) {
+    case BO_LT:
+      Bits = (Bits & ~AtMost) | Below;
+      break;
+    case BO_LE:
+      if (!(Bits & Below))
+        Bits |= AtMost;
+      break;
+    case BO_NE:
+      if (Bits & AtMost)
+        Bits = (Bits & ~AtMost) | Below;
+      break;
+    case BO_EQ:
+      if (Bits & Below)
+        return false;
+      Bits |= AtMost;
+      break;
+    case BO_GE:
+      if (Bits & Below)
+        return false;
+      break;
+    default: // BO_GT
+      if (Bits & (Below | AtMost))
+        return false;
+      break;
+    }
+    return true;
+  }
+
+  /// Take into \p Bits what \p Node does to the index.
+  void applyChange(const Stmt *Node, uint32_t &Bits) const {
+    const VarDecl *Var = Active->Var;
+    auto Step = [&](bool Up) {
+      if (Up)
+        Bits = (Bits & Below) ? ((Bits & ~Below) | AtMost) : (Bits & ~AtMost);
+      else if (Bits & AtMost)
+        Bits = (Bits & ~AtMost) | Below;
+    };
+    auto IsOne = [&](const Expr *E) {
+      Expr::EvalResult R;
+      return !E->isValueDependent() && E->EvaluateAsInt(R, Ctx) &&
+             R.Val.getInt() == 1;
+    };
+    auto Set = [&](const Expr *RHS) {
+      // "i = i + 1" is a step.
+      if (const auto *BO = dyn_cast_or_null<BinaryOperator>(
+              RHS ? RHS->IgnoreParenImpCasts() : nullptr);
+          BO && BO->isAdditiveOp() &&
+          getDirectLinuxVariable(BO->getLHS()) == Var && IsOne(BO->getRHS())) {
+        Step(BO->getOpcode() == BO_Add);
+        return;
+      }
+      Bits &= ~(Below | AtMost);
+      Expr::EvalResult K, B;
+      if (!RHS || RHS->isValueDependent() || !RHS->EvaluateAsInt(K, Ctx) ||
+          Active->Bound->isValueDependent() ||
+          !Active->Bound->EvaluateAsInt(B, Ctx))
+        return;
+      int Order = llvm::APSInt::compareValues(K.Val.getInt(), B.Val.getInt());
+      if (Order < 0)
+        Bits |= Below;
+      else if (Order == 0)
+        Bits |= AtMost;
+    };
+    if (const auto *UO = dyn_cast<UnaryOperator>(Node)) {
+      if (UO->isIncrementDecrementOp() &&
+          getDirectLinuxVariable(UO->getSubExpr()) == Var)
+        Step(UO->isIncrementOp());
+    } else if (const auto *BO = dyn_cast<BinaryOperator>(Node)) {
+      if (!BO->isAssignmentOp() || getDirectLinuxVariable(BO->getLHS()) != Var)
+        return;
+      if (BO->getOpcode() == BO_Assign)
+        Set(BO->getRHS());
+      else if ((BO->getOpcode() == BO_AddAssign ||
+                BO->getOpcode() == BO_SubAssign) &&
+               IsOne(BO->getRHS()))
+        Step(BO->getOpcode() == BO_AddAssign);
+      else
+        Bits &= ~(Below | AtMost);
+    } else if (const auto *DS = dyn_cast<DeclStmt>(Node)) {
+      if (llvm::is_contained(DS->decls(), Var))
+        Set(Var->getInit());
+    }
+  }
+
+  /// "&Var->Member" for a pointer variable and a member that is a list
+  /// head.
+  static bool isMemberAddress(const Expr *E, const VarDecl *&Var,
+                              const FieldDecl *&Member) {
+    const auto *UO = dyn_cast<UnaryOperator>(E->IgnoreParenImpCasts());
+    if (!UO || UO->getOpcode() != UO_AddrOf)
+      return false;
+    const auto *ME = dyn_cast<MemberExpr>(UO->getSubExpr()->IgnoreParens());
+    if (!ME || !ME->isArrow())
+      return false;
+    Var = getDirectLinuxVariable(ME->getBase());
+    Member = dyn_cast<FieldDecl>(ME->getMemberDecl());
+    if (!Var || !Member || !Var->hasLocalStorage() ||
+        !Var->getType()->isPointerType())
+      return false;
+    const RecordDecl *RD = Member->getType()->getAsRecordDecl();
+    return RD && RD->getIdentifier() && RD->getName() == "list_head";
+  }
+
+  /// "list_is_head(&Var->Member, head)", which is what
+  /// list_entry_is_head() and the loops of <linux/list.h> expand to, and
+  /// "&Var->Member == head", which the loops of <linux/rculist.h> have.
+  ///
+  /// The entry is on the left there.  "next != &parent->children" has the
+  /// same form with the owner of the list in the place of the entry, and is
+  /// not taken.
+  static bool isHeadTest(const Expr *E, const VarDecl *&Var,
+                         const FieldDecl *&Member, const Expr *&Head,
+                         bool &HeadWhen) {
+    E = E->IgnoreParenImpCasts();
+    if (const auto *CE = dyn_cast<CallExpr>(E)) {
+      const FunctionDecl *Callee = CE->getDirectCallee();
+      HeadWhen = true;
+      if (!Callee || !Callee->getIdentifier() ||
+          Callee->getName() != "list_is_head" || CE->getNumArgs() != 2)
+        return false;
+      Head = CE->getArg(1);
+      return isMemberAddress(CE->getArg(0), Var, Member);
+    }
+    const auto *BO = dyn_cast<BinaryOperator>(E);
+    if (!BO || !BO->isEqualityOp())
+      return false;
+    HeadWhen = BO->getOpcode() == BO_EQ;
+    Head = BO->getRHS();
+    return isMemberAddress(BO->getLHS(), Var, Member);
+  }
+
+  /// Whether the function asks if the list \p Head is empty.
+  bool testsEmptiness(const Stmt *St, const Expr *Head) const {
+    if (!St)
+      return false;
+    if (const auto *CE = dyn_cast<CallExpr>(St)) {
+      const FunctionDecl *Callee = CE->getDirectCallee();
+      if (Callee && Callee->getIdentifier() && CE->getNumArgs() == 1 &&
+          (Callee->getName() == "list_empty" ||
+           Callee->getName() == "list_empty_careful") &&
+          isSameLinuxExpr(Ctx, CE->getArg(0), Head))
+        return true;
+    }
+    for (const Stmt *Child : St->children())
+      if (testsEmptiness(Child, Head))
+        return true;
+    return false;
+  }
+
+  void collect(bool WantIndex, bool WantCursor) {
+    for (const CFGBlock *B : Cfg) {
+      if (!LinuxPathSearch::isConditionalBranch(B))
+        continue;
+      const CFGBlock *True = B->succ_begin()->getReachableBlock();
+      const CFGBlock *False = (B->succ_begin() + 1)->getReachableBlock();
+      if (True == False)
+        continue;
+      bool Negated = false;
+      const Expr *Cond = LinuxPathSearch::getBranchCondition(B);
+      const Expr *E = stripCondition(Cond, Negated);
+      if (!E)
+        continue;
+      Candidate C;
+      C.Block = B;
+      C.Cond = Cond;
+      C.IsLoop = getLoop(B);
+      bool When = false;
+      BinaryOperatorKind Op = BO_EQ;
+      if (WantIndex && isBoundTest(E, C.Var, C.Bound, Op)) {
+        C.Member = nullptr;
+        When = isPast(Op);
+      } else if (WantCursor &&
+                 isHeadTest(E, C.Var, C.Member, C.Head, When)) {
+        // The variable that the loop moves along the list.  The same
+        // comparison is written with the owner of a list in the place of
+        // the entry: "next == &dev->children".
+        const Stmt *Loop = getLoop(B);
+        if (!Loop || Search.isAddressTaken(C.Var))
+          continue;
+        const auto *For = dyn_cast<ForStmt>(Loop);
+        const Stmt *Body = For ? For->getBody()
+                           : isa<WhileStmt>(Loop)
+                               ? cast<WhileStmt>(Loop)->getBody()
+                               : cast<DoStmt>(Loop)->getBody();
+        if (!(For && assigns(For->getInc(), C.Var)) && !assigns(Body, C.Var))
+          continue;
+        if (!branchesOn(Body, C.Var) ||
+            testsEmptiness(FD->getBody(), C.Head))
+          continue;
+        C.Bound = nullptr;
+      } else {
+        continue;
+      }
+      C.Past = (When != Negated) ? True : False;
+      if (C.Past)
+        Candidates.push_back(C);
+    }
+  }
+
+  /// The lvalue that \p Node reads or writes.  Taking an address is not
+  /// an access.
+  static const Expr *accessedLvalue(const Stmt *Node) {
+    if (const auto *ICE = dyn_cast<ImplicitCastExpr>(Node))
+      return ICE->getCastKind() == CK_LValueToRValue ? ICE->getSubExpr()
+                                                     : nullptr;
+    if (const auto *BO = dyn_cast<BinaryOperator>(Node))
+      return BO->isAssignmentOp() ? BO->getLHS() : nullptr;
+    if (const auto *UO = dyn_cast<UnaryOperator>(Node))
+      return UO->isIncrementDecrementOp() ? UO->getSubExpr() : nullptr;
+    return nullptr;
+  }
+
+  /// The use of the candidate's variable in \p Node that is wrong while it
+  /// is past the end.
+  const Expr *findMisuse(const Stmt *Node, const CallExpr *&Through) {
+    const Candidate &C = *Active;
+    Through = nullptr;
+    if (!C.Bound)
+      if (const auto *CE = dyn_cast<CallExpr>(Node)) {
+        const FunctionDecl *Callee = CE->getDirectCallee();
+        if (!Callee)
+          return nullptr;
+        for (unsigned I = 0,
+                      E = std::min(CE->getNumArgs(), Callee->getNumParams());
+             I != E; ++I)
+          if (getDirectLinuxVariable(CE->getArg(I)) == C.Var &&
+              (getUnconditionalParameterDeref(Callee, I, Unit) ||
+               derefsParameterByContract(Callee, I, Unit))) {
+            Through = CE;
+            return CE->getArg(I);
+          }
+        return nullptr;
+      }
+    const Expr *LV = accessedLvalue(Node);
+    while (LV) {
+      LV = LV->IgnoreParens();
+      if (const auto *ME = dyn_cast<MemberExpr>(LV)) {
+        if (!ME->isArrow()) {
+          LV = ME->getBase();
+          continue;
+        }
+        // "pos->member.next" reads the head, which is there.
+        if (!C.Bound && getDirectLinuxVariable(ME->getBase()) == C.Var &&
+            ME->getMemberDecl() != C.Member)
+          return ME;
+        return nullptr;
+      }
+      if (const auto *UO = dyn_cast<UnaryOperator>(LV)) {
+        if (!C.Bound && UO->getOpcode() == UO_Deref &&
+            getDirectLinuxVariable(UO->getSubExpr()) == C.Var)
+          return UO;
+        return nullptr;
+      }
+      const auto *ASE = dyn_cast<ArraySubscriptExpr>(LV);
+      if (!ASE)
+        return nullptr;
+      const Expr *Base = ASE->getBase()->IgnoreParenImpCasts();
+      if (C.Bound && getDirectLinuxVariable(ASE->getIdx()) == C.Var &&
+          isLinuxElementCount(S, C.Bound, Base, Count))
+        return ASE;
+      if (!Base->getType()->isArrayType())
+        return nullptr;
+      LV = Base;
+    }
+    return nullptr;
+  }
+
+  /// Whether \p Node gives the variable another value, or tests it: what
+  /// was known about it does not hold behind that.
+  bool settles(const Stmt *Node) const {
+    const Candidate &C = *Active;
+    if (const auto *DS = dyn_cast<DeclStmt>(Node))
+      return llvm::is_contained(DS->decls(), C.Var);
+    if (const auto *UO = dyn_cast<UnaryOperator>(Node))
+      return UO->isIncrementDecrementOp() &&
+             getDirectLinuxVariable(UO->getSubExpr()) == C.Var;
+    if (const auto *BO = dyn_cast<BinaryOperator>(Node)) {
+      if (BO->isAssignmentOp()) {
+        // "ma = grow(ma);" makes "ma->max" the bound of another array.
+        const VarDecl *VD = getDirectLinuxVariable(BO->getLHS());
+        return VD && (VD == C.Var || (C.Bound && mentions(C.Bound, VD)));
+      }
+      if (C.Bound && BO->isComparisonOp())
+        return getDirectLinuxVariable(BO->getLHS()) == C.Var ||
+               getDirectLinuxVariable(BO->getRHS()) == C.Var;
+    }
+    if (!C.Bound)
+      if (const auto *E = dyn_cast<Expr>(Node)) {
+        const VarDecl *Var = nullptr;
+        const FieldDecl *Member = nullptr;
+        const Expr *Head = nullptr;
+        bool When = false;
+        if (isa<CallExpr, BinaryOperator>(E) &&
+            isHeadTest(E, Var, Member, Head, When) && Var == C.Var)
+          return true;
+      }
+    return false;
+  }
+
+  bool statement(const Stmt *Node, LinuxPathSearch::State &St) override {
+    if (FromEntry && Active->Bound)
+      applyChange(Node, St.Client);
+    if (!(St.Client & Armed))
+      return true;
+    const CallExpr *Through = nullptr;
+    if (const Expr *Use = findMisuse(Node, Through)) {
+      Misuse = Use;
+      Call = Through;
+      FoundPath.clear();
+      Search.getPath(FoundPath);
+      Search.stop();
+      return false;
+    }
+    if (!settles(Node))
+      return true;
+    St.Client &= ~Armed;
+    // The search from the test on has nothing to look for behind this.
+    return FromEntry;
+  }
+
+  bool edge(const CFGBlock *From, const CFGBlock *To,
+            LinuxPathSearch::State &St) override {
+    if (!FromEntry)
+      return true;
+    if (!applyTest(From, To, St.Client))
+      return false;
+    if (From == Active->Block)
+      St.Client = To == Active->Past ? (St.Client | Armed)
+                                     : (St.Client & ~Armed);
+    return (St.Client & Armed) || ReachesTest.test(To->getBlockID());
+  }
+
+  void computeReachesTest() {
+    ReachesTest.clear();
+    ReachesTest.resize(Cfg.getNumBlockIDs());
+    llvm::SmallVector<const CFGBlock *, 16> Work;
+    ReachesTest.set(Active->Block->getBlockID());
+    Work.push_back(Active->Block);
+    while (!Work.empty()) {
+      const CFGBlock *B = Work.pop_back_val();
+      for (const CFGBlock::AdjacentBlock &Pred : B->preds()) {
+        const CFGBlock *P = Pred.getReachableBlock();
+        if (P && !ReachesTest.test(P->getBlockID())) {
+          ReachesTest.set(P->getBlockID());
+          Work.push_back(P);
+        }
+      }
+    }
+  }
+
+  /// Whether a block that the path can come to from the test has a use
+  /// that would be wrong.  Most loops have none, and need no search.
+  bool hasMisuseBehind() {
+    llvm::BitVector Seen(Cfg.getNumBlockIDs());
+    llvm::SmallVector<const CFGBlock *, 16> Work;
+    Seen.set(Active->Past->getBlockID());
+    Work.push_back(Active->Past);
+    while (!Work.empty()) {
+      const CFGBlock *B = Work.pop_back_val();
+      for (const CFGElement &Elem : *B)
+        if (std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>()) {
+          const CallExpr *Through = nullptr;
+          if (findMisuse(CS->getStmt(), Through))
+            return true;
+        }
+      for (const CFGBlock::AdjacentBlock &Succ : B->succs()) {
+        const CFGBlock *Next = Succ.getReachableBlock();
+        if (Next && !Seen.test(Next->getBlockID())) {
+          Seen.set(Next->getBlockID());
+          Work.push_back(Next);
+        }
+      }
+    }
+    return false;
+  }
+
+  void report() {
+    const Candidate &C = *Active;
+    std::string Text;
+    llvm::raw_string_ostream OS(Text);
+    if (C.Bound) {
+      const auto *ASE = cast<ArraySubscriptExpr>(Misuse);
+      OS << "'" << C.Var->getName() << "' is the index into '"
+         << getLinuxExprText(ASE->getBase()->IgnoreParenImpCasts(), S)
+         << "' here, but on this path ";
+      if (C.IsLoop)
+        OS << "the loop has run to its end, which leaves '"
+           << C.Var->getName() << "' at " << Count
+           << ", the number of elements";
+      else
+        OS << "a test has found '" << C.Var->getName()
+           << "' not to be below " << Count << ", the number of elements";
+    } else {
+      OS << "'" << C.Var->getName() << "' is ";
+      if (Call && Call->getDirectCallee())
+        OS << "passed to '" << Call->getDirectCallee()->getName()
+           << "', which dereferences it";
+      else
+        OS << "dereferenced here";
+      OS << ", but on this path the loop over the list has run to its end, "
+            "which leaves '"
+         << C.Var->getName()
+         << "' at the head of the list, taken for an entry";
+    }
+    S.Diag(Misuse->getExprLoc(), diag::warn_linux_kernel_experimental)
+        << Text << (C.Bound ? "index-past-end" : "cursor-past-end")
+        << Misuse->getSourceRange();
+    S.Diag(C.Cond->getExprLoc(), diag::note_linux_kernel_experimental)
+        << (C.IsLoop ? "the loop ends here if nothing has left it before"
+                     : "the test is here")
+        << C.Cond->getSourceRange();
+  }
+
+  void notePath() {
+    unsigned From = 0;
+    for (unsigned I = 0, E = FoundPath.size(); I != E; ++I)
+      if (FoundPath[I] == Active->Block)
+        From = I + 1;
+    unsigned Notes = 0;
+    for (unsigned I = From; I + 1 < FoundPath.size() && Notes < 16; ++I) {
+      const CFGBlock *B = FoundPath[I];
+      if (!LinuxPathSearch::isConditionalBranch(B))
+        continue;
+      const Expr *Cond = LinuxPathSearch::getBranchCondition(B);
+      bool Outcome = B->succ_begin()->getReachableBlock() == FoundPath[I + 1];
+      S.Diag(Cond->getExprLoc(), diag::note_linux_kernel_experimental)
+          << (Outcome ? "the path takes the true branch here"
+                      : "the path takes the false branch here")
+          << Cond->getSourceRange();
+      ++Notes;
+    }
+  }
+
+public:
+  LinuxLoopEndChecker(Sema &S, const FunctionDecl *FD, const CFG &Cfg,
+                      LinuxPathSearch &Search,
+                      sema::LinuxKernelUnit::Impl &Unit)
+      : S(S), FD(FD), Cfg(Cfg), Ctx(S.getASTContext()), Search(Search),
+        Unit(Unit) {}
+
+  static bool wanted(const Sema &S, SourceLocation Loc) {
+    return isLinuxExperimentEnabled(S, "index-past-end", Loc) ||
+           isLinuxExperimentEnabled(S, "cursor-past-end", Loc);
+  }
+
+  void run() {
+    SourceLocation Loc = FD->getBeginLoc();
+    collect(isLinuxExperimentEnabled(S, "index-past-end", Loc),
+            isLinuxExperimentEnabled(S, "cursor-past-end", Loc));
+    for (const Candidate &C : Candidates) {
+      Active = &C;
+      if (!hasMisuseBehind())
+        continue;
+      // First from the test on, which is cheap.
+      Misuse = nullptr;
+      FromEntry = false;
+      LinuxPathSearch::State Init;
+      Init.Client = Armed;
+      Search.run(C.Past, 0, Init, *this);
+      if (!Misuse)
+        continue;
+      // Then from the entry of the function, with what the code before
+      // the test establishes.
+      if (!isLinuxExperimentEnabled(S, "unconfirmed-paths", Loc,
+                                    /*IsCheck=*/false)) {
+        Misuse = nullptr;
+        FromEntry = true;
+        computeReachesTest();
+        Search.run(&Cfg.getEntry(), 0, LinuxPathSearch::State(), *this);
+        if (!Misuse)
+          continue;
+      }
+      if (!Reported.insert(Misuse).second)
+        continue;
+      report();
+      if (isLinuxExperimentEnabled(S, "path-notes", Loc, /*IsCheck=*/false))
+        notePath();
+    }
+  }
+};
+
 /// The second half of the unwind check, at the end of the translation unit:
 /// an error path that returns with a resource which its own function never
 /// releases, while another function releases what the same member holds.
@@ -12729,7 +13445,8 @@ void clang::sema::IssueLinuxKernelFlowWarnings(Sema &S, const FunctionDecl *FD,
   bool WantTestedValue = LinuxTestedValueChecker::wanted(S, Loc);
   bool WantUnwind = LinuxUnwindChecker::wanted(S, Loc);
   bool WantOutput = LinuxOutputParamChecker::wanted(S, Loc);
-  if (!WantTestedValue && !WantUnwind && !WantOutput)
+  bool WantLoopEnd = LinuxLoopEndChecker::wanted(S, Loc);
+  if (!WantTestedValue && !WantUnwind && !WantOutput && !WantLoopEnd)
     return;
   LinuxPathSearch Search(S.getASTContext(), FD, *Cfg, *Unit.State);
   if (WantTestedValue)
@@ -12740,4 +13457,6 @@ void clang::sema::IssueLinuxKernelFlowWarnings(Sema &S, const FunctionDecl *FD,
     LinuxOutputParamChecker(S, FD, *Cfg, AC.getParentMap(), Search,
                             *Unit.State)
         .run();
+  if (WantLoopEnd)
+    LinuxLoopEndChecker(S, FD, *Cfg, Search, *Unit.State).run();
 }

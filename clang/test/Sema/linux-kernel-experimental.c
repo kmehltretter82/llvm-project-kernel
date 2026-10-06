@@ -690,13 +690,16 @@ int first_entry_or_null(struct list_head *head) {
 int after_loop(struct list_head *head, int id) {
   struct item *pos;
 
-  list_for_each_entry(pos, head, list) // expected-note {{'pos' gets its value here}}
+  list_for_each_entry(pos, head, list)
+// expected-note@-1 {{'pos' gets its value here}}
+// expected-note@-2 {{the loop ends here if nothing has left it before}}
     if (pos->id == id)
       break;
   if (!pos)
 // expected-warning@-1 {{'pos' is tested for NULL, but list_for_each_entry() never yields NULL: for an empty list, or behind the last entry, it is a pointer computed from the list head (experimental check 'container-of-null')}}
     return -ENOENT;
   return pos->id;
+// expected-warning@-1 {{'pos' is dereferenced here, but on this path the loop over the list has run to its end, which leaves 'pos' at the head of the list, taken for an entry (experimental check 'cursor-past-end')}}
 }
 
 int after_loop_found(struct list_head *head, int id) {

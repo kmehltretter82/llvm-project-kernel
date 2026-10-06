@@ -421,6 +421,30 @@ group of its own once a kernel scan has shown what it finds. The names:
   design), and memory, which goes where the structure goes. A function
   that both acquires and releases the member is not taken as the one that
   tears down.
+- `index-past-end`: `a[i]` on a path where a test has found `i` not to be
+  below the number of elements of `a`, which is its constant size or the
+  member that `__counted_by()` names. The usual case is a loop that looks
+  for an entry and runs to its end: `for (i = 0; i < ARRAY_SIZE(t); i++)
+  if (t[i].id == id) break; use(t[i]);`. The path ends where `i` is
+  assigned or compared again, or where a variable that the bound is read
+  from is assigned. A flag that the loop sets where it leaves is known to
+  be clear on the path, so `if (!found) return;` deals with it. Where the
+  counter is relative to the bound is followed through tests and steps by
+  one: `level++; if (level == MAX) goto done; continue;` comes back to the
+  loop test below the bound, and the path that leaves the loop there does
+  not exist. Taking the address of the element behind the last one is not
+  reported.
+- `cursor-past-end`: the cursor of `list_for_each_entry()` or one of its
+  relatives is dereferenced, or passed to a function that dereferences it,
+  on a path where the loop has run to its end. The cursor is then the list
+  head, taken for an entry. `list_entry_is_head()` and `&pos->member ==
+  head` are the tests for that, `pos->member` itself can be read, and its
+  address can be passed on, as `list_add(&new->list, &pos->list)` does to
+  append. Two kinds of loop are left alone: one over a list that the
+  function also tests with `list_empty()`, because a loop that takes its
+  entries off the list leaves an empty list when it runs to its end, and
+  one that has no branch on the cursor, because a loop that counts to the
+  entry with a given number relies on the list having that many.
 
 Some names change how the path checks work and are not part of `all`.
 `path-notes` adds a note for each branch between the test and the misuse,
