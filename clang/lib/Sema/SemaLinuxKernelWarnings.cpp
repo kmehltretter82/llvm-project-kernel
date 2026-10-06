@@ -10822,7 +10822,9 @@ public:
         return;
     }
 
-    // In[B]: the variables that no path to B has written.
+    // In[B]: the variables that some path to B has not written.  A call in
+    // a loop is reached with its variable written by the turn before, and
+    // unwritten the first time, which is the path that counts.
     std::vector<llvm::SmallBitVector> In(Cfg.getNumBlockIDs());
     llvm::BitVector Reached(Cfg.getNumBlockIDs());
     In[Cfg.getEntry().getBlockID()].resize(Vars.size());
@@ -10846,8 +10848,8 @@ public:
             Reached.set(ID);
             In[ID] = Out;
             Changed = true;
-          } else if ((In[ID] & Out) != In[ID]) {
-            In[ID] &= Out;
+          } else if ((In[ID] | Out) != In[ID]) {
+            In[ID] |= Out;
             Changed = true;
           }
         }

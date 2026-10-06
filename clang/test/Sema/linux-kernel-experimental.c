@@ -57,7 +57,7 @@ static int read_reg(struct dev *d, u32 *val) {
   int ret = xfer(d, d->buf);
 
   if (ret < 0)
-    return ret; // expected-note 3 {{'read_reg' returns here without having written through 'val'}}
+    return ret; // expected-note 5 {{'read_reg' returns here without having written through 'val'}}
   *val = d->buf[0];
   return 0;
 }
@@ -334,6 +334,41 @@ int out_preset(struct dev *d) {
   val = 0;
   read_reg(d, &val);
   return val;
+}
+
+// A call in a loop: the turn before has written the variable, the first
+// turn has not.
+u32 out_in_loop(struct dev *d, int n) {
+  u32 val, sum = 0;
+  int i;
+
+  for (i = 0; i < n; i++) {
+    read_reg(d, &val); // expected-note {{the address of 'val' is passed to 'read_reg' here}}
+    sum += val; // expected-warning {{'val' is read here, but 'read_reg' does not write to it when it fails, and the result of the call is not tested (experimental check 'uninit-output')}}
+  }
+  return sum;
+}
+
+u32 out_in_loop_tested(struct dev *d, int n) {
+  u32 val, sum = 0;
+  int i;
+
+  for (i = 0; i < n; i++) {
+    if (read_reg(d, &val))
+      break;
+    sum += val;
+  }
+  return sum;
+}
+
+// Written on one of two ways to the call.
+int out_one_way(struct dev *d) {
+  u32 val;
+
+  if (d->cached)
+    val = d->cache;
+  read_reg(d, &val); // expected-note {{the address of 'val' is passed to 'read_reg' here}}
+  return val; // expected-warning {{'val' is read here, but 'read_reg' does not write to it when it fails, and the result of the call is not tested (experimental check 'uninit-output')}}
 }
 
 // bool: false is the failure.

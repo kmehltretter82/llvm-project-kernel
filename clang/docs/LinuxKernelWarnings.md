@@ -363,7 +363,10 @@ group of its own once a kernel scan has shown what it finds. The names:
   what the caller needs unless the call passes a constant, an assertion
   (`if (WARN_ON(...)) return;`) does not fire, a path that writes another
   output parameter has told the caller what to look at, and a caller that
-  branches on another output of the same call knows what it is doing.
+  branches on another output of the same call knows what it is doing. The
+  variable has to be unwritten on some path to the call, not on every one:
+  a call in a loop is reached with what the turn before wrote, and the
+  first time with nothing.
 - `null-argument`: a literal `NULL` is passed for a parameter that the
   callee dereferences before its first branch and tests nowhere.
 - `container-of-null`: a NULL test of the result of `container_of()`. The
