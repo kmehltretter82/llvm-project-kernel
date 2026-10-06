@@ -2721,9 +2721,16 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
   bool findOffByOne(const Stmt *St, const BoundTest &T) {
     if (!St)
       return false;
-    if (const auto *BO = dyn_cast<BinaryOperator>(St))
+    if (const auto *BO = dyn_cast<BinaryOperator>(St)) {
       if (BO->isAssignmentOp() && getDirectLinuxVariable(BO->getLHS()) == T.Index)
         return true; // the index changes: stop looking
+      // Another test of the index: "if (i > cnt) return; if (i < cnt)
+      // use(elem[i]);" has the access under the second one.
+      if (BO->isComparisonOp() &&
+          (getDirectLinuxVariable(BO->getLHS()) == T.Index ||
+           getDirectLinuxVariable(BO->getRHS()) == T.Index))
+        return true;
+    }
     if (const auto *UO = dyn_cast<UnaryOperator>(St))
       if (UO->isIncrementDecrementOp() &&
           getDirectLinuxVariable(UO->getSubExpr()) == T.Index)
@@ -7312,6 +7319,32 @@ class LinuxTestedValueChecker : LinuxPathSearch::Client {
 
   llvm::SmallVector<std::pair<unsigned, unsigned>, 8> Reported;
   std::optional<bool> ReturnsValidPointer;
+  /// The ERR_PTR() calls that are an operand of a conditional operator:
+  /// "return dev ?: ERR_PTR(err);" asks for the error only if there is no
+  /// device, and then there is an error.
+  std::optional<llvm::SmallPtrSet<const CallExpr *, 4>> GuardedErrPtrs;
+
+  bool isGuardedErrPtr(const CallExpr *CE) {
+    if (!GuardedErrPtrs) {
+      GuardedErrPtrs.emplace();
+      struct Walk {
+        llvm::SmallPtrSet<const CallExpr *, 4> &Out;
+        void visit(const Stmt *St) {
+          if (!St)
+            return;
+          if (const auto *CO = dyn_cast<AbstractConditionalOperator>(St))
+            for (const Expr *Operand : {CO->getTrueExpr(), CO->getFalseExpr()})
+              if (const auto *Call = dyn_cast_or_null<CallExpr>(
+                      Operand ? Operand->IgnoreParenCasts() : nullptr))
+                Out.insert(Call);
+          for (const Stmt *Child : St->children())
+            visit(Child);
+        }
+      } W{*GuardedErrPtrs};
+      W.visit(FD->getBody());
+    }
+    return GuardedErrPtrs->count(CE);
+  }
 
   bool isPlace(const Expr *E) {
     return E && Search.locate(E->IgnoreParenCasts(), /*Create=*/false) ==
@@ -7516,7 +7549,8 @@ class LinuxTestedValueChecker : LinuxPathSearch::Client {
     case ErrPtrOfZero:
       if (Callee && Callee->getIdentifier() && CE->getNumArgs() == 1 &&
           Callee->getName() == "ERR_PTR" && isPlace(CE->getArg(0)) &&
-          !isWrittenInMacro(CE->getExprLoc(), S.getSourceManager()))
+          !isWrittenInMacro(CE->getExprLoc(), S.getSourceManager()) &&
+          !isGuardedErrPtr(CE))
         return found(CE);
       break;
     case NullTestOfError:

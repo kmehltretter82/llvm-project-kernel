@@ -341,3 +341,29 @@ int checked_member(struct owner *o) {
   t->id = 1;
   return 0;
 }
+
+// Another test of the index comes before the access.
+
+struct elems {
+  unsigned int cnt;
+  int elem[];
+};
+
+int second_test(struct elems *e, unsigned int i) {
+  if (!e->cnt || i > e->cnt)
+    return 0;
+  if (i < e->cnt)
+    return e->elem[i];
+  return -1;
+}
+
+static unsigned char weights[16];
+
+int tighter_test(unsigned int n) {
+  if (n > ARRAY_SIZE(weights))
+    return -1;
+  if (n > 8)
+    return -2;
+  weights[n] = 0;
+  return 0;
+}

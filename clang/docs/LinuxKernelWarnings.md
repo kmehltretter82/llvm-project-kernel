@@ -216,7 +216,8 @@ reports nothing then.
 - `-Wlinux-kernel-error-pointer-zero` diagnoses `ERR_PTR(err)` on a path
   where a test found `err` to be zero, in a function that returns objects
   on other paths and NULL nowhere. Its callers test the result with
-  `IS_ERR()` and take NULL for an object.
+  `IS_ERR()` and take NULL for an object. `return dev ?: ERR_PTR(err);` is
+  left alone: the error is asked for only if there is no object.
 - `-Wlinux-kernel-missing-unwind` diagnoses an error return that keeps a
   resource which the function releases on another path behind the
   acquisition:
@@ -322,7 +323,8 @@ The rest look at single expressions and calls:
 - `-Wlinux-kernel-off-by-one` diagnoses `a[i]` where the bounds test on the
   way lets `i` be the number of elements: `if (i > ARRAY_SIZE(a)) return;`,
   or the same against the member that `__counted_by()` names for a flexible
-  array.
+  array. Another comparison of `i` between that test and the access ends
+  the search: `if (i > cnt) return; if (i < cnt) use(a[i]);` is fine.
 - `-Wlinux-kernel-unchecked-allocation` diagnoses `p->member` where `p` was
   given the result of `kmalloc()` or one of its relatives directly and the
   function tests `p` nowhere. An allocation with `__GFP_NOFAIL` is left

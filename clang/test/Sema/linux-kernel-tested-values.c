@@ -461,3 +461,19 @@ struct thing *mkdir_like(int n) {
 out:
   return ERR_PTR(err);
 }
+
+// "dev ?: ERR_PTR(err)" asks for the error only if there is no device.
+
+struct thing *make_or_error(int n) {
+  struct thing *t = NULL;
+  int err = prepare(n);
+
+  if (err)
+    goto out;
+  t = alloc_thing();
+  if (!t)
+    err = -EINVAL;
+out:
+  finish();
+  return t ?: ERR_PTR(err);
+}
