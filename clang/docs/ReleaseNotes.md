@@ -277,6 +277,21 @@ features cannot lower the translation-unit ABI level;
   example a variable both initialized and used under the same unchanged flag.
   Those uses are available under `-Wconditional-uninitialized-correlated`.
 
+- Added `-Wuninitialized-cleanup` and `-Wconditional-uninitialized-cleanup`.
+  They diagnose a variable with the `cleanup` attribute whose cleanup function
+  runs at a scope exit while the variable is uninitialized, on every path to
+  that exit or on some of them.
+
+- The `-Wlinux-kernel` checks now infer the pointer return convention of a
+  function from its body instead of relying on the built-in table alone, and
+  `-flinux-kernel-emit-facts=` together with `-flinux-kernel-contracts=`
+  carries the result across translation units. New groups in the umbrella:
+  `-Wlinux-kernel-cleanup-return` and `-Wlinux-kernel-counted-by-order`.
+  New groups outside it: `-Wlinux-kernel-missing-error-code`,
+  `-Wlinux-kernel-cleanup-escape`, `-Wlinux-kernel-ptr-err-zero`,
+  `-Wlinux-kernel-error-pointer-deref` and
+  `-Wlinux-kernel-deref-before-check`.
+
 - New option `-fdefined-pointer-subtraction` added to preserve stable semantics
   when subtracting pointers to unrelated objects.
 
