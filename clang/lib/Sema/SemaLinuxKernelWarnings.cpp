@@ -16,6 +16,7 @@
 #include "clang/AST/Decl.h"
 #include "clang/AST/DynamicRecursiveASTVisitor.h"
 #include "clang/AST/Expr.h"
+#include "clang/AST/ParentMap.h"
 #include "clang/AST/RecordLayout.h"
 #include "clang/AST/Stmt.h"
 #include "clang/Analysis/Analyses/Dominators.h"
@@ -108,6 +109,34 @@ struct sema::LinuxKernelUnit::Impl {
   /// Whether a function with a body may keep the pointer that a parameter
   /// is given.
   llvm::DenseMap<const ParmVarDecl *, bool> Captures;
+  /// How a function with a body can return without having written through
+  /// a pointer parameter.
+  struct OutputSummary {
+    /// Stands for a function that returns no value.
+    enum : uint8_t { NoValue = 8 };
+    /// The classes of return values (see LinuxPathValue) of the paths that
+    /// do not write.  Zero if every path writes, or if that is not known.
+    uint8_t Mask = 0;
+    /// Where one such path returns: one that reports a failure, and one
+    /// that does not.
+    SourceLocation Failure, Success;
+  };
+  llvm::DenseMap<const ParmVarDecl *, OutputSummary> OutputSummaries;
+  /// An error path that returns with a resource which its function
+  /// releases nowhere.  Whether another function of the translation unit
+  /// does is known at its end.
+  struct PendingUnwind {
+    const FunctionDecl *Function = nullptr;
+    /// The member that holds the handle: "priv->clk".
+    const FieldDecl *Field = nullptr;
+    SourceLocation Return, Acquire;
+    SourceRange ReturnRange, AcquireRange;
+    std::string Handle, Acquirer;
+    int ReleaseArg = 0;
+    llvm::SmallVector<StringRef, 4> Releases;
+    StringRef ReleasePrefix;
+  };
+  std::vector<PendingUnwind> PendingUnwinds;
 
   Impl() { OpaqueSources.Opaque = true; }
 };
@@ -468,6 +497,25 @@ static bool isLinuxBranchWrittenInMacro(const CFGBlock *B,
   else if (const auto *DS = dyn_cast<DoStmt>(Term))
     Loc = DS->getWhileLoc();
   return isWrittenInMacro(Loc, SM);
+}
+
+/// Whether the name of \p VD says that it carries an error code, as "ret",
+/// "err", "rc" or "status" do.  Counts and sizes are returned after a
+/// message as well, and zero is a valid answer for them.
+static bool isLinuxErrorCodeName(const VarDecl *VD) {
+  if (!VD->getIdentifier())
+    return false;
+  std::string Lower = VD->getName().rtrim("0123456789").lower();
+  llvm::SmallVector<StringRef, 4> Words;
+  StringRef(Lower).split(Words, '_', -1, /*KeepEmpty=*/false);
+  for (StringRef Word : Words)
+    if (llvm::StringSwitch<bool>(Word)
+            .Cases({"ret", "retval", "rval", "rv", "rc", "r"}, true)
+            .Cases({"err", "error", "errno", "errcode", "ec", "e"}, true)
+            .Cases({"res", "result", "status"}, true)
+            .Default(false))
+      return true;
+  return false;
 }
 
 /// Strip the wrappers that do not change which values make a condition true,
@@ -1050,6 +1098,8 @@ class LinuxKernelInference {
 public:
   LinuxKernelInference(Sema &S, sema::LinuxKernelUnit &Unit)
       : S(S), Ctx(S.getASTContext()), U(*Unit.State) {}
+  LinuxKernelInference(Sema &S, sema::LinuxKernelUnit::Impl &U)
+      : S(S), Ctx(S.getASTContext()), U(U) {}
 
   LinuxKernelReturnConvention convention(const FunctionDecl *FD) {
     if (!FD->getReturnType()->isPointerType())
@@ -3520,21 +3570,8 @@ class ErrorPathSuccessChecker {
   llvm::SmallVector<const VarDecl *, 4> Candidates;
   llvm::DenseMap<const CFGBlock *, bool> InCycle;
 
-  /// Whether the name of \p VD says that it carries an error code, as "ret",
-  /// "err", "rc" or "status" do.  Counts and sizes are returned after a
-  /// message as well, and zero is a valid answer for them.
   static bool isNamedLikeErrorCode(const VarDecl *VD) {
-    std::string Lower = VD->getName().rtrim("0123456789").lower();
-    llvm::SmallVector<StringRef, 4> Words;
-    StringRef(Lower).split(Words, '_', -1, /*KeepEmpty=*/false);
-    for (StringRef Word : Words)
-      if (llvm::StringSwitch<bool>(Word)
-              .Cases({"ret", "retval", "rval", "rv", "rc", "r"}, true)
-              .Cases({"err", "error", "errno", "errcode", "ec", "e"}, true)
-              .Cases({"res", "result", "status"}, true)
-              .Default(false))
-        return true;
-    return false;
+    return isLinuxErrorCodeName(VD);
   }
 
   static bool containsAllocation(const Stmt *St) {
@@ -4493,6 +4530,45 @@ public:
   }
 };
 
+/// The pointer that the branch at the end of \p B tests for NULL, with the
+/// condition.
+static const VarDecl *getLinuxNullTest(const Sema &S, const CFGBlock *B,
+                                       const Expr *&Cond) {
+  ASTContext &Ctx = S.getASTContext();
+  const Stmt *Term = B->getTerminatorStmt();
+  if (!Term || B->succ_size() != 2 || isa<SwitchStmt, GCCAsmStmt>(Term))
+    return nullptr;
+  // A test that a macro makes is not the author's statement about this
+  // pointer: dev_err(), kfree() and many others test whatever they get.
+  SourceLocation Loc = Term->getBeginLoc();
+  if (const auto *BO = dyn_cast<BinaryOperator>(Term))
+    Loc = BO->getOperatorLoc();
+  else if (const auto *CO = dyn_cast<ConditionalOperator>(Term))
+    Loc = CO->getQuestionLoc();
+  if (isWrittenInMacro(Loc, S.getSourceManager()))
+    return nullptr;
+
+  Cond = B->getLastCondition();
+  if (!Cond)
+    Cond = dyn_cast_or_null<Expr>(B->getTerminatorCondition());
+  bool Negated = false;
+  const Expr *E = stripLinuxCondition(Cond, Negated);
+  if (!E || isLinuxAssertionMacroExpansion(Cond, S))
+    return nullptr;
+  if (const VarDecl *VD = getDirectLinuxVariable(E))
+    return VD;
+  const auto *BO = dyn_cast<BinaryOperator>(E->IgnoreParenImpCasts());
+  if (!BO || !BO->isEqualityOp())
+    return nullptr;
+  if (BO->getRHS()->isNullPointerConstant(Ctx,
+                                          Expr::NPC_ValueDependentIsNotNull))
+    return getDirectLinuxVariable(BO->getLHS());
+  if (BO->getLHS()->isNullPointerConstant(Ctx,
+                                          Expr::NPC_ValueDependentIsNotNull))
+    return getDirectLinuxVariable(BO->getRHS());
+  return nullptr;
+}
+
 /// A pointer that is tested for NULL after every path has dereferenced it:
 ///
 ///   len = req->len;
@@ -4629,38 +4705,7 @@ class DerefBeforeCheckChecker {
 
   /// The pointer that the branch at the end of \p B tests for NULL.
   const VarDecl *getNullTest(const CFGBlock *B, const Expr *&Cond) const {
-    const Stmt *Term = B->getTerminatorStmt();
-    if (!Term || B->succ_size() != 2 || isa<SwitchStmt, GCCAsmStmt>(Term))
-      return nullptr;
-    // A test that a macro makes is not the author's statement about this
-    // pointer: dev_err(), kfree() and many others test whatever they get.
-    SourceLocation Loc = Term->getBeginLoc();
-    if (const auto *BO = dyn_cast<BinaryOperator>(Term))
-      Loc = BO->getOperatorLoc();
-    else if (const auto *CO = dyn_cast<ConditionalOperator>(Term))
-      Loc = CO->getQuestionLoc();
-    if (isWrittenInMacro(Loc, S.getSourceManager()))
-      return nullptr;
-
-    Cond = B->getLastCondition();
-    if (!Cond)
-      Cond = dyn_cast_or_null<Expr>(B->getTerminatorCondition());
-    bool Negated = false;
-    const Expr *E = stripLinuxCondition(Cond, Negated);
-    if (!E || isLinuxAssertionMacroExpansion(Cond, S))
-      return nullptr;
-    if (const VarDecl *VD = getDirectLinuxVariable(E))
-      return VD;
-    const auto *BO = dyn_cast<BinaryOperator>(E->IgnoreParenImpCasts());
-    if (!BO || !BO->isEqualityOp())
-      return nullptr;
-    if (BO->getRHS()->isNullPointerConstant(Ctx,
-                                            Expr::NPC_ValueDependentIsNotNull))
-      return getDirectLinuxVariable(BO->getLHS());
-    if (BO->getLHS()->isNullPointerConstant(Ctx,
-                                            Expr::NPC_ValueDependentIsNotNull))
-      return getDirectLinuxVariable(BO->getRHS());
-    return nullptr;
+    return getLinuxNullTest(S, B, Cond);
   }
 
 public:
@@ -4961,6 +5006,12 @@ public:
     virtual bool edge(const CFGBlock *From, const CFGBlock *To, State &St) {
       return true;
     }
+    /// The value of the call \p CE on this path, if the check knows what
+    /// the search does not.
+    virtual std::optional<LinuxPathValue> callValue(const CallExpr *CE,
+                                                    const State &St) {
+      return std::nullopt;
+    }
   };
 
 private:
@@ -5000,6 +5051,8 @@ private:
   unsigned Steps = 0;
   bool Stopped = false;
   bool GaveUp = false;
+  /// The check that the search is running for.
+  Client *Running = nullptr;
   /// The blocks that the search has entered, each with the one it came
   /// from, and the one it is in.
   std::vector<std::pair<const CFGBlock *, int>> Trail;
@@ -5395,12 +5448,33 @@ private:
         assign(UO->getSubExpr(), nullptr, St);
     } else if (const auto *CE = dyn_cast<CallExpr>(Node)) {
       call(CE, St);
-    } else if (isa<GCCAsmStmt>(Node)) {
-      // Inline assembly can change whatever its operands reach.
-      St.Vals.clear();
-      St.Preds.clear();
-      St.Same.clear();
+    } else if (const auto *AS = dyn_cast<GCCAsmStmt>(Node)) {
+      // Inline assembly can change its operands and whatever memory they
+      // reach.  A local variable that it does not name stays as it is: the
+      // trap of WARN_ON() does not change the condition that was tested.
+      llvm::SmallVector<const VarDecl *, 4> Named;
+      for (const Stmt *Child : AS->children())
+        collectVariables(Child, Named);
+      for (const VarDecl *VD : Named) {
+        invalidate(VD, {}, St);
+        if (int Loc = find(VD, {}); Loc >= 0)
+          set(St, Loc, Value());
+      }
+      forgetMemoryConditions(St);
+      forgetChains(St, [&](unsigned O) { return !Locations[O].Path.empty(); });
     }
+  }
+
+  static void collectVariables(const Stmt *St,
+                               llvm::SmallVectorImpl<const VarDecl *> &Out) {
+    if (!St)
+      return;
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(St))
+      if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))
+        if (!llvm::is_contained(Out, VD))
+          Out.push_back(VD);
+    for (const Stmt *Child : St->children())
+      collectVariables(Child, Out);
   }
 
   /// Whether the switch \p SS, on a value known to be \p K, goes to \p Next.
@@ -5754,6 +5828,9 @@ public:
            ID == Builtin::BI__builtin_expect_with_probability) &&
           CE->getNumArgs() >= 1)
         return value(CE->getArg(0), St);
+      if (Running)
+        if (std::optional<Value> Known = Running->callValue(CE, St))
+          return *Known;
       const FunctionDecl *FD = CE->getDirectCallee();
       if (!FD || !FD->getIdentifier() || CE->getNumArgs() != 1)
         return Value();
@@ -5939,7 +6016,7 @@ public:
     if (std::optional<bool> Known = value(E, St).truth())
       return *Known == Outcome;
 
-    if (int Loc = locate(E, /*Create=*/false); Loc >= 0)
+    if (int Loc = locate(stripWidening(E), /*Create=*/false); Loc >= 0)
       return narrow(Loc, Outcome ? uint8_t(Value::Neg | Value::Pos) : Value::Zero,
                     St);
 
@@ -5957,10 +6034,10 @@ public:
         const Expr *Side = BO->getLHS();
         const Expr *Other = BO->getRHS();
         BinaryOperatorKind Op = BO->getOpcode();
-        int Loc = locate(Side, /*Create=*/false);
+        int Loc = locate(stripWidening(Side), /*Create=*/false);
         if (Loc < 0) {
           std::swap(Side, Other);
-          Loc = locate(Side, /*Create=*/false);
+          Loc = locate(stripWidening(Side), /*Create=*/false);
           switch (Op) {
           case BO_LT: Op = BO_GT; break;
           case BO_GT: Op = BO_LT; break;
@@ -6033,6 +6110,29 @@ public:
     return true;
   }
 
+  /// Strip the implicit conversions to a wider integer type that a test of
+  /// a "u16" or a "bool" goes through.  They change neither the sign of the
+  /// value nor whether it is zero.
+  const Expr *stripWidening(const Expr *E) const {
+    for (;;) {
+      E = E->IgnoreParens();
+      const auto *ICE = dyn_cast<ImplicitCastExpr>(E);
+      if (!ICE || ICE->getCastKind() != CK_IntegralCast)
+        return E;
+      const Expr *Sub = ICE->getSubExpr();
+      if (!Sub->getType()->isIntegralOrEnumerationType() ||
+          !ICE->getType()->isIntegralOrEnumerationType() ||
+          Ctx.getIntWidth(ICE->getType()) < Ctx.getIntWidth(Sub->getType()))
+        return E;
+      // "u32" to "int" keeps the width and loses the sign.
+      if (Ctx.getIntWidth(ICE->getType()) == Ctx.getIntWidth(Sub->getType()) &&
+          ICE->getType()->isUnsignedIntegerOrEnumerationType() !=
+              Sub->getType()->isUnsignedIntegerOrEnumerationType())
+        return E;
+      E = Sub;
+    }
+  }
+
   /// End the search: the check has what it was looking for.
   void stop() { Stopped = true; }
 
@@ -6059,6 +6159,7 @@ public:
     Trail.push_back({Start, -1});
     Work.push_back({Start, Init, 0});
     bool AtStart = true;
+    Running = &C;
 
     while (!Work.empty() && !Stopped) {
       Item Popped = Work.pop_back_val();
@@ -6140,6 +6241,7 @@ public:
           push(Next, Refined, Seen, Work);
       }
     }
+    Running = nullptr;
     FunctionSteps += Steps;
     return Steps <= MaxSteps && !GaveUp;
   }
@@ -6270,6 +6372,561 @@ static const Expr *getUnconditionalParameterDeref(
   return Result;
 }
 
+/// Whether \p E is the pointer in \p P or points into the object that it
+/// points to: "p", "p + n", "&p->member" and "p->array".  A pointer that is
+/// read from the object, as in "p->next", is something else.
+static bool isLinuxPointerInto(const Expr *E, const VarDecl *P);
+
+/// Whether the lvalue \p LV is reached through the pointer in \p P:
+/// "*p", "p->member", "p[i]" and their members.
+static bool isLinuxLvalueThrough(const Expr *LV, const VarDecl *P) {
+  while (LV) {
+    LV = LV->IgnoreParens();
+    if (const auto *ME = dyn_cast<MemberExpr>(LV)) {
+      if (ME->isArrow())
+        return isLinuxPointerInto(ME->getBase(), P);
+      LV = ME->getBase();
+    } else if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(LV)) {
+      const Expr *Base = ASE->getBase()->IgnoreParens();
+      const auto *ICE = dyn_cast<ImplicitCastExpr>(Base);
+      if (!ICE || ICE->getCastKind() != CK_ArrayToPointerDecay)
+        return isLinuxPointerInto(Base, P);
+      LV = ICE->getSubExpr();
+    } else if (const auto *UO = dyn_cast<UnaryOperator>(LV)) {
+      return UO->getOpcode() == UO_Deref &&
+             isLinuxPointerInto(UO->getSubExpr(), P);
+    } else if (const auto *CE = dyn_cast<CastExpr>(LV)) {
+      LV = CE->getSubExpr();
+    } else {
+      return false;
+    }
+  }
+  return false;
+}
+
+static bool isLinuxPointerInto(const Expr *E, const VarDecl *P) {
+  E = E ? E->IgnoreParenCasts() : nullptr;
+  if (!E)
+    return false;
+  if (const auto *DRE = dyn_cast<DeclRefExpr>(E))
+    return DRE->getDecl() == P;
+  if (const auto *BO = dyn_cast<BinaryOperator>(E))
+    return BO->isAdditiveOp() && (isLinuxPointerInto(BO->getLHS(), P) ||
+                                  isLinuxPointerInto(BO->getRHS(), P));
+  if (const auto *UO = dyn_cast<UnaryOperator>(E))
+    return UO->getOpcode() == UO_AddrOf &&
+           isLinuxLvalueThrough(UO->getSubExpr(), P);
+  return E->getType()->isArrayType() && isLinuxLvalueThrough(E, P);
+}
+
+/// A function that only prints or traces what it is given.
+static bool isLinuxPrintCallee(const FunctionDecl *FD) {
+  if (!FD->getIdentifier())
+    return false;
+  StringRef Name = FD->getName();
+  if (Name == "_printk" || Name == "printk" || Name == "dump_stack" ||
+      Name == "dev_printk_emit" || Name == "dev_err_probe" ||
+      Name == "dev_warn_probe" || Name.starts_with("_dev_") ||
+      Name.starts_with("netdev_") || Name.starts_with("__dynamic_") ||
+      Name.starts_with("__warn") || Name.starts_with("trace_") ||
+      Name.starts_with("__trace") || Name.ends_with("_printk"))
+    return true;
+  // The logging function of a driver: "ath11k_info(ab, "...", ...)".
+  if (!FD->hasAttr<FormatAttr>() || !FD->getReturnType()->isVoidType())
+    return false;
+  for (StringRef Word : {"err", "warn", "info", "dbg", "debug", "log", "print",
+                         "notice", "crit", "msg"})
+    if (Name.contains(Word))
+      return true;
+  return false;
+}
+
+static const sema::LinuxKernelUnit::Impl::OutputSummary &
+getLinuxOutputSummary(const FunctionDecl *Def, unsigned Index,
+                      sema::LinuxKernelUnit::Impl &Unit, unsigned Depth = 0);
+
+/// Works out how a function can return without having written through one of
+/// its pointer parameters:
+///
+///   static int read_reg(struct dev *d, u32 *val)
+///   {
+///           int ret = xfer(d, d->buf);
+///
+///           if (ret < 0)
+///                   return ret;             /* *val is not written */
+///           *val = get_unaligned_le32(d->buf);
+///           return 0;
+///   }
+///
+/// The paths of the function are walked from its entry (see LinuxPathSearch).
+/// A path ends where it writes through the parameter, and where it hands the
+/// pointer to a function that may write or stores it: from there on nothing
+/// is known.  A path that reaches a return adds the class of its return value
+/// to the summary: here "negative".  The caller's variable is then known to
+/// be unwritten exactly when the call returns such a value.
+///
+/// Some things are taken on trust.  A loop whose body writes is assumed to
+/// run at least once when the function succeeds, since the caller usually
+/// passes a count that is not zero.  For the same reason a path that
+/// succeeds without writing because of what a scalar parameter is, as in
+/// "if (len) memcpy(out, buf, len);", does not count, unless the argument of
+/// the call at hand is a constant: the walk then starts with that value.  A
+/// path that writes through another pointer parameter does not count either:
+/// "*count = 0; return 0;" tells the caller not to look at the rest.  And a
+/// return value about which the path knows nothing makes the whole summary
+/// unknown, because the caller's test of it could then not tell the paths
+/// apart.
+class LinuxOutputSummarizer : LinuxPathSearch::Client {
+  using Value = LinuxPathValue;
+  using Summary = sema::LinuxKernelUnit::Impl::OutputSummary;
+
+  const FunctionDecl *Def;
+  const ParmVarDecl *Param;
+  sema::LinuxKernelUnit::Impl &Unit;
+  unsigned Depth;
+  /// The call that the summary is for, if it is for one call only.
+  const CallExpr *Site;
+  const CFG *Cfg = nullptr;
+  LinuxPathSearch *Search = nullptr;
+  Summary Result;
+  bool Unknown = false;
+  /// The scalar parameters whose value at the call is known.
+  llvm::SmallPtrSet<const VarDecl *, 4> Seeded;
+  /// The loops whose body writes, and the operators in their conditions
+  /// that the CFG branches on.
+  llvm::SmallPtrSet<const Stmt *, 4> WritingLoops;
+  /// ThroughLoop: the path has come by a loop that writes.  OnParam: it has
+  /// branched on a scalar parameter of unknown value.  WroteOther: it has
+  /// written through another pointer parameter.
+  enum : uint32_t { ThroughLoop = 1, OnParam = 2, WroteOther = 4 };
+
+  /// Whether \p St reads a scalar parameter whose value at the call is not
+  /// known.
+  bool readsOpenParameter(const Stmt *St) const {
+    if (!St)
+      return false;
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(St))
+      if (const auto *P = dyn_cast<ParmVarDecl>(DRE->getDecl()))
+        if (P->getType()->isIntegralOrEnumerationType() && !Seeded.count(P))
+          return true;
+    for (const Stmt *Child : St->children())
+      if (readsOpenParameter(Child))
+        return true;
+    return false;
+  }
+
+  bool writesOtherParameter(const Stmt *Node) const {
+    const Expr *LHS = nullptr;
+    if (const auto *BO = dyn_cast<BinaryOperator>(Node)) {
+      if (BO->isAssignmentOp())
+        LHS = BO->getLHS();
+    } else if (const auto *UO = dyn_cast<UnaryOperator>(Node)) {
+      if (UO->isIncrementDecrementOp())
+        LHS = UO->getSubExpr();
+    }
+    if (!LHS)
+      return false;
+    for (const ParmVarDecl *P : Def->parameters())
+      if (P != Param && P->getType()->isPointerType() &&
+          isLinuxLvalueThrough(LHS, P))
+        return true;
+    return false;
+  }
+
+  /// The summary of the callee of \p CE for the argument that is the
+  /// parameter itself, if the callee can leave it unwritten.
+  const Summary *forwarded(const CallExpr *CE) const {
+    const FunctionDecl *Callee = CE->getDirectCallee();
+    const FunctionDecl *CalleeDef = nullptr;
+    if (!Callee || Depth >= 2 || !Callee->hasBody(CalleeDef))
+      return nullptr;
+    for (unsigned I = 0, E = CE->getNumArgs(); I != E; ++I) {
+      const auto *DRE =
+          dyn_cast<DeclRefExpr>(CE->getArg(I)->IgnoreParenCasts());
+      if (!DRE || DRE->getDecl() != Param)
+        continue;
+      if (I >= CalleeDef->getNumParams())
+        return nullptr;
+      const Summary &Inner =
+          getLinuxOutputSummary(CalleeDef, I, Unit, Depth + 1);
+      return Inner.Mask ? &Inner : nullptr;
+    }
+    return nullptr;
+  }
+
+  /// Whether the call may write through the parameter or keep the pointer.
+  /// A call that hands the parameter to a function that can leave it
+  /// unwritten is a write only for the question whether the function writes
+  /// at all: the walk goes on behind it, in the case that it did not write.
+  bool callWrites(const CallExpr *CE, bool Walk) const {
+    unsigned ID = CE->getBuiltinCallee();
+    if (ID == Builtin::BI__builtin_expect ||
+        ID == Builtin::BI__builtin_expect_with_probability ||
+        ID == Builtin::BI__builtin_constant_p)
+      return false;
+    const FunctionDecl *Callee = CE->getDirectCallee();
+    if (Callee && (isLinuxReadOnlyCallee(Callee) ||
+                   Callee->hasAttr<ConstAttr>() || Callee->hasAttr<PureAttr>()))
+      return false;
+    bool Forwarded = Walk && forwarded(CE) != nullptr;
+    for (const Expr *Arg : CE->arguments()) {
+      if (!isLinuxPointerInto(Arg, Param))
+        continue;
+      QualType T = Arg->getType();
+      if (T->isPointerType() && T->getPointeeType().isConstQualified())
+        continue;
+      const auto *DRE = dyn_cast<DeclRefExpr>(Arg->IgnoreParenCasts());
+      if (Forwarded && DRE && DRE->getDecl() == Param)
+        continue;
+      return true;
+    }
+    return false;
+  }
+
+  /// Whether \p Node writes through the parameter, or does something with
+  /// the pointer after which a write can no longer be seen.
+  bool writes(const Stmt *Node, bool Walk) const {
+    if (const auto *BO = dyn_cast<BinaryOperator>(Node)) {
+      if (!BO->isAssignmentOp())
+        return false;
+      const Expr *LHS = BO->getLHS();
+      return isLinuxLvalueThrough(LHS, Param) ||
+             getDirectLinuxVariable(LHS) == Param ||
+             isLinuxPointerInto(BO->getRHS(), Param);
+    }
+    if (const auto *UO = dyn_cast<UnaryOperator>(Node)) {
+      const Expr *Sub = UO->getSubExpr();
+      if (UO->isIncrementDecrementOp())
+        return isLinuxLvalueThrough(Sub, Param) ||
+               getDirectLinuxVariable(Sub) == Param;
+      return UO->getOpcode() == UO_AddrOf &&
+             getDirectLinuxVariable(Sub) == Param;
+    }
+    if (const auto *DS = dyn_cast<DeclStmt>(Node)) {
+      for (const Decl *D : DS->decls())
+        if (const auto *VD = dyn_cast<VarDecl>(D))
+          if (VD->getInit() && isLinuxPointerInto(VD->getInit(), Param))
+            return true;
+      return false;
+    }
+    if (const auto *RS = dyn_cast<ReturnStmt>(Node))
+      return RS->getRetValue() &&
+             isLinuxPointerInto(RS->getRetValue(), Param);
+    if (const auto *CE = dyn_cast<CallExpr>(Node))
+      return callWrites(CE, Walk);
+    if (const auto *AS = dyn_cast<GCCAsmStmt>(Node)) {
+      for (const Stmt *Child : AS->children())
+        if (const auto *E = dyn_cast_or_null<Expr>(Child))
+          if (isLinuxPointerInto(E, Param) || isLinuxLvalueThrough(E, Param))
+            return true;
+      return false;
+    }
+    return false;
+  }
+
+  bool containsWrite(const Stmt *St) const {
+    if (!St || isa<UnaryExprOrTypeTraitExpr>(St))
+      return false;
+    if (writes(St, /*Walk=*/false))
+      return true;
+    for (const Stmt *Child : St->children())
+      if (containsWrite(Child))
+        return true;
+    return false;
+  }
+
+  /// Whether every use of the parameter in \p St is one that writes() and
+  /// the walk understand: an access through it, a test, an argument, the
+  /// right side of an assignment.
+  bool onlyKnownUses(const Stmt *St) const {
+    if (!St || isa<UnaryExprOrTypeTraitExpr>(St))
+      return true;
+    auto IsParam = [&](const Expr *E) {
+      const auto *DRE =
+          dyn_cast_or_null<DeclRefExpr>(E ? E->IgnoreParenCasts() : nullptr);
+      return DRE && DRE->getDecl() == Param;
+    };
+    // The children that the statement uses in a known way.
+    llvm::SmallVector<const Stmt *, 4> Known;
+    if (const auto *ME = dyn_cast<MemberExpr>(St)) {
+      if (ME->isArrow() && isLinuxPointerInto(ME->getBase(), Param))
+        Known.push_back(ME->getBase());
+    } else if (const auto *UO = dyn_cast<UnaryOperator>(St)) {
+      UnaryOperatorKind Op = UO->getOpcode();
+      if ((Op == UO_Deref && isLinuxPointerInto(UO->getSubExpr(), Param)) ||
+          ((Op == UO_LNot || Op == UO_AddrOf ||
+            UO->isIncrementDecrementOp()) &&
+           IsParam(UO->getSubExpr())))
+        Known.push_back(UO->getSubExpr());
+    } else if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(St)) {
+      if (isLinuxPointerInto(ASE->getBase(), Param))
+        Known.push_back(ASE->getBase());
+    } else if (const auto *BO = dyn_cast<BinaryOperator>(St)) {
+      if (BO->isComparisonOp() || BO->isLogicalOp()) {
+        if (IsParam(BO->getLHS()))
+          Known.push_back(BO->getLHS());
+        if (IsParam(BO->getRHS()))
+          Known.push_back(BO->getRHS());
+      } else if (BO->isAssignmentOp()) {
+        if (IsParam(BO->getLHS()))
+          Known.push_back(BO->getLHS());
+        if (isLinuxPointerInto(BO->getRHS(), Param))
+          Known.push_back(BO->getRHS());
+      }
+    } else if (const auto *CE = dyn_cast<CallExpr>(St)) {
+      for (const Expr *Arg : CE->arguments())
+        if (isLinuxPointerInto(Arg, Param))
+          Known.push_back(Arg);
+    } else if (const auto *DS = dyn_cast<DeclStmt>(St)) {
+      for (const Decl *D : DS->decls())
+        if (const auto *VD = dyn_cast<VarDecl>(D))
+          if (VD->getInit() && isLinuxPointerInto(VD->getInit(), Param))
+            Known.push_back(VD->getInit());
+    } else if (const auto *RS = dyn_cast<ReturnStmt>(St)) {
+      if (RS->getRetValue() && isLinuxPointerInto(RS->getRetValue(), Param))
+        Known.push_back(RS->getRetValue());
+    } else if (const auto *IS = dyn_cast<IfStmt>(St)) {
+      if (IsParam(IS->getCond()))
+        Known.push_back(IS->getCond());
+    } else if (const auto *WS = dyn_cast<WhileStmt>(St)) {
+      if (IsParam(WS->getCond()))
+        Known.push_back(WS->getCond());
+    } else if (const auto *CO = dyn_cast<AbstractConditionalOperator>(St)) {
+      if (IsParam(CO->getCond()))
+        Known.push_back(CO->getCond());
+    } else if (const auto *DRE = dyn_cast<DeclRefExpr>(St)) {
+      if (DRE->getDecl() == Param)
+        return false;
+    }
+    for (const Stmt *Child : St->children())
+      if (!llvm::is_contained(Known, Child) && !onlyKnownUses(Child))
+        return false;
+    return true;
+  }
+
+  void collectLoops(const Stmt *St) {
+    if (!St)
+      return;
+    const Stmt *Body = nullptr;
+    if (const auto *FS = dyn_cast<ForStmt>(St))
+      Body = FS->getBody();
+    else if (const auto *WS = dyn_cast<WhileStmt>(St))
+      Body = WS->getBody();
+    if (Body && containsWrite(Body)) {
+      WritingLoops.insert(St);
+      const Expr *Cond = isa<ForStmt>(St) ? cast<ForStmt>(St)->getCond()
+                                          : cast<WhileStmt>(St)->getCond();
+      collectBranches(Cond);
+    }
+    for (const Stmt *Child : St->children())
+      collectLoops(Child);
+  }
+
+  void collectBranches(const Stmt *St) {
+    if (!St)
+      return;
+    if (const auto *BO = dyn_cast<BinaryOperator>(St)) {
+      if (BO->isLogicalOp())
+        WritingLoops.insert(St);
+    } else if (isa<AbstractConditionalOperator>(St)) {
+      WritingLoops.insert(St);
+    }
+    for (const Stmt *Child : St->children())
+      collectBranches(Child);
+  }
+
+  bool statement(const Stmt *Node, LinuxPathSearch::State &St) override {
+    if (writesOtherParameter(Node))
+      St.Client |= WroteOther;
+    return !writes(Node, /*Walk=*/true);
+  }
+
+  std::optional<Value> callValue(const CallExpr *CE,
+                                 const LinuxPathSearch::State &St) override {
+    const Summary *Inner = forwarded(CE);
+    if (!Inner || !(Inner->Mask & Value::Any))
+      return std::nullopt;
+    return Value::ofMask(Inner->Mask & Value::Any);
+  }
+
+  /// A path without a write leaves the function from \p From.
+  void record(const CFGBlock *From, const LinuxPathSearch::State &St) {
+    const ReturnStmt *RS = nullptr;
+    for (auto It = From->rbegin(), End = From->rend(); It != End; ++It)
+      if (std::optional<CFGStmt> CS = It->getAs<CFGStmt>()) {
+        RS = dyn_cast<ReturnStmt>(CS->getStmt());
+        break;
+      }
+    QualType RT = Def->getReturnType();
+    uint8_t Class = Summary::NoValue;
+    uint8_t Success = Summary::NoValue;
+    if (!RT->isVoidType()) {
+      const Expr *E = RS ? RS->getRetValue() : nullptr;
+      if (!E) {
+        Unknown = true;
+        Search->stop();
+        return;
+      }
+      Value V = Search->value(E, St);
+      // "return PTR_ERR(p);" and "return dev_err_probe(...);" say it.
+      if (const auto *CE = dyn_cast<CallExpr>(E->IgnoreParenCasts())) {
+        const FunctionDecl *F = CE->getDirectCallee();
+        if (F && F->getIdentifier() &&
+            llvm::StringSwitch<bool>(F->getName())
+                .Cases({"PTR_ERR", "ERR_PTR", "ERR_CAST", "dev_err_probe"},
+                       true)
+                .Default(false))
+          V = Value::ofMask(Value::Neg);
+      }
+      // A value that may or may not be zero does not tell the caller which
+      // path it was.
+      if (V.isAny() ||
+          (!V.HasConst && (V.Mask & Value::Zero) && (V.Mask & Value::Pos))) {
+        Unknown = true;
+        Search->stop();
+        return;
+      }
+      Class = V.Mask;
+      bool Status = RT->isSignedIntegerType() && !RT->isBooleanType();
+      // A status that a test found not to be zero is an error code, whatever
+      // else the tests on the way have compared it with.
+      if (Status && !V.HasConst && !(Class & Value::Zero))
+        Class = Value::Neg;
+      Success = RT->isPointerType() || RT->isBooleanType()
+                    ? uint8_t(Value::Pos)
+                    : uint8_t(Value::Zero | Value::Pos);
+    }
+    if (St.Client & WroteOther)
+      return;
+    if (St.Client & (ThroughLoop | OnParam))
+      Class &= ~Success;
+    if (!Class)
+      return;
+    Result.Mask |= Class;
+    SourceLocation Where =
+        RS ? RS->getBeginLoc() : Def->getBody()->getEndLoc();
+    if ((Class & Success) && Result.Success.isInvalid())
+      Result.Success = Where;
+    if ((Class & ~Success) && Result.Failure.isInvalid())
+      Result.Failure = Where;
+  }
+
+  bool edge(const CFGBlock *From, const CFGBlock *To,
+            LinuxPathSearch::State &St) override {
+    // The path comes by a loop that writes.  If it leaves the function
+    // without having written, the loop did not find what it was looking
+    // for, or did not run at all.
+    if (const Stmt *Term = From->getTerminatorStmt()) {
+      if (WritingLoops.count(Term))
+        St.Client |= ThroughLoop;
+      if (From->succ_size() >= 2 && !(St.Client & OnParam) &&
+          readsOpenParameter(From->getTerminatorCondition()))
+        St.Client |= OnParam;
+    }
+    if (To != &Cfg->getExit())
+      return true;
+    if (!From->hasNoReturnElement())
+      record(From, St);
+    return false;
+  }
+
+public:
+  LinuxOutputSummarizer(const FunctionDecl *Def, const ParmVarDecl *Param,
+                        sema::LinuxKernelUnit::Impl &Unit, unsigned Depth,
+                        const CallExpr *Site = nullptr)
+      : Def(Def), Param(Param), Unit(Unit), Depth(Depth), Site(Site) {}
+
+  /// Whether a summary for the call \p Site alone can differ from the one
+  /// for any call: an argument for a scalar parameter is a constant.
+  static bool hasConstantArguments(const FunctionDecl *Def,
+                                   const CallExpr *Site) {
+    ASTContext &Ctx = Def->getASTContext();
+    for (unsigned I = 0, E = std::min(Def->getNumParams(), Site->getNumArgs());
+         I != E; ++I) {
+      Expr::EvalResult R;
+      const Expr *Arg = Site->getArg(I);
+      if (Def->getParamDecl(I)->getType()->isIntegralOrEnumerationType() &&
+          !Arg->isValueDependent() && Arg->EvaluateAsInt(R, Ctx))
+        return true;
+    }
+    return false;
+  }
+
+  Summary run() {
+    QualType T = Param->getType();
+    if (!T->isPointerType())
+      return {};
+    QualType Pointee = T->getPointeeType();
+    if (Pointee.isConstQualified() || Pointee->isFunctionType())
+      return {};
+    // A function that never writes through the parameter reads what it is
+    // given.  That is another matter.
+    if (!containsWrite(Def->getBody()) || !onlyKnownUses(Def->getBody()))
+      return {};
+    collectLoops(Def->getBody());
+
+    AnalysisDeclContext AC(/*ADCMgr=*/nullptr, Def);
+    AC.getCFGBuildOptions()
+        .setAlwaysAdd(Stmt::BinaryOperatorClass)
+        .setAlwaysAdd(Stmt::CompoundAssignOperatorClass)
+        .setAlwaysAdd(Stmt::ImplicitCastExprClass)
+        .setAlwaysAdd(Stmt::UnaryOperatorClass);
+    Cfg = AC.getCFG();
+    if (!Cfg)
+      return {};
+    LinuxPathSearch PS(Def->getASTContext(), Def, *Cfg, Unit);
+    Search = &PS;
+    LinuxPathSearch::State Init;
+    // The caller passes the address of a variable.
+    if (int Loc = PS.locate(Param); Loc >= 0) {
+      PS.pin(Loc);
+      LinuxPathSearch::set(Init, Loc, Value::ofMask(Value::Pos));
+    }
+    // And for one call, the numbers that it passes.
+    if (Site) {
+      ASTContext &Ctx = Def->getASTContext();
+      for (unsigned I = 0,
+                    E = std::min(Def->getNumParams(), Site->getNumArgs());
+           I != E; ++I) {
+        const ParmVarDecl *P = Def->getParamDecl(I);
+        const Expr *Arg = Site->getArg(I);
+        Expr::EvalResult R;
+        if (!P->getType()->isIntegralOrEnumerationType() ||
+            Arg->isValueDependent() || !Arg->EvaluateAsInt(R, Ctx))
+          continue;
+        std::optional<int64_t> Fits = R.Val.getInt().tryExtValue();
+        int Loc = PS.locate(P);
+        if (!Fits || Loc < 0)
+          continue;
+        PS.pin(Loc);
+        LinuxPathSearch::set(Init, Loc, Value::constant(*Fits));
+        Seeded.insert(P);
+      }
+    }
+    bool Complete = PS.run(&Cfg->getEntry(), 0, Init, *this);
+    Search = nullptr;
+    if (!Complete || Unknown)
+      return {};
+    return Result;
+  }
+};
+
+/// How the function \p Def can return without having written through its
+/// parameter \p Index.  The mask is zero if it cannot, or if that is not
+/// known.
+static const sema::LinuxKernelUnit::Impl::OutputSummary &
+getLinuxOutputSummary(const FunctionDecl *Def, unsigned Index,
+                      sema::LinuxKernelUnit::Impl &Unit, unsigned Depth) {
+  const ParmVarDecl *Param = Def->getParamDecl(Index);
+  auto Known = Unit.OutputSummaries.find(Param);
+  if (Known != Unit.OutputSummaries.end())
+    return Known->second;
+  // The answer while this is being worked out, for recursion.
+  Unit.OutputSummaries[Param] = {};
+  auto Result = LinuxOutputSummarizer(Def, Param, Unit, Depth).run();
+  return Unit.OutputSummaries[Param] = Result;
+}
+
 /// Misuse of a value on a path where a test has just said what it is.
 /// Three rules share the machinery:
 ///
@@ -6313,7 +6970,7 @@ class LinuxTestedValueChecker : LinuxPathSearch::Client {
   sema::LinuxKernelUnit::Impl &Unit;
 
   enum Rule { DerefNull, DerefError, DerefNullOrError, PtrErrOfValid,
-              ErrPtrOfZero };
+              ErrPtrOfZero, NullTestOfError, UntestedError };
 
   // Per search.
   Rule Active = DerefNull;
@@ -6323,13 +6980,24 @@ class LinuxTestedValueChecker : LinuxPathSearch::Client {
   const Expr *Misuse = nullptr;
   const CallExpr *Call = nullptr;
   const Expr *CalleeAccess = nullptr;
+  /// For an untested result: the function that it is the result of.
+  const FunctionDecl *Source = nullptr;
   /// The second search starts at the entry of the function and has to come
   /// through the test before a misuse counts.
   bool FromEntry = false;
   const CFGBlock *TestBlock = nullptr;
   llvm::BitVector ReachesTest;
-  enum : uint32_t { PastTest = 1 };
+  /// PastNull: the path has come through a NULL test of the location with
+  /// an error pointer.  Joined: it is back where the other outcome of that
+  /// test leads as well.  Mentioned: it has read the location since.
+  enum : uint32_t { PastTest = 1, PastNull = 2, Joined = 4, Mentioned = 8 };
   llvm::SmallVector<const CFGBlock *, 16> FoundPath;
+  /// The NULL test that an error pointer passes, and what the outcome
+  /// "NULL" of it leads to.
+  const Expr *NullTest = nullptr;
+  const CFGBlock *NullTestBlock = nullptr;
+  llvm::BitVector ReachFromNull;
+  const Expr *UseAfterNullTest = nullptr;
 
   llvm::SmallVector<std::pair<unsigned, unsigned>, 8> Reported;
   std::optional<bool> ReturnsValidPointer;
@@ -6376,13 +7044,73 @@ class LinuxTestedValueChecker : LinuxPathSearch::Client {
            Search.locate(Target, /*Create=*/false) == int(Place);
   }
 
+  /// The condition at the end of \p B, if it tests the location for NULL
+  /// and the author wrote it.
+  const Expr *nullTestOfPlace(const CFGBlock *B) {
+    if (!LinuxPathSearch::isConditionalBranch(B))
+      return nullptr;
+    const Expr *Cond = LinuxPathSearch::getBranchCondition(B);
+    bool Negated = false;
+    const Expr *E = stripLinuxCondition(Cond, Negated);
+    if (!E || isWrittenInMacro(E->getExprLoc(), S.getSourceManager()) ||
+        isLinuxBranchWrittenInMacro(B, S.getSourceManager()) ||
+        isLinuxAssertionMacroExpansion(Cond, S))
+      return nullptr;
+    const Expr *Tested = E;
+    if (const auto *BO = dyn_cast<BinaryOperator>(E->IgnoreParenImpCasts())) {
+      if (!BO->isEqualityOp())
+        return nullptr;
+      if (BO->getRHS()->isNullPointerConstant(
+              Ctx, Expr::NPC_ValueDependentIsNotNull))
+        Tested = BO->getLHS();
+      else if (BO->getLHS()->isNullPointerConstant(
+                   Ctx, Expr::NPC_ValueDependentIsNotNull))
+        Tested = BO->getRHS();
+      else
+        return nullptr;
+    }
+    return isPlace(Tested) ? Cond : nullptr;
+  }
+
   bool edge(const CFGBlock *From, const CFGBlock *To,
             LinuxPathSearch::State &St) override {
+    // A NULL test of the result of an error pointer function is wrong, and
+    // reported as that.
+    if (Active == UntestedError)
+      return !nullTestOfPlace(From);
+    // "if (p)" lets an error pointer through.
+    if (Active == NullTestOfError && From != TestBlock &&
+        (!FromEntry || (St.Client & PastTest)) &&
+        !(LinuxPathSearch::get(St, Place).Mask & ~Within)) {
+      if (!(St.Client & PastNull) &&
+          (!NullTestBlock || NullTestBlock == From)) {
+        if (const Expr *Test = nullTestOfPlace(From)) {
+          if (!NullTestBlock) {
+            NullTest = Test;
+            NullTestBlock = From;
+            computeReachFromNull(To);
+          }
+          St.Client |= PastNull;
+        }
+      }
+      if (St.Client & PastNull) {
+        if (ReachFromNull.test(To->getBlockID()))
+          St.Client |= Joined;
+        // The function ends, and nothing but the NULL test has looked at
+        // the error pointer.
+        if (To == &Cfg.getExit() && !(St.Client & Mentioned) &&
+            !From->hasNoReturnElement()) {
+          UseAfterNullTest = nullptr;
+          return found(NullTest);
+        }
+      }
+    }
     if (!FromEntry)
       return true;
     // The outcome of the test that leaves the value within the mask is the
     // one to follow.
     if (From == TestBlock) {
+      St.Client &= ~uint32_t(PastNull | Joined | Mentioned);
       if (LinuxPathSearch::get(St, Place).Mask & ~Within)
         St.Client &= ~uint32_t(PastTest);
       else
@@ -6390,6 +7118,32 @@ class LinuxTestedValueChecker : LinuxPathSearch::Client {
     }
     // A path that cannot come to the test any more is of no interest.
     return (St.Client & PastTest) || ReachesTest.test(To->getBlockID());
+  }
+
+  /// The blocks that the outcome "NULL" of the NULL test leads to: the
+  /// successor of its block that the error pointer does not take, \p Taken
+  /// being the one it does, and what follows.
+  void computeReachFromNull(const CFGBlock *Taken) {
+    ReachFromNull.clear();
+    ReachFromNull.resize(Cfg.getNumBlockIDs());
+    llvm::SmallVector<const CFGBlock *, 16> Work;
+    for (const CFGBlock::AdjacentBlock &Succ : NullTestBlock->succs()) {
+      const CFGBlock *B = Succ.getReachableBlock();
+      if (B && B != Taken && !ReachFromNull.test(B->getBlockID())) {
+        ReachFromNull.set(B->getBlockID());
+        Work.push_back(B);
+      }
+    }
+    while (!Work.empty()) {
+      const CFGBlock *B = Work.pop_back_val();
+      for (const CFGBlock::AdjacentBlock &Succ : B->succs()) {
+        const CFGBlock *Next = Succ.getReachableBlock();
+        if (Next && !ReachFromNull.test(Next->getBlockID())) {
+          ReachFromNull.set(Next->getBlockID());
+          Work.push_back(Next);
+        }
+      }
+    }
   }
 
   bool statement(const Stmt *Node, LinuxPathSearch::State &St) override {
@@ -6400,16 +7154,24 @@ class LinuxTestedValueChecker : LinuxPathSearch::Client {
     if ((LinuxPathSearch::get(St, Place).Mask & ~Within) || assignsPlace(Node)) {
       if (!FromEntry)
         return false;
-      St.Client &= ~uint32_t(PastTest);
+      St.Client &= ~uint32_t(PastTest | PastNull | Joined | Mentioned);
       return true;
     }
 
     const auto *CE = dyn_cast<CallExpr>(Node);
     const FunctionDecl *Callee = CE ? CE->getDirectCallee() : nullptr;
+    // Any test of the value shows that its author has thought of it: one
+    // that narrows it down, and IS_ERR() or PTR_ERR() wherever they are.
+    if (Active == UntestedError &&
+        (LinuxPathSearch::get(St, Place).Mask != Within ||
+         (Callee && LinuxPathSearch::isErrorPointerHelper(Callee) &&
+          CE->getNumArgs() == 1 && isPlace(CE->getArg(0)))))
+      return false;
     switch (Active) {
     case DerefNull:
     case DerefError:
     case DerefNullOrError:
+    case UntestedError:
       if (const Expr *Pointer = LinuxPathSearch::accessedPointer(Node)) {
         if (isPlace(Pointer))
           return found(Pointer);
@@ -6435,6 +7197,30 @@ class LinuxTestedValueChecker : LinuxPathSearch::Client {
           Callee->getName() == "ERR_PTR" && isPlace(CE->getArg(0)) &&
           !isWrittenInMacro(CE->getExprLoc(), S.getSourceManager()))
         return found(CE);
+      break;
+    case NullTestOfError:
+      if (!(St.Client & PastNull))
+        break;
+      if (const auto *ICE = dyn_cast<ImplicitCastExpr>(Node))
+        if (ICE->getCastKind() == CK_LValueToRValue &&
+            isPlace(ICE->getSubExpr()))
+          St.Client |= Mentioned;
+      // A use that only a pointer that is not NULL gets to.
+      if (St.Client & Joined)
+        break;
+      if (const Expr *Pointer = LinuxPathSearch::accessedPointer(Node)) {
+        if (isPlace(Pointer)) {
+          UseAfterNullTest = Pointer;
+          return found(NullTest);
+        }
+      } else if (Callee && !isLinuxPrintCallee(Callee) &&
+                 !LinuxPathSearch::isErrorPointerHelper(Callee)) {
+        for (const Expr *Arg : CE->arguments())
+          if (isPlace(Arg)) {
+            UseAfterNullTest = Arg;
+            return found(NullTest);
+          }
+      }
       break;
     }
     return true;
@@ -6541,6 +7327,7 @@ class LinuxTestedValueChecker : LinuxPathSearch::Client {
       const Expr *Tested = CE->getArg(0)->IgnoreParenCasts();
       if (Callee->getName() == "IS_ERR") {
         Out.push_back({Tested, DerefError, SuccFor(true)});
+        Out.push_back({Tested, NullTestOfError, SuccFor(true)});
         Out.push_back({Tested, PtrErrOfValid, SuccFor(false)});
       } else if (Callee->getName() == "IS_ERR_OR_NULL") {
         Out.push_back({Tested, DerefNullOrError, SuccFor(true)});
@@ -6565,6 +7352,10 @@ class LinuxTestedValueChecker : LinuxPathSearch::Client {
     case ErrPtrOfZero:
       return !Diags.isIgnored(diag::warn_linux_kernel_err_ptr_zero, Loc) &&
              FD->getReturnType()->isPointerType() && returnsValidPointer();
+    case NullTestOfError:
+      return isLinuxExperimentEnabled(S, "error-pointer-null-test", Loc);
+    case UntestedError:
+      return isLinuxExperimentEnabled(S, "error-deref-path", Loc);
     }
     return false;
   }
@@ -6612,6 +7403,44 @@ class LinuxTestedValueChecker : LinuxPathSearch::Client {
       S.Diag(Cond->getExprLoc(), diag::note_linux_kernel_zero_known_here)
           << Search.root(Place) << Cond->getSourceRange();
       return;
+    case NullTestOfError: {
+      std::string Message =
+          "'" + Text +
+          "' is tested for NULL here, but on this path it holds an error "
+          "pointer, which the test takes for a valid pointer";
+      Message += UseAfterNullTest ? " and lets through to where it is used"
+                                  : ", and nothing else looks at it";
+      S.Diag(Misuse->getExprLoc(), diag::warn_linux_kernel_experimental)
+          << Message << "error-pointer-null-test" << Misuse->getSourceRange();
+      S.Diag(Cond->getExprLoc(), diag::note_linux_kernel_is_err_tested_here)
+          << Cond->getSourceRange();
+      if (UseAfterNullTest)
+        S.Diag(UseAfterNullTest->getExprLoc(),
+               diag::note_linux_kernel_experimental)
+            << "the error pointer is used here"
+            << UseAfterNullTest->getSourceRange();
+      return;
+    }
+    case UntestedError: {
+      std::string Message = "'" + Text + "' is ";
+      if (Call)
+        Message += "passed to '" + Call->getDirectCallee()->getNameAsString() +
+                   "', which dereferences it";
+      else
+        Message += "dereferenced here";
+      Message += ", but it is the result of '" + Source->getNameAsString() +
+                 "', which returns an error pointer on failure, and this "
+                 "path has not tested it";
+      S.Diag(Misuse->getExprLoc(), diag::warn_linux_kernel_experimental)
+          << Message << "error-deref-path" << Misuse->getSourceRange();
+      if (Call)
+        S.Diag(CalleeAccess->getExprLoc(),
+               diag::note_linux_kernel_dereferenced_here)
+            << CalleeAccess << CalleeAccess->getSourceRange();
+      S.Diag(Cond->getExprLoc(), diag::note_linux_kernel_experimental)
+          << "the value is assigned here" << Cond->getSourceRange();
+      return;
+    }
     }
   }
 
@@ -6667,7 +7496,77 @@ public:
     return !Diags.isIgnored(diag::warn_linux_kernel_deref_after_check, Loc) ||
            !Diags.isIgnored(diag::warn_linux_kernel_ptr_err_valid, Loc) ||
            !Diags.isIgnored(diag::warn_linux_kernel_err_ptr_zero, Loc) ||
-           isLinuxExperimentEnabled(S, "error-deref-after-check", Loc);
+           isLinuxExperimentEnabled(S, "error-deref-after-check", Loc) ||
+           isLinuxExperimentEnabled(S, "error-pointer-null-test", Loc) ||
+           isLinuxExperimentEnabled(S, "error-deref-path", Loc);
+  }
+
+  /// "p = get(); ... p->member": the result of a function that returns an
+  /// error pointer on failure is dereferenced on a path that has not tested
+  /// it.  Unlike the other rules this one starts at an assignment.
+  void runUntested() {
+    SourceLocation Loc = FD->getBeginLoc();
+    if (!isLinuxExperimentEnabled(S, "error-deref-path", Loc))
+      return;
+    LinuxKernelInference Inference(S, Unit);
+    unsigned Searches = 0;
+    for (const CFGBlock *B : Cfg) {
+      unsigned Index = 0;
+      for (const CFGElement &Elem : *B) {
+        unsigned This = Index++;
+        std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>();
+        if (!CS)
+          continue;
+        const Expr *Target = nullptr, *RHS = nullptr;
+        const VarDecl *TargetVar = nullptr;
+        if (const auto *BO = dyn_cast<BinaryOperator>(CS->getStmt())) {
+          if (BO->getOpcode() != BO_Assign)
+            continue;
+          Target = BO->getLHS();
+          RHS = BO->getRHS();
+        } else if (const auto *DS = dyn_cast<DeclStmt>(CS->getStmt())) {
+          if (!DS->isSingleDecl())
+            continue;
+          TargetVar = dyn_cast<VarDecl>(DS->getSingleDecl());
+          RHS = TargetVar ? TargetVar->getInit() : nullptr;
+        }
+        const auto *CE =
+            dyn_cast_or_null<CallExpr>(RHS ? RHS->IgnoreParenCasts() : nullptr);
+        const FunctionDecl *Callee = CE ? CE->getDirectCallee() : nullptr;
+        if (!Callee || !Callee->getIdentifier() ||
+            !RHS->getType()->isPointerType() ||
+            isWrittenInMacro(CE->getRParenLoc(), S.getSourceManager()))
+          continue;
+        if (classifyLinuxKernelCallee(Callee) !=
+                LinuxKernelAPIKind::ErrorPointer &&
+            Inference.convention(Callee) !=
+                LinuxKernelReturnConvention::ErrorPointer)
+          continue;
+        int Where = Target ? Search.locate(Target) : Search.locate(TargetVar);
+        if (Where < 0 ||
+            llvm::is_contained(Reported, std::make_pair(unsigned(Where),
+                                                        unsigned(UntestedError))))
+          continue;
+        if (++Searches > 16)
+          return;
+        Active = UntestedError;
+        Place = Where;
+        Within = Value::Neg | Value::Pos;
+        Misuse = CalleeAccess = nullptr;
+        Call = nullptr;
+        Source = Callee;
+        FromEntry = false;
+        TestBlock = nullptr;
+        Search.pin(Place);
+        LinuxPathSearch::State Init;
+        LinuxPathSearch::set(Init, Place, Value::ofMask(Within));
+        Search.run(B, This + 1, Init, *this);
+        if (!Misuse)
+          continue;
+        Reported.push_back({Place, unsigned(UntestedError)});
+        report(CE);
+      }
+    }
   }
 
   void run() {
@@ -6694,12 +7593,16 @@ public:
         Place = Where;
         Misuse = CalleeAccess = nullptr;
         Call = nullptr;
+        NullTest = UseAfterNullTest = nullptr;
+        NullTestBlock = nullptr;
         switch (T.Kind) {
         case DerefNull: Within = Value::Zero; break;
         case DerefError: Within = Value::Neg; break;
         case DerefNullOrError: Within = Value::Neg | Value::Zero; break;
         case PtrErrOfValid: Within = Value::Zero | Value::Pos; break;
         case ErrPtrOfZero: Within = Value::Zero; break;
+        case NullTestOfError: Within = Value::Neg; break;
+        case UntestedError: Within = Value::Neg | Value::Pos; break;
         }
         Search.pin(Place);
         TestBlock = B;
@@ -6717,6 +7620,8 @@ public:
                                       /*IsCheck=*/false)) {
           Misuse = CalleeAccess = nullptr;
           Call = nullptr;
+          NullTest = UseAfterNullTest = nullptr;
+          NullTestBlock = nullptr;
           FromEntry = true;
           computeReachesTest();
           Search.run(&Cfg.getEntry(), 0, LinuxPathSearch::State(), *this);
@@ -6729,6 +7634,7 @@ public:
           notePath();
       }
     }
+    runUntested();
   }
 };
 
@@ -7135,6 +8041,10 @@ class LinuxUnwindChecker : LinuxPathSearch::Client {
   /// an error, and no other release in the function is needed.
   bool Local = false;
   const ReturnStmt *Found = nullptr;
+  /// The return hands on the result of a call that may have failed: the
+  /// call, or the variable that holds its result.
+  const Expr *PassedOn = nullptr;
+  bool WantPassedOn = false;
   std::unique_ptr<CFGDomTree> DomTree;
 
   enum : uint32_t { StatusOpen = 1 };
@@ -7194,18 +8104,20 @@ class LinuxUnwindChecker : LinuxPathSearch::Client {
   /// source.  A release before it belongs to "disable, change, enable
   /// again", where an error return after the acquisition leaves things as
   /// the function found them.
-  const CallExpr *findRelease(const Stmt *St) const {
+  const CallExpr *findRelease(const Stmt *St, bool AnyOrder = false) const {
     if (!St)
       return nullptr;
     if (const auto *CE = dyn_cast<CallExpr>(St)) {
       const SourceManager &SM = S.getSourceManager();
       if (isReleaseOf(CE, Kind) &&
-          SM.isBeforeInTranslationUnit(SM.getExpansionLoc(Acquire->getExprLoc()),
-                                       SM.getExpansionLoc(CE->getExprLoc())))
+          (AnyOrder ||
+           SM.isBeforeInTranslationUnit(
+               SM.getExpansionLoc(Acquire->getExprLoc()),
+               SM.getExpansionLoc(CE->getExprLoc()))))
         return CE;
     }
     for (const Stmt *Child : St->children())
-      if (const CallExpr *CE = findRelease(Child))
+      if (const CallExpr *CE = findRelease(Child, AnyOrder))
         return CE;
     return nullptr;
   }
@@ -7336,6 +8248,69 @@ class LinuxUnwindChecker : LinuxPathSearch::Client {
     return !(V.Mask & Value::Zero);
   }
 
+  /// "return register_it(priv);", and "return ret;" for a status that the
+  /// path has not looked at: the function returns whatever its last call
+  /// returned.  If that is an error, the resource is still held.
+  bool passesFailureOn(const ReturnStmt *RS,
+                       const LinuxPathSearch::State &St) {
+    QualType RT = FD->getReturnType();
+    if (!WantPassedOn || !RS->getRetValue() || !RT->isSignedIntegerType() ||
+        RT->isBooleanType())
+      return false;
+    const Expr *E = RS->getRetValue()->IgnoreParenImpCasts();
+    if (const auto *CE = dyn_cast<CallExpr>(E)) {
+      const FunctionDecl *Callee = CE->getDirectCallee();
+      if (!Callee || !Callee->getIdentifier() || CE->getBuiltinCallee() ||
+          !Callee->getReturnType()->isSignedIntegerType() ||
+          Callee->getReturnType()->isBooleanType() ||
+          isWrittenInMacro(CE->getRParenLoc(), S.getSourceManager()))
+        return false;
+      PassedOn = CE;
+      return true;
+    }
+    const VarDecl *VD = getDirectLinuxVariable(E);
+    if (!VD || !VD->hasLocalStorage() || !isLinuxErrorCodeName(VD) ||
+        Search.locate(E, /*Create=*/false) < 0 || !Search.value(E, St).isAny())
+      return false;
+    PassedOn = E;
+    return true;
+  }
+
+  /// Whether \p St releases a resource of this kind that the member
+  /// \p Field holds, in whatever object.
+  bool releasesField(const Stmt *St, const FieldDecl *Field) const {
+    if (!St)
+      return false;
+    if (const auto *CE = dyn_cast<CallExpr>(St)) {
+      const FunctionDecl *Callee = CE->getDirectCallee();
+      if (Callee && Callee->getIdentifier() &&
+          Kind.isRelease(Callee->getName()) && Kind.ReleaseArg >= 0 &&
+          CE->getNumArgs() > unsigned(Kind.ReleaseArg)) {
+        const Expr *E = CE->getArg(Kind.ReleaseArg)->IgnoreParenImpCasts();
+        if (const auto *UO = dyn_cast<UnaryOperator>(E);
+            UO && UO->getOpcode() == UO_AddrOf)
+          E = UO->getSubExpr()->IgnoreParenImpCasts();
+        const auto *ME = dyn_cast<MemberExpr>(E);
+        if (ME && ME->getMemberDecl() == Field)
+          return true;
+      }
+    }
+    for (const Stmt *Child : St->children())
+      if (releasesField(Child, Field))
+        return true;
+    return false;
+  }
+
+  /// The member that holds the handle, if one does: "priv->clk".
+  const FieldDecl *handleField() const {
+    const Expr *E = Handle ? Handle->IgnoreParenImpCasts() : nullptr;
+    if (const auto *UO = dyn_cast_or_null<UnaryOperator>(E);
+        UO && UO->getOpcode() == UO_AddrOf)
+      E = UO->getSubExpr()->IgnoreParenImpCasts();
+    const auto *ME = dyn_cast_or_null<MemberExpr>(E);
+    return ME ? dyn_cast<FieldDecl>(ME->getMemberDecl()) : nullptr;
+  }
+
   bool statement(const Stmt *Node, LinuxPathSearch::State &St) override {
     // Has the acquisition failed on this path?
     if (HandleLoc >= 0) {
@@ -7392,7 +8367,7 @@ class LinuxUnwindChecker : LinuxPathSearch::Client {
       if (E && (isHandle(E) ||
                 (Kind.Owned && HandleVar && mentionsVar(E, HandleVar))))
         return false;
-      if (Local || isErrorReturn(RS, St)) {
+      if (Local || isErrorReturn(RS, St) || passesFailureOn(RS, St)) {
         Found = RS;
         Search.stop();
       }
@@ -7464,6 +8439,10 @@ class LinuxUnwindChecker : LinuxPathSearch::Client {
       return true;
     if (Kind.Result == LinuxResourceKind::Pointer)
       return !failedPointerEdge(From, To);
+    // "if (fw) release_firmware(fw);": the other outcome has nothing to
+    // release.
+    if (failedPointerEdge(From, To))
+      return false;
     if (Kind.Result != LinuxResourceKind::Status)
       return true;
     bool Negated = false;
@@ -7573,6 +8552,7 @@ class LinuxUnwindChecker : LinuxPathSearch::Client {
     HandleLoc = StatusLoc = -1;
     Local = false;
     Found = nullptr;
+    PassedOn = nullptr;
 
     // What the result is stored in: the statements that follow in the
     // block.
@@ -7669,7 +8649,8 @@ public:
   static bool wanted(const Sema &S, SourceLocation Loc) {
     const DiagnosticsEngine &Diags = S.getDiagnostics();
     return !Diags.isIgnored(diag::warn_linux_kernel_missing_unwind, Loc) ||
-           !Diags.isIgnored(diag::warn_linux_kernel_memory_leak, Loc);
+           !Diags.isIgnored(diag::warn_linux_kernel_memory_leak, Loc) ||
+           isLinuxExperimentEnabled(S, "unwind-far", Loc);
   }
 
   void run() {
@@ -7678,6 +8659,9 @@ public:
     bool WantUnwind =
         !Diags.isIgnored(diag::warn_linux_kernel_missing_unwind, Loc);
     bool WantLeak = !Diags.isIgnored(diag::warn_linux_kernel_memory_leak, Loc);
+    bool WantFar = isLinuxExperimentEnabled(S, "unwind-far", Loc);
+    bool WantReturnCall =
+        WantUnwind && isLinuxExperimentEnabled(S, "unwind-return-call", Loc);
     unsigned Searches = 0;
 
     for (const CFGBlock *B : Cfg) {
@@ -7696,8 +8680,26 @@ public:
         if (!First)
           continue;
         const CallExpr *Release = findRelease(FD->getBody());
-        if (Local ? !WantLeak : (!WantUnwind || !Release))
-          continue;
+        // If the function releases it nowhere, another one may.
+        const FieldDecl *FarField = nullptr;
+        if (Local) {
+          if (!WantLeak)
+            continue;
+        } else if (Release) {
+          if (!WantUnwind)
+            continue;
+        } else {
+          FarField = WantFar && !findRelease(FD->getBody(), /*AnyOrder=*/true)
+                         ? handleField()
+                         : nullptr;
+          // "entry = &adapter->entries[i]": the same member, reached in
+          // another way.
+          if (!FarField || releasesField(FD->getBody(), FarField))
+            continue;
+        }
+        // A lock that is held at "return ret;" is held on success as well.
+        WantPassedOn = WantReturnCall && Release && !Local &&
+                       Kind.Result != LinuxResourceKind::Always;
         if (!Local && retakesAfterRelease(B))
           continue;
         if (++Searches > 24)
@@ -7716,6 +8718,42 @@ public:
         std::string Text = HandleVar ? HandleVar->getNameAsString()
                            : Handle  ? getLinuxExprText(Handle, S)
                                      : std::string("the lock");
+        if (FarField) {
+          sema::LinuxKernelUnit::Impl::PendingUnwind P;
+          P.Function = FD;
+          P.Field = FarField;
+          P.Return = Found->getBeginLoc();
+          P.ReturnRange = Found->getSourceRange();
+          P.Acquire = CE->getExprLoc();
+          P.AcquireRange = CE->getSourceRange();
+          P.Handle = Text;
+          P.Acquirer = Callee->getName().str();
+          P.ReleaseArg = Kind.ReleaseArg;
+          P.Releases = Kind.Releases;
+          P.ReleasePrefix = Kind.ReleasePrefix;
+          Unit.PendingUnwinds.push_back(std::move(P));
+          continue;
+        }
+        if (PassedOn) {
+          const auto *Passed = dyn_cast<CallExpr>(PassedOn);
+          std::string What =
+              Passed ? "'" + Passed->getDirectCallee()->getNameAsString() + "'"
+                     : "the call that set '" +
+                           getLinuxExprText(PassedOn, S) + "'";
+          std::string Message =
+              "'" + Text + "' was acquired with " + Callee->getName().str() +
+              "() and is still held if " + What +
+              " fails and this return passes the error on, although other "
+              "error paths call " +
+              Release->getDirectCallee()->getName().str() + "()";
+          S.Diag(Found->getBeginLoc(), diag::warn_linux_kernel_experimental)
+              << Message << "unwind-return-call" << Found->getSourceRange();
+          S.Diag(CE->getExprLoc(), diag::note_linux_kernel_acquired_here)
+              << CE->getSourceRange();
+          S.Diag(Release->getExprLoc(), diag::note_linux_kernel_released_here)
+              << Release->getSourceRange();
+          continue;
+        }
         if (Local) {
           S.Diag(Found->getBeginLoc(), diag::warn_linux_kernel_memory_leak)
               << HandleVar << Callee->getName() << Found->getSourceRange();
@@ -8358,6 +9396,1228 @@ public:
   }
 };
 
+/// A variable that is read although the function that was to fill it in may
+/// not have done so:
+///
+///   u32 val;
+///
+///   read_reg(dev, &val);            /* returns an error without writing */
+///   return val & MASK;
+///
+/// For each call that is given the address of a local variable which nothing
+/// has written yet, the summary of the callee says for which return values
+/// it leaves the variable alone (see LinuxOutputSummarizer).  The checker
+/// then walks the paths behind the call on which the call has returned such
+/// a value (see LinuxPathSearch): "if (ret) return ret;" ends them, and a
+/// path that comes to a read of the variable is reported.
+///
+/// Only scalar variables are followed, and only those whose address goes
+/// nowhere but into calls.
+class LinuxOutputParamChecker : LinuxPathSearch::Client {
+  using Value = LinuxPathValue;
+  using Summary = sema::LinuxKernelUnit::Impl::OutputSummary;
+
+  Sema &S;
+  const FunctionDecl *FD;
+  const CFG &Cfg;
+  ParentMap &PM;
+  LinuxPathSearch &Search;
+  sema::LinuxKernelUnit::Impl &Unit;
+
+  llvm::SmallVector<const VarDecl *, 8> Vars;
+  llvm::DenseMap<const VarDecl *, unsigned> Index;
+  llvm::SmallPtrSet<const VarDecl *, 4> Reported;
+
+  // Per search.
+  const VarDecl *Var = nullptr;
+  const CallExpr *Call = nullptr;
+  uint8_t Mask = 0;
+  /// Where the result of the call is kept, or -1.
+  int ResultLoc = -1;
+  const Expr *Read = nullptr;
+  /// The return values that the path to the read leaves possible.
+  uint8_t ReadMask = 0;
+
+  enum ResultUse { Rejected, Tracked, Discarded };
+
+  static const VarDecl *addressed(const Expr *Arg) {
+    const auto *UO = dyn_cast<UnaryOperator>(Arg->IgnoreParenCasts());
+    if (!UO || UO->getOpcode() != UO_AddrOf)
+      return nullptr;
+    const auto *DRE = dyn_cast<DeclRefExpr>(UO->getSubExpr()->IgnoreParens());
+    return DRE ? dyn_cast<VarDecl>(DRE->getDecl()) : nullptr;
+  }
+
+  /// The local scalars without an initializer, less those whose address is
+  /// used for anything but an argument.
+  void collect(const Stmt *St) {
+    if (!St || isa<UnaryExprOrTypeTraitExpr>(St))
+      return;
+    if (const auto *DS = dyn_cast<DeclStmt>(St)) {
+      for (const Decl *D : DS->decls()) {
+        const auto *VD = dyn_cast<VarDecl>(D);
+        if (!VD || !VD->hasLocalStorage() || VD->getInit() ||
+            VD->hasAttr<CleanupAttr>() || VD->getType().isVolatileQualified())
+          continue;
+        QualType T = VD->getType();
+        if (!T->isIntegralOrEnumerationType() && !T->isPointerType())
+          continue;
+        Index[VD] = Vars.size();
+        Vars.push_back(VD);
+      }
+    }
+    for (const Stmt *Child : St->children())
+      collect(Child);
+  }
+
+  void disqualify(const Stmt *St, llvm::SmallPtrSetImpl<const VarDecl *> &Out) {
+    if (!St || isa<UnaryExprOrTypeTraitExpr>(St))
+      return;
+    if (const auto *UO = dyn_cast<UnaryOperator>(St)) {
+      if (UO->getOpcode() == UO_AddrOf)
+        if (const auto *DRE =
+                dyn_cast<DeclRefExpr>(UO->getSubExpr()->IgnoreParens()))
+          if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
+              VD && Index.count(VD)) {
+            const Stmt *Parent = PM.getParentIgnoreParenCasts(UO);
+            const auto *CE = dyn_cast_or_null<CallExpr>(Parent);
+            bool IsArgument = false;
+            if (CE)
+              for (const Expr *Arg : CE->arguments())
+                IsArgument |= Arg->IgnoreParenCasts() == UO;
+            if (!IsArgument)
+              Out.insert(VD);
+          }
+    } else if (const auto *AS = dyn_cast<GCCAsmStmt>(St)) {
+      for (const Stmt *Child : AS->children())
+        if (const VarDecl *VD =
+                getDirectLinuxVariable(dyn_cast_or_null<Expr>(Child)))
+          Out.insert(VD);
+    }
+    for (const Stmt *Child : St->children())
+      disqualify(Child, Out);
+  }
+
+  /// The variable that \p Node gives a value.
+  static const VarDecl *assigned(const Stmt *Node) {
+    if (const auto *BO = dyn_cast<BinaryOperator>(Node))
+      return BO->isAssignmentOp() ? getDirectLinuxVariable(BO->getLHS())
+                                  : nullptr;
+    if (const auto *UO = dyn_cast<UnaryOperator>(Node))
+      return UO->isIncrementDecrementOp()
+                 ? getDirectLinuxVariable(UO->getSubExpr())
+                 : nullptr;
+    return nullptr;
+  }
+
+  struct Site {
+    const CFGBlock *Block;
+    unsigned Element;
+    const CallExpr *Call;
+    unsigned Arg;
+    const VarDecl *Var;
+  };
+
+  /// Follow, through \p B, which variables no path has written since their
+  /// declaration.
+  void runBlock(const CFGBlock *B, llvm::SmallBitVector &St,
+                llvm::SmallVectorImpl<Site> *Sites) {
+    unsigned Element = 0;
+    for (const CFGElement &Elem : *B) {
+      unsigned This = Element++;
+      std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>();
+      if (!CS)
+        continue;
+      const Stmt *Node = CS->getStmt();
+      if (const auto *DS = dyn_cast<DeclStmt>(Node)) {
+        for (const Decl *D : DS->decls())
+          if (auto It = Index.find(dyn_cast<VarDecl>(D)); It != Index.end())
+            St.set(It->second);
+      } else if (const auto *CE = dyn_cast<CallExpr>(Node)) {
+        for (unsigned I = 0, E = CE->getNumArgs(); I != E; ++I)
+          if (const VarDecl *VD = addressed(CE->getArg(I)))
+            if (auto It = Index.find(VD); It != Index.end()) {
+              if (Sites && St.test(It->second))
+                Sites->push_back({B, This, CE, I, VD});
+              St.reset(It->second);
+            }
+      } else if (const VarDecl *VD = assigned(Node)) {
+        if (auto It = Index.find(VD); It != Index.end())
+          St.reset(It->second);
+      }
+    }
+  }
+
+  /// What becomes of the value of the call \p CE: whether the search can
+  /// follow it into the branches that test it.
+  ResultUse classifyResult(const CallExpr *CE) {
+    const Stmt *Child = CE;
+    for (unsigned Depth = 0; Depth < 16; ++Depth) {
+      const Stmt *P = PM.getParent(Child);
+      if (!P)
+        return Rejected;
+      if (isa<ParenExpr, CastExpr>(P)) {
+        Child = P;
+        continue;
+      }
+      if (const auto *UO = dyn_cast<UnaryOperator>(P)) {
+        if (UO->getOpcode() != UO_LNot)
+          return Rejected;
+        Child = P;
+        continue;
+      }
+      if (const auto *Outer = dyn_cast<CallExpr>(P)) {
+        unsigned ID = Outer->getBuiltinCallee();
+        if ((ID != Builtin::BI__builtin_expect &&
+             ID != Builtin::BI__builtin_expect_with_probability) ||
+            Outer->getNumArgs() < 1 || Outer->getArg(0) != Child)
+          return Rejected;
+        Child = P;
+        continue;
+      }
+      if (const auto *BO = dyn_cast<BinaryOperator>(P)) {
+        if (BO->isComparisonOp() || BO->isLogicalOp()) {
+          Child = P;
+          continue;
+        }
+        if (BO->getOpcode() == BO_Assign && BO->getRHS() == Child) {
+          int Loc = Search.locate(BO->getLHS());
+          if (Loc < 0)
+            return Rejected;
+          Search.pin(Loc);
+          ResultLoc = Loc;
+          return Tracked;
+        }
+        if (BO->getOpcode() == BO_Comma && BO->getLHS() == Child)
+          return Discarded;
+        return Rejected;
+      }
+      if (const auto *CO = dyn_cast<AbstractConditionalOperator>(P))
+        return CO->getCond() == Child ? Tracked : Rejected;
+      if (const auto *DS = dyn_cast<DeclStmt>(P)) {
+        for (const Decl *D : DS->decls())
+          if (const auto *VD = dyn_cast<VarDecl>(D);
+              VD && VD->getInit() == Child) {
+            int Loc = Search.locate(VD);
+            if (Loc < 0)
+              return Rejected;
+            Search.pin(Loc);
+            ResultLoc = Loc;
+            return Tracked;
+          }
+        return Rejected;
+      }
+      if (isa<ReturnStmt>(P))
+        return Tracked;
+      if (const auto *IS = dyn_cast<IfStmt>(P))
+        return IS->getCond() == Child ? Tracked : Discarded;
+      if (const auto *WS = dyn_cast<WhileStmt>(P))
+        return WS->getCond() == Child ? Tracked : Discarded;
+      if (const auto *DoS = dyn_cast<DoStmt>(P))
+        return DoS->getCond() == Child ? Tracked : Discarded;
+      if (const auto *FS = dyn_cast<ForStmt>(P))
+        return FS->getCond() == Child ? Tracked : Discarded;
+      if (const auto *CS = dyn_cast<CompoundStmt>(P)) {
+        // The value of a statement expression goes somewhere else.
+        const Stmt *Outer = PM.getParent(P);
+        if (Outer && isa<StmtExpr>(Outer) && CS->body_back() == Child)
+          return Rejected;
+        return Discarded;
+      }
+      if (isa<LabelStmt, SwitchCase, AttributedStmt>(P))
+        return Discarded;
+      return Rejected;
+    }
+    return Rejected;
+  }
+
+  std::optional<Value> callValue(const CallExpr *CE,
+                                 const LinuxPathSearch::State &St) override {
+    if (CE != Call || !(Mask & Value::Any))
+      return std::nullopt;
+    return Value::ofMask(Mask & Value::Any);
+  }
+
+  bool statement(const Stmt *Node, LinuxPathSearch::State &St) override {
+    if (const auto *DS = dyn_cast<DeclStmt>(Node)) {
+      // The next round of a loop has a new variable.
+      return !llvm::is_contained(DS->decls(), Var);
+    }
+    if (const auto *CE = dyn_cast<CallExpr>(Node)) {
+      for (const Expr *Arg : CE->arguments())
+        if (addressed(Arg) == Var)
+          return false;
+      return true;
+    }
+    if (const auto *BO = dyn_cast<BinaryOperator>(Node)) {
+      if (!BO->isAssignmentOp() || getDirectLinuxVariable(BO->getLHS()) != Var)
+        return true;
+      if (BO->getOpcode() == BO_Assign)
+        return false;
+      Read = BO->getLHS();
+    } else if (const auto *UO = dyn_cast<UnaryOperator>(Node)) {
+      if (!UO->isIncrementDecrementOp() ||
+          getDirectLinuxVariable(UO->getSubExpr()) != Var)
+        return true;
+      Read = UO->getSubExpr();
+    } else if (const auto *ICE = dyn_cast<ImplicitCastExpr>(Node)) {
+      const auto *DRE = dyn_cast<DeclRefExpr>(ICE->getSubExpr()->IgnoreParens());
+      if (ICE->getCastKind() != CK_LValueToRValue || !DRE ||
+          DRE->getDecl() != Var)
+        return true;
+      Read = DRE;
+    } else {
+      return true;
+    }
+    ReadMask = Mask;
+    if (ResultLoc >= 0)
+      ReadMask &= LinuxPathSearch::get(St, ResultLoc).Mask | Summary::NoValue;
+    Search.stop();
+    return false;
+  }
+
+  void report(const FunctionDecl *Callee, const ParmVarDecl *Param,
+              const Summary &Sum, ResultUse Use) {
+    QualType RT = Callee->getReturnType();
+    uint8_t Success = RT->isPointerType() || RT->isBooleanType()
+                          ? uint8_t(Value::Pos)
+                          : uint8_t(Value::Zero | Value::Pos);
+    std::string Name = Callee->getNameAsString();
+    std::string Message = "'" + Var->getNameAsString() + "' is read here, but ";
+    bool Succeeded = Mask == Summary::NoValue || (ReadMask & Success);
+    if (Mask == Summary::NoValue)
+      Message += "'" + Name + "' can return without writing to it";
+    else if (Succeeded)
+      Message += "'" + Name + "' can return " +
+                 (RT->isPointerType()   ? "a valid pointer"
+                  : RT->isBooleanType() ? "true"
+                  : (ReadMask & Value::Zero) ? "0"
+                                             : "a positive value") +
+                 " without writing to it";
+    else if (Use == Discarded)
+      Message += "'" + Name +
+                 "' does not write to it when it fails, and the result of "
+                 "the call is not tested";
+    else
+      Message += "on this path '" + Name +
+                 "' has failed and has not written to it";
+    S.Diag(Read->getExprLoc(), diag::warn_linux_kernel_experimental)
+        << Message << "uninit-output" << Read->getSourceRange();
+    S.Diag(Call->getExprLoc(), diag::note_linux_kernel_experimental)
+        << ("the address of '" + Var->getNameAsString() + "' is passed to '" +
+            Name + "' here")
+        << Call->getSourceRange();
+    SourceLocation Where = Succeeded ? Sum.Success : Sum.Failure;
+    if (Where.isInvalid())
+      Where = Succeeded ? Sum.Failure : Sum.Success;
+    S.Diag(Where, diag::note_linux_kernel_experimental)
+        << ("'" + Name + "' returns here without having written through '" +
+            Param->getNameAsString() + "'");
+  }
+
+public:
+  LinuxOutputParamChecker(Sema &S, const FunctionDecl *FD, const CFG &Cfg,
+                          ParentMap &PM, LinuxPathSearch &Search,
+                          sema::LinuxKernelUnit::Impl &Unit)
+      : S(S), FD(FD), Cfg(Cfg), PM(PM), Search(Search), Unit(Unit) {}
+
+  static bool wanted(const Sema &S, SourceLocation Loc) {
+    return isLinuxExperimentEnabled(S, "uninit-output", Loc);
+  }
+
+  void run() {
+    collect(FD->getBody());
+    if (Vars.empty())
+      return;
+    llvm::SmallPtrSet<const VarDecl *, 8> Bad;
+    disqualify(FD->getBody(), Bad);
+    if (!Bad.empty()) {
+      llvm::erase_if(Vars, [&](const VarDecl *VD) { return Bad.count(VD); });
+      Index.clear();
+      for (unsigned I = 0, E = Vars.size(); I != E; ++I)
+        Index[Vars[I]] = I;
+      if (Vars.empty())
+        return;
+    }
+
+    // In[B]: the variables that no path to B has written.
+    std::vector<llvm::SmallBitVector> In(Cfg.getNumBlockIDs());
+    llvm::BitVector Reached(Cfg.getNumBlockIDs());
+    In[Cfg.getEntry().getBlockID()].resize(Vars.size());
+    Reached.set(Cfg.getEntry().getBlockID());
+    bool Changed = true;
+    unsigned Rounds = 0;
+    while (Changed && ++Rounds < 64) {
+      Changed = false;
+      for (const CFGBlock *B : Cfg) {
+        if (!Reached.test(B->getBlockID()))
+          continue;
+        llvm::SmallBitVector Out = In[B->getBlockID()];
+        runBlock(B, Out, nullptr);
+        for (const CFGBlock::AdjacentBlock &Succ : B->succs()) {
+          const CFGBlock *Next = Succ.getReachableBlock();
+          if (!Next)
+            continue;
+          unsigned ID = Next->getBlockID();
+          if (!Reached.test(ID)) {
+            Reached.set(ID);
+            In[ID] = Out;
+            Changed = true;
+          } else if ((In[ID] & Out) != In[ID]) {
+            In[ID] &= Out;
+            Changed = true;
+          }
+        }
+      }
+    }
+
+    llvm::SmallVector<Site, 8> Sites;
+    for (const CFGBlock *B : Cfg) {
+      if (!Reached.test(B->getBlockID()))
+        continue;
+      llvm::SmallBitVector Out = In[B->getBlockID()];
+      runBlock(B, Out, &Sites);
+    }
+
+    unsigned Searches = 0;
+    for (const Site &Where : Sites) {
+      if (Reported.count(Where.Var))
+        continue;
+      const FunctionDecl *Callee = Where.Call->getDirectCallee();
+      const FunctionDecl *Def = nullptr;
+      if (!Callee || !Callee->hasBody(Def) || Where.Arg >= Def->getNumParams())
+        continue;
+      // For any call first, which is kept, then for this one with the
+      // numbers that it passes.
+      Summary Sum = getLinuxOutputSummary(Def, Where.Arg, Unit);
+      if (LinuxOutputSummarizer::hasConstantArguments(Def, Where.Call)) {
+        if (++Searches > 16)
+          return;
+        Sum = LinuxOutputSummarizer(Def, Def->getParamDecl(Where.Arg), Unit, 0,
+                                    Where.Call)
+                  .run();
+      }
+      if (!Sum.Mask)
+        continue;
+      ResultUse Use = Discarded;
+      ResultLoc = -1;
+      if (Sum.Mask & Value::Any) {
+        Use = classifyResult(Where.Call);
+        if (Use == Rejected)
+          continue;
+      }
+      if (++Searches > 24)
+        return;
+      Var = Where.Var;
+      Call = Where.Call;
+      Mask = Sum.Mask;
+      Read = nullptr;
+      Search.run(Where.Block, Where.Element + 1, LinuxPathSearch::State(),
+                 *this);
+      if (!Read)
+        continue;
+      Reported.insert(Var);
+      report(Def, Def->getParamDecl(Where.Arg), Sum, Use);
+    }
+  }
+};
+
+/// A literal NULL for a parameter that the callee dereferences whenever it
+/// is called (see getUnconditionalParameterDeref()).
+static void checkLinuxNullArguments(Sema &S, const CFG &Cfg,
+                                    sema::LinuxKernelUnit::Impl &Unit) {
+  ASTContext &Ctx = S.getASTContext();
+  const SourceManager &SM = S.getSourceManager();
+  // Code that the configuration has switched off passes what it likes.
+  llvm::BitVector Reached(Cfg.getNumBlockIDs());
+  llvm::SmallVector<const CFGBlock *, 32> Work;
+  Reached.set(Cfg.getEntry().getBlockID());
+  Work.push_back(&Cfg.getEntry());
+  while (!Work.empty()) {
+    const CFGBlock *B = Work.pop_back_val();
+    for (const CFGBlock::AdjacentBlock &Succ : B->succs()) {
+      const CFGBlock *Next = Succ.getReachableBlock();
+      if (Next && !Reached.test(Next->getBlockID())) {
+        Reached.set(Next->getBlockID());
+        Work.push_back(Next);
+      }
+    }
+  }
+
+  for (const CFGBlock *B : Cfg) {
+    if (!Reached.test(B->getBlockID()))
+      continue;
+    for (const CFGElement &Elem : *B) {
+      std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>();
+      const auto *CE = CS ? dyn_cast<CallExpr>(CS->getStmt()) : nullptr;
+      const FunctionDecl *Callee = CE ? CE->getDirectCallee() : nullptr;
+      if (!Callee || isWrittenInMacro(CE->getRParenLoc(), SM))
+        continue;
+      for (unsigned I = 0, E = CE->getNumArgs(); I != E; ++I) {
+        const Expr *Arg = CE->getArg(I);
+        if (!Arg->getType()->isPointerType() ||
+            !Arg->IgnoreParenCasts()->isNullPointerConstant(
+                Ctx, Expr::NPC_ValueDependentIsNotNull))
+          continue;
+        const Expr *Access = getUnconditionalParameterDeref(Callee, I, Unit);
+        if (!Access)
+          continue;
+        std::string Message =
+            "NULL is passed for parameter " + std::to_string(I + 1) + " of '" +
+            Callee->getNameAsString() +
+            "', which dereferences it without a test";
+        S.Diag(Arg->getExprLoc(), diag::warn_linux_kernel_experimental)
+            << Message << "null-argument" << Arg->getSourceRange();
+        S.Diag(Access->getExprLoc(), diag::note_linux_kernel_dereferenced_here)
+            << Access << Access->getSourceRange();
+      }
+    }
+  }
+}
+
+/// A NULL test of a pointer that container_of() has computed:
+///
+///   entry = list_first_entry(&head, struct item, list);
+///   if (!entry)                     /* never true: an empty list gives */
+///           return -ENOENT;         /* the address of the head, shifted */
+///
+///   list_for_each_entry(pos, &head, list)
+///           if (pos->id == id)
+///                   break;
+///   if (!pos)                       /* the same, after the last entry */
+///           return -ENOENT;
+///
+/// container_of() subtracts the offset of a member from a pointer.  The
+/// result is NULL only if the pointer was the offset itself, or NULL with the
+/// member at offset zero.  The entry macros of <linux/list.h> are given
+/// pointers that come from a list, which holds no NULL.  For each pointer
+/// variable the checker follows one fact through the CFG: whether every path
+/// has assigned it such a value last.
+class LinuxContainerOfChecker {
+  Sema &S;
+  const FunctionDecl *FD;
+  const CFG &Cfg;
+  ASTContext &Ctx;
+
+  struct Origin {
+    const Expr *Value = nullptr;
+    /// The macro of <linux/list.h> that the value was written with.
+    std::string ListMacro;
+    int64_t Offset = -1;
+  };
+  llvm::SmallVector<const VarDecl *, 8> Vars;
+  llvm::DenseMap<const VarDecl *, unsigned> Index;
+  llvm::DenseMap<const VarDecl *, Origin> Origins;
+  llvm::SmallPtrSet<const VarDecl *, 8> AddressTaken;
+  llvm::SmallPtrSet<const Stmt *, 4> Reported;
+
+  /// Whether \p RHS is the value of a container_of(), and which.
+  bool classify(const Expr *RHS, Origin &O) const {
+    const auto *SE = dyn_cast_or_null<StmtExpr>(RHS ? RHS->IgnoreParenCasts()
+                                                    : nullptr);
+    if (!SE)
+      return false;
+    const SourceManager &SM = S.getSourceManager();
+    SourceLocation Loc = SE->getBeginLoc();
+    if (!Loc.isMacroID() ||
+        Lexer::getImmediateMacroName(Loc, SM, S.getLangOpts()) !=
+            "container_of")
+      return false;
+    O.Value = RHS;
+    // The macros around it, from the inside out.
+    for (unsigned Depth = 0; Depth < 8; ++Depth) {
+      Loc = SM.getImmediateMacroCallerLoc(Loc);
+      if (!Loc.isMacroID())
+        break;
+      StringRef Name = Lexer::getImmediateMacroName(Loc, SM, S.getLangOpts());
+      if (Name.starts_with("list_"))
+        O.ListMacro = Name.str();
+    }
+    // "((type *)(__mptr - offsetof(type, member)))" is the value.
+    const CompoundStmt *Body = SE->getSubStmt();
+    const auto *Last =
+        Body->body_empty() ? nullptr : dyn_cast<Expr>(Body->body_back());
+    const auto *Sub = dyn_cast_or_null<BinaryOperator>(
+        Last ? Last->IgnoreParenCasts() : nullptr);
+    Expr::EvalResult R;
+    if (Sub && Sub->getOpcode() == BO_Sub &&
+        !Sub->getRHS()->isValueDependent() &&
+        Sub->getRHS()->EvaluateAsInt(R, Ctx))
+      if (std::optional<int64_t> Fits = R.Val.getInt().tryExtValue())
+        O.Offset = *Fits;
+    return !O.ListMacro.empty() || O.Offset > 0;
+  }
+
+  void collect(const Stmt *St) {
+    if (!St || isa<UnaryExprOrTypeTraitExpr>(St))
+      return;
+    const VarDecl *VD = nullptr;
+    const Expr *RHS = nullptr;
+    if (const auto *DS = dyn_cast<DeclStmt>(St)) {
+      for (const Decl *D : DS->decls())
+        if (const auto *Local = dyn_cast<VarDecl>(D);
+            Local && Local->hasLocalStorage() && Local->getInit())
+          note(Local, Local->getInit());
+    } else if (const auto *BO = dyn_cast<BinaryOperator>(St)) {
+      if (BO->getOpcode() == BO_Assign) {
+        VD = getDirectLinuxVariable(BO->getLHS());
+        RHS = BO->getRHS();
+      }
+    } else if (const auto *UO = dyn_cast<UnaryOperator>(St)) {
+      if (UO->getOpcode() == UO_AddrOf)
+        if (const VarDecl *Taken = getDirectLinuxVariable(UO->getSubExpr()))
+          AddressTaken.insert(Taken);
+    }
+    if (VD && VD->hasLocalStorage())
+      note(VD, RHS);
+    for (const Stmt *Child : St->children())
+      collect(Child);
+  }
+
+  void note(const VarDecl *VD, const Expr *RHS) {
+    Origin O;
+    if (!VD->getType()->isPointerType() || Index.count(VD) || !classify(RHS, O))
+      return;
+    Index[VD] = Vars.size();
+    Vars.push_back(VD);
+    Origins[VD] = O;
+  }
+
+  void assign(const VarDecl *VD, const Expr *RHS, llvm::SmallBitVector &St) {
+    auto It = Index.find(VD);
+    if (It == Index.end())
+      return;
+    Origin O;
+    if (RHS && classify(RHS, O))
+      St.set(It->second);
+    else
+      St.reset(It->second);
+  }
+
+  void runBlock(const CFGBlock *B, llvm::SmallBitVector &St) {
+    for (const CFGElement &Elem : *B) {
+      std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>();
+      if (!CS)
+        continue;
+      const Stmt *Node = CS->getStmt();
+      if (const auto *DS = dyn_cast<DeclStmt>(Node)) {
+        for (const Decl *D : DS->decls())
+          if (const auto *VD = dyn_cast<VarDecl>(D))
+            assign(VD, VD->getInit(), St);
+      } else if (const auto *BO = dyn_cast<BinaryOperator>(Node)) {
+        if (BO->isAssignmentOp())
+          if (const VarDecl *VD = getDirectLinuxVariable(BO->getLHS()))
+            assign(VD, BO->getOpcode() == BO_Assign ? BO->getRHS() : nullptr,
+                   St);
+      } else if (const auto *UO = dyn_cast<UnaryOperator>(Node)) {
+        if (UO->isIncrementDecrementOp())
+          if (const VarDecl *VD = getDirectLinuxVariable(UO->getSubExpr()))
+            assign(VD, nullptr, St);
+      }
+    }
+  }
+
+public:
+  LinuxContainerOfChecker(Sema &S, const FunctionDecl *FD, const CFG &Cfg)
+      : S(S), FD(FD), Cfg(Cfg), Ctx(S.getASTContext()) {}
+
+  static bool wanted(const Sema &S, SourceLocation Loc) {
+    return isLinuxExperimentEnabled(S, "container-of-null", Loc);
+  }
+
+  void run() {
+    collect(FD->getBody());
+    if (Vars.empty())
+      return;
+
+    // In[B]: the variables that hold such a value on every path to B.
+    std::vector<llvm::SmallBitVector> In(Cfg.getNumBlockIDs());
+    llvm::BitVector Reached(Cfg.getNumBlockIDs());
+    In[Cfg.getEntry().getBlockID()].resize(Vars.size());
+    Reached.set(Cfg.getEntry().getBlockID());
+    bool Changed = true;
+    unsigned Rounds = 0;
+    while (Changed && ++Rounds < 64) {
+      Changed = false;
+      for (const CFGBlock *B : Cfg) {
+        if (!Reached.test(B->getBlockID()))
+          continue;
+        llvm::SmallBitVector Out = In[B->getBlockID()];
+        runBlock(B, Out);
+        for (const CFGBlock::AdjacentBlock &Succ : B->succs()) {
+          const CFGBlock *Next = Succ.getReachableBlock();
+          if (!Next)
+            continue;
+          unsigned ID = Next->getBlockID();
+          if (!Reached.test(ID)) {
+            Reached.set(ID);
+            In[ID] = Out;
+            Changed = true;
+          } else if ((In[ID] & Out) != In[ID]) {
+            In[ID] &= Out;
+            Changed = true;
+          }
+        }
+      }
+    }
+
+    for (const CFGBlock *B : Cfg) {
+      if (!Reached.test(B->getBlockID()))
+        continue;
+      const Expr *Cond = nullptr;
+      const VarDecl *VD = getLinuxNullTest(S, B, Cond);
+      auto It = VD ? Index.find(VD) : Index.end();
+      if (It == Index.end() || AddressTaken.count(VD))
+        continue;
+      llvm::SmallBitVector Out = In[B->getBlockID()];
+      runBlock(B, Out);
+      if (!Out.test(It->second) || !Reported.insert(Cond).second)
+        continue;
+      // "ASSERT(p)" says what its author believes.  likely() and unlikely()
+      // are how a test is written.
+      StringRef Outermost;
+      for (SourceLocation L = Cond->getExprLoc(); L.isMacroID();
+           L = S.getSourceManager().getImmediateMacroCallerLoc(L))
+        Outermost = Lexer::getImmediateMacroName(L, S.getSourceManager(),
+                                                 S.getLangOpts());
+      if (!Outermost.empty() && Outermost != "likely" &&
+          Outermost != "unlikely")
+        continue;
+      const Origin &O = Origins[VD];
+      std::string Message = "'" + VD->getNameAsString() +
+                            "' is tested for NULL, but ";
+      if (!O.ListMacro.empty())
+        Message += O.ListMacro +
+                   "() never yields NULL: for an empty list, or behind the "
+                   "last entry, it is a pointer computed from the list head";
+      else
+        Message += "it comes from container_of() with the member at offset " +
+                   std::to_string(O.Offset) +
+                   ", so it is not NULL even if the pointer it was computed "
+                   "from is";
+      S.Diag(Cond->getExprLoc(), diag::warn_linux_kernel_experimental)
+          << Message << "container-of-null" << Cond->getSourceRange();
+      S.Diag(S.getSourceManager().getExpansionLoc(O.Value->getExprLoc()),
+             diag::note_linux_kernel_experimental)
+          << ("'" + VD->getNameAsString() + "' gets its value here");
+    }
+  }
+};
+
+/// An error path that returns where its neighbours unwind:
+///
+///   ret = clk_prepare_enable(priv->clk);
+///   if (ret)
+///           return ret;
+///   ret = setup_a(priv);
+///   if (ret)
+///           goto err_disable;
+///   if (!priv->regs)
+///           return -ENODEV;             /* leaves the clock enabled */
+///   ret = setup_b(priv);
+///   if (ret)
+///           goto err_disable;
+///
+/// This check knows no resources.  It takes the function's own error
+/// handling as the evidence: an error path before the return and one after
+/// it both jump to code that cleans up and returns, the later one to the
+/// same code or to more of it, and nothing in between calls a function that
+/// the cleanup code calls.  What the first jump undoes is then still to be
+/// undone at the return.
+class LinuxDirectReturnChecker {
+  Sema &S;
+  const FunctionDecl *FD;
+  const CFG &Cfg;
+  ASTContext &Ctx;
+
+  struct Unwind {
+    const LabelStmt *Label = nullptr;
+    const CFGBlock *Block = nullptr;
+    /// The blocks from the label to the end of the function.
+    llvm::BitVector Region;
+    /// What the code calls, each with its first argument: kfree(priv) is
+    /// not kfree(buf).
+    llvm::SmallVector<const CallExpr *, 4> Calls;
+    bool Valid = false;
+  };
+  struct Jump {
+    const GotoStmt *Goto;
+    /// The branch that decides whether the jump is made.
+    const CFGBlock *Branch;
+    unsigned Target;
+  };
+  std::vector<Unwind> Unwinds;
+  llvm::SmallVector<Jump, 8> Jumps;
+
+  static const CFGBlock *onlyPredecessor(const CFGBlock *B) {
+    if (B->pred_size() != 1)
+      return nullptr;
+    const CFGBlock *P = B->pred_begin()->getReachableBlock();
+    return P && P->succ_size() >= 2 ? P : nullptr;
+  }
+
+  /// The code behind \p Label, if all it does is clean up and return.
+  void describe(Unwind &U) {
+    U.Region.resize(Cfg.getNumBlockIDs());
+    llvm::SmallVector<const CFGBlock *, 8> Work;
+    Work.push_back(U.Block);
+    U.Region.set(U.Block->getBlockID());
+    unsigned Blocks = 0;
+    while (!Work.empty()) {
+      const CFGBlock *B = Work.pop_back_val();
+      if (B == &Cfg.getExit())
+        continue;
+      if (++Blocks > 24 || isa_and_nonnull<GotoStmt>(B->getTerminatorStmt()))
+        return;
+      for (const CFGElement &Elem : *B) {
+        std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>();
+        const auto *CE = CS ? dyn_cast<CallExpr>(CS->getStmt()) : nullptr;
+        const FunctionDecl *Callee = CE ? CE->getDirectCallee() : nullptr;
+        if (Callee && Callee->getIdentifier() && !isLinuxPrintCallee(Callee) &&
+            !LinuxPathSearch::isErrorPointerHelper(Callee) &&
+            U.Calls.size() < 16)
+          U.Calls.push_back(CE);
+      }
+      for (const CFGBlock::AdjacentBlock &Succ : B->succs()) {
+        const CFGBlock *Next = Succ.getReachableBlock();
+        if (Next && !U.Region.test(Next->getBlockID())) {
+          U.Region.set(Next->getBlockID());
+          Work.push_back(Next);
+        }
+      }
+    }
+    if (U.Calls.empty())
+      return;
+    // "fallback: *val = DEFAULT; return 0;" is another way to succeed.
+    for (const CFGBlock *B : Cfg) {
+      if (!U.Region.test(B->getBlockID()))
+        continue;
+      for (const CFGElement &Elem : *B) {
+        std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>();
+        const auto *RS = CS ? dyn_cast<ReturnStmt>(CS->getStmt()) : nullptr;
+        const Expr *E = RS ? RS->getRetValue() : nullptr;
+        if (!E)
+          continue;
+        Expr::EvalResult R;
+        bool Constant = !E->isValueDependent() && E->EvaluateAsInt(R, Ctx);
+        if (!Constant || R.Val.getInt().isNegative() ||
+            (FD->getReturnType()->isPointerType() && R.Val.getInt().isZero()))
+          U.Valid = true;
+      }
+    }
+  }
+
+  /// Whether the return \p RS, which the branch at the end of \p Branch
+  /// leads to, reports a failure.
+  bool isErrorReturn(const ReturnStmt *RS, const CFGBlock *Block,
+                     const CFGBlock *Branch) const {
+    const Expr *E = RS->getRetValue();
+    if (!E)
+      return false;
+    E = E->IgnoreParenImpCasts();
+    QualType RT = FD->getReturnType();
+    if (RT->isPointerType()) {
+      if (E->IgnoreParenCasts()->isNullPointerConstant(
+              Ctx, Expr::NPC_ValueDependentIsNotNull))
+        return true;
+    } else if (!RT->isSignedIntegerType() || RT->isBooleanType()) {
+      return false;
+    }
+    if (const auto *CE = dyn_cast<CallExpr>(E->IgnoreParenCasts())) {
+      const FunctionDecl *Callee = CE->getDirectCallee();
+      return Callee && Callee->getIdentifier() &&
+             llvm::StringSwitch<bool>(Callee->getName())
+                 .Cases({"PTR_ERR", "ERR_PTR", "ERR_CAST", "dev_err_probe"},
+                        true)
+                 .Default(false);
+    }
+    if (RT->isPointerType())
+      return false;
+    Expr::EvalResult R;
+    if (!E->isValueDependent() && E->EvaluateAsInt(R, Ctx))
+      return R.Val.getInt().isNegative();
+    // "if (ret) return ret;", and "ret = -EINVAL; return ret;".
+    const VarDecl *VD = getDirectLinuxVariable(E);
+    if (!VD)
+      return false;
+    for (const CFGElement &Elem : *Block) {
+      std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>();
+      const auto *BO = CS ? dyn_cast<BinaryOperator>(CS->getStmt()) : nullptr;
+      if (BO && BO->getOpcode() == BO_Assign &&
+          getDirectLinuxVariable(BO->getLHS()) == VD)
+        return !BO->getRHS()->isValueDependent() &&
+               BO->getRHS()->EvaluateAsInt(R, Ctx) &&
+               R.Val.getInt().isNegative();
+    }
+    const Stmt *Cond = Branch->getTerminatorCondition();
+    return Cond && mentions(Cond, VD);
+  }
+
+  static bool mentions(const Stmt *St, const VarDecl *VD) {
+    if (!St)
+      return false;
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(St))
+      if (DRE->getDecl() == VD)
+        return true;
+    for (const Stmt *Child : St->children())
+      if (mentions(Child, VD))
+        return true;
+    return false;
+  }
+
+  /// The expression whose failure the branch at the end of \p Branch
+  /// tests: "p" in "if (IS_ERR(p))", "if (!p)" and "if (p < 0)".
+  static const Expr *testedExpr(const CFGBlock *Branch) {
+    if (!LinuxPathSearch::isConditionalBranch(Branch))
+      return nullptr;
+    bool Negated = false;
+    const Expr *E = stripLinuxCondition(
+        LinuxPathSearch::getBranchCondition(Branch), Negated);
+    if (!E)
+      return nullptr;
+    E = E->IgnoreParenImpCasts();
+    if (const auto *CE = dyn_cast<CallExpr>(E)) {
+      const FunctionDecl *Callee = CE->getDirectCallee();
+      if (Callee && LinuxPathSearch::isErrorPointerHelper(Callee) &&
+          CE->getNumArgs() == 1)
+        return CE->getArg(0)->IgnoreParenImpCasts();
+      return nullptr;
+    }
+    if (const auto *BO = dyn_cast<BinaryOperator>(E))
+      return BO->isComparisonOp() ? BO->getLHS()->IgnoreParenImpCasts()
+                                  : nullptr;
+    return E;
+  }
+
+  /// Whether the cleanup code is given \p E.
+  bool cleansUp(const Unwind &U, const Expr *E) const {
+    for (const CallExpr *Cleanup : U.Calls)
+      for (const Expr *Arg : Cleanup->arguments())
+        if (isSameLinuxExpr(Ctx, Arg, E))
+          return true;
+    return false;
+  }
+
+  bool callsAnyOf(const CFGBlock *B, const Unwind &U) const {
+    for (const CFGElement &Elem : *B) {
+      std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>();
+      const auto *CE = CS ? dyn_cast<CallExpr>(CS->getStmt()) : nullptr;
+      const FunctionDecl *Callee = CE ? CE->getDirectCallee() : nullptr;
+      if (!Callee)
+        continue;
+      for (const CallExpr *Cleanup : U.Calls)
+        if (Cleanup->getDirectCallee()->getCanonicalDecl() ==
+                Callee->getCanonicalDecl() &&
+            (CE->getNumArgs() == 0 || Cleanup->getNumArgs() == 0 ||
+             isSameLinuxExpr(Ctx, CE->getArg(0), Cleanup->getArg(0))))
+          return true;
+    }
+    return false;
+  }
+
+public:
+  LinuxDirectReturnChecker(Sema &S, const FunctionDecl *FD, const CFG &Cfg)
+      : S(S), FD(FD), Cfg(Cfg), Ctx(S.getASTContext()) {}
+
+  static bool wanted(const Sema &S, SourceLocation Loc) {
+    return isLinuxExperimentEnabled(S, "direct-return", Loc);
+  }
+
+  void run() {
+    const SourceManager &SM = S.getSourceManager();
+    // The labels that error paths jump to.
+    llvm::DenseMap<const LabelStmt *, unsigned> Known;
+    for (const CFGBlock *B : Cfg) {
+      const auto *GS = dyn_cast_or_null<GotoStmt>(B->getTerminatorStmt());
+      const CFGBlock *Branch = GS ? onlyPredecessor(B) : nullptr;
+      if (!Branch || B->succ_size() != 1)
+        continue;
+      const CFGBlock *Target = B->succ_begin()->getReachableBlock();
+      const auto *LS =
+          Target ? dyn_cast_or_null<LabelStmt>(Target->getLabel()) : nullptr;
+      if (!LS)
+        continue;
+      auto [It, New] = Known.try_emplace(LS, Unwinds.size());
+      if (New) {
+        Unwinds.emplace_back();
+        Unwinds.back().Label = LS;
+        Unwinds.back().Block = Target;
+        describe(Unwinds.back());
+      }
+      if (Unwinds[It->second].Valid)
+        Jumps.push_back({GS, Branch, It->second});
+    }
+    if (Jumps.size() < 2)
+      return;
+
+    CFGDomTree Dom(const_cast<CFG *>(&Cfg));
+    auto Dominates = [&](const CFGBlock *A, const CFGBlock *B) {
+      return Dom.dominates(A, B);
+    };
+
+    for (const CFGBlock *B : Cfg) {
+      const ReturnStmt *RS = nullptr;
+      bool Plain = true;
+      for (const CFGElement &Elem : *B) {
+        std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>();
+        if (!CS)
+          continue;
+        if (const auto *CE = dyn_cast<CallExpr>(CS->getStmt())) {
+          const FunctionDecl *Callee = CE->getDirectCallee();
+          unsigned ID = CE->getBuiltinCallee();
+          // Whatever else the block calls may be its way of cleaning up.
+          if (!(Callee && (isLinuxPrintCallee(Callee) ||
+                           LinuxPathSearch::isErrorPointerHelper(Callee))) &&
+              ID != Builtin::BI__builtin_expect)
+            Plain = false;
+        }
+        RS = dyn_cast<ReturnStmt>(CS->getStmt());
+      }
+      const CFGBlock *Branch = RS && Plain ? onlyPredecessor(B) : nullptr;
+      if (!Branch || isWrittenInMacro(RS->getBeginLoc(), SM))
+        continue;
+      bool InUnwind = false;
+      for (const Unwind &U : Unwinds)
+        InUnwind |= U.Valid && U.Region.test(B->getBlockID());
+      if (InUnwind || !isErrorReturn(RS, B, Branch))
+        continue;
+
+      const Jump *Before = nullptr, *After = nullptr;
+      for (const Jump &J1 : Jumps) {
+        if (J1.Branch == Branch || !Dominates(J1.Branch, B))
+          continue;
+        const Unwind &U1 = Unwinds[J1.Target];
+        // "p = again(p); if (IS_ERR(p)) return PTR_ERR(p);": what the label
+        // would free is what this path has just found to be gone.
+        if (const Expr *Tested = testedExpr(Branch))
+          if (cleansUp(U1, Tested))
+            continue;
+        // Has the path let go of something that the label would undo?
+        bool Released = false;
+        for (const CFGBlock *X : Cfg)
+          if (X != J1.Branch && Dominates(J1.Branch, X) && Dominates(X, B) &&
+              callsAnyOf(X, U1)) {
+            Released = true;
+            break;
+          }
+        if (Released)
+          continue;
+        for (const Jump &J2 : Jumps) {
+          if (J2.Branch == Branch || J2.Branch == J1.Branch ||
+              !Dominates(Branch, J2.Branch))
+            continue;
+          // The later jump undoes at least as much.
+          if (!Unwinds[J2.Target].Region.test(U1.Block->getBlockID()))
+            continue;
+          Before = &J1;
+          After = &J2;
+          break;
+        }
+        if (Before)
+          break;
+      }
+      if (!Before)
+        continue;
+
+      std::string First = Unwinds[Before->Target].Label->getName();
+      std::string Second = Unwinds[After->Target].Label->getName();
+      std::string Message =
+          "this error path returns directly, but the error paths before and "
+          "after it jump to '" + First + "'" +
+          (First == Second ? "" : " and '" + Second + "'") +
+          " to undo what the function has done";
+      S.Diag(RS->getBeginLoc(), diag::warn_linux_kernel_experimental)
+          << Message << "direct-return" << RS->getSourceRange();
+      S.Diag(Before->Goto->getBeginLoc(), diag::note_linux_kernel_experimental)
+          << "an earlier error path unwinds here"
+          << Before->Goto->getSourceRange();
+      S.Diag(After->Goto->getBeginLoc(), diag::note_linux_kernel_experimental)
+          << "a later error path unwinds here"
+          << After->Goto->getSourceRange();
+    }
+  }
+};
+
+/// The second half of the unwind check, at the end of the translation unit:
+/// an error path that returns with a resource which its own function never
+/// releases, while another function releases what the same member holds.
+///
+///   static int foo_probe(struct platform_device *pdev)
+///   {
+///           ...
+///           priv->base = of_iomap(np, 0);
+///           ...
+///           if (irq < 0)
+///                   return irq;             /* the mapping stays */
+///   }
+///
+///   static void foo_remove(struct platform_device *pdev)
+///   {
+///           iounmap(priv->base);
+///   }
+///
+/// That the remove callback releases it says that nothing else does, devres
+/// for one.  A function that fails is not followed by its counterpart: if
+/// probe fails, remove is not called.  The exception is a function whose
+/// caller cleans up after it, so a candidate is dropped if a function that
+/// calls it releases the member, itself or in what it calls.  A function that
+/// other translation units can call is dropped as well, unless this one uses
+/// it as a callback.
+class LinuxFarUnwindReporter {
+  using Pending = sema::LinuxKernelUnit::Impl::PendingUnwind;
+
+  Sema &S;
+  sema::LinuxKernelUnit::Impl &U;
+
+  static const FieldDecl *lastField(const Expr *E) {
+    E = E->IgnoreParenImpCasts();
+    if (const auto *UO = dyn_cast<UnaryOperator>(E);
+        UO && UO->getOpcode() == UO_AddrOf)
+      E = UO->getSubExpr()->IgnoreParenImpCasts();
+    const auto *ME = dyn_cast<MemberExpr>(E);
+    return ME ? dyn_cast<FieldDecl>(ME->getMemberDecl()) : nullptr;
+  }
+
+  static bool isRelease(const CallExpr *CE, const Pending &P) {
+    const FunctionDecl *Callee = CE->getDirectCallee();
+    if (!Callee || !Callee->getIdentifier())
+      return false;
+    StringRef Name = Callee->getName();
+    if (!llvm::is_contained(P.Releases, Name) &&
+        (P.ReleasePrefix.empty() || !Name.starts_with(P.ReleasePrefix)))
+      return false;
+    return P.ReleaseArg >= 0 && CE->getNumArgs() > unsigned(P.ReleaseArg) &&
+           lastField(CE->getArg(P.ReleaseArg)) == P.Field;
+  }
+
+  /// A release of the member in \p St, or in a function that it calls, up to
+  /// \p Follow levels down.
+  static const CallExpr *findRelease(const Stmt *St, const Pending &P,
+                                     unsigned Follow) {
+    if (!St)
+      return nullptr;
+    if (const auto *CE = dyn_cast<CallExpr>(St)) {
+      if (isRelease(CE, P))
+        return CE;
+      const FunctionDecl *Callee = CE->getDirectCallee();
+      const FunctionDecl *Def = nullptr;
+      if (Follow && Callee && Callee->hasBody(Def) &&
+          Def->getCanonicalDecl() != P.Function->getCanonicalDecl())
+        if (const CallExpr *Inner =
+                findRelease(Def->getBody(), P, Follow - 1))
+          return Inner;
+    }
+    for (const Stmt *Child : St->children())
+      if (const CallExpr *CE = findRelease(Child, P, Follow))
+        return CE;
+    return nullptr;
+  }
+
+  static bool calls(const Stmt *St, const FunctionDecl *F) {
+    if (!St)
+      return false;
+    if (const auto *CE = dyn_cast<CallExpr>(St))
+      if (const FunctionDecl *Callee = CE->getDirectCallee())
+        if (Callee->getCanonicalDecl() == F->getCanonicalDecl())
+          return true;
+    for (const Stmt *Child : St->children())
+      if (calls(Child, F))
+        return true;
+    return false;
+  }
+
+  static bool refers(const Stmt *St, const FunctionDecl *F) {
+    if (!St)
+      return false;
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(St))
+      if (const auto *FD = dyn_cast<FunctionDecl>(DRE->getDecl()))
+        if (FD->getCanonicalDecl() == F->getCanonicalDecl())
+          return true;
+    for (const Stmt *Child : St->children())
+      if (refers(Child, F))
+        return true;
+    return false;
+  }
+
+public:
+  LinuxFarUnwindReporter(Sema &S, sema::LinuxKernelUnit::Impl &U)
+      : S(S), U(U) {}
+
+  void run() {
+    if (U.PendingUnwinds.empty())
+      return;
+    const TranslationUnitDecl *TU = S.getASTContext().getTranslationUnitDecl();
+    llvm::SmallVector<const FunctionDecl *, 64> Defs;
+    for (const Decl *D : TU->decls())
+      if (const auto *FD = dyn_cast<FunctionDecl>(D);
+          FD && FD->doesThisDeclarationHaveABody())
+        Defs.push_back(FD);
+
+    for (const Pending &P : U.PendingUnwinds) {
+      // The functions that call it, and those that call them.
+      llvm::SmallPtrSet<const FunctionDecl *, 8> Callers;
+      llvm::SmallVector<const FunctionDecl *, 8> Level;
+      Level.push_back(P.Function);
+      for (unsigned Depth = 0; Depth < 3 && !Level.empty(); ++Depth) {
+        llvm::SmallVector<const FunctionDecl *, 8> Next;
+        for (const FunctionDecl *G : Defs) {
+          if (G->getCanonicalDecl() == P.Function->getCanonicalDecl() ||
+              Callers.count(G))
+            continue;
+          for (const FunctionDecl *F : Level)
+            if (calls(G->getBody(), F)) {
+              Callers.insert(G);
+              Next.push_back(G);
+              break;
+            }
+        }
+        Level = std::move(Next);
+      }
+      bool Called = !Callers.empty(), CallerReleases = false;
+      for (const FunctionDecl *G : Callers)
+        CallerReleases |= findRelease(G->getBody(), P, /*Follow=*/2) != nullptr;
+      if (CallerReleases)
+        continue;
+
+      const CallExpr *Release = nullptr;
+      const FunctionDecl *Releaser = nullptr;
+      for (const FunctionDecl *G : Defs) {
+        if (G->getCanonicalDecl() == P.Function->getCanonicalDecl() ||
+            Callers.count(G))
+          continue;
+        Release = findRelease(G->getBody(), P, /*Follow=*/0);
+        if (Release) {
+          Releaser = G;
+          break;
+        }
+      }
+      if (!Release)
+        continue;
+      // Who else calls it, and what they do when it fails, is not known.
+      if (!Called && P.Function->isExternallyVisible()) {
+        bool Callback = false;
+        for (const Decl *D : TU->decls())
+          if (const auto *VD = dyn_cast<VarDecl>(D))
+            Callback |= VD->getInit() && refers(VD->getInit(), P.Function);
+        if (!Callback)
+          continue;
+      }
+      std::string Message =
+          "'" + P.Handle + "' was acquired with " + P.Acquirer +
+          "() and this error path returns without " +
+          Release->getDirectCallee()->getName().str() + "(), which '" +
+          Releaser->getNameAsString() + "' calls for it";
+      S.Diag(P.Return, diag::warn_linux_kernel_experimental)
+          << Message << "unwind-far" << P.ReturnRange;
+      S.Diag(P.Acquire, diag::note_linux_kernel_acquired_here)
+          << P.AcquireRange;
+      S.Diag(Release->getExprLoc(), diag::note_linux_kernel_released_here)
+          << Release->getSourceRange();
+    }
+    U.PendingUnwinds.clear();
+  }
+};
+
 static bool shouldRunLinuxKernelWarnings(const Sema &S, SourceLocation Loc) {
   const DiagnosticsEngine &Diags = S.getDiagnostics();
   return !Diags.isIgnored(diag::warn_linux_kernel_bool_negative_return, Loc) ||
@@ -8407,7 +10667,10 @@ void clang::sema::IssueLinuxKernelWarnings(Sema &S, const FunctionDecl *FD,
 }
 
 void clang::sema::FinishLinuxKernelWarnings(Sema &S, LinuxKernelUnit &Unit) {
-  if (S.getLangOpts().CPlusPlus || S.getLangOpts().LinuxKernelFactsFile.empty())
+  if (S.getLangOpts().CPlusPlus)
+    return;
+  LinuxFarUnwindReporter(S, *Unit.State).run();
+  if (S.getLangOpts().LinuxKernelFactsFile.empty())
     return;
   LinuxKernelInference(S, Unit).emitFacts();
 }
@@ -8461,14 +10724,26 @@ void clang::sema::IssueLinuxKernelFlowWarnings(Sema &S, const FunctionDecl *FD,
       !Diags.isIgnored(diag::warn_linux_kernel_use_after_free, Loc))
     UseAfterFreeChecker(S, FD, *Cfg).run();
 
+  if (isLinuxExperimentEnabled(S, "null-argument", Loc))
+    checkLinuxNullArguments(S, *Cfg, *Unit.State);
+  if (LinuxContainerOfChecker::wanted(S, Loc))
+    LinuxContainerOfChecker(S, FD, *Cfg).run();
+  if (LinuxDirectReturnChecker::wanted(S, Loc))
+    LinuxDirectReturnChecker(S, FD, *Cfg).run();
+
   // The checks that follow single paths share one search.
   bool WantTestedValue = LinuxTestedValueChecker::wanted(S, Loc);
   bool WantUnwind = LinuxUnwindChecker::wanted(S, Loc);
-  if (!WantTestedValue && !WantUnwind)
+  bool WantOutput = LinuxOutputParamChecker::wanted(S, Loc);
+  if (!WantTestedValue && !WantUnwind && !WantOutput)
     return;
   LinuxPathSearch Search(S.getASTContext(), FD, *Cfg, *Unit.State);
   if (WantTestedValue)
     LinuxTestedValueChecker(S, FD, *Cfg, Search, *Unit.State).run();
   if (WantUnwind)
     LinuxUnwindChecker(S, FD, *Cfg, Search, *Unit.State).run();
+  if (WantOutput)
+    LinuxOutputParamChecker(S, FD, *Cfg, AC.getParentMap(), Search,
+                            *Unit.State)
+        .run();
 }

@@ -327,12 +327,56 @@ The rest look at single expressions and calls:
 
 `-Wlinux-kernel-experimental` is the group of checks that are being tried
 out. `-flinux-kernel-experimental=<name>,...` selects them, and `all`
-selects every one. At present there is `error-deref-after-check`, the
-dereference rule for a pointer that `IS_ERR()` found to be an error
-pointer. Two more names change how the path checks work and are not part of
-`all`: `path-notes` adds a note for each branch between the test and the
-misuse, and `unconfirmed-paths` reports candidates without the second
-search from the function entry.
+selects every one. The group alone turns nothing on. A check moves to a
+group of its own once a kernel scan has shown what it finds. The names:
+
+- `error-deref-after-check`: the dereference rule for a pointer that
+  `IS_ERR()` found to be an error pointer.
+- `error-deref-path`: the result of a function that returns an error pointer
+  on failure is dereferenced, or handed to a function that dereferences it,
+  on a path that has not tested it. This is the path version of
+  `-Wlinux-kernel-error-pointer-deref`, which gives up when the assignment
+  is inside a branch.
+- `error-pointer-null-test`: a pointer that `IS_ERR()` found to be an error
+  pointer comes to a NULL test, as in `out: if (p) put(p);`. It is reported
+  when the pointer is then used where only a pointer that is not NULL gets
+  to, and when nothing else looks at it before the function returns, so that
+  what the NULL test guards is skipped for the failure.
+- `uninit-output`: a local variable is read although the function that was
+  given its address may not have written to it. The compiler works out, for
+  each function with a body, for which return values a pointer parameter is
+  left unwritten, and follows the caller's paths on which the call returned
+  such a value. `ret = read(&val); if (ret) return ret;` is fine,
+  `read(&val); use(val);` is not if `read()` can fail before it writes. A
+  loop that fills the buffer is taken to run, a size parameter is taken to
+  be what the caller needs unless the call passes a constant, and a path
+  that writes another output parameter does not count.
+- `null-argument`: a literal `NULL` is passed for a parameter that the
+  callee dereferences before its first branch and tests nowhere.
+- `container-of-null`: a NULL test of the result of `container_of()`. The
+  entry macros of `<linux/list.h>` never yield NULL, in particular not for
+  an empty list and not after the last round of `list_for_each_entry()`.
+  A plain `container_of()` is reported if the member is not at offset zero.
+- `direct-return`: an error path returns although an error path before it
+  and one after it jump to cleanup code, the later one to the same code or
+  to more of it, and nothing in between calls what that code calls. This
+  check knows no resources, the function's own error handling is the
+  evidence.
+- `unwind-return-call`: `-Wlinux-kernel-missing-unwind` for `return
+  register(priv);` and for `return ret;` with a status that no test has
+  looked at. If that call fails, the resource is still held.
+- `unwind-far`: `-Wlinux-kernel-missing-unwind` for a function that
+  releases the resource nowhere, when another function of the translation
+  unit releases what the same structure member holds, typically the remove
+  callback. It is reported at the end of the translation unit, and not if
+  a function that calls the one in question, directly or through two
+  others, releases the member, nor for a function that other translation
+  units can call unless this one uses it as a callback.
+
+Two more names change how the path checks work and are not part of `all`:
+`path-notes` adds a note for each branch between the test and the misuse,
+and `unconfirmed-paths` reports candidates without the second search from
+the function entry.
 
 ## Architectures without a code generator
 
