@@ -1370,8 +1370,9 @@ public:
   auto end() const { return Blocks.end(); }
 };
 
-/// Which assignment a use of a local variable, or of a member that is
-/// reached through one ("priv->clk"), sees.
+/// Which assignment a use of a variable sees, or a use of a place that is
+/// reached through one: a member ("priv->clk"), an element ("clks[i]",
+/// "priv->clks[i]") or what a pointer points to ("*out").
 ///
 /// The visitor below walks the syntax tree and remembers what was assigned
 /// to a variable, but only for an assignment at the top level of the
@@ -1383,21 +1384,31 @@ public:
 /// This class answers the question from the CFG, with reaching definitions.
 /// A use sees an assignment if that assignment is the only definition of
 /// the place that reaches it.  Where two meet the answer is "none", which
-/// is what the walk says behind a branch.  A member has a value before the
-/// function runs, and that counts as a definition: "if (c) p->m = get();"
-/// leaves two.  As in the walk, a call does not count as one for a member.
+/// is what the walk says behind a branch.
+///
+/// Everything but a local variable has a value before the function runs,
+/// and that counts as a definition: "if (c) p->m = get();" leaves two.  An
+/// assignment to the variable that a place is reached through, or to the
+/// variable that is its index, makes it another place.  A call can assign to
+/// a global variable, and to what a pointer or an array that it is given
+/// points to.  As in the walk, a call is not taken to change a member.
 class LinuxReachingDefs {
 public:
-  /// A variable, or a member of what a variable is or points to.
-  using Place = std::pair<const VarDecl *, const FieldDecl *>;
+  static constexpr int64_t NoIndex = -1;
+
+  /// The variable, the member of it or of what it points to (or null), and
+  /// for an element the variable that is the index (or null) or the index
+  /// itself (or NoIndex).  "*p" is "p[0]".
+  using Place =
+      std::tuple<const VarDecl *, const FieldDecl *, const VarDecl *, int64_t>;
 
   struct Def {
     Place Where;
     /// What is assigned.  Null where the place changes in a way that
     /// leaves nothing to go by: its value at function entry, "x++",
     /// "x += n", "&x", an output of inline assembly, a declaration without
-    /// an initializer, and for a member an assignment to the variable that
-    /// it is reached through.
+    /// an initializer, an assignment to the variable that the place is
+    /// reached through, a call that may write to it.
     const Expr *Value = nullptr;
     SourceLocation Loc;
   };
@@ -1406,10 +1417,13 @@ private:
   ParentMap &Parents;
   std::vector<Def> Defs;
   llvm::DenseMap<Place, llvm::SmallVector<unsigned, 4>> DefsOf;
-  /// The members that are assigned somewhere, by the variable that they
-  /// are reached through.
-  llvm::DenseMap<const VarDecl *, llvm::SmallVector<const FieldDecl *, 2>>
-      Members;
+  /// The places that are assigned somewhere and are no plain variables, by
+  /// the variables that they depend on: the one that they are reached
+  /// through and the one that is the index.
+  llvm::DenseMap<const VarDecl *, llvm::SmallVector<Place, 2>> Dependents;
+  /// Those of them that a call can write to without being given anything:
+  /// the ones that are reached through a global variable.
+  llvm::SmallVector<Place, 4> Globals;
   /// The definitions that a CFG element or an "asm goto" at the end of a
   /// block makes.
   llvm::DenseMap<const Stmt *, llvm::SmallVector<unsigned, 1>> Made;
@@ -1424,32 +1438,51 @@ private:
     return T->isPointerType() || T->isIntegralOrEnumerationType();
   }
 
-  /// The place that \p E names: a local variable, or a member of one or
-  /// of what one points to.
+  static bool isPlain(const Place &Where) {
+    return !std::get<1>(Where) && !std::get<2>(Where) &&
+           std::get<3>(Where) == NoIndex;
+  }
+
+  /// The place that \p E names.
   static std::optional<Place> getPlace(const Expr *E) {
     E = E ? E->IgnoreParenImpCasts() : nullptr;
-    if (!E)
+    if (!E || !isTrackedType(E->getType()))
       return std::nullopt;
-    if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
-      const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
-      if (!VD || !VD->hasLocalStorage() || !isTrackedType(VD->getType()))
+    const VarDecl *Index = nullptr;
+    int64_t Constant = NoIndex;
+    if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
+      if (UO->getOpcode() != UO_Deref)
         return std::nullopt;
-      return Place{VD, nullptr};
+      Constant = 0;
+      E = UO->getSubExpr()->IgnoreParenImpCasts();
+    } else if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(E)) {
+      const Expr *Idx = ASE->getIdx()->IgnoreParenImpCasts();
+      if (const auto *IL = dyn_cast<IntegerLiteral>(Idx)) {
+        Constant = int64_t(IL->getValue().getLimitedValue(1 << 20));
+      } else {
+        const auto *DRE = dyn_cast<DeclRefExpr>(Idx);
+        Index = DRE ? dyn_cast<VarDecl>(DRE->getDecl()) : nullptr;
+        if (!Index || !Index->hasLocalStorage())
+          return std::nullopt;
+      }
+      E = ASE->getBase()->IgnoreParenImpCasts();
     }
-    const auto *ME = dyn_cast<MemberExpr>(E);
-    const auto *Field = ME ? dyn_cast<FieldDecl>(ME->getMemberDecl()) : nullptr;
-    if (!Field || !isTrackedType(Field->getType()))
-      return std::nullopt;
-    const Expr *Base = ME->getBase()->IgnoreParenImpCasts();
-    if (!ME->isArrow())
-      if (const auto *UO = dyn_cast<UnaryOperator>(Base))
-        if (UO->getOpcode() == UO_Deref)
-          Base = UO->getSubExpr()->IgnoreParenImpCasts();
-    const auto *DRE = dyn_cast<DeclRefExpr>(Base);
+    const FieldDecl *Field = nullptr;
+    if (const auto *ME = dyn_cast<MemberExpr>(E)) {
+      Field = dyn_cast<FieldDecl>(ME->getMemberDecl());
+      if (!Field)
+        return std::nullopt;
+      E = ME->getBase()->IgnoreParenImpCasts();
+      if (!ME->isArrow())
+        if (const auto *UO = dyn_cast<UnaryOperator>(E))
+          if (UO->getOpcode() == UO_Deref)
+            E = UO->getSubExpr()->IgnoreParenImpCasts();
+    }
+    const auto *DRE = dyn_cast<DeclRefExpr>(E);
     const auto *VD = DRE ? dyn_cast<VarDecl>(DRE->getDecl()) : nullptr;
-    if (!VD || !VD->hasLocalStorage())
+    if (!VD || VD->getType().isVolatileQualified())
       return std::nullopt;
-    return Place{VD, Field};
+    return Place{VD, Field, Index, Constant};
   }
 
   unsigned add(Place Where, const Expr *Value, SourceLocation Loc) {
@@ -1458,27 +1491,40 @@ private:
     return Defs.size() - 1;
   }
 
-  /// \p At gives \p Where a new value.  With the variable, the members
-  /// that are reached through it are other objects from here on.
+  /// \p At gives \p Where a new value.  What is reached through a variable
+  /// or indexed by it is another place from here on, and the elements of
+  /// a member are those of another array.
   void define(const Stmt *At, Place Where, const Expr *Value,
               SourceLocation Loc) {
     Made[At].push_back(add(Where, Value, Loc));
-    if (Where.second)
+    if (std::get<2>(Where) || std::get<3>(Where) != NoIndex)
       return;
-    auto It = Members.find(Where.first);
-    if (It != Members.end())
-      for (const FieldDecl *Field : It->second)
-        Made[At].push_back(add({Where.first, Field}, nullptr, Loc));
+    auto It = Dependents.find(std::get<0>(Where));
+    if (It == Dependents.end())
+      return;
+    for (const Place &Other : It->second) {
+      if (Other == Where)
+        continue;
+      // A member: only its own elements.
+      if (std::get<1>(Where) &&
+          (std::get<0>(Other) != std::get<0>(Where) ||
+           std::get<1>(Other) != std::get<1>(Where)))
+        continue;
+      Made[At].push_back(add(Other, nullptr, Loc));
+    }
   }
 
   /// Call \p Fn for each place that \p St gives a new value itself, not
   /// through its operands, with what is assigned.
-  template <typename Callback> static void forEachDef(const Stmt *St, Callback Fn) {
+  template <typename Callback>
+  static void forEachDef(const Stmt *St, Callback Fn) {
     if (const auto *DS = dyn_cast<DeclStmt>(St)) {
       for (const Decl *D : DS->decls())
         if (const auto *VD = dyn_cast<VarDecl>(D))
-          if (VD->hasLocalStorage() && isTrackedType(VD->getType()))
-            Fn(Place{VD, nullptr}, VD->getInit(), VD->getLocation());
+          if (VD->hasLocalStorage())
+            Fn(Place{VD, nullptr, nullptr, NoIndex},
+               isTrackedType(VD->getType()) ? VD->getInit() : nullptr,
+               VD->getLocation());
     } else if (const auto *BO = dyn_cast<BinaryOperator>(St)) {
       if (BO->isAssignmentOp())
         if (std::optional<Place> Where = getPlace(BO->getLHS()))
@@ -1492,6 +1538,18 @@ private:
       for (unsigned I = 0, E = AS->getNumOutputs(); I != E; ++I)
         if (std::optional<Place> Where = getPlace(AS->getOutputExpr(I)))
           Fn(*Where, nullptr, AS->getAsmLoc());
+    }
+  }
+
+  /// The local pointers and arrays that \p CE hands to its callee, which
+  /// can then write to what they point to.
+  static void handedOver(const CallExpr *CE,
+                         llvm::SmallVectorImpl<const VarDecl *> &Out) {
+    for (const Expr *Arg : CE->arguments()) {
+      const auto *DRE = dyn_cast<DeclRefExpr>(Arg->IgnoreParenCasts());
+      const auto *VD = DRE ? dyn_cast<VarDecl>(DRE->getDecl()) : nullptr;
+      if (VD && (VD->getType()->isPointerType() || VD->getType()->isArrayType()))
+        Out.push_back(VD);
     }
   }
 
@@ -1510,15 +1568,12 @@ private:
   /// an "asm goto" at its end, whose outputs are written when it ends.
   template <typename Callback>
   void forEachStmt(const CFGBlock *B, Callback Fn) const {
-    unsigned Index = 0;
-    for (const CFGElement &Elem : *B) {
-      unsigned This = Index++;
+    for (const CFGElement &Elem : *B)
       if (std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>())
-        Fn(CS->getStmt(), This);
-    }
+        Fn(CS->getStmt());
     const Stmt *Term = B->getTerminatorStmt();
     if (isa_and_nonnull<GCCAsmStmt>(Term) && !Position.count(Term))
-      Fn(Term, Index);
+      Fn(Term);
   }
 
 public:
@@ -1534,34 +1589,75 @@ public:
           Position.try_emplace(CS->getStmt(), B->getBlockID(), This);
       }
     }
-    // The members first: an assignment to a variable is a definition of
-    // each of them.
-    llvm::SmallPtrSet<const Stmt *, 32> Scanned;
+    // First the places that are no plain local variables: an assignment
+    // to a variable is a definition of what is reached through it.
+    llvm::SmallVector<Place, 8> Others;
     for (const CFGBlock *B : Cfg)
-      forEachStmt(B, [&](const Stmt *St, unsigned) {
+      forEachStmt(B, [&](const Stmt *St) {
         forEachDef(St, [&](Place Where, const Expr *, SourceLocation) {
-          if (!Where.second)
+          const VarDecl *Base = std::get<0>(Where);
+          if ((isPlain(Where) && Base->hasLocalStorage()) ||
+              llvm::is_contained(Others, Where))
             return;
-          auto &Fields = Members[Where.first];
-          if (!llvm::is_contained(Fields, Where.second))
-            Fields.push_back(Where.second);
+          Others.push_back(Where);
+          Dependents[Base].push_back(Where);
+          if (const VarDecl *Index = std::get<2>(Where); Index && Index != Base)
+            Dependents[Index].push_back(Where);
+          if (!Base->hasLocalStorage())
+            Globals.push_back(Where);
         });
       });
+    // A function that assigns to many global variables: every call would
+    // be a definition of each.
+    if (Globals.size() > 8) {
+      llvm::erase_if(Others, [](const Place &Where) {
+        return !std::get<0>(Where)->hasLocalStorage();
+      });
+      for (auto &Entry : Dependents)
+        llvm::erase_if(Entry.second, [](const Place &Where) {
+          return !std::get<0>(Where)->hasLocalStorage();
+        });
+      Globals.clear();
+    }
     // What is there when the function starts.
     llvm::SmallVector<unsigned, 8> AtEntry;
     for (const ParmVarDecl *P : FD->parameters())
-      if (isTrackedType(P->getType()))
-        AtEntry.push_back(add({P, nullptr}, nullptr, P->getLocation()));
-    for (const auto &[Base, Fields] : Members)
-      for (const FieldDecl *Field : Fields)
-        AtEntry.push_back(add({Base, Field}, nullptr, Base->getLocation()));
+      AtEntry.push_back(add(Place{P, nullptr, nullptr, NoIndex}, nullptr,
+                            P->getLocation()));
+    for (const Place &Where : Others)
+      AtEntry.push_back(add(Where, nullptr, std::get<0>(Where)->getLocation()));
+
+    llvm::SmallPtrSet<const Stmt *, 32> Scanned;
+    llvm::SmallVector<const VarDecl *, 4> Handed;
     for (const CFGBlock *B : Cfg)
-      forEachStmt(B, [&](const Stmt *St, unsigned) {
+      forEachStmt(B, [&](const Stmt *St) {
         if (!Scanned.insert(St).second)
           return;
         forEachDef(St, [&](Place Where, const Expr *Value, SourceLocation Loc) {
+          // Not what is reached through a global variable if those are
+          // not followed in this function.
+          if (!std::get<0>(Where)->hasLocalStorage() && !DefsOf.count(Where))
+            return;
           define(St, Where, Value, Loc);
         });
+        const auto *CE = dyn_cast<CallExpr>(St);
+        if (!CE)
+          return;
+        for (const Place &Where : Globals)
+          Made[St].push_back(add(Where, nullptr, CE->getExprLoc()));
+        Handed.clear();
+        handedOver(CE, Handed);
+        for (const VarDecl *VD : Handed) {
+          auto It = Dependents.find(VD);
+          if (It == Dependents.end())
+            continue;
+          // What the pointer or the array itself leads to, not the members
+          // of a structure.
+          for (const Place &Where : It->second)
+            if (std::get<0>(Where) == VD && !std::get<1>(Where) &&
+                VD->hasLocalStorage())
+              Made[St].push_back(add(Where, nullptr, CE->getExprLoc()));
+        }
       });
 
     In.assign(Cfg.getNumBlockIDs(), llvm::BitVector(Defs.size()));
@@ -1574,7 +1670,7 @@ public:
       Changed = false;
       for (const CFGBlock *B : Order) {
         llvm::BitVector State = In[B->getBlockID()];
-        forEachStmt(B, [&](const Stmt *St, unsigned) { make(St, State); });
+        forEachStmt(B, [&](const Stmt *St) { make(St, State); });
         for (const CFGBlock::AdjacentBlock &Succ : B->succs()) {
           const CFGBlock *Next = Succ.getReachableBlock();
           if (!Next)
@@ -1591,7 +1687,8 @@ public:
   }
 
   /// The definition of its place that \p Use sees, if every path to the
-  /// use comes from the same one.  \p Use reads a variable or a member.
+  /// use comes from the same one.  \p Use reads a variable, a member, an
+  /// element or what a pointer points to.
   const Def *unique(const Expr *Use) const {
     if (!Valid || !Use)
       return nullptr;
@@ -1654,7 +1751,9 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
   /// "if (IS_ERR(p)) return p;": what is returned there is an error pointer
   /// or NULL, which the cleanup functions of <linux/cleanup.h> leave alone.
   llvm::SmallPtrSet<const ReturnStmt *, 4> NothingToRelease;
-  llvm::SmallPtrSet<const VarDecl *, 4> ReportedErrorDerefs;
+  /// The variables, and for other places the members or the variables that
+  /// they are reached through, that a dereference was reported for.
+  llvm::SmallPtrSet<const Decl *, 4> ReportedErrorDerefs;
   /// "x & ~mask" expressions whose result is cut down to the width of the
   /// mask anyway.
   llvm::SmallPtrSet<const Expr *, 4> NarrowedAnds;
@@ -1880,10 +1979,16 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
     }
 
     if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
-      if (BO->getOpcode() == BO_Assign)
+      if (BO->getOpcode() == BO_Assign || BO->getOpcode() == BO_Comma)
         return getOrigin(BO->getRHS(), SeenVariables);
       return {};
     }
+
+    // "clks[i]" and "*out": only the CFG knows.
+    if (isa<ArraySubscriptExpr>(E) ||
+        (isa<UnaryOperator>(E) &&
+         cast<UnaryOperator>(E)->getOpcode() == UO_Deref))
+      return getReachingOrigin(E, SeenVariables);
 
     if (const auto *CO = dyn_cast<ConditionalOperator>(E)) {
       llvm::SmallPtrSet<const VarDecl *, 8> TrueSeen;
@@ -1968,7 +2073,11 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
     --ReachingDepth;
     if (Origin) {
       Origin.Assigned = D->Loc;
-      Origin.Copied = isa<DeclRefExpr, MemberExpr>(D->Value->IgnoreParenCasts());
+      const Expr *From = D->Value->IgnoreParenCasts();
+      Origin.Copied =
+          isa<DeclRefExpr, MemberExpr, ArraySubscriptExpr>(From) ||
+          (isa<UnaryOperator>(From) &&
+           cast<UnaryOperator>(From)->getOpcode() == UO_Deref);
       if (Value)
         *Value = D->Value;
     }
@@ -2292,11 +2401,37 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
   using PointerCopies =
       llvm::SmallVector<std::pair<const VarDecl *, const VarDecl *>, 8>;
   /// The members that a function tests, whatever object they are members
-  /// of, and the variables that are given the value of a member.
+  /// of, the variables that are given the value of a member, and the
+  /// variables that something is tested through: "arr" for "if (!arr[i])"
+  /// and "out" for "if (IS_ERR(*out))".
   struct TestedMembers {
     llvm::SmallPtrSet<const FieldDecl *, 8> Tested;
+    /// A variable and a member of which one was assigned to the other.
     llvm::SmallVector<std::pair<const VarDecl *, const FieldDecl *>, 8> Copies;
+    llvm::SmallPtrSet<const VarDecl *, 4> Through;
+    /// A variable, and the variable through which the place is reached that
+    /// one was assigned to or from: "r = *ranges;", "slots[i] = dev;".
+    llvm::SmallVector<std::pair<const VarDecl *, const VarDecl *>, 4>
+        ThroughCopies;
   };
+  std::optional<TestedMembers> TestedMemberInfo;
+
+  /// "p[i]" and "*p": the array or the pointer.
+  static const Expr *stripElement(const Expr *E) {
+    for (;;) {
+      E = E ? E->IgnoreParenCasts() : nullptr;
+      if (!E)
+        return E;
+      if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(E)) {
+        E = ASE->getBase();
+      } else if (const auto *UO = dyn_cast<UnaryOperator>(E);
+                 UO && UO->getOpcode() == UO_Deref) {
+        E = UO->getSubExpr();
+      } else {
+        return E;
+      }
+    }
+  }
 
   /// The pointers that \p St tests, and the pairs of pointers of which one
   /// is a plain copy of the other.
@@ -2323,8 +2458,29 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
       }
       if (const VarDecl *VD = getDirectLinuxVariable(E))
         Out.insert(VD);
-      if (const FieldDecl *Field = Members ? Member(E) : nullptr)
+      if (!Members)
+        return;
+      // A test of an element or of what a pointer points to counts for the
+      // member, or else for the variable, that it is reached through.
+      const Expr *Inner = stripElement(E);
+      if (const FieldDecl *Field = Member(Inner))
         Members->Tested.insert(Field);
+      else if (Inner != E)
+        if (const VarDecl *VD = getDirectLinuxVariable(Inner))
+          Members->Through.insert(VD);
+    };
+    // A variable and a place that is none, of which one is assigned to the
+    // other: "chan = data->chan;" after "if (IS_ERR(data->chan))", and
+    // "nbd->disk = disk;" after "if (IS_ERR(disk))".
+    auto AddPlaceCopy = [&](const VarDecl *Var, const Expr *Place) {
+      if (!Members || !Var || !Place)
+        return;
+      const Expr *Inner = stripElement(Place);
+      if (const FieldDecl *Field = Member(Inner))
+        Members->Copies.push_back({Var, Field});
+      else if (Inner != Place->IgnoreParenCasts())
+        if (const VarDecl *Base = getDirectLinuxVariable(Inner))
+          Members->ThroughCopies.push_back({Var, Base});
     };
     auto AddCopy = [&](const VarDecl *To, const Expr *From) {
       const VarDecl *Source =
@@ -2332,17 +2488,20 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
       if (Copies && To && Source && To != Source &&
           To->getType()->isPointerType() && Source->getType()->isPointerType())
         Copies->push_back({To, Source});
-      // "chan = data->chan;" after "if (IS_ERR(data->chan))".
-      if (const FieldDecl *Field = Members && To ? Member(From) : nullptr)
-        Members->Copies.push_back({To, Field});
+      AddPlaceCopy(To, From);
     };
     if (const auto *DS = dyn_cast<DeclStmt>(St)) {
       for (const Decl *D : DS->decls())
         if (const auto *VD = dyn_cast<VarDecl>(D))
           AddCopy(VD, VD->getInit());
     } else if (const auto *BO = dyn_cast<BinaryOperator>(St)) {
-      if (BO->getOpcode() == BO_Assign)
-        AddCopy(getDirectLinuxVariable(BO->getLHS()), BO->getRHS());
+      if (BO->getOpcode() == BO_Assign) {
+        if (const VarDecl *To = getDirectLinuxVariable(BO->getLHS()))
+          AddCopy(To, BO->getRHS());
+        else
+          AddPlaceCopy(getDirectLinuxVariable(BO->getRHS()->IgnoreParenCasts()),
+                       BO->getLHS());
+      }
     }
     if (const auto *CE = dyn_cast<CallExpr>(St)) {
       const FunctionDecl *Callee = CE->getDirectCallee();
@@ -2379,12 +2538,11 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
     if (!TestedPointers) {
       TestedPointers.emplace();
       PointerCopies Copies;
-      TestedMembers Members;
+      TestedMemberInfo.emplace();
+      TestedMembers &Members = *TestedMemberInfo;
       collectTestedPointers(CurrentFunction->getBody(), *TestedPointers,
                             &Copies, &Members);
-      for (auto [To, Field] : Members.Copies)
-        if (Members.Tested.count(Field))
-          TestedPointers->insert(To);
+      // A test of one end of a copy counts for the other end.
       for (bool Changed = true; Changed;) {
         Changed = false;
         for (auto [To, From] : Copies)
@@ -2393,9 +2551,84 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
             TestedPointers->insert(From);
             Changed = true;
           }
+        for (auto [Var, Field] : Members.Copies)
+          if (bool(TestedPointers->count(Var)) !=
+              bool(Members.Tested.count(Field))) {
+            TestedPointers->insert(Var);
+            Members.Tested.insert(Field);
+            Changed = true;
+          }
+        for (auto [Var, Base] : Members.ThroughCopies)
+          if (bool(TestedPointers->count(Var)) !=
+              bool(Members.Through.count(Base))) {
+            TestedPointers->insert(Var);
+            Members.Through.insert(Base);
+            Changed = true;
+          }
       }
     }
     return *TestedPointers;
+  }
+
+  /// The pointer that a dereference goes through, for the checks that ask
+  /// whether the function tests it anywhere: a local variable, or a place
+  /// that only the CFG can follow (a member, an element, what a pointer
+  /// points to, a global variable).
+  struct Dereferenced {
+    /// The local variable, if it is one.
+    const VarDecl *Var = nullptr;
+    /// What tests and reports are counted by: the variable, or the member
+    /// or the variable that the place is reached through.
+    const Decl *Key = nullptr;
+    /// How the diagnostic names it.
+    std::string Name;
+  };
+
+  std::optional<Dereferenced> getDereferenced(const Expr *Base) const {
+    Base = Base->IgnoreParenCasts();
+    Dereferenced D;
+    if (const VarDecl *VD = getDirectLinuxVariable(Base)) {
+      if (isa<ParmVarDecl>(VD) || (!VD->hasLocalStorage() && !Reaching))
+        return std::nullopt;
+      D.Var = VD->hasLocalStorage() ? VD : nullptr;
+      D.Key = VD;
+      D.Name = "'" + VD->getNameAsString() + "'";
+      return D;
+    }
+    if (!Reaching)
+      return std::nullopt;
+    const Expr *Inner = stripElement(Base);
+    const auto *ME = dyn_cast_or_null<MemberExpr>(Inner);
+    if (const FieldDecl *Field =
+            ME ? dyn_cast<FieldDecl>(ME->getMemberDecl()) : nullptr)
+      D.Key = Field;
+    else if (const VarDecl *VD = Inner != Base ? getDirectLinuxVariable(Inner)
+                                               : nullptr)
+      D.Key = VD;
+    else
+      return std::nullopt;
+    D.Name = "'" + getLinuxExprText(Base, S) + "'";
+    return D;
+  }
+
+  /// Where the pointer comes from.  \p Value is set to what was assigned if
+  /// the CFG gave the answer.
+  LinuxKernelAPIOrigin originOf(const Dereferenced &D, const Expr *Base,
+                                const Expr **Value = nullptr) const {
+    Base = Base->IgnoreParenCasts();
+    if (D.Var)
+      return originAt(D.Var, Base, Value);
+    llvm::SmallPtrSet<const VarDecl *, 8> SeenVariables;
+    return getReachingOrigin(Base, SeenVariables, Value);
+  }
+
+  bool isTestedSomewhere(const Dereferenced &D) {
+    const llvm::SmallPtrSetImpl<const VarDecl *> &Variables =
+        getTestedPointers();
+    if (const auto *Field = dyn_cast<FieldDecl>(D.Key))
+      return TestedMemberInfo->Tested.count(Field);
+    const auto *VD = cast<VarDecl>(D.Key);
+    return Variables.count(VD) || (!D.Var && TestedMemberInfo->Through.count(VD));
   }
 
   /// "p = get(); p->member": the result of an error pointer function is
@@ -2403,18 +2636,16 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
   void checkErrorPointerDeref(const MemberExpr *ME) {
     if (!ME->isArrow() || !CurrentFunction)
       return;
-    const VarDecl *VD =
-        getDirectLinuxVariable(ME->getBase()->IgnoreParenCasts());
-    if (!VD || !VD->hasLocalStorage() || isa<ParmVarDecl>(VD))
+    std::optional<Dereferenced> D = getDereferenced(ME->getBase());
+    if (!D)
       return;
-    LinuxKernelAPIOrigin Origin =
-        originAt(VD, ME->getBase()->IgnoreParenCasts());
+    LinuxKernelAPIOrigin Origin = originOf(*D, ME->getBase());
     if (Origin.Kind != LinuxKernelAPIKind::ErrorPointer)
       return;
-    if (getTestedPointers().count(VD) || !ReportedErrorDerefs.insert(VD).second)
+    if (isTestedSomewhere(*D) || !ReportedErrorDerefs.insert(D->Key).second)
       return;
     S.Diag(ME->getOperatorLoc(), diag::warn_linux_kernel_err_ptr_deref)
-        << VD << Origin.Callee << ME->getSourceRange();
+        << D->Name << Origin.Callee << ME->getSourceRange();
     noteInferred(Origin);
   }
 
@@ -2423,13 +2654,11 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
   void checkUncheckedAllocation(const MemberExpr *ME) {
     if (!ME->isArrow() || !CurrentFunction)
       return;
-    const VarDecl *VD =
-        getDirectLinuxVariable(ME->getBase()->IgnoreParenCasts());
-    if (!VD || !VD->hasLocalStorage() || isa<ParmVarDecl>(VD))
+    std::optional<Dereferenced> D = getDereferenced(ME->getBase());
+    if (!D)
       return;
     const Expr *Value = nullptr;
-    LinuxKernelAPIOrigin Origin =
-        originAt(VD, ME->getBase()->IgnoreParenCasts(), &Value);
+    LinuxKernelAPIOrigin Origin = originOf(*D, ME->getBase(), &Value);
     if (!Origin || Origin.Inferred || Origin.Copied)
       return;
     switch (Origin.Kind) {
@@ -2445,11 +2674,11 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
     if (Value &&
         getLinuxExprText(Value, S).find("__GFP_NOFAIL") != std::string::npos)
       return;
-    if (AllocationsThatCannotFail.count(VD) || getTestedPointers().count(VD) ||
-        !ReportedErrorDerefs.insert(VD).second)
+    if ((D->Var && AllocationsThatCannotFail.count(D->Var)) ||
+        isTestedSomewhere(*D) || !ReportedErrorDerefs.insert(D->Key).second)
       return;
     S.Diag(ME->getOperatorLoc(), diag::warn_linux_kernel_unchecked_alloc)
-        << VD << Origin.Callee << ME->getSourceRange();
+        << D->Name << Origin.Callee << ME->getSourceRange();
   }
 
   static const MemberExpr *findDeref(const Stmt *St, const VarDecl *VD) {
@@ -2493,23 +2722,22 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
     if (!Callee || !CurrentFunction)
       return;
     for (unsigned I = 0, E = Call->getNumArgs(); I != E; ++I) {
-      const VarDecl *VD =
-          getDirectLinuxVariable(Call->getArg(I)->IgnoreParenCasts());
-      if (!VD || !VD->hasLocalStorage() || isa<ParmVarDecl>(VD))
+      if (!Call->getArg(I)->getType()->isPointerType())
         continue;
-      LinuxKernelAPIOrigin Origin =
-          originAt(VD, Call->getArg(I)->IgnoreParenCasts());
+      std::optional<Dereferenced> D = getDereferenced(Call->getArg(I));
+      if (!D)
+        continue;
+      LinuxKernelAPIOrigin Origin = originOf(*D, Call->getArg(I));
       if (Origin.Kind != LinuxKernelAPIKind::ErrorPointer)
         continue;
       const MemberExpr *Deref = getParameterDeref(Callee, I);
       if (!Deref)
         continue;
-      if (getTestedPointers().count(VD) ||
-          !ReportedErrorDerefs.insert(VD).second)
+      if (isTestedSomewhere(*D) || !ReportedErrorDerefs.insert(D->Key).second)
         continue;
       S.Diag(Call->getArg(I)->getExprLoc(),
              diag::warn_linux_kernel_err_ptr_deref)
-          << VD << Origin.Callee << Call->getArg(I)->getSourceRange();
+          << D->Name << Origin.Callee << Call->getArg(I)->getSourceRange();
       S.Diag(Deref->getOperatorLoc(),
              diag::note_linux_kernel_dereferenced_here)
           << Deref->getBase()->IgnoreParenCasts() << Deref->getSourceRange();

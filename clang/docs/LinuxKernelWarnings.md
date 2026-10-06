@@ -649,8 +649,10 @@ kernels without requiring changes to kernel headers.
 
 What a variable or a member such as `priv->clk` holds at a use is decided
 from the control flow graph: the use sees an assignment if that assignment
-is the only definition that reaches it. That holds inside a branch, in a
-loop and behind a `goto`:
+is the only definition that reaches it. The same goes for an element
+(`clks[i]`, `priv->clks[i]`) as long as its index is not assigned to, for
+what a pointer points to (`*out`), and for a global variable. That holds
+inside a branch, in a loop and behind a `goto`:
 
 ```c
 for (i = 0; i < n; i++) {
@@ -665,7 +667,9 @@ Where two definitions meet, nothing is known and nothing is reported: after
 at the label, and for a member that an assignment under a condition may or
 may not have replaced. Taking the address of a tracked local, counting it
 up or down, writing it from inline assembly and releasing it end what the
-assignment before says. A member is taken to keep its value over a call.
+assignment before says. A member is taken to keep its value over a call. A
+global variable is not, and neither is what a pointer or an array points to
+that the call is given.
 `-flinux-kernel-experimental=walk-origins` gives the older and narrower
 rule, for a comparison: assignments count only at the top level of a
 function and before its first `goto`.
@@ -673,7 +677,10 @@ function and before its first `goto`.
 A function that tests a pointer anywhere is not reported for dereferencing
 it without a test. The test can be of a copy, of the assignment itself
 (`if (!(p = get()))`), or of the member that the pointer was read from
-(`if (IS_ERR(d->chan)) ...; chan = d->chan;`).
+(`if (IS_ERR(d->chan)) ...; chan = d->chan;`). For a pointer that is no
+local variable the question is asked of the member, whatever object it is
+a member of, and for an element of the array: one tested element of
+`priv->clks` is enough to keep the check quiet about all of them.
 
 A negative NULL test next to an `IS_ERR()` or `IS_ERR_OR_NULL()` test of the
 same variable is treated as one combined guard. This avoids diagnosing the

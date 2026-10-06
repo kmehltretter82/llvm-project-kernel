@@ -211,6 +211,153 @@ out:
 }
 
 // ---------------------------------------------------------------------------
+// Places that are no variables: an element, what a pointer points to, a
+// global variable.  An assignment to the index or to the variable that leads
+// there makes it another place, and a call can write to a global variable
+// and through a pointer that it is given.
+
+struct holder {
+  struct dev *slots[4];
+  struct dev *one;
+};
+static struct dev *the_dev;
+
+int element_in_loop(struct holder *h, int n) {
+  int i;
+
+  for (i = 0; i < n; i++) {
+    h->slots[i] = dev_lookup(i);
+    if (!h->slots[i]) // cfg-warning {{dev_lookup returns an encoded error pointer on failure, which a NULL test does not detect; use IS_ERR()}}
+      return -ENODEV;
+  }
+  return 0;
+}
+
+int element_other_index(struct holder *h, int i) {
+  h->slots[i] = dev_lookup(i);
+  i++;
+  if (!h->slots[i])
+    return -ENODEV;
+  return 0;
+}
+
+int local_array(int n) {
+  struct dev *found[4];
+  int i, sum = 0;
+
+  for (i = 0; i < n && i < 4; i++) {
+    found[i] = dev_lookup(i);
+    if (!found[i]) // cfg-warning {{dev_lookup returns an encoded error pointer on failure, which a NULL test does not detect; use IS_ERR()}}
+      break;
+    sum += found[i]->a;
+  }
+  return sum;
+}
+
+int out_parameter(struct dev **out) {
+  *out = dev_lookup(1);
+  if (!*out) // cfg-warning {{dev_lookup returns an encoded error pointer on failure, which a NULL test does not detect; use IS_ERR()}}
+    return -ENODEV;
+  return 0;
+}
+
+int out_parameter_handed_on(struct dev **out) {
+  *out = dev_lookup(1);
+  fill(out);
+  if (!*out)
+    return -ENODEV;
+  return 0;
+}
+
+int global_in_branch(struct dev *d) {
+  if (d->mode) {
+    the_dev = dev_lookup(1);
+    if (!the_dev) // cfg-warning {{dev_lookup returns an encoded error pointer on failure, which a NULL test does not detect; use IS_ERR()}}
+      return -ENODEV;
+  }
+  return 0;
+}
+
+int global_behind_call(struct dev *d) {
+  if (d->mode) {
+    the_dev = dev_lookup(1);
+    note(1);
+    if (!the_dev)
+      return -ENODEV;
+  }
+  return 0;
+}
+
+int through_comma(struct dev *d) {
+  struct dev *o;
+
+  if (d->mode) {
+    o = (note(1), dev_lookup(1));
+    if (!o) // cfg-warning {{dev_lookup returns an encoded error pointer on failure, which a NULL test does not detect; use IS_ERR()}}
+      return -ENODEV;
+  }
+  return 0;
+}
+
+// The dereference checks follow the same places.
+int member_deref(struct holder *h) {
+  h->one = dev_lookup(1);
+  return h->one->a; // cfg-warning {{'h->one' holds an encoded error pointer if 'dev_lookup' failed, and is dereferenced here without an IS_ERR() test}}
+}
+
+int member_deref_tested(struct holder *h) {
+  h->one = dev_lookup(1);
+  if (IS_ERR(h->one))
+    return PTR_ERR(h->one);
+  return h->one->a;
+}
+
+int member_deref_copy_tested(struct holder *h) {
+  struct dev *o;
+
+  h->one = dev_lookup(1);
+  o = h->one;
+  if (IS_ERR(o))
+    return PTR_ERR(o);
+  return h->one->a;
+}
+
+// The variable is tested, and its value goes into the member afterwards.
+int member_from_tested(struct holder *h) {
+  struct dev *o = dev_lookup(1);
+
+  if (IS_ERR(o))
+    return PTR_ERR(o);
+  h->one = o;
+  return h->one->a;
+}
+
+// What the pointer points to is tested, and then copied.
+int pointee_tested_then_copied(struct dev **out) {
+  struct dev *o;
+
+  *out = dev_lookup(1);
+  if (IS_ERR(*out))
+    return PTR_ERR(*out);
+  o = *out;
+  return o->a;
+}
+
+int element_deref(struct holder *h, int i) {
+  h->slots[i] = kzalloc(sizeof(struct dev), 0);
+  h->slots[i]->a = 1; // cfg-warning {{'h->slots[i]' holds the result of 'kzalloc', which is NULL when the allocation fails, and is dereferenced here without a test}}
+  return 0;
+}
+
+int element_deref_tested(struct holder *h, int i) {
+  h->slots[i] = kzalloc(sizeof(struct dev), 0);
+  if (!h->slots[i])
+    return -ENOMEM;
+  h->slots[i]->a = 1;
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Where two definitions meet, nothing is known.
 
 int two_ways(struct dev *d) {
