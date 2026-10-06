@@ -20,8 +20,8 @@
 // off-no-diagnostics
 
 // The line for the translation unit is at the start of the file.
-// live-warning@1 {{statistics for this file: functions 3, path searches 26, out of steps 0, dropped paths 0, not run 0, checks stopped early 1 (experimental check 'statistics')}}
-// dead-warning@1 {{statistics for this file: functions 3, path searches 26, out of steps 0, dropped paths 1, not run 0, checks stopped early 1 (experimental check 'statistics')}}
+// live-warning@1 {{statistics for this file: functions 4, path searches 26, out of steps 0, dropped paths 0, not run 0, checks stopped early 1, tables full 1 (experimental check 'statistics')}}
+// dead-warning@1 {{statistics for this file: functions 4, path searches 26, out of steps 0, dropped paths 1, not run 0, checks stopped early 1, tables full 1 (experimental check 'statistics')}}
 
 #define EIO 5
 
@@ -77,7 +77,7 @@ int few(struct priv *p) {
 
 // The unwind check follows two dozen acquisitions in one function and then
 // leaves the function alone.
-int many(struct priv *p) { // expected-warning {{statistics for 'many': path searches 24, out of steps 0, dropped paths 0, not run 0, checks stopped early 1 (experimental check 'statistics')}}
+int many(struct priv *p) { // expected-warning {{statistics for 'many': path searches 24, out of steps 0, dropped paths 0, not run 0, checks stopped early 1, tables full 0 (experimental check 'statistics')}}
   mutex_lock(&p->l0);
   if (setup(p->dev)) {
     mutex_unlock(&p->l0);
@@ -242,7 +242,7 @@ int many(struct priv *p) { // expected-warning {{statistics for 'many': path sea
 // is known about it is dropped: the paths come to the end of the function
 // in one state.  With "keep-dead-facts" they come in thirty-two, which is
 // more than the search keeps for one block.
-int flags(struct priv *p, int a, int b, int c, int d, int e) { // dead-warning {{statistics for 'flags': path searches 1, out of steps 0, dropped paths 1, not run 0, checks stopped early 0 (experimental check 'statistics')}}
+int flags(struct priv *p, int a, int b, int c, int d, int e) { // dead-warning {{statistics for 'flags': path searches 1, out of steps 0, dropped paths 1, not run 0, checks stopped early 0, tables full 0 (experimental check 'statistics')}}
   int ret;
 
   mutex_lock(&p->lock);
@@ -269,4 +269,14 @@ int flags(struct priv *p, int a, int b, int c, int d, int e) { // dead-warning {
   ret = setup(p->dev);
   mutex_unlock(&p->lock);
   return ret;
+}
+
+// More conditions than a search has numbers for.  What it cannot number it
+// knows nothing about, and the function is one in which a limit was reached
+// although no search ran.
+#define TEST(n) if (p->lock.owner == (n)) note(n);
+#define TEST10(b) TEST(b + 0) TEST(b + 1) TEST(b + 2) TEST(b + 3) TEST(b + 4) \
+                  TEST(b + 5) TEST(b + 6) TEST(b + 7) TEST(b + 8) TEST(b + 9)
+void crowded(struct priv *p) { // expected-warning {{statistics for 'crowded': path searches 0, out of steps 0, dropped paths 0, not run 0, checks stopped early 0, tables full 1 (experimental check 'statistics')}}
+  TEST10(0) TEST10(10) TEST10(20) TEST10(30) TEST10(40) TEST10(50) TEST10(60)
 }

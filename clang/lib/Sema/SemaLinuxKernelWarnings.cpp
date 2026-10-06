@@ -175,6 +175,8 @@ struct sema::LinuxKernelUnit::Impl {
                               ///< function had used up its steps
     unsigned Capped = 0;      ///< checks that stopped at the number of
                               ///< searches they allow themselves
+    unsigned TableFull = 0;   ///< functions with more locations or
+                              ///< conditions than a search numbers
   };
   Statistics Stats;
 
@@ -5604,6 +5606,7 @@ private:
   llvm::DenseMap<const VarDecl *, unsigned> VarIndex;
   std::vector<llvm::SmallBitVector> LiveVars;
   bool KeepDeadFacts = false;
+  bool TableFull = false;
   unsigned FunctionSteps = 0;
   unsigned Steps = 0;
   bool Stopped = false;
@@ -5798,6 +5801,14 @@ private:
     return true;
   }
 
+  /// The function has more locations or conditions than the search has
+  /// numbers for.  What it cannot number it knows nothing about.
+  void noteTableFull() {
+    if (!TableFull)
+      ++Unit.Stats.TableFull;
+    TableFull = true;
+  }
+
   /// The index of the condition \p E, which is already stripped, or -1 if
   /// it has a side effect or there is no room for it.
   int conditionIndex(const Expr *E, bool Create) {
@@ -5806,8 +5817,12 @@ private:
     for (unsigned I = 0, N = Conditions.size(); I != N; ++I)
       if (Conditions[I].ID == ID)
         return I;
-    if (!Create || Conditions.size() >= MaxConditions)
+    if (!Create)
       return -1;
+    if (Conditions.size() >= MaxConditions) {
+      noteTableFull();
+      return -1;
+    }
     Condition C;
     if (!scanCondition(E, C))
       return -1;
@@ -6307,8 +6322,12 @@ public:
       return -1;
     if (int Loc = find(Root, Path); Loc >= 0)
       return Loc;
-    if (!Create || Locations.size() >= MaxLocations)
+    if (!Create)
       return -1;
+    if (Locations.size() >= MaxLocations) {
+      noteTableFull();
+      return -1;
+    }
     Location L;
     L.Root = Root;
     L.Path = std::move(Path);
@@ -6338,8 +6357,10 @@ public:
       return -1;
     if (int Loc = find(VD, {}); Loc >= 0)
       return Loc;
-    if (Locations.size() >= MaxLocations)
+    if (Locations.size() >= MaxLocations) {
+      noteTableFull();
       return -1;
+    }
     Location L;
     L.Root = VD;
     Locations.push_back(std::move(L));
@@ -7098,6 +7119,9 @@ static void noteLinuxNoFixpoint(Sema &S, const FunctionDecl *FD,
 ///   not run              the function had used up its steps
 ///   checks stopped early a check came to the number of searches that it
 ///                        allows itself in one function
+///   tables full          a function has more locations or more conditions
+///                        than a search numbers, and nothing is known about
+///                        the ones that are left
 class LinuxStatisticsScope {
   using Statistics = sema::LinuxKernelUnit::Impl::Statistics;
 
@@ -7118,7 +7142,8 @@ public:
     unsigned States = Stats.OutOfStates - Before.OutOfStates;
     unsigned Refused = Stats.Refused - Before.Refused;
     unsigned Capped = Stats.Capped - Before.Capped;
-    if (!(Steps + States + Refused + Capped) ||
+    unsigned Full = Stats.TableFull - Before.TableFull;
+    if (!(Steps + States + Refused + Capped + Full) ||
         !isLinuxExperimentEnabled(S, "statistics", FD->getBeginLoc(),
                                   /*IsCheck=*/false))
       return;
@@ -7127,7 +7152,7 @@ public:
     OS << "statistics for '" << FD->getName() << "': path searches "
        << Stats.Searches - Before.Searches << ", out of steps " << Steps
        << ", dropped paths " << States << ", not run " << Refused
-       << ", checks stopped early " << Capped;
+       << ", checks stopped early " << Capped << ", tables full " << Full;
     S.Diag(FD->getLocation(), diag::warn_linux_kernel_experimental)
         << Text << "statistics";
   }
@@ -9544,8 +9569,9 @@ class LinuxUnwindChecker : LinuxPathSearch::Client {
     if (!DomTree)
       DomTree = std::make_unique<CFGDomTree>(const_cast<CFG *>(&Cfg));
     bool BeforeAcquire = false;
-    const CFGBlock *B = AcquireBlock;
-    for (unsigned Depth = 0; B && Depth < 64; ++Depth) {
+    // Up the dominator tree to the entry.  A limit on the number of steps
+    // would stop short in a long function, where each branch is a step.
+    for (const CFGBlock *B = AcquireBlock; B;) {
       for (auto It = B->rbegin(), End = B->rend(); It != End; ++It) {
         std::optional<CFGStmt> CS = It->getAs<CFGStmt>();
         const auto *CE = CS ? dyn_cast<CallExpr>(CS->getStmt()) : nullptr;
@@ -12107,7 +12133,7 @@ void clang::sema::FinishLinuxKernelWarnings(Sema &S, LinuxKernelUnit &Unit) {
        << ", path searches " << Stats.Searches << ", out of steps "
        << Stats.OutOfSteps << ", dropped paths " << Stats.OutOfStates
        << ", not run " << Stats.Refused << ", checks stopped early "
-       << Stats.Capped;
+       << Stats.Capped << ", tables full " << Stats.TableFull;
     S.Diag(Start, diag::warn_linux_kernel_experimental)
         << Text << "statistics";
   }

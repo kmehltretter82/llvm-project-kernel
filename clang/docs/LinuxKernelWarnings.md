@@ -420,12 +420,17 @@ line, and so does each translation unit:
 ```console
 drivers/net/ethernet/intel/ixgbe/ixgbe_main.c:11549:12: warning: statistics
       for 'ixgbe_probe': path searches 14, out of steps 0, dropped paths 1,
-      not run 0, checks stopped early 0 (experimental check 'statistics')
-drivers/net/ethernet/intel/ixgbe/ixgbe_main.c:1:1: warning: statistics for
-      this file: functions 8656, path searches 868, out of steps 0, dropped
-      paths 6, not run 0, checks stopped early 0 (experimental check
+      not run 0, checks stopped early 0, tables full 0 (experimental check
       'statistics')
+drivers/net/ethernet/intel/ixgbe/ixgbe_main.c:1:1: warning: statistics for
+      this file: functions 8656, path searches 869, out of steps 0, dropped
+      paths 6, not run 0, checks stopped early 0, tables full 0
+      (experimental check 'statistics')
 ```
+
+"Tables full" counts the functions that have more locations (96) or more
+conditions (64) than a search gives numbers to. It knows nothing about the
+ones that are left.
 
 The numbers of a function include the searches in the functions that it
 calls, which are made to learn what those do with their parameters. The
