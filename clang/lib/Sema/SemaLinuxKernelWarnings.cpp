@@ -20,6 +20,7 @@
 #include "clang/AST/RecordLayout.h"
 #include "clang/AST/Stmt.h"
 #include "clang/Analysis/Analyses/Dominators.h"
+#include "clang/Analysis/Analyses/PostOrderCFGView.h"
 #include "clang/Analysis/AnalysisDeclContext.h"
 #include "clang/Analysis/CFG.h"
 #include "clang/Basic/Builtins.h"
@@ -3569,6 +3570,35 @@ public:
   }
 };
 
+/// The blocks of a function in the order in which a forward dataflow has to
+/// visit them: reverse post-order, where a block comes after its
+/// predecessors unless a back edge leads to it.  One pass in that order
+/// carries a fact from the entry to the exit, and a loop costs one more
+/// pass.
+///
+/// The CFG lists its blocks the other way round, from the exit to the entry.
+/// A pass in that order moves a fact by a single block, so a dataflow with a
+/// bounded number of passes never gets to the end of a long function, and
+/// what it knows about the blocks that it did get to lacks the paths that
+/// had not arrived yet.
+class LinuxForwardOrder {
+  std::vector<const CFGBlock *> Blocks;
+
+public:
+  explicit LinuxForwardOrder(const CFG &Cfg) {
+    PostOrderCFGView View(&Cfg);
+    Blocks.assign(View.begin(), View.end());
+  }
+
+  /// The number of passes after which a dataflow gives up.  It is not
+  /// reached by code that a person wrote, and a dataflow that stops there
+  /// has no fixpoint to report from.
+  static constexpr unsigned MaxPasses = 64;
+
+  auto begin() const { return Blocks.begin(); }
+  auto end() const { return Blocks.end(); }
+};
+
 /// Finds returns that report success on a path that has just reported a
 /// failure:
 ///
@@ -3614,6 +3644,7 @@ class ErrorPathSuccessChecker {
   const FunctionDecl *FD;
   const CFG &Cfg;
   ASTContext &Ctx;
+  LinuxForwardOrder Order;
 
   struct Facts {
     bool Reached = false;
@@ -4180,13 +4211,13 @@ class ErrorPathSuccessChecker {
   /// Propagate facts to fixpoint.  With \p JumpPass false only Zero and
   /// Message are computed.  With it true, those are taken as final and only
   /// Jumped is propagated, so that it cannot depend on an early, optimistic
-  /// value of Message.
-  void solve(const VarDecl *V, std::vector<Facts> &In, bool JumpPass) {
+  /// value of Message.  Returns false if there is no fixpoint to go by.
+  bool solve(const VarDecl *V, std::vector<Facts> &In, bool JumpPass) {
     bool Changed = true;
     unsigned Rounds = 0;
-    while (Changed && ++Rounds < 64) {
+    while (Changed && ++Rounds < LinuxForwardOrder::MaxPasses) {
       Changed = false;
-      for (const CFGBlock *B : Cfg) {
+      for (const CFGBlock *B : Order) {
         const Facts &Entry = In[B->getBlockID()];
         if (!Entry.Reached)
           continue;
@@ -4302,11 +4333,12 @@ class ErrorPathSuccessChecker {
         }
       }
     }
+    return !Changed;
   }
 
 public:
   ErrorPathSuccessChecker(Sema &S, const FunctionDecl *FD, const CFG &Cfg)
-      : S(S), FD(FD), Cfg(Cfg), Ctx(S.getASTContext()) {}
+      : S(S), FD(FD), Cfg(Cfg), Ctx(S.getASTContext()), Order(Cfg) {}
 
   void run() {
     QualType RT = FD->getReturnType();
@@ -4322,8 +4354,9 @@ public:
         continue;
       std::vector<Facts> In(Cfg.getNumBlockIDs());
       In[Cfg.getEntry().getBlockID()].Reached = true;
-      solve(V, In, /*JumpPass=*/false);
-      solve(V, In, /*JumpPass=*/true);
+      if (!solve(V, In, /*JumpPass=*/false) ||
+          !solve(V, In, /*JumpPass=*/true))
+        continue;
       for (const CFGBlock *B : Cfg)
         if (In[B->getBlockID()].Reached)
           runBlock(B, In[B->getBlockID()], V, /*Report=*/true);
@@ -4598,16 +4631,19 @@ public:
 
   void run() {
     collect(FD->getBody());
+    std::optional<LinuxForwardOrder> Order;
     for (Object &O : Objects) {
       if (!O.Fresh || !O.Allocation)
         continue;
+      if (!Order)
+        Order.emplace(Cfg);
       std::vector<State> In(Cfg.getNumBlockIDs(), Unreached);
       In[Cfg.getEntry().getBlockID()] = Other;
       bool Changed = true;
       unsigned Rounds = 0;
-      while (Changed && ++Rounds < 64) {
+      while (Changed && ++Rounds < LinuxForwardOrder::MaxPasses) {
         Changed = false;
-        for (const CFGBlock *B : Cfg) {
+        for (const CFGBlock *B : *Order) {
           State Entry = In[B->getBlockID()];
           if (Entry == Unreached)
             continue;
@@ -4624,6 +4660,8 @@ public:
           }
         }
       }
+      if (Changed)
+        continue;
       for (const CFGBlock *B : Cfg)
         if (In[B->getBlockID()] != Unreached)
           runBlock(B, In[B->getBlockID()], O, /*Report=*/true);
@@ -4860,11 +4898,12 @@ public:
     llvm::BitVector Reached(Cfg.getNumBlockIDs());
     In[Cfg.getEntry().getBlockID()].resize(Vars.size());
     Reached.set(Cfg.getEntry().getBlockID());
+    LinuxForwardOrder Order(Cfg);
     bool Changed = true;
     unsigned Rounds = 0;
-    while (Changed && ++Rounds < 64) {
+    while (Changed && ++Rounds < LinuxForwardOrder::MaxPasses) {
       Changed = false;
-      for (const CFGBlock *B : Cfg) {
+      for (const CFGBlock *B : Order) {
         if (!Reached.test(B->getBlockID()))
           continue;
         llvm::SmallBitVector Out = In[B->getBlockID()];
@@ -4885,6 +4924,8 @@ public:
         }
       }
     }
+    if (Changed)
+      return;
 
     for (const CFGBlock *B : Cfg) {
       if (!Reached.test(B->getBlockID()))
@@ -9412,11 +9453,12 @@ public:
     llvm::BitVector Reached(Cfg.getNumBlockIDs());
     In[Cfg.getEntry().getBlockID()].resize(Places.size());
     Reached.set(Cfg.getEntry().getBlockID());
+    LinuxForwardOrder Order(Cfg);
     bool Changed = true;
     unsigned Rounds = 0;
-    while (Changed && ++Rounds < 64) {
+    while (Changed && ++Rounds < LinuxForwardOrder::MaxPasses) {
       Changed = false;
-      for (const CFGBlock *B : Cfg) {
+      for (const CFGBlock *B : Order) {
         if (!Reached.test(B->getBlockID()))
           continue;
         llvm::SmallBitVector Out = In[B->getBlockID()];
@@ -9437,6 +9479,8 @@ public:
         }
       }
     }
+    if (Changed)
+      return;
     for (const CFGBlock *B : Cfg)
       if (Reached.test(B->getBlockID())) {
         llvm::SmallBitVector Out = In[B->getBlockID()];
@@ -9728,11 +9772,12 @@ public:
     llvm::BitVector Reached(Cfg.getNumBlockIDs());
     In[Cfg.getEntry().getBlockID()].assign(Vars.size(), Fact());
     Reached.set(Cfg.getEntry().getBlockID());
+    LinuxForwardOrder Order(Cfg);
     bool Changed = true;
     unsigned Rounds = 0;
-    while (Changed && ++Rounds < 64) {
+    while (Changed && ++Rounds < LinuxForwardOrder::MaxPasses) {
       Changed = false;
-      for (const CFGBlock *B : Cfg) {
+      for (const CFGBlock *B : Order) {
         if (!Reached.test(B->getBlockID()))
           continue;
         Facts Out = In[B->getBlockID()];
@@ -9788,6 +9833,8 @@ public:
         }
       }
     }
+    if (Changed)
+      return;
 
     for (const CFGBlock *B : Cfg) {
       if (!Reached.test(B->getBlockID()) || !isConditionalBranch(B))
@@ -10197,11 +10244,12 @@ public:
     llvm::BitVector Reached(Cfg.getNumBlockIDs());
     In[Cfg.getEntry().getBlockID()].resize(Vars.size());
     Reached.set(Cfg.getEntry().getBlockID());
+    LinuxForwardOrder Order(Cfg);
     bool Changed = true;
     unsigned Rounds = 0;
-    while (Changed && ++Rounds < 64) {
+    while (Changed && ++Rounds < LinuxForwardOrder::MaxPasses) {
       Changed = false;
-      for (const CFGBlock *B : Cfg) {
+      for (const CFGBlock *B : Order) {
         if (!Reached.test(B->getBlockID()))
           continue;
         llvm::SmallBitVector Out = In[B->getBlockID()];
@@ -10222,6 +10270,8 @@ public:
         }
       }
     }
+    if (Changed)
+      return;
 
     llvm::SmallVector<Site, 8> Sites;
     for (const CFGBlock *B : Cfg) {
@@ -10517,11 +10567,12 @@ public:
     llvm::BitVector Reached(Cfg.getNumBlockIDs());
     In[Cfg.getEntry().getBlockID()].resize(Vars.size());
     Reached.set(Cfg.getEntry().getBlockID());
+    LinuxForwardOrder Order(Cfg);
     bool Changed = true;
     unsigned Rounds = 0;
-    while (Changed && ++Rounds < 64) {
+    while (Changed && ++Rounds < LinuxForwardOrder::MaxPasses) {
       Changed = false;
-      for (const CFGBlock *B : Cfg) {
+      for (const CFGBlock *B : Order) {
         if (!Reached.test(B->getBlockID()))
           continue;
         llvm::SmallBitVector Out = In[B->getBlockID()];
@@ -10542,6 +10593,8 @@ public:
         }
       }
     }
+    if (Changed)
+      return;
 
     for (const CFGBlock *B : Cfg) {
       if (!Reached.test(B->getBlockID()))
