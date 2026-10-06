@@ -142,3 +142,11 @@ void stored_with_reference(struct owner *o) {
   o->node = n;
   node_get(n);
 }
+
+// Whether there is one: the function returns a truth value, and the node
+// is released as it should be.
+_Bool node_present(void) {
+  struct node *n __free(node) = find_node(1);
+
+  return n;
+}

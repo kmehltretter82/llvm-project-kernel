@@ -343,3 +343,21 @@ int part_reassigned(struct ext_stream *hext, struct stream *other) {
     return -ENODEV;
   return index;
 }
+
+// The expectation of a KUnit test is no statement that the pointer can be
+// NULL.
+struct kunit;
+void kunit_fail(struct kunit *test);
+#define KUNIT_UNARY_ASSERTION(test, condition)                                 \
+  do {                                                                         \
+    if (!(condition))                                                          \
+      kunit_fail(test);                                                        \
+  } while (0)
+#define KUNIT_EXPECT_TRUE(test, condition) KUNIT_UNARY_ASSERTION(test, condition)
+
+void expectation(struct kunit *test, struct thing *t) {
+  struct thing *next = t->next;
+
+  KUNIT_EXPECT_TRUE(test, t && next);
+  use(next);
+}

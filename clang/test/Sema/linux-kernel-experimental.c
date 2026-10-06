@@ -1512,3 +1512,68 @@ const struct client_ops codec_ops = {
   .probe = codec_probe,
   .remove = codec_remove,
 };
+
+// ---------------------------------------------------------------------------
+// unwind-far: a variable with a cleanup function that is declared behind the
+// acquisition releases it at the end of its scope.
+
+struct gphy {
+  struct clk *clk;
+  int ready;
+};
+
+static void gphy_clk_disable(struct gphy *g) {
+  clk_disable_unprepare(g->clk); // expected-note {{another path releases it here}}
+}
+
+static inline void __free_gphy_clk(void *arg) {
+  struct gphy *g = *(struct gphy **)arg;
+
+  if (g)
+    gphy_clk_disable(g);
+}
+
+int gphy_reset(struct gphy *g);
+
+static int gphy_init(struct gphy *g) {
+  int ret;
+
+  ret = clk_prepare_enable(g->clk);
+  if (ret)
+    return ret;
+  struct gphy *guard __attribute__((cleanup(__free_gphy_clk))) = g;
+
+  ret = gphy_reset(g);
+  if (ret)
+    return ret;
+  guard = NULL;
+  g->ready = 1;
+  return 0;
+}
+
+// The same without the variable.
+static int gphy_init_bare(struct gphy *g) {
+  int ret;
+
+  ret = clk_prepare_enable(g->clk); // expected-note {{acquired here}}
+  if (ret)
+    return ret;
+  ret = gphy_reset(g);
+  if (ret)
+    return ret;
+// expected-warning@-1 {{'g->clk' was acquired with clk_prepare_enable() and this error path returns without clk_disable_unprepare(), which 'gphy_clk_disable' calls for it (experimental check 'unwind-far')}}
+  g->ready = 1;
+  return 0;
+}
+
+static void gphy_exit(struct gphy *g) {
+  gphy_clk_disable(g);
+}
+
+struct gphy_ops {
+  int (*init)(struct gphy *);
+  void (*exit)(struct gphy *);
+};
+const struct gphy_ops gphy_ops = { .init = gphy_init, .exit = gphy_exit };
+const struct gphy_ops gphy_bare_ops = { .init = gphy_init_bare, .exit = gphy_exit };
+

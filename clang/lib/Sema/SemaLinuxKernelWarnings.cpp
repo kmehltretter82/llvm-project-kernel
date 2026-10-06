@@ -545,12 +545,23 @@ static bool isLinuxAssertionMacroExpansion(const Expr *E, const Sema &S) {
     return false;
   StringRef Name =
       Lexer::getImmediateMacroName(Loc, S.getSourceManager(), S.getLangOpts());
-  return llvm::StringSwitch<bool>(Name)
-      .Cases({"WARN", "WARN_ON", "WARN_ONCE", "WARN_ON_ONCE"}, true)
-      .Cases({"WARN_RATELIMIT", "WARN_ON_RATELIMIT", "BUG_ON"}, true)
-      .Cases({"VM_BUG_ON", "VM_BUG_ON_PAGE", "VM_BUG_ON_FOLIO"}, true)
-      .Cases({"VM_WARN_ON", "VM_WARN_ON_ONCE"}, true)
-      .Default(false);
+  if (llvm::StringSwitch<bool>(Name)
+          .Cases({"WARN", "WARN_ON", "WARN_ONCE", "WARN_ON_ONCE"}, true)
+          .Cases({"WARN_RATELIMIT", "WARN_ON_RATELIMIT", "BUG_ON"}, true)
+          .Cases({"VM_BUG_ON", "VM_BUG_ON_PAGE", "VM_BUG_ON_FOLIO"}, true)
+          .Cases({"VM_WARN_ON", "VM_WARN_ON_ONCE"}, true)
+          .Default(false))
+    return true;
+  // "KUNIT_EXPECT_TRUE(test, xe && tile && gt);": the expectations of a
+  // KUnit test go through several macros.
+  const SourceManager &SM = S.getSourceManager();
+  for (unsigned Depth = 0; Loc.isMacroID() && Depth < 12; ++Depth) {
+    Name = Lexer::getImmediateMacroName(Loc, SM, S.getLangOpts());
+    if (Name.starts_with("KUNIT_EXPECT") || Name.starts_with("KUNIT_ASSERT"))
+      return true;
+    Loc = SM.getImmediateMacroCallerLoc(Loc);
+  }
+  return false;
 }
 
 /// Whether the code at \p Loc was written in the body of a macro, at any
@@ -2949,6 +2960,10 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
   }
 
   void checkCleanupReturn(const ReturnStmt *RS) {
+    // "bool present(...) { struct device_node *np __free(device_node) =
+    // find(...); return np; }" returns whether there is one.
+    if (!CurrentFunction->getReturnType()->isPointerType())
+      return;
     const Expr *Value = RS->getRetValue()->IgnoreParenCasts();
     const VarDecl *VD = getDirectLinuxVariable(Value);
     const FunctionDecl *Cleanup = getFreeCleanup(VD);
@@ -3071,6 +3086,12 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
       // holds the complement, in its own width.
       const DeclRefExpr *Mask = nullptr;
       if (Not && Not->getOpcode() == UO_Not) {
+        // FIELD_PREP() tests "~(mask >> shift) & value" to see whether a
+        // constant fits its field.  That is the macro's own business.
+        const SourceManager &SM = S.getSourceManager();
+        if (SM.getFilename(SM.getSpellingLoc(Not->getOperatorLoc()))
+                .ends_with("linux/bitfield.h"))
+          continue;
         Narrow = Not->getType();
       } else {
         Mask = dyn_cast<DeclRefExpr>(ICE->getSubExpr()->IgnoreParenImpCasts());
@@ -7590,6 +7611,13 @@ public:
         if (std::optional<Value> Known = Running->callValue(CE, St))
           return *Known;
       const FunctionDecl *FD = CE->getDirectCallee();
+      // The Bluetooth status codes: none for 0, a positive error number
+      // for the others.  "err = -bt_to_errno(status);" under "if (status)".
+      if (FD && FD->getIdentifier() && CE->getNumArgs() == 1 &&
+          FD->getName() == "bt_to_errno")
+        return Value::ofMask(value(CE->getArg(0), St).Mask == Value::Pos
+                                 ? uint8_t(Value::Pos)
+                                 : uint8_t(Value::Zero | Value::Pos));
       // "ret = dev_err_probe(dev, -EINVAL, ...);": these return the error
       // code that they are given.
       if (FD && FD->getIdentifier() && CE->getNumArgs() >= 2 &&
@@ -10687,6 +10715,14 @@ class LinuxUnwindChecker : LinuxPathSearch::Client {
     } else if (const auto *DS = dyn_cast<DeclStmt>(Node)) {
       for (const Decl *D : DS->decls())
         if (const auto *VD = dyn_cast<VarDecl>(D); VD && VD->getInit()) {
+          // "struct foo *guard __free(foo_clk_disable) = foo;" behind the
+          // acquisition: the end of the scope releases it.
+          if (const auto *A = VD->getAttr<CleanupAttr>()) {
+            const FunctionDecl *Def = nullptr;
+            if (A->getFunctionDecl() && A->getFunctionDecl()->hasBody(Def) &&
+                releasesInside(Def->getBody(), 0))
+              return false;
+          }
           noteStatus(nullptr, VD, VD->getInit(), St);
           if (VD->getInit()->IgnoreParenCasts() == Acquire) {
             if (Kind.Result == LinuxResourceKind::Status && StatusLoc >= 0)

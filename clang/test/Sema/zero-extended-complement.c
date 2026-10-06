@@ -1,9 +1,10 @@
 // RUN: %clang_cc1 -triple x86_64-unknown-linux-gnu -fsyntax-only \
-// RUN:   -Wzero-extended-complement -verify %s
+// RUN:   -I %S/Inputs/linux-kernel -Wzero-extended-complement -verify %s
 // RUN: %clang_cc1 -triple i386-unknown-linux-gnu -fsyntax-only \
-// RUN:   -Wzero-extended-complement -verify=expected,ilp32 %s
+// RUN:   -I %S/Inputs/linux-kernel -Wzero-extended-complement \
+// RUN:   -verify=expected,ilp32 %s
 // RUN: %clang_cc1 -triple x86_64-unknown-linux-gnu -fsyntax-only -Wall \
-// RUN:   -Wextra -verify=wall %s
+// RUN:   -I %S/Inputs/linux-kernel -Wextra -verify=wall %s
 
 // wall-no-diagnostics
 
@@ -96,4 +97,12 @@ u64 fine_mask_variable(u64 addr, u32 size) {
   u64 mask = ~(u64)(size - 1);
 
   return addr & mask;
+}
+
+// The test that FIELD_PREP() makes of its value is the macro's own, and
+// what it gives is cut down to the width of the mask anyway.
+#include <linux/bitfield.h>
+
+u32 field_from_wide_value(u64 pfn) {
+  return FIELD_PREP(0x00fff000u, pfn);
 }
