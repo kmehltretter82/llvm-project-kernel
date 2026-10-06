@@ -244,3 +244,58 @@ int argument_only_passed_on(struct holder *h) {
   use(t);
   return 0;
 }
+
+// "switch (PTR_ERR(p))" sorts out the values itself, and a NULL test inside
+// the branch knows more than the outer test.
+
+int sorted_by_switch(struct holder *h) {
+  struct thing *t = get_thing(h);
+
+  if (IS_ERR_OR_NULL(t)) {
+    switch (PTR_ERR(t)) {
+    case 0:
+      return -ENODEV;
+    default:
+      return PTR_ERR(t);
+    }
+  }
+  return t->id;
+}
+
+int sorted_by_test(struct holder *h) {
+  struct thing *t = get_thing(h);
+
+  if (IS_ERR_OR_NULL(t)) {
+    warn();
+    if (!t)
+      return -EINVAL;
+    return PTR_ERR(t);
+  }
+  return t->id;
+}
+
+// A test of a copy is a test of the pointer.
+
+int tested_copy(struct holder *h) {
+  struct thing *t = get_thing(h);
+  const void *copy = t;
+
+  if (IS_ERR(copy))
+    return -ENODEV;
+  return t->id;
+}
+
+struct wide {
+  struct thing base;
+  int more;
+};
+
+int tested_original(struct holder *h) {
+  struct thing *t = get_thing(h);
+  struct wide *w;
+
+  if (IS_ERR(t))
+    return PTR_ERR(t);
+  w = (struct wide *)t;
+  return w->more;
+}

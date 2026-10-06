@@ -70,14 +70,77 @@ struct item *ext_mixed(struct ctx *c) {
   return &c->slot;
 }
 
-// The result of a function that is defined nowhere, tested for NULL.
+// The result of a function that is defined nowhere, tested for NULL: once
+// the test has passed, the author takes it for an object.
 struct item *ext_far(struct ctx *c);
 // FACTS-DAG: fn{{	}}ext_chain{{	.*	}}E,k:ext_far{{	}}ext_far
+// CONTRACTS-DAG: err_ptr{{	}}ext_chain
 struct item *ext_chain(struct ctx *c) {
   struct item *i = ext_far(c);
 
   if (!i)
     return ERR_PTR(-ENOMEM);
+  return i;
+}
+
+// The same with an IS_ERR() test.
+// FACTS-DAG: fn{{	}}ext_tested{{	.*	}}e,t:ext_far{{	}}IS_ERR,ext_far
+// CONTRACTS-DAG: err_ptr{{	}}ext_tested
+struct item *ext_tested(struct ctx *c) {
+  struct item *i = ext_far(c);
+
+  if (IS_ERR(i))
+    return i;
+  i->id = 1;
+  return i;
+}
+
+// Untested, nothing is known.
+// FACTS-DAG: fn{{	}}ext_untested{{	.*	}}E,c:ext_far{{	}}ext_far
+struct item *ext_untested(struct ctx *c) {
+  if (!c)
+    return ERR_PTR(-ENODEV);
+  return ext_far(c);
+}
+
+// "if (IS_ERR_OR_NULL(i)) return i;" hands the NULL on to the caller: this
+// is not a test that keeps it inside.
+bool IS_ERR_OR_NULL(const void *);
+// FACTS-DAG: fn{{	}}ext_optional{{	.*	}}E,c:ext_far{{	}}IS_ERR_OR_NULL,ext_far
+struct item *ext_optional(struct ctx *c) {
+  struct item *i = ext_far(c);
+
+  if (IS_ERR_OR_NULL(i))
+    return i;
+  if (i->id < 0)
+    return ERR_PTR(-ENODEV);
+  return i;
+}
+
+struct ops {
+  struct item *(*make)(struct ctx *c);
+  struct item *cached;
+};
+
+// The result of an indirect call that is tested for NULL, and a value from
+// memory that is tested with IS_ERR(): both are objects after the test.
+// FACTS-DAG: fn{{	}}ext_indirect{{	.*	}}EV{{	}}-
+// CONTRACTS-DAG: err_ptr{{	}}ext_indirect
+struct item *ext_indirect(struct ctx *c, struct ops *o) {
+  struct item *i = o->make(c);
+
+  if (!i)
+    return ERR_PTR(-ENOMEM);
+  return i;
+}
+
+// FACTS-DAG: fn{{	}}ext_cached{{	.*	}}eV{{	}}IS_ERR
+// CONTRACTS-DAG: err_ptr{{	}}ext_cached
+struct item *ext_cached(struct ops *o) {
+  struct item *i = o->cached;
+
+  if (!IS_ERR(i))
+    i->id++;
   return i;
 }
 
@@ -111,8 +174,9 @@ void ext_hint(struct ctx *c, int atomic) {
 // CONTRACTS-DAG: null{{	}}ext_null
 // CONTRACTS-DAG: sleeps{{	}}ext_sleeps
 // CONTRACTS-NOT: ext_mixed
-// CONTRACTS-NOT: ext_chain
 // CONTRACTS-NOT: ext_branch
+// CONTRACTS-NOT: ext_optional
+// CONTRACTS-NOT: ext_untested
 
 #else
 

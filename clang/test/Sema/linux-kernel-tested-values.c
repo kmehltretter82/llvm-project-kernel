@@ -161,6 +161,31 @@ int loop_exit_tested(struct thing *t, int id) {
   return t->count;
 }
 
+// The condition of a do-while loop: when the first operand of "&&" is
+// false the loop ends, whatever the second one is.
+
+int do_while_exit(struct thing *t, struct thing *end) {
+  int n = 0;
+
+  do {
+    n += t->id;
+    t = t->next;
+  } while (t && t != end);
+  if (!t)
+    return -EINVAL;
+  return n + t->count;
+}
+
+int do_while_exit_untested(struct thing *t, struct thing *end) {
+  int n = 0;
+
+  do {
+    n += t->id;
+    t = t->next;
+  } while (t && t != end); // deref-note {{'t' is tested here}}
+  return n + t->count; // deref-warning {{'t' is dereferenced here}}
+}
+
 // Members.
 
 int member(struct dev *d) {

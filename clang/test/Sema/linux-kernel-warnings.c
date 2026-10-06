@@ -210,6 +210,26 @@ int errptr_checked_as_null(const char *path) {
     return -EFAULT;
   if (file == NULL) // kernel-warning {{filp_open returns an encoded error pointer on failure, which a NULL test does not detect}} error-pointer-warning {{filp_open returns an encoded error pointer on failure, which a NULL test does not detect}}
     return -EFAULT;
+  return 0;
+}
+
+// The error pointer is tested for as well: the NULL test is for a
+// configuration in which the function is a stub that returns NULL.
+int errptr_checked_both_ways(const char *path) {
+  void *file = filp_open(path, 0, 0);
+
+  if (!file)
+    return -EFAULT;
+  return IS_ERR(file) ? -EFAULT : 0;
+}
+
+// The IS_ERR() test of another value of the same variable does not count.
+int errptr_variable_reused(const char *path, const char *other) {
+  void *file = filp_open(path, 0, 0);
+
+  if (!file) // kernel-warning {{filp_open returns an encoded error pointer on failure, which a NULL test does not detect}} error-pointer-warning {{filp_open returns an encoded error pointer on failure, which a NULL test does not detect}}
+    return -EFAULT;
+  file = filp_open(other, 0, 0);
   return IS_ERR(file) ? -EFAULT : 0;
 }
 

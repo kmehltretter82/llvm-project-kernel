@@ -123,3 +123,22 @@ int never_set(int bad) {
   buf = kzalloc(4, 0);
   return use(buf);
 }
+
+// A reference that is taken for the stored pointer: the cleanup function
+// drops the other one.
+
+struct node;
+struct node *node_get(struct node *n);
+struct node *find_node(int id);
+static inline void __free_node(void *p) { (void)p; }
+
+struct owner {
+  struct node *node;
+};
+
+void stored_with_reference(struct owner *o) {
+  struct node *n __free(node) = find_node(1);
+
+  o->node = n;
+  node_get(n);
+}

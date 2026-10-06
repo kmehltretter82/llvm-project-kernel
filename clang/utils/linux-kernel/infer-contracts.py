@@ -17,7 +17,12 @@ The return sources are letters: E (ERR_PTR), e (the result of an error
 pointer function), N (NULL), n (the untested result of a function that
 returns NULL on failure), V (valid), M (read from memory), O (opaque).
 ",c:<name>" follows for a function of another translation unit whose result
-is returned, ",k:<name>" if that result was tested for NULL first.
+is returned, ",k:<name>" if that result was tested for NULL first, and
+",t:<name>" if it was only tested with IS_ERR().
+
+A result that the caller tests counts as valid once the test has passed,
+also where nothing is known about the function it comes from: the test is
+what the author of the caller knows about it.
 
 usage: infer-contracts.py [-o contracts] [--explain name] facts...
 """
@@ -59,7 +64,10 @@ SLEEPS = {
 
 
 def parse(paths):
-    """name -> list of (file, flags, [(callee, checked)], calls) per definition."""
+    """name -> list of (file, flags, [(callee, test)], calls) per definition.
+
+    test is "c" (untested), "k" (tested for NULL) or "t" (tested with IS_ERR()).
+    """
     defs = collections.defaultdict(list)
     seen = set()
     for path in paths:
@@ -75,11 +83,11 @@ def parse(paths):
                 flags, callees = None, []
                 if returns != "-":
                     first, *rest = returns.split(",")
-                    flags = set(first) if first[:2] not in ("c:", "k:") else set()
-                    if first[:2] in ("c:", "k:"):
+                    flags = set(first) if first[1:2] != ":" else set()
+                    if first[1:2] == ":":
                         rest = [first] + rest
                     for token in rest:
-                        callees.append((token[2:], token[0] == "k"))
+                        callees.append((token[2:], token[0]))
                 always = [] if calls == "-" else calls.split(",")
                 defs[name].append((file, flags, callees, always))
     return defs
@@ -123,14 +131,14 @@ def conventions(defs):
             kinds = set()
             for _, flags, callees, _ in entries:
                 flags = set(flags)
-                for callee, checked in callees:
+                for callee, test in callees:
                     kind = result.get(callee, UNKNOWN)
                     if kind == ERR:
                         flags.add("e")
                     elif kind == NULL:
-                        flags.add("V" if checked else "n")
+                        flags.add("V" if test == "k" else "n")
                     else:
-                        flags.add("O")
+                        flags.add("O" if test == "c" else "V")
                 kinds.add(classify(flags))
             result[name] = kinds.pop() if len(kinds) == 1 else UNKNOWN
             del pending[name]
@@ -162,8 +170,8 @@ def explain(name, defs, conv, sleeps):
         print(f"{name} in {file}")
         if flags is not None:
             print("  returns:", "".join(sorted(flags)) or "(nothing local)",
-                  " ".join(f"{'k' if k else 'c'}:{c}={conv.get(c, 'undefined')}"
-                           for c, k in callees))
+                  " ".join(f"{t}:{c}={conv.get(c, 'undefined')}"
+                           for c, t in callees))
         hits = [c for c in always if c in sleeps]
         if hits:
             print("  always calls:", ", ".join(hits))

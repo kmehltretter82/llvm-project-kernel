@@ -65,8 +65,10 @@ struct sema::LinuxKernelUnit::Impl {
     bool Memory = false;     ///< a parameter or a field: no call, no constant
     bool Opaque = false;     ///< a call that nothing is known about
     /// Functions without a body in this translation unit that the answer
-    /// depends on, and whether their result was tested for NULL first.
-    llvm::SmallVector<std::pair<const FunctionDecl *, bool>, 2> External;
+    /// depends on, and what their result was tested for before it was
+    /// returned.
+    enum : uint8_t { NullTested = 1, ErrorTested = 2 };
+    llvm::SmallVector<std::pair<const FunctionDecl *, uint8_t>, 2> External;
 
     /// A function that only ever returns ERR_PTR(), or only NULL, stands in
     /// for a real implementation that some other configuration has.  It says
@@ -119,6 +121,8 @@ struct LinuxKernelAPIOrigin {
   /// The contract is not listed or annotated: it was inferred from the
   /// definition of the function.
   bool Inferred = false;
+  /// Where a variable was given the value, if it is held by one.
+  SourceLocation Assigned = SourceLocation();
 
   explicit operator bool() const { return Kind != LinuxKernelAPIKind::None; }
 
@@ -237,8 +241,7 @@ static LinuxKernelAPIKind classifyLinuxKernelAPI(StringRef Name) {
       .Cases({"devm_gpiod_get", "devm_gpiod_get_index", "pinctrl_get",
               "devm_pinctrl_get"},
              LinuxKernelAPIKind::ErrorPointer)
-      .Cases({"__reset_control_get", "__devm_reset_control_get", "memdup_user",
-              "memdup_user_nul"},
+      .Cases({"memdup_user", "memdup_user_nul"},
              LinuxKernelAPIKind::ErrorPointer)
       .Cases({"vmemdup_user", "strndup_user", "sock_alloc_file",
               "anon_inode_getfile"},
@@ -605,6 +608,19 @@ class LinuxKernelInference {
     return false;
   }
 
+  static bool returnsVariable(const Stmt *St, const VarDecl *V) {
+    if (!St)
+      return false;
+    if (const auto *RS = dyn_cast<ReturnStmt>(St)) {
+      const Expr *E = RS->getRetValue();
+      return E && getDirectLinuxVariable(E->IgnoreParenCasts()) == V;
+    }
+    for (const Stmt *Child : St->children())
+      if (returnsVariable(Child, V))
+        return true;
+    return false;
+  }
+
   /// 1 if \p Cond being true means that \p V is NULL, 2 if it means that
   /// \p V is not NULL, and 0 if it says neither.
   int nullTest(const Expr *Cond, const VarDecl *V) const {
@@ -667,13 +683,18 @@ class LinuxKernelInference {
           Out.Opaque = true;
     } else if (const auto *IS = dyn_cast<IfStmt>(St)) {
       int Test = nullTest(IS->getCond(), V);
-      if ((Test == 1 && leaves(IS->getThen())) ||
-          (Test == 2 && IS->getElse() && leaves(IS->getElse())))
+      const Stmt *NullBranch = Test == 1   ? IS->getThen()
+                               : Test == 2 ? IS->getElse()
+                                           : nullptr;
+      // "if (IS_ERR_OR_NULL(p)) return p;" does not keep the NULL from the
+      // caller: it is what the function returns there.
+      if (NullBranch && leaves(NullBranch) && !returnsVariable(NullBranch, V))
         Out.NullChecked = true;
     } else if (const auto *CE = dyn_cast<CallExpr>(St)) {
       const FunctionDecl *Callee = CE->getDirectCallee();
+      // IS_ERR_OR_NULL() is a NULL test, which the "if" above deals with.
       if (Callee && Callee->getIdentifier() && CE->getNumArgs() == 1 &&
-          (Callee->getName().starts_with("IS_ERR") ||
+          (Callee->getName() == "IS_ERR" ||
            Callee->getName().starts_with("PTR_ERR")) &&
           getDirectLinuxVariable(CE->getArg(0)->IgnoreParenCasts()) == V)
         Out.ErrorTested = true;
@@ -684,8 +705,9 @@ class LinuxKernelInference {
 
   /// What a function hands on from the function it calls keeps the nature of
   /// that function: the wrapper of a stub is a stub.
-  static void merge(Sources &R, const Sources &Callee, bool NullChecked) {
+  static void merge(Sources &R, const Sources &Callee, uint8_t Tests) {
     bool Stub = Callee.isStub();
+    bool NullChecked = Tests & Sources::NullTested;
     if (Callee.ErrDirect || Callee.ErrCallee)
       (Stub ? R.ErrDirect : R.ErrCallee) = true;
     if (Callee.NullDirect || Callee.NullCallee) {
@@ -696,21 +718,28 @@ class LinuxKernelInference {
     }
     if (Callee.Valid)
       R.Valid = true;
+    // What the caller tests is an object to its author once the test has
+    // passed, wherever the callee has it from.
     if (Callee.Memory)
-      (NullChecked ? R.Valid : R.Memory) = true;
+      (Tests ? R.Valid : R.Memory) = true;
     if (Callee.Opaque)
-      R.Opaque = true;
-    for (auto [F, Checked] : Callee.External)
-      R.External.push_back({F, Checked || NullChecked});
+      (Tests ? R.Valid : R.Opaque) = true;
+    for (auto [F, Earlier] : Callee.External)
+      R.External.push_back({F, uint8_t(Earlier | Tests)});
   }
 
   void addCall(const CallExpr *Call, Sources &R, bool NullChecked,
-               unsigned Depth) {
+               bool ErrorTested, unsigned Depth) {
     const FunctionDecl *Callee = Call->getDirectCallee();
     if (!Callee || !Callee->getIdentifier()) {
-      R.Opaque = true;
+      // An indirect call.  What the function tests the result for is what
+      // it can be: after a NULL test or an IS_ERR() test, what is left is
+      // an object.
+      (NullChecked || ErrorTested ? R.Valid : R.Opaque) = true;
       return;
     }
+    uint8_t Tests = (NullChecked ? Sources::NullTested : 0) |
+                    (ErrorTested ? Sources::ErrorTested : 0);
     StringRef Name = Callee->getName();
     if (Name == "ERR_PTR" || Name == "ERR_CAST") {
       // ERR_PTR(0) is NULL.
@@ -729,18 +758,25 @@ class LinuxKernelInference {
                !Callee->getReturnType()->isPointerType()) {
       R.Opaque = true;
     } else if (const FunctionDecl *Def = getBodyDecl(Callee)) {
-      merge(R, sources(Def, Depth + 1), NullChecked);
+      merge(R, sources(Def, Depth + 1), Tests);
     } else {
-      R.External.push_back({Callee->getCanonicalDecl(), NullChecked});
+      R.External.push_back({Callee->getCanonicalDecl(), Tests});
     }
   }
 
+  /// \p NullChecked: the function leaves when it finds the value to be
+  /// NULL.  \p ErrorTested: the function tests the value with IS_ERR(), so
+  /// its author takes it for an error pointer or an object, wherever it
+  /// comes from.
   void addValue(const Expr *E, Sources &R, const Stmt *Body, bool NullChecked,
-                llvm::SmallPtrSetImpl<const VarDecl *> &Seen, unsigned Depth) {
+                llvm::SmallPtrSetImpl<const VarDecl *> &Seen, unsigned Depth,
+                bool ErrorTested = false) {
     if (!E || Depth > 12) {
       R.Opaque = true;
       return;
     }
+    // What was read from memory is an object once it was tested.
+    bool Known = NullChecked || ErrorTested;
     E = E->IgnoreParens();
     if (E->isNullPointerConstant(Ctx, Expr::NPC_ValueDependentIsNotNull)) {
       R.NullDirect = true;
@@ -749,27 +785,34 @@ class LinuxKernelInference {
     E = E->IgnoreParenCasts();
 
     if (const auto *BCO = dyn_cast<BinaryConditionalOperator>(E)) {
-      addValue(BCO->getCommon(), R, Body, NullChecked, Seen, Depth + 1);
-      addValue(BCO->getFalseExpr(), R, Body, NullChecked, Seen, Depth + 1);
+      addValue(BCO->getCommon(), R, Body, NullChecked, Seen, Depth + 1,
+               ErrorTested);
+      addValue(BCO->getFalseExpr(), R, Body, NullChecked, Seen, Depth + 1,
+               ErrorTested);
     } else if (const auto *CO = dyn_cast<ConditionalOperator>(E)) {
-      addValue(CO->getTrueExpr(), R, Body, NullChecked, Seen, Depth + 1);
-      addValue(CO->getFalseExpr(), R, Body, NullChecked, Seen, Depth + 1);
+      addValue(CO->getTrueExpr(), R, Body, NullChecked, Seen, Depth + 1,
+               ErrorTested);
+      addValue(CO->getFalseExpr(), R, Body, NullChecked, Seen, Depth + 1,
+               ErrorTested);
     } else if (const auto *SE = dyn_cast<StmtExpr>(E)) {
       const CompoundStmt *CS = SE->getSubStmt();
       const Stmt *Last = CS->body_empty() ? nullptr : CS->body_back();
       addValue(dyn_cast_or_null<Expr>(Last), R, Body, NullChecked, Seen,
-               Depth + 1);
+               Depth + 1, ErrorTested);
     } else if (const auto *GSE = dyn_cast<GenericSelectionExpr>(E)) {
       addValue(GSE->isResultDependent() ? nullptr : GSE->getResultExpr(), R,
-               Body, NullChecked, Seen, Depth + 1);
+               Body, NullChecked, Seen, Depth + 1,
+               ErrorTested);
     } else if (const auto *CE = dyn_cast<ChooseExpr>(E)) {
       addValue(CE->isConditionDependent() ? nullptr : CE->getChosenSubExpr(), R,
-               Body, NullChecked, Seen, Depth + 1);
+               Body, NullChecked, Seen, Depth + 1,
+               ErrorTested);
     } else if (const auto *Call = dyn_cast<CallExpr>(E)) {
-      addCall(Call, R, NullChecked, Depth);
+      addCall(Call, R, NullChecked, ErrorTested, Depth);
     } else if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
       if (BO->getOpcode() == BO_Comma || BO->getOpcode() == BO_Assign)
-        addValue(BO->getRHS(), R, Body, NullChecked, Seen, Depth + 1);
+        addValue(BO->getRHS(), R, Body, NullChecked, Seen, Depth + 1,
+               ErrorTested);
       else if (BO->isAdditiveOp() && BO->getType()->isPointerType())
         R.Valid = true; // pointer arithmetic, which container_of() is
       else
@@ -778,7 +821,7 @@ class LinuxKernelInference {
       if (UO->getOpcode() == UO_AddrOf)
         R.Valid = true;
       else
-        (NullChecked ? R.Valid : R.Memory) = true;
+        (Known ? R.Valid : R.Memory) = true;
     } else if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
       const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
       if (!VD || VD->getType()->isArrayType()) {
@@ -786,7 +829,7 @@ class LinuxKernelInference {
         return;
       }
       if (!VD->hasLocalStorage()) {
-        (NullChecked ? R.Valid : R.Memory) = true;
+        (Known ? R.Valid : R.Memory) = true;
         return;
       }
       if (!Seen.insert(VD).second)
@@ -801,8 +844,9 @@ class LinuxKernelInference {
         return;
       }
       bool Checked = NullChecked || Info.NullChecked;
+      bool Tested = ErrorTested || Info.ErrorTested;
       if (IsParameter)
-        (Checked ? R.Valid : R.Memory) = true;
+        (Checked || Tested ? R.Valid : R.Memory) = true;
       if (Info.ErrorTested)
         R.ErrCallee = true;
       for (const Expr *Value : Info.Values) {
@@ -811,14 +855,14 @@ class LinuxKernelInference {
         if (Checked && Value->IgnoreParens()->isNullPointerConstant(
                            Ctx, Expr::NPC_ValueDependentIsNotNull))
           continue;
-        addValue(Value, R, Body, Checked, Seen, Depth + 1);
+        addValue(Value, R, Body, Checked, Seen, Depth + 1, Tested);
       }
     } else if (isa<StringLiteral>(E)) {
       R.Valid = true;
     } else if (E->getType()->isPointerType() ||
                E->getType()->isArrayType()) {
       // A field or an array element.
-      (NullChecked ? R.Valid : R.Memory) = true;
+      (Known ? R.Valid : R.Memory) = true;
     } else {
       R.Opaque = true; // an integer cast to a pointer
     }
@@ -860,12 +904,12 @@ class LinuxKernelInference {
   Sources resolve(const Sources &In, unsigned Depth) {
     Sources R = In;
     R.External.clear();
-    for (auto [F, Checked] : In.External) {
+    for (auto [F, Tests] : In.External) {
       const FunctionDecl *Def = getBodyDecl(F);
       if (!Def)
-        R.External.push_back({F, Checked});
+        R.External.push_back({F, Tests});
       else if (Depth < 6)
-        merge(R, resolve(Sources(sources(Def)), Depth + 1), Checked);
+        merge(R, resolve(Sources(sources(Def)), Depth + 1), Tests);
       else
         R.Opaque = true;
     }
@@ -997,16 +1041,16 @@ public:
       return fileContract(FD);
 
     Sources R = resolve(Sources(sources(Def)), 0);
-    for (auto [F, Checked] : R.External) {
+    for (auto [F, Tests] : R.External) {
       switch (fileContract(F)) {
       case LinuxKernelReturnConvention::ErrorPointer:
         R.ErrCallee = true;
         break;
       case LinuxKernelReturnConvention::NullOnFailure:
-        (Checked ? R.Valid : R.NullCallee) = true;
+        (Tests & Sources::NullTested ? R.Valid : R.NullCallee) = true;
         break;
       case LinuxKernelReturnConvention::Unknown:
-        R.Opaque = true;
+        (Tests ? R.Valid : R.Opaque) = true;
         break;
       }
     }
@@ -1030,8 +1074,9 @@ public:
   /// The return sources are the letters E (ERR_PTR), e (error pointer
   /// callee), N (NULL), n (NULL-on-failure callee), V (valid), M (memory)
   /// and O (opaque), followed by ",c:<name>" for each function defined
-  /// elsewhere whose result is returned, or ",k:<name>" if that result was
-  /// tested for NULL first.
+  /// elsewhere whose result is returned, ",k:<name>" if that result was
+  /// tested for NULL first, or ",t:<name>" if it was only tested with
+  /// IS_ERR().
   void emitFacts() {
     const std::string &Path = S.getLangOpts().LinuxKernelFactsFile;
     if (Path.empty())
@@ -1057,8 +1102,11 @@ public:
         if (R.Memory) Returns += 'M';
         if (R.Opaque) Returns += 'O';
         std::vector<std::string> Callees;
-        for (auto [F, Checked] : R.External)
-          Callees.push_back((Checked ? "k:" : "c:") + F->getName().str());
+        for (auto [F, Tests] : R.External)
+          Callees.push_back((Tests & Sources::NullTested ? "k:"
+                             : Tests                     ? "t:"
+                                                         : "c:") +
+                            F->getName().str());
         llvm::sort(Callees);
         Callees.erase(llvm::unique(Callees), Callees.end());
         for (const std::string &C : Callees)
@@ -1120,6 +1168,13 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
   llvm::DenseMap<const VarDecl *, bool> CleanupDisarmed;
   /// Pointers that the function tests somewhere, for NULL or for an error.
   std::optional<llvm::SmallPtrSet<const VarDecl *, 16>> TestedPointers;
+  /// Where the function tests each pointer with IS_ERR(), and where it
+  /// assigns it.
+  struct TestsAndAssignments {
+    llvm::SmallVector<SourceLocation, 2> Tests, Assignments;
+  };
+  std::optional<llvm::DenseMap<const VarDecl *, TestsAndAssignments>>
+      ErrorTests;
   /// "if (IS_ERR(p)) return p;": what is returned there is an error pointer
   /// or NULL, which the cleanup functions of <linux/cleanup.h> leave alone.
   llvm::SmallPtrSet<const ReturnStmt *, 4> NothingToRelease;
@@ -1449,6 +1504,60 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
         << Origin.getName() << BO->getSourceRange();
   }
 
+  /// Where the function hands each variable to IS_ERR(), IS_ERR_OR_NULL()
+  /// or PTR_ERR(), and where it assigns each variable.
+  void collectErrorTests(const Stmt *St) {
+    if (!St)
+      return;
+    if (const auto *CE = dyn_cast<CallExpr>(St)) {
+      const FunctionDecl *Callee = CE->getDirectCallee();
+      if (Callee && Callee->getIdentifier() &&
+          (Callee->getName().starts_with("IS_ERR") ||
+           Callee->getName().starts_with("PTR_ERR")))
+        for (const Expr *Arg : CE->arguments())
+          if (const VarDecl *VD =
+                  getDirectLinuxVariable(Arg->IgnoreParenCasts()))
+            (*ErrorTests)[VD].Tests.push_back(CE->getExprLoc());
+    } else if (const auto *BO = dyn_cast<BinaryOperator>(St)) {
+      if (BO->isAssignmentOp())
+        if (const VarDecl *VD = getDirectLinuxVariable(BO->getLHS()))
+          (*ErrorTests)[VD].Assignments.push_back(BO->getOperatorLoc());
+    }
+    for (const Stmt *Child : St->children())
+      collectErrorTests(Child);
+  }
+
+  /// Whether the function also tests the value of \p E with IS_ERR(),
+  /// between the assignment that \p Origin is from and the next one.  Its
+  /// NULL test is then for a configuration in which the callee is a stub
+  /// that returns NULL, and the code handles both.
+  bool isAlsoErrorTested(const Expr *E, const LinuxKernelAPIOrigin &Origin) {
+    const VarDecl *VD = getDirectVariable(E);
+    if (!VD || !CurrentFunction || Origin.Assigned.isInvalid())
+      return false;
+    if (!ErrorTests) {
+      ErrorTests.emplace();
+      collectErrorTests(CurrentFunction->getBody());
+    }
+    auto It = ErrorTests->find(VD);
+    if (It == ErrorTests->end())
+      return false;
+    const SourceManager &SM = S.getSourceManager();
+    auto After = [&](SourceLocation A, SourceLocation B) {
+      return SM.isBeforeInTranslationUnit(SM.getExpansionLoc(A),
+                                          SM.getExpansionLoc(B));
+    };
+    // The next assignment after the one that gave the value.
+    SourceLocation Next;
+    for (SourceLocation Loc : It->second.Assignments)
+      if (After(Origin.Assigned, Loc) && (Next.isInvalid() || After(Loc, Next)))
+        Next = Loc;
+    for (SourceLocation Loc : It->second.Tests)
+      if (After(Origin.Assigned, Loc) && (Next.isInvalid() || After(Loc, Next)))
+        return true;
+    return false;
+  }
+
   void checkErrorPointerNullComparison(const BinaryOperator *BO) {
     // Diagnose only the negative test.  A positive `pointer != NULL` test is
     // useful after an IS_ERR() guard and cannot be judged without
@@ -1460,14 +1569,18 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
     const Expr *LHS = BO->getLHS();
     const Expr *RHS = BO->getRHS();
     LinuxKernelAPIOrigin Origin;
+    const Expr *Tested = nullptr;
     if (RHS->isNullPointerConstant(S.getASTContext(),
                                    Expr::NPC_ValueDependentIsNotNull))
-      Origin = getOrigin(LHS);
+      Tested = LHS;
     else if (LHS->isNullPointerConstant(S.getASTContext(),
                                         Expr::NPC_ValueDependentIsNotNull))
-      Origin = getOrigin(RHS);
+      Tested = RHS;
+    if (Tested)
+      Origin = getOrigin(Tested);
 
-    if (Origin.Kind == LinuxKernelAPIKind::ErrorPointer) {
+    if (Origin.Kind == LinuxKernelAPIKind::ErrorPointer &&
+        !isAlsoErrorTested(Tested, Origin)) {
       S.Diag(BO->getOperatorLoc(), diag::warn_linux_kernel_null_test_on_err_ptr)
           << Origin.getName() << BO->getSourceRange();
       noteInferred(Origin);
@@ -1479,7 +1592,8 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
       return;
     const Expr *Value = UO->getSubExpr();
     LinuxKernelAPIOrigin Origin = getOrigin(Value);
-    if (Origin.Kind == LinuxKernelAPIKind::ErrorPointer) {
+    if (Origin.Kind == LinuxKernelAPIKind::ErrorPointer &&
+        !isAlsoErrorTested(Value, Origin)) {
       S.Diag(Value->getExprLoc(), diag::warn_linux_kernel_null_test_on_err_ptr)
           << Origin.getName() << Value->getSourceRange();
       noteInferred(Origin);
@@ -1557,6 +1671,18 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
     }
   }
 
+  bool mentionsExpr(const Stmt *St, const Expr *E) const {
+    if (!St)
+      return false;
+    if (const auto *Inner = dyn_cast<Expr>(St))
+      if (isSameLinuxExpr(S.getASTContext(), Inner, E))
+        return true;
+    for (const Stmt *Child : St->children())
+      if (mentionsExpr(Child, E))
+        return true;
+    return false;
+  }
+
   static bool assigns(const Stmt *St, const ASTContext &Ctx, const Expr *To) {
     if (!St)
       return false;
@@ -1571,8 +1697,9 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
 
   void checkPtrErrIn(const Stmt *St, const Stmt *Branch,
                      const PointerTests &Tests) {
-    // A nested test has its own answer: "t ? PTR_ERR(t) : -ENOMEM".
-    if (!St || isa<IfStmt, AbstractConditionalOperator>(St))
+    // A nested test has its own answer: "t ? PTR_ERR(t) : -ENOMEM".  So has
+    // "switch (PTR_ERR(t))", which sorts out the values itself.
+    if (!St || isa<IfStmt, AbstractConditionalOperator, SwitchStmt>(St))
       return;
     if (const auto *BO = dyn_cast<BinaryOperator>(St); BO && BO->isLogicalOp())
       return;
@@ -1619,8 +1746,17 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
       if (Tests.Errors.empty() && !Tests.ErrorOrNull && !Tests.Null)
         continue;
       if (const auto *CS = dyn_cast<CompoundStmt>(Branch)) {
-        for (const Stmt *Child : CS->body())
+        for (const Stmt *Child : CS->body()) {
           checkPtrErrIn(Child, Branch, Tests);
+          // "if (!t) return -EINVAL;" inside the branch: what comes after
+          // it knows more than the outer test.
+          const auto *Nested = dyn_cast<IfStmt>(Child);
+          if (Nested && Nested->getCond() &&
+              ((Tests.Null && mentionsExpr(Nested->getCond(), Tests.Null)) ||
+               (Tests.ErrorOrNull &&
+                mentionsExpr(Nested->getCond(), Tests.ErrorOrNull))))
+            break;
+        }
       } else {
         checkPtrErrIn(Branch, Branch, Tests);
       }
@@ -1895,6 +2031,18 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
           BO->getRHS()->IgnoreParens()->isNullPointerConstant(
               const_cast<ASTContext &>(Ctx), Expr::NPC_ValueDependentIsNotNull))
         Found = true;
+    } else if (const auto *CE = dyn_cast<CallExpr>(St)) {
+      // "obj->node = child; fwnode_handle_get(child);" takes a reference
+      // of its own for what it stores.
+      const FunctionDecl *Callee = CE->getDirectCallee();
+      if (Callee && Callee->getIdentifier() && CE->getNumArgs() >= 1 &&
+          getDirectLinuxVariable(CE->getArg(0)->IgnoreParenCasts()) == VD) {
+        StringRef Name = Callee->getName();
+        if (Name.ends_with("_get") || Name.starts_with("get_") ||
+            Name.contains("_get_") || Name.ends_with("_hold") ||
+            Name.ends_with("_ref"))
+          Found = true;
+      }
     }
     for (const Stmt *Child : St->children())
       findCleanupDisarm(Child, VD, Ctx, Found);
@@ -3021,6 +3169,7 @@ public:
       return true;
     LinuxKernelAPIOrigin Origin = getOrigin(VD->getInit());
     if (Origin) {
+      Origin.Assigned = VD->getLocation();
       VariableOrigins[VD] = Origin;
       noteAllocationFlags(VD, VD->getInit());
     }
@@ -3190,6 +3339,7 @@ public:
             CanTrack ? getOrigin(BO->getRHS()) : LinuxKernelAPIOrigin{};
         if (VD) {
           if (Origin) {
+            Origin.Assigned = BO->getOperatorLoc();
             VariableOrigins[VD] = Origin;
             noteAllocationFlags(VD, BO->getRHS());
           } else {
@@ -5082,9 +5232,15 @@ public:
   }
 
   /// The condition that decides which way \p B branches.  A block that ends
-  /// in "if (a && b)" evaluates only b.
+  /// in "if (a && b)" evaluates only b: a was decided by an earlier block,
+  /// and this one is reached with the outcome of a that leaves the result
+  /// open.  The condition of "do ... while (a && b)" is different: the CFG
+  /// computes its value like that of any other expression and the block
+  /// that ends the loop branches on the whole of it.
   static const Expr *getBranchCondition(const CFGBlock *B) {
     const Expr *Cond = cast<Expr>(B->getTerminatorCondition());
+    if (B->getLastCondition() == Cond->IgnoreParens())
+      return Cond;
     for (;;) {
       const auto *BO = dyn_cast<BinaryOperator>(Cond->IgnoreParens());
       if (!BO || !BO->isLogicalOp())
