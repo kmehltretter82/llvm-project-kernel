@@ -33,6 +33,7 @@
 #include "llvm/ADT/PackedVector.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringSwitch.h"
 #include <algorithm>
 #include <cassert>
 #include <optional>
@@ -1716,11 +1717,46 @@ void TransferFunctions::reportUse(const Expr *ex, const VarDecl *vd) {
   handler.handleUseOfUninitVariable(vd, Use);
 }
 
+/// Whether \p FD does nothing but overwrite the object that its parameter
+/// points to, as a function that wipes a key does.  Such a cleanup function
+/// does not read the variable.
+static bool onlyOverwritesArgument(const FunctionDecl *FD) {
+  const FunctionDecl *Def = nullptr;
+  if (!FD || !FD->hasBody(Def) || Def->getNumParams() != 1)
+    return false;
+  const auto *Body = dyn_cast<CompoundStmt>(Def->getBody());
+  if (!Body || Body->body_empty())
+    return false;
+  for (const Stmt *S : Body->body()) {
+    const auto *E = dyn_cast<Expr>(S);
+    const auto *Call =
+        dyn_cast_or_null<CallExpr>(E ? E->IgnoreParenImpCasts() : nullptr);
+    const FunctionDecl *Callee = Call ? Call->getDirectCallee() : nullptr;
+    if (!Callee || !Callee->getIdentifier() || Call->getNumArgs() < 1)
+      return false;
+    if (!llvm::StringSwitch<bool>(Callee->getName())
+             .Cases({"memset", "__builtin_memset", "bzero", "__builtin_bzero"},
+                    true)
+             .Cases({"explicit_bzero", "memset_explicit", "memset_s",
+                     "memzero_explicit"},
+                    true)
+             .Default(false))
+      return false;
+    const auto *Arg = dyn_cast<DeclRefExpr>(Call->getArg(0)->IgnoreParenCasts());
+    if (!Arg || Arg->getDecl() != Def->getParamDecl(0))
+      return false;
+  }
+  return true;
+}
+
 /// The cleanup function of \p vd runs here.  It is handed the address of the
 /// variable and reads it, so an uninitialized variable is used.
 void TransferFunctions::reportCleanup(const VarDecl *vd, const Stmt *leave) {
   if (!handler.wantsCleanupUses() || !isTrackedVar(vd))
     return;
+  if (const auto *A = vd->getAttr<CleanupAttr>())
+    if (onlyOverwritesArgument(A->getFunctionDecl()))
+      return;
   Value v = vals[vd];
   if (isUninitialized(v))
     handler.handleUninitCleanup(vd, isAlwaysUninit(v), leave);

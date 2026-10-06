@@ -59,3 +59,37 @@ int set_before_any_exit(int bad) {
     return -EINVAL;
   return use(buf);
 }
+
+// A cleanup function that only overwrites the variable does not read it.
+struct key {
+  unsigned char bytes[32];
+  int *extra;
+};
+void *memset(void *, int, unsigned long);
+void memzero_explicit(void *, unsigned long);
+static inline void wipe_key(struct key *k) { memzero_explicit(k, sizeof(*k)); }
+static inline void clear_key(struct key *k) { memset(k, 0, sizeof(*k)); }
+static inline void drop_key(struct key *k) {
+  kfree(k->extra);
+  memset(k, 0, sizeof(*k));
+}
+int prepare(struct key *);
+
+int wiped_on_early_return(int bad) {
+  struct key k __attribute__((cleanup(wipe_key)));
+  struct key c __attribute__((cleanup(clear_key)));
+
+  if (bad)
+    return -EINVAL;
+  return prepare(&k) + prepare(&c);
+}
+
+int read_on_early_return(int bad) {
+  struct key k __attribute__((cleanup(drop_key))); // uninit-warning {{variable 'k' is uninitialized when its cleanup function 'drop_key' runs}} \
+                                                   // always-warning {{variable 'k' is uninitialized when its cleanup function 'drop_key' runs}}
+
+  if (bad)
+    return -EINVAL; // uninit-note {{the scope of 'k' is left here}} \
+                    // always-note {{the scope of 'k' is left here}}
+  return prepare(&k);
+}
