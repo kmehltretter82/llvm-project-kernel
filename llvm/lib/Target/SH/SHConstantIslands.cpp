@@ -45,6 +45,7 @@
 #include "SHInstrInfo.h"
 #include "SHSubtarget.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/LivePhysRegs.h"
@@ -280,9 +281,13 @@ void SHConstantIslands::place(bool Materialize) {
       }
       Addr += Size;
 
-      // Behind an unconditional branch nothing runs into the literals.
-      if (!Pool.empty() && MI.isBarrier() && I == MBB->end())
-        flush(*MBB, I, /*Inline=*/false, Materialize);
+      // Behind an unconditional branch nothing runs into the literals, if
+      // it is the last thing in its block that takes room.  What takes none
+      // does not count: debug information must not change the code.
+      if (!Pool.empty() && MI.isBarrier() &&
+          none_of(make_range(I, MBB->end()),
+                  [&](const MachineInstr &Next) { return sizeOf(Next) != 0; }))
+        flush(*MBB, MBB->end(), /*Inline=*/false, Materialize);
     }
   }
   if (!Pool.empty())

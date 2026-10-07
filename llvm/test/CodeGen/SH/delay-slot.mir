@@ -397,6 +397,63 @@ body:             |
     RTS
 ...
 
+# An instruction that sets up the frame stays where it is, and nothing is
+# taken from in front of it.  The second function is the first without the
+# unwind information: the code has to be the same, because -g adds that
+# information and must not change the code.
+---
+name:            frame
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $r4, $r5, $r15
+
+    ; CHECK-LABEL: name: frame
+    ; CHECK: liveins: $r4, $r5, $r15
+    ; CHECK-NEXT: {{  $}}
+    ; CHECK-NEXT: $r5 = ADDri killed $r5, 1
+    ; CHECK-NEXT: $r15 = frame-setup ADDri $r15, -8
+    ; CHECK-NEXT: frame-setup CFI_INSTRUCTION def_cfa_offset 8
+    ; CHECK-NEXT: $r1 = MOVrr killed $r4
+    ; CHECK-NEXT: JSR killed $r1, $r5, csr_sh_fpu, implicit-def dead $pr, implicit-def dead $t, implicit-def dead $mach, implicit-def dead $macl, implicit-def $r15 {
+    ; CHECK-NEXT:   NOP
+    ; CHECK-NEXT: }
+    ; CHECK-NEXT: RTS {
+    ; CHECK-NEXT:   NOP
+    ; CHECK-NEXT: }
+    $r5 = ADDri killed $r5, 1
+    $r15 = frame-setup ADDri $r15, -8
+    frame-setup CFI_INSTRUCTION def_cfa_offset 8
+    $r1 = MOVrr killed $r4
+    JSR killed $r1, $r5, csr_sh_fpu, implicit-def dead $pr, implicit-def dead $t, implicit-def dead $mach, implicit-def dead $macl, implicit-def $r15
+    RTS
+...
+---
+name:            frame_bare
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $r4, $r5, $r15
+
+    ; CHECK-LABEL: name: frame_bare
+    ; CHECK: liveins: $r4, $r5, $r15
+    ; CHECK-NEXT: {{  $}}
+    ; CHECK-NEXT: $r5 = ADDri killed $r5, 1
+    ; CHECK-NEXT: $r15 = frame-setup ADDri $r15, -8
+    ; CHECK-NEXT: $r1 = MOVrr killed $r4
+    ; CHECK-NEXT: JSR killed $r1, $r5, csr_sh_fpu, implicit-def dead $pr, implicit-def dead $t, implicit-def dead $mach, implicit-def dead $macl, implicit-def $r15 {
+    ; CHECK-NEXT:   NOP
+    ; CHECK-NEXT: }
+    ; CHECK-NEXT: RTS {
+    ; CHECK-NEXT:   NOP
+    ; CHECK-NEXT: }
+    $r5 = ADDri killed $r5, 1
+    $r15 = frame-setup ADDri $r15, -8
+    $r1 = MOVrr killed $r4
+    JSR killed $r1, $r5, csr_sh_fpu, implicit-def dead $pr, implicit-def dead $t, implicit-def dead $mach, implicit-def dead $macl, implicit-def $r15
+    RTS
+...
+
 # bra takes the instruction in front of it, but nothing from in front of a
 # conditional branch.
 ---

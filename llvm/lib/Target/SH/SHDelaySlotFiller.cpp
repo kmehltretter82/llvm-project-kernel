@@ -25,7 +25,8 @@
 // instructions behind it, because none of them reads what it writes or
 // writes what it reads or writes.  A load or a store is not moved over
 // another one: the order of the accesses to memory stays as it is, which a
-// volatile object needs.
+// volatile object needs.  The search ends at a call, a branch, inline
+// assembly, a label, and at the instructions that set up the frame.
 //
 // The two are one bundle, so that the branch is still the last thing in its
 // block for everyone who looks.  A nop is behind the branch in the bundle.
@@ -156,6 +157,12 @@ MachineInstr *SHDelaySlotFiller::findFiller(MachineInstr &Branch) const {
       ++Budget;
       continue;
     }
+    // The instructions that set up the frame stay where the unwind
+    // information says they are.  The pass stops at them whether there is
+    // such information or not: it is there with -g and may not be without,
+    // and the code has to be the same.
+    if (MI.getFlag(MachineInstr::FrameSetup))
+      return nullptr;
     // Nothing is moved over these.
     if (MI.isMetaInstruction() || MI.isInlineAsm() || MI.isCall() ||
         MI.isTerminator() || MI.isBundled() || MI.hasDelaySlot() ||
