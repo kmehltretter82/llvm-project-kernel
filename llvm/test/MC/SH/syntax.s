@@ -31,6 +31,11 @@
 # CHECK: fmov.s @r1,fr2 ! encoding: [0x18,0xf2]
 1:
 
+# The compare and swap of the J2, which the GNU as of most toolchains does
+# not know.  The bytes are the ones of the assembler of the J-Core project.
+	cas.l	r9,r6,@r0
+# CHECK: cas.l r9,r6,@r0 ! encoding: [0x93,0x26]
+
 # A comment begins with "!", and ";" ends a statement.
 	nop ! nothing
 # CHECK: nop ! encoding: [0x09,0x00]

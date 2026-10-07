@@ -1270,6 +1270,10 @@ def MOVLldgbr : SHAsm<(ins disp8x4:$disp), "mov.l\t@($disp,gbr),r0">,
 
 def XTRCT : SHAsm<(ins GPR:$rn, GPR:$rm), "xtrct\t$rm,$rn">,
             EncNM<0b0010, 0b1101>;
+// Compare and swap, which only the J2 has: if the long word at r0 is Rm, it
+// becomes Rn, and Rn is what was there.
+def CASL : SHAsm<(ins GPR:$rm, GPR:$rn), "cas.l\t$rm,$rn,@r0">,
+           EncNM<0b0010, 0b0011>;
 def MOVCAL : SHAsm<(ins GPR:$rn), "movca.l\tr0,@$rn">,
              EncN<0b0000, 0b11000011>;
 def MOVCOL : SHAsm<(ins GPR:$rn), "movco.l\tr0,@$rn">,
