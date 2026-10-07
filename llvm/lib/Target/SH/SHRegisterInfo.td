@@ -102,6 +102,22 @@ def FPR : RegisterClass<"SH", [f32], 32, (sequence "FR%u", 0, 15)>;
 def DFPR : RegisterClass<"SH", [f64], 32,
                          (add DR0, DR2, DR4, DR6, DR8, DR10, DR12, DR14)>;
 
+// For the assembler: the registers of the unit's second set as doubles,
+// which an instruction names by an odd number, the vectors of four floats,
+// and the matrix that the second set is.
+foreach I = [0, 2, 4, 6, 8, 10, 12, 14] in
+  def XD#I : SHReg<!add(I, 1), "xd"#I>;
+foreach I = [0, 4, 8, 12] in
+  def FV#I : SHReg<!srl(I, 2), "fv"#I>;
+def XMTRX : SHReg<0, "xmtrx">;
+def XDPR : RegisterClass<"SH", [f64], 32,
+                         (add XD0, XD2, XD4, XD6, XD8, XD10, XD12, XD14)> {
+  let isAllocatable = 0;
+}
+def FVR : RegisterClass<"SH", [i32], 32, (add FV0, FV4, FV8, FV12)> {
+  let isAllocatable = 0;
+}
+
 def FPSysReg : RegisterClass<"SH", [i32], 32, (add FPUL, FPSCR)> {
   let isAllocatable = 0;
 }

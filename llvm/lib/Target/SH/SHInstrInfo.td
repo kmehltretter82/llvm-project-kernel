@@ -1442,6 +1442,50 @@ def FMOVDstr0x : SHAsm<(ins DFPR:$rm, GPR:$rn), "fmov.d\t$rm,@(r0,$rn)">,
                  EncNM<0b1111, 0b0111>;
 }
 
+// The same with a register of the second set, which has an odd number in
+// the instruction.
+multiclass SHXDMove<RegisterClass RN, RegisterClass RM> {
+  def "" : SHAsm<(ins RN:$rn, RM:$rm), "fmov\t$rm,$rn">,
+           EncNM<0b1111, 0b1100>;
+}
+let DecoderNamespace = "SHXD" in
+defm FMOVXD : SHXDMove<DFPR, XDPR>;
+let DecoderNamespace = "SHDX" in
+defm FMOVDX : SHXDMove<XDPR, DFPR>;
+let DecoderNamespace = "SHXX" in {
+defm FMOVXX : SHXDMove<XDPR, XDPR>;
+def FMOVXind : SHAsm<(ins XDPR:$rn, GPR:$rm), "fmov\t@$rm,$rn">,
+               EncNM<0b1111, 0b1000>;
+def FMOVXldinc : SHAsm<(ins XDPR:$rn, GPR:$rm), "fmov\t@$rm+,$rn">,
+                 EncNM<0b1111, 0b1001>;
+def FMOVXldr0x : SHAsm<(ins XDPR:$rn, GPR:$rm), "fmov\t@(r0,$rm),$rn">,
+                 EncNM<0b1111, 0b0110>;
+def FMOVXsti : SHAsm<(ins XDPR:$rm, GPR:$rn), "fmov\t$rm,@$rn">,
+               EncNM<0b1111, 0b1010>;
+def FMOVXstdec : SHAsm<(ins XDPR:$rm, GPR:$rn), "fmov\t$rm,@-$rn">,
+                 EncNM<0b1111, 0b1011>;
+def FMOVXstr0x : SHAsm<(ins XDPR:$rm, GPR:$rn), "fmov\t$rm,@(r0,$rn)">,
+                 EncNM<0b1111, 0b0111>;
+}
+
+// The inner product of two vectors of four floats, and a vector times the
+// matrix.
+def FIPR : SHAsm<(ins FVR:$fvm, FVR:$fvn), "fipr\t$fvm,$fvn"> {
+  bits<2> fvm;
+  bits<2> fvn;
+  let Inst{15 - 12} = 0b1111;
+  let Inst{11 - 10} = fvn;
+  let Inst{9 - 8} = fvm;
+  let Inst{7 - 0} = 0b11101101;
+}
+def FTRV : SHAsm<(ins FVR:$fvn), "ftrv\txmtrx,$fvn"> {
+  bits<2> fvn;
+  let Inst{15 - 12} = 0b1111;
+  let Inst{11 - 10} = fvn;
+  let Inst{9 - 8} = 0b01;
+  let Inst{7 - 0} = 0b11111101;
+}
+
 // Other spellings that GNU as takes.
 def : MnemonicAlias<"bt.s", "bt/s">;
 def : MnemonicAlias<"bf.s", "bf/s">;
@@ -1457,3 +1501,5 @@ def : InstAlias<"fmov\t@(r0,$rm),$rn", (FMOVSldr0x FPR:$rn, GPR:$rm), 0>;
 def : InstAlias<"fmov\t$rm,@(r0,$rn)", (FMOVSstr0x FPR:$rm, GPR:$rn), 0>;
 def : InstAlias<"fmov\t@(r0,$rm),$rn", (FMOVDldr0x DFPR:$rn, GPR:$rm), 0>;
 def : InstAlias<"fmov\t$rm,@(r0,$rn)", (FMOVDstr0x DFPR:$rm, GPR:$rn), 0>;
+def : InstAlias<"fmov\t@$rm+,$rn", (FMOVDldinc DFPR:$rn, GPR:$rm), 0>;
+def : InstAlias<"fmov\t$rm,@-$rn", (FMOVDstdec DFPR:$rm, GPR:$rn), 0>;

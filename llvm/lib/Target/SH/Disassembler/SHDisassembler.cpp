@@ -65,6 +65,9 @@ static const MCRegister FPRs[] = {SH::FR0,  SH::FR1,  SH::FR2,  SH::FR3,
                                   SH::FR12, SH::FR13, SH::FR14, SH::FR15};
 static const MCRegister DFPRs[] = {SH::DR0, SH::DR2,  SH::DR4,  SH::DR6,
                                    SH::DR8, SH::DR10, SH::DR12, SH::DR14};
+static const MCRegister XDPRs[] = {SH::XD0, SH::XD2,  SH::XD4,  SH::XD6,
+                                   SH::XD8, SH::XD10, SH::XD12, SH::XD14};
+static const MCRegister FVRs[] = {SH::FV0, SH::FV4, SH::FV8, SH::FV12};
 static const MCRegister BankRegs[] = {SH::R0_BANK, SH::R1_BANK, SH::R2_BANK,
                                       SH::R3_BANK, SH::R4_BANK, SH::R5_BANK,
                                       SH::R6_BANK, SH::R7_BANK};
@@ -90,6 +93,23 @@ static DecodeStatus DecodeDFPRRegisterClass(MCInst &Inst, unsigned RegNo,
   if (RegNo & 1)
     return MCDisassembler::Fail;
   Inst.addOperand(MCOperand::createReg(DFPRs[(RegNo & 15) >> 1]));
+  return MCDisassembler::Success;
+}
+
+// A double register of the second set has an odd number.
+static DecodeStatus DecodeXDPRRegisterClass(MCInst &Inst, unsigned RegNo,
+                                            uint64_t Address,
+                                            const MCDisassembler *Decoder) {
+  if (!(RegNo & 1))
+    return MCDisassembler::Fail;
+  Inst.addOperand(MCOperand::createReg(XDPRs[(RegNo & 15) >> 1]));
+  return MCDisassembler::Success;
+}
+
+static DecodeStatus DecodeFVRRegisterClass(MCInst &Inst, unsigned RegNo,
+                                           uint64_t Address,
+                                           const MCDisassembler *Decoder) {
+  Inst.addOperand(MCOperand::createReg(FVRs[RegNo & 3]));
   return MCDisassembler::Success;
 }
 

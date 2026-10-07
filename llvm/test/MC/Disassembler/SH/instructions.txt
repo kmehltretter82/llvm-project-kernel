@@ -363,6 +363,10 @@
 # CHECK: fmov.s{{[[:space:]]+}}fr5,@-r9
 0x57 0xf9
 # CHECK: fmov.s{{[[:space:]]+}}fr5,@(r0,r9)
+0xed 0xf9
+# CHECK: fipr{{[[:space:]]+}}fv4,fv8
+0xfd 0xf9
+# CHECK: ftrv{{[[:space:]]+}}xmtrx,fv8
 0x1d 0xf5
 # CHECK: flds{{[[:space:]]+}}fr5,fpul
 0x0d 0xfb
