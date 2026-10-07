@@ -119,6 +119,10 @@ StringRef Triple::getArchTypeName(ArchType Kind) {
     return "riscv32be";
   case riscv64be:
     return "riscv64be";
+  case sh:
+    return "sh";
+  case sheb:
+    return "sheb";
   case shave:
     return "shave";
   case sparc:
@@ -347,6 +351,9 @@ StringRef Triple::getArchTypePrefix(ArchType Kind) {
     return "kalimba";
   case lanai:
     return "lanai";
+  case sh:
+  case sheb:
+    return "sh";
   case shave:
     return "shave";
   case wasm32:
@@ -515,6 +522,8 @@ Triple::ArchType Triple::getArchTypeForLLVMName(StringRef Name) {
       .Case("kalimba", kalimba)
       .Case("lanai", lanai)
       .Case("shave", shave)
+      .Case("sh", sh)
+      .Case("sheb", sheb)
       .Case("wasm32", wasm32)
       .Case("wasm64", wasm64)
       .Case("renderscript32", renderscript32)
@@ -591,6 +600,24 @@ static Triple::ArchType parseARMArch(StringRef ArchName) {
   }
 
   return arch;
+}
+
+// SuperH: "sh" and a processor (sh2, sh2a, sh2e, sh3, sh3e, sh4, sh4a) or
+// none, and "eb" or "be" behind it for big endian, "le" or "el" or nothing
+// for little endian.  "sh2eb" is a big-endian SH-2, as for config.sub.
+static Triple::ArchType parseSHArch(StringRef ArchName) {
+  StringRef Name = ArchName;
+  if (!Name.consume_front("sh"))
+    return Triple::UnknownArch;
+  bool BigEndian = Name.consume_back("eb") || Name.consume_back("be");
+  if (!BigEndian && !Name.consume_back("le"))
+    Name.consume_back("el");
+  bool Known = StringSwitch<bool>(Name)
+                   .Cases({"", "2", "2a", "2e", "3", "3e", "4", "4a"}, true)
+                   .Default(false);
+  if (!Known)
+    return Triple::UnknownArch;
+  return BigEndian ? Triple::sheb : Triple::sh;
 }
 
 Triple::ArchType Triple::parseArch(StringRef ArchName) {
@@ -690,6 +717,8 @@ Triple::ArchType Triple::parseArch(StringRef ArchName) {
       return parseARMArch(ArchName);
     if (ArchName.starts_with("bpf"))
       return parseBPFArch(ArchName);
+    if (ArchName.starts_with("sh"))
+      return parseSHArch(ArchName);
   }
 
   return AT;
@@ -995,6 +1024,8 @@ static Triple::ObjectFormatType getDefaultFormat(const Triple &T) {
   case Triple::riscv64:
   case Triple::riscv32be:
   case Triple::riscv64be:
+  case Triple::sh:
+  case Triple::sheb:
   case Triple::shave:
   case Triple::sparc:
   case Triple::sparcel:
@@ -1761,6 +1792,8 @@ unsigned Triple::getArchPointerBitWidth(llvm::Triple::ArchType Arch) {
   case llvm::Triple::renderscript32:
   case llvm::Triple::riscv32:
   case llvm::Triple::riscv32be:
+  case llvm::Triple::sh:
+  case llvm::Triple::sheb:
   case llvm::Triple::shave:
   case llvm::Triple::sparc:
   case llvm::Triple::sparcel:
@@ -1872,6 +1905,8 @@ Triple Triple::get32BitArchVariant() const {
   case Triple::renderscript32:
   case Triple::riscv32:
   case Triple::riscv32be:
+  case Triple::sh:
+  case Triple::sheb:
   case Triple::shave:
   case Triple::sparc:
   case Triple::sparcel:
@@ -1964,6 +1999,8 @@ Triple Triple::get64BitArchVariant() const {
   case Triple::m68k:
   case Triple::msp430:
   case Triple::r600:
+  case Triple::sh:
+  case Triple::sheb:
   case Triple::shave:
   case Triple::sparcel:
   case Triple::tce:
@@ -2141,6 +2178,14 @@ Triple Triple::getBigEndianArchVariant() const {
   case Triple::riscv64:
     T.setArch(Triple::riscv64be);
     break;
+  case Triple::sh: {
+    // "sh4" becomes "sh4eb": the name keeps the processor.
+    StringRef Name = getArchName();
+    if (!Name.consume_back("le"))
+      Name.consume_back("el");
+    T.setArchName((Name + "eb").str());
+    break;
+  }
   case Triple::sparcel:
     T.setArch(Triple::sparc);
     break;
@@ -2196,6 +2241,13 @@ Triple Triple::getLittleEndianArchVariant() const {
   case Triple::riscv64be:
     T.setArch(Triple::riscv64);
     break;
+  case Triple::sheb: {
+    StringRef Name = getArchName();
+    if (!Name.consume_back("eb"))
+      Name.consume_back("be");
+    T.setArchName(Name.str());
+    break;
+  }
   case Triple::sparc:
     T.setArch(Triple::sparcel);
     break;
@@ -2238,6 +2290,7 @@ bool Triple::isLittleEndian() const {
   case Triple::renderscript64:
   case Triple::riscv32:
   case Triple::riscv64:
+  case Triple::sh:
   case Triple::shave:
   case Triple::sparcel:
   case Triple::spir64:
@@ -2503,6 +2556,8 @@ ExceptionHandling Triple::getDefaultExceptionHandling() const {
   case Triple::m68k:
   case Triple::msp430:
   case Triple::systemz:
+  case Triple::sh:
+  case Triple::sheb:
   case Triple::xcore:
   case Triple::xtensa:
     return ExceptionHandling::DwarfCFI;

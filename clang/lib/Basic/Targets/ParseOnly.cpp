@@ -54,7 +54,10 @@ ParseOnlyTargetInfo::getTargetBuiltins() const {
 
 std::optional<ParseOnlyTargetInfo::ArchKind>
 ParseOnlyTargetInfo::getArchKind(const llvm::Triple &Triple) {
-  if (Triple.getArch() != llvm::Triple::UnknownArch)
+  // LLVM knows SuperH by now.  clang still describes it here.
+  if (Triple.getArch() != llvm::Triple::UnknownArch &&
+      Triple.getArch() != llvm::Triple::sh &&
+      Triple.getArch() != llvm::Triple::sheb)
     return std::nullopt;
   StringRef Name = Triple.getArchName();
   if (Name.starts_with("alpha"))

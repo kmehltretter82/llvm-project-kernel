@@ -87,4 +87,7 @@
 /* Define if the Xtensa target is built in */
 #cmakedefine01 LLVM_HAS_XTENSA_TARGET
 
+/* Define if the SH target is built in */
+#cmakedefine01 LLVM_HAS_SH_TARGET
+
 #endif

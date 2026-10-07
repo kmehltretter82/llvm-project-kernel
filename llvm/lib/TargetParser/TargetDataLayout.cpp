@@ -670,6 +670,11 @@ std::string Triple::computeDataLayout(StringRef ABIName) const {
     return "e-m:e-p:32:32-i1:8:32-i8:8:32-i16:16:32-i64:32-f64:32-a:0:32-n32";
   case Triple::xtensa:
     return "e-m:e-p:32:32-i8:8:32-i16:16:32-i64:64-n32";
+  // GCC aligns nothing to more than 32 bits on SuperH.
+  case Triple::sh:
+    return "e-m:e-p:32:32-i64:32-f64:32-n32-S32";
+  case Triple::sheb:
+    return "E-m:e-p:32:32-i64:32-f64:32-n32-S32";
   case Triple::nvptx:
   case Triple::nvptx64:
     return computeNVPTXDataLayout(*this, ABIName);

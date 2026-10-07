@@ -1,0 +1,272 @@
+//===-- SHInstrInfo.cpp - SuperH instructions -----===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+#include "SHInstrInfo.h"
+#include "SHSubtarget.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
+#include "llvm/CodeGen/MachineFunction.h"
+#include "llvm/CodeGen/MachineInstrBuilder.h"
+#include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/MC/MCAsmInfo.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Target/TargetMachine.h"
+
+using namespace llvm;
+
+#define GET_INSTRINFO_CTOR_DTOR
+#include "SHGenInstrInfo.inc"
+
+void SHInstrInfo::anchor() {}
+
+SHInstrInfo::SHInstrInfo(const SHSubtarget &STI)
+    : SHGenInstrInfo(STI, RI, SH::ADJCALLSTACKDOWN, SH::ADJCALLSTACKUP), RI() {}
+
+void SHInstrInfo::copyPhysReg(MachineBasicBlock &MBB,
+                              MachineBasicBlock::iterator I, const DebugLoc &DL,
+                              Register DestReg, Register SrcReg, bool KillSrc,
+                              bool RenamableDest, bool RenamableSrc) const {
+  bool DestGPR = SH::GPRRegClass.contains(DestReg);
+  bool SrcGPR = SH::GPRRegClass.contains(SrcReg);
+  if (DestGPR && SrcGPR) {
+    BuildMI(MBB, I, DL, get(SH::MOVrr), DestReg)
+        .addReg(SrcReg, getKillRegState(KillSrc));
+    return;
+  }
+  // To and from the system registers.
+  unsigned Opc = 0;
+  if (DestGPR) {
+    Opc = SrcReg == SH::PR     ? SH::STSPR
+          : SrcReg == SH::MACL ? SH::STSMACL
+          : SrcReg == SH::MACH ? SH::STSMACH
+          : SrcReg == SH::GBR  ? SH::STCGBR
+                               : 0;
+    if (Opc) {
+      BuildMI(MBB, I, DL, get(Opc), DestReg);
+      return;
+    }
+  } else if (SrcGPR) {
+    Opc = DestReg == SH::PR     ? SH::LDSPR
+          : DestReg == SH::MACL ? SH::LDSMACL
+          : DestReg == SH::MACH ? SH::LDSMACH
+          : DestReg == SH::GBR  ? SH::LDCGBR
+                                : 0;
+    if (Opc) {
+      BuildMI(MBB, I, DL, get(Opc)).addReg(SrcReg, getKillRegState(KillSrc));
+      return;
+    }
+  }
+  llvm_unreachable("cannot copy between these registers");
+}
+
+void SHInstrInfo::storeRegToStackSlot(
+    MachineBasicBlock &MBB, MachineBasicBlock::iterator MI, Register SrcReg,
+    bool IsKill, int FrameIndex, const TargetRegisterClass *RC, Register VReg,
+    MachineInstr::MIFlag Flags) const {
+  DebugLoc DL;
+  if (MI != MBB.end())
+    DL = MI->getDebugLoc();
+  assert(SH::GPRRegClass.hasSubClassEq(RC) && "cannot store this register");
+  BuildMI(MBB, MI, DL, get(SH::MOVLst))
+      .addReg(SrcReg, getKillRegState(IsKill))
+      .addFrameIndex(FrameIndex)
+      .addImm(0)
+      .setMIFlag(Flags);
+}
+
+void SHInstrInfo::loadRegFromStackSlot(MachineBasicBlock &MBB,
+                                       MachineBasicBlock::iterator MI,
+                                       Register DestReg, int FrameIndex,
+                                       const TargetRegisterClass *RC,
+                                       Register VReg, unsigned SubReg,
+                                       MachineInstr::MIFlag Flags) const {
+  DebugLoc DL;
+  if (MI != MBB.end())
+    DL = MI->getDebugLoc();
+  assert(SH::GPRRegClass.hasSubClassEq(RC) && "cannot load this register");
+  BuildMI(MBB, MI, DL, get(SH::MOVLld), DestReg)
+      .addFrameIndex(FrameIndex)
+      .addImm(0)
+      .setMIFlag(Flags);
+}
+
+unsigned SHInstrInfo::getInstSizeInBytes(const MachineInstr &MI) const {
+  switch (MI.getOpcode()) {
+  case TargetOpcode::INLINEASM:
+  case TargetOpcode::INLINEASM_BR: {
+    const MachineFunction *MF = MI.getParent()->getParent();
+    return getInlineAsmLength(MI.getOperand(0).getSymbolName(),
+                              MF->getTarget().getMCAsmInfo());
+  }
+  case SH::CPALIGN:
+    return MI.getOperand(0).getImm();
+  default:
+    if (MI.isMetaInstruction())
+      return 0;
+    return MI.getDesc().getSize();
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// Branches.  The condition is one number: 1 for "branch if T is set", 0 for
+// "branch if T is clear".
+//===----------------------------------------------------------------------===//
+
+bool SHInstrInfo::analyzeBranch(MachineBasicBlock &MBB, MachineBasicBlock *&TBB,
+                                MachineBasicBlock *&FBB,
+                                SmallVectorImpl<MachineOperand> &Cond,
+                                bool AllowModify) const {
+  MachineBasicBlock::iterator I = MBB.end();
+  while (I != MBB.begin()) {
+    --I;
+    if (I->isDebugInstr())
+      continue;
+    if (!isUnpredicatedTerminator(*I))
+      break;
+    unsigned Opc = I->getOpcode();
+    if (Opc != SH::BRA && Opc != SH::BT && Opc != SH::BF)
+      return true;
+
+    if (Opc == SH::BRA) {
+      if (!AllowModify) {
+        TBB = I->getOperand(0).getMBB();
+        continue;
+      }
+      // Nothing behind an unconditional branch is reached.
+      MBB.erase(std::next(I), MBB.end());
+      Cond.clear();
+      FBB = nullptr;
+      if (MBB.isLayoutSuccessor(I->getOperand(0).getMBB())) {
+        TBB = nullptr;
+        I->eraseFromParent();
+        I = MBB.end();
+        continue;
+      }
+      TBB = I->getOperand(0).getMBB();
+      continue;
+    }
+
+    // A second conditional branch is more than this can describe.
+    if (!Cond.empty())
+      return true;
+    FBB = TBB;
+    TBB = I->getOperand(0).getMBB();
+    Cond.push_back(MachineOperand::CreateImm(Opc == SH::BT));
+  }
+  return false;
+}
+
+unsigned SHInstrInfo::removeBranch(MachineBasicBlock &MBB,
+                                   int *BytesRemoved) const {
+  assert(!BytesRemoved && "code size not handled");
+  MachineBasicBlock::iterator I = MBB.end();
+  unsigned Count = 0;
+  while (I != MBB.begin()) {
+    --I;
+    if (I->isDebugInstr())
+      continue;
+    unsigned Opc = I->getOpcode();
+    if (Opc != SH::BRA && Opc != SH::BT && Opc != SH::BF)
+      break;
+    I->eraseFromParent();
+    I = MBB.end();
+    ++Count;
+  }
+  return Count;
+}
+
+unsigned SHInstrInfo::insertBranch(MachineBasicBlock &MBB,
+                                   MachineBasicBlock *TBB,
+                                   MachineBasicBlock *FBB,
+                                   ArrayRef<MachineOperand> Cond,
+                                   const DebugLoc &DL, int *BytesAdded) const {
+  assert(TBB && "insertBranch must not be told to insert a fallthrough");
+  assert(Cond.size() <= 1 && "a SuperH branch condition is one number");
+  assert(!BytesAdded && "code size not handled");
+
+  if (Cond.empty()) {
+    assert(!FBB && "unconditional branch with two targets");
+    BuildMI(&MBB, DL, get(SH::BRA)).addMBB(TBB);
+    return 1;
+  }
+  BuildMI(&MBB, DL, get(Cond[0].getImm() ? SH::BT : SH::BF)).addMBB(TBB);
+  if (!FBB)
+    return 1;
+  BuildMI(&MBB, DL, get(SH::BRA)).addMBB(FBB);
+  return 2;
+}
+
+bool SHInstrInfo::reverseBranchCondition(
+    SmallVectorImpl<MachineOperand> &Cond) const {
+  assert(Cond.size() == 1 && "a SuperH branch condition is one number");
+  Cond[0].setImm(!Cond[0].getImm());
+  return false;
+}
+
+//===----------------------------------------------------------------------===//
+// Pseudo instructions
+//===----------------------------------------------------------------------===//
+
+bool SHInstrInfo::expandPostRAPseudo(MachineInstr &MI) const {
+  MachineBasicBlock &MBB = *MI.getParent();
+  DebugLoc DL = MI.getDebugLoc();
+  switch (MI.getOpcode()) {
+  default:
+    return false;
+  case SH::MUL32:
+  case SH::MULHU32:
+  case SH::MULHS32: {
+    // The product is in MACL or MACH, whatever the registers of the
+    // operands are.
+    unsigned Mul = MI.getOpcode() == SH::MUL32     ? SH::MULL
+                   : MI.getOpcode() == SH::MULHU32 ? SH::DMULU
+                                                   : SH::DMULS;
+    Register Dst = MI.getOperand(0).getReg();
+    BuildMI(MBB, MI, DL, get(Mul))
+        .addReg(MI.getOperand(1).getReg(),
+                getKillRegState(MI.getOperand(1).isKill()))
+        .addReg(MI.getOperand(2).getReg(),
+                getKillRegState(MI.getOperand(2).isKill()));
+    BuildMI(MBB, MI, DL,
+            get(MI.getOpcode() == SH::MUL32 ? SH::STSMACL : SH::STSMACH), Dst);
+    break;
+  }
+  case SH::MOVRT: {
+    // 0 - (-1) - T
+    Register Dst = MI.getOperand(0).getReg();
+    BuildMI(MBB, MI, DL, get(SH::MOVI), Dst).addImm(-1);
+    BuildMI(MBB, MI, DL, get(SH::NEGC), Dst).addReg(Dst, RegState::Kill);
+    break;
+  }
+  }
+  MI.eraseFromParent();
+  return true;
+}
+
+void SHInstrInfo::loadImmediate(MachineBasicBlock &MBB,
+                                MachineBasicBlock::iterator I,
+                                const DebugLoc &DL, Register Reg,
+                                int64_t Value) const {
+  Value = SignExtend64<32>(Value);
+  if (isInt<8>(Value)) {
+    BuildMI(MBB, I, DL, get(SH::MOVI), Reg).addImm(Value);
+    return;
+  }
+  // An eight bit number that is shifted.  shll2, shll8 and shll16 leave T
+  // alone.
+  static const std::pair<unsigned, unsigned> Shifts[] = {
+      {2, SH::SHLL2}, {8, SH::SHLL8}, {16, SH::SHLL16}};
+  for (auto [Amount, Opc] : Shifts) {
+    int64_t Mask = (int64_t(1) << Amount) - 1;
+    if ((Value & Mask) == 0 && isInt<8>(Value >> Amount)) {
+      BuildMI(MBB, I, DL, get(SH::MOVI), Reg).addImm(Value >> Amount);
+      BuildMI(MBB, I, DL, get(Opc), Reg).addReg(Reg, RegState::Kill);
+      return;
+    }
+  }
+  BuildMI(MBB, I, DL, get(SH::MOVLpcrel), Reg).addImm(Value);
+}

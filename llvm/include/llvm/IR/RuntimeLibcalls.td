@@ -108,6 +108,8 @@ def IsArchCSKY : LibcallPredicate<[{TT.getArch() == Triple::csky}]>;
 def IsArchArc : LibcallPredicate<[{TT.getArch() == Triple::arc}]>;
 def IsArchM68k : LibcallPredicate<[{TT.getArch() == Triple::m68k}]>;
 def IsArchXtensa : LibcallPredicate<[{TT.getArch() == Triple::xtensa}]>;
+def IsSH : LibcallPredicate<[{TT.getArch() == Triple::sh ||
+                              TT.getArch() == Triple::sheb}]>;
 
 /// Libcall Predicates
 def isOSDarwin : RuntimeLibcallAvailability<(all_of IsOSDarwin)>;
@@ -3513,6 +3515,26 @@ def X86_32SystemLibrary
 def X86_64SystemLibrary
     : SystemRuntimeLibrary<isX86_64,
       (add X86CommonLibcalls, Int128RTLibcalls)>;
+
+//===----------------------------------------------------------------------===//
+// SuperH Runtime Libcalls
+//===----------------------------------------------------------------------===//
+
+// libgcc and the Linux kernel have the signed division under this name on
+// SuperH, and neither has a function for the remainder: it is computed from
+// the quotient.
+def __sdivsi3 : RuntimeLibcallImpl<SDIV_I32>;
+
+defvar SHDefaultOptOut = [
+  __divsi3, __modsi3, __umodsi3
+];
+
+def isSH : RuntimeLibcallAvailability<(all_of IsSH)>;
+def SHSystemLibrary
+    : SystemRuntimeLibrary<isSH,
+    (add (sub DefaultRuntimeLibcallImpls, SHDefaultOptOut),
+         __sdivsi3,
+         __stack_chk_fail, __stack_chk_guard)>;
 
 //===----------------------------------------------------------------------===//
 // XCore Runtime Libcalls

@@ -1105,6 +1105,11 @@ enum {
 #include "ELFRelocs/Xtensa.def"
 };
 
+// ELF Relocation types for SuperH
+enum {
+#include "ELFRelocs/SH.def"
+};
+
 #undef ELF_RELOC
 
 // Section header.
