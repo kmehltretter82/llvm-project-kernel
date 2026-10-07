@@ -16,6 +16,7 @@
 #include "llvm/MC/MCSubtargetInfo.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/Compiler.h"
+#include "llvm/TargetParser/SHTargetParser.h"
 #include "llvm/TargetParser/Triple.h"
 
 using namespace llvm;
@@ -52,25 +53,10 @@ static MCAsmInfo *createSHMCAsmInfo(const MCRegisterInfo &MRI, const Triple &TT,
   return MAI;
 }
 
-// The name of the processor that a triple such as sh4-linux-gnu names with
-// its first part.
-static StringRef getCPUFromTriple(const Triple &TT) {
-  StringRef Arch = TT.getArchName();
-  if (Arch.starts_with("sh4a"))
-    return "sh4a";
-  if (Arch.starts_with("sh4"))
-    return "sh4";
-  if (Arch.starts_with("sh3"))
-    return "sh3";
-  if (Arch.starts_with("sh2"))
-    return "sh2";
-  return "generic";
-}
-
 static MCSubtargetInfo *createSHMCSubtargetInfo(const Triple &TT, StringRef CPU,
                                                 StringRef FS) {
   if (CPU.empty())
-    CPU = getCPUFromTriple(TT);
+    CPU = SH::getDefaultCPU(TT);
   return createSHMCSubtargetInfoImpl(TT, CPU, /*TuneCPU=*/CPU, FS);
 }
 

@@ -26,9 +26,13 @@
 // and plans again until no branch changes.  Branches only ever get longer,
 // so this ends.  Then the plan is carried out.
 //
-// The literals are pseudo instructions inside their block.  A jump around
-// them is one too (CPJUMP), which keeps the blocks and their edges as they
-// are.
+// The literals of one place are a block of their own, which nothing leads
+// to.  Where they go into running code, the block is split and its first
+// part gets a branch to the second.
+//
+// The delay slots are filled after this pass, so a branch with a slot
+// counts as four bytes here.  Filling a slot with an instruction from in
+// front of the branch makes the code shorter, which no distance minds.
 //
 //===----------------------------------------------------------------------===//
 
@@ -36,7 +40,9 @@
 #include "SHInstrInfo.h"
 #include "SHSubtarget.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/CodeGen/LivePhysRegs.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/MC/MCContext.h"
@@ -85,6 +91,8 @@ private:
 
   DenseMap<const MachineInstr *, int> InstAddr;
   DenseMap<const MachineBasicBlock *, int> BlockAddr;
+  /// The blocks of literals that this pass made.
+  SmallPtrSet<const MachineBasicBlock *, 8> Islands;
 
   /// The literals that are waiting for a place, in the order of their
   /// first use.
@@ -95,9 +103,15 @@ private:
   int Worst = INT_MIN;
   int Addr = 0;
 
+  /// The bytes that an instruction takes, with its delay slot.
+  int sizeOf(const MachineInstr &MI) const {
+    return TII->getInstSizeInBytes(MI) + (MI.hasDelaySlot() ? 2 : 0);
+  }
+
   void addLiteral(const MachineOperand &Value, int UseAddr, MachineInstr *User);
-  void flush(MachineBasicBlock &MBB, MachineBasicBlock::iterator Before,
-             bool Inline, bool Materialize);
+  MachineBasicBlock *flush(MachineBasicBlock &MBB,
+                           MachineBasicBlock::iterator Before, bool Inline,
+                           bool Materialize);
   void place(bool Materialize);
   bool relaxBranches();
 };
@@ -121,31 +135,41 @@ void SHConstantIslands::addLiteral(const MachineOperand &Value, int UseAddr,
   Pool.push_back({Value, {User}});
 }
 
-/// Put the waiting literals in front of \p Before.  \p Inline: the code
-/// runs on here, and a jump goes around them.
-void SHConstantIslands::flush(MachineBasicBlock &MBB,
-                              MachineBasicBlock::iterator Before, bool Inline,
-                              bool Materialize) {
+/// Put the waiting literals behind \p MBB.  \p Inline: the code runs on
+/// there.  The block then ends in front of \p Before with a jump around the
+/// literals, and what was behind it is a block of its own, which is
+/// returned once it exists.
+MachineBasicBlock *SHConstantIslands::flush(MachineBasicBlock &MBB,
+                                            MachineBasicBlock::iterator Before,
+                                            bool Inline, bool Materialize) {
   MCContext &Ctx = MF->getContext();
   DebugLoc DL;
-  MCSymbol *Skip = nullptr;
-  if (Inline) {
-    if (Materialize) {
-      Skip = Ctx.createTempSymbol();
-      BuildMI(MBB, Before, DL, TII->get(SH::CPJUMP)).addSym(Skip);
+  MachineBasicBlock *Island = nullptr, *Rest = nullptr;
+  if (Materialize) {
+    MachineFunction::iterator After = std::next(MBB.getIterator());
+    Island = MF->CreateMachineBasicBlock();
+    MF->insert(After, Island);
+    Island->setAlignment(Align(4));
+    Islands.insert(Island);
+    if (Inline) {
+      Rest = MF->CreateMachineBasicBlock(MBB.getBasicBlock());
+      MF->insert(After, Rest);
+      Rest->splice(Rest->begin(), &MBB, Before, MBB.end());
+      Rest->transferSuccessors(&MBB);
+      MBB.addSuccessor(Rest);
+      BuildMI(&MBB, DL, TII->get(SH::BRA)).addMBB(Rest);
+      LivePhysRegs LiveRegs;
+      computeAndAddLiveIns(LiveRegs, *Rest);
     }
-    Addr += 4;
   }
-  int Pad = Addr & 2;
-  if (Materialize)
-    BuildMI(MBB, Before, DL, TII->get(SH::CPALIGN)).addImm(Pad);
-  Addr += Pad;
+  // The jump and its delay slot, and the alignment of the literals.
+  if (Inline)
+    Addr += 4;
+  Addr += Addr & 2;
   for (Literal &L : Pool) {
     if (Materialize) {
       MCSymbol *Label = Ctx.createTempSymbol();
-      BuildMI(MBB, Before, DL, TII->get(SH::CPENTRY))
-          .addSym(Label)
-          .add(L.Value);
+      BuildMI(Island, DL, TII->get(SH::CPENTRY)).addSym(Label).add(L.Value);
       for (MachineInstr *User : L.Users) {
         if (User->getOpcode() != SH::MOVLpcrel) {
           User->getOperand(1).ChangeToMCSymbol(Label);
@@ -159,10 +183,9 @@ void SHConstantIslands::flush(MachineBasicBlock &MBB,
     }
     Addr += 4;
   }
-  if (Skip)
-    BuildMI(MBB, Before, DL, TII->get(SH::CPLABEL)).addSym(Skip);
   Pool.clear();
   Worst = INT_MIN;
+  return Rest;
 }
 
 /// Walk the function, give every instruction and block its address, and
@@ -174,24 +197,40 @@ void SHConstantIslands::place(bool Materialize) {
   InstAddr.clear();
   BlockAddr.clear();
 
-  // The next instruction is in the delay slot of a branch, and that branch
-  // is one that control does not pass.
-  bool InSlot = false, SlotOfBarrier = false;
-
-  for (MachineBasicBlock &MBB : *MF) {
-    BlockAddr[&MBB] = Addr;
-    for (auto I = MBB.begin(); I != MBB.end();) {
+  for (MachineFunction::iterator BI = MF->begin(); BI != MF->end(); ++BI) {
+    MachineBasicBlock *MBB = &*BI;
+    // What this walk has placed is counted.
+    if (Islands.count(MBB))
+      continue;
+    BlockAddr[MBB] = Addr;
+    bool InTerminators = false;
+    for (auto I = MBB->begin(); I != MBB->end();) {
       MachineInstr &MI = *I;
       ++I;
-      int Size = TII->getInstSizeInBytes(MI);
+      int Size = sizeOf(MI);
       if (!Size)
         continue;
 
       // If the literals do not reach from behind this instruction, they go
-      // in front of it.  Sixteen bytes are for what cannot be split off:
-      // the instruction in a delay slot, and a literal of this instruction.
-      if (!Pool.empty() && !InSlot && Addr + 6 + Worst + 16 + Size > Reach)
-        flush(MBB, MI.getIterator(), /*Inline=*/true, Materialize);
+      // in front of it.  The branches at the end of a block stay together:
+      // the question is asked for all of them at the first.  Sixteen bytes
+      // are for a literal of this instruction and for rounding.
+      if (!Pool.empty() && !InTerminators) {
+        int Need = Size;
+        if (MI.isTerminator())
+          for (auto T = I; T != MBB->end(); ++T)
+            Need += sizeOf(*T);
+        if (Addr + 6 + Worst + 16 + Need > Reach)
+          if (MachineBasicBlock *Rest =
+                  flush(*MBB, MI.getIterator(), /*Inline=*/true, Materialize)) {
+            // MI is the first instruction of a new block now.
+            MBB = Rest;
+            BI = Rest->getIterator();
+            BlockAddr[MBB] = Addr;
+            I = std::next(MI.getIterator());
+          }
+      }
+      InTerminators |= MI.isTerminator();
 
       InstAddr[&MI] = Addr;
       switch (MI.getOpcode()) {
@@ -214,18 +253,9 @@ void SHConstantIslands::place(bool Materialize) {
       }
       Addr += Size;
 
-      bool WasSlotOfBarrier = InSlot && SlotOfBarrier;
-      bool WasSlot = InSlot;
-      InSlot = SlotOfBarrier = false;
-      if (MI.hasDelaySlot()) {
-        InSlot = true;
-        SlotOfBarrier = MI.isBarrier();
-        continue;
-      }
-      // Behind an unconditional branch and its delay slot nothing runs into
-      // the literals.
-      if (!Pool.empty() && (WasSlotOfBarrier || (!WasSlot && MI.isBarrier())))
-        flush(MBB, I, /*Inline=*/false, Materialize);
+      // Behind an unconditional branch nothing runs into the literals.
+      if (!Pool.empty() && MI.isBarrier() && I == MBB->end())
+        flush(*MBB, I, /*Inline=*/false, Materialize);
     }
   }
   if (!Pool.empty())
@@ -275,12 +305,6 @@ bool SHConstantIslands::relaxBranches() {
           continue;
         MI.setDesc(TII->get(SH::BRAfar));
         MI.addOperand(*MF, MachineOperand::CreateImm(0));
-        // The far form brings its own delay slot.
-        if (I != MBB.end() && I->getOpcode() == SH::NOP) {
-          MachineInstr &Nop = *I;
-          ++I;
-          Nop.eraseFromParent();
-        }
         break;
       }
       Changed = true;
@@ -291,6 +315,7 @@ bool SHConstantIslands::relaxBranches() {
 bool SHConstantIslands::runOnMachineFunction(MachineFunction &Fn) {
   MF = &Fn;
   TII = MF->getSubtarget<SHSubtarget>().getInstrInfo();
+  Islands.clear();
   // The padding in front of literals is computed from the start of the
   // function.
   MF->ensureAlignment(Align(4));

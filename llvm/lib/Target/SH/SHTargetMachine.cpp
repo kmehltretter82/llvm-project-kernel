@@ -97,10 +97,10 @@ bool SHPassConfig::addInstSelector() {
 }
 
 // The two passes that need the final order and size of the code: the
-// instruction behind a delayed branch, and the places of the literals.
+// places of the literals, and the instruction behind a delayed branch.
 void SHPassConfig::addPreEmitPass() {
-  addPass(createSHDelaySlotFillerPass());
   addPass(createSHConstantIslandsPass());
+  addPass(createSHDelaySlotFillerPass());
 }
 
 TargetPassConfig *SHTargetMachine::createPassConfig(PassManagerBase &PM) {

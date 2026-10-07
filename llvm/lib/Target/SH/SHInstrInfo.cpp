@@ -102,8 +102,6 @@ unsigned SHInstrInfo::getInstSizeInBytes(const MachineInstr &MI) const {
     return getInlineAsmLength(MI.getOperand(0).getSymbolName(),
                               MF->getTarget().getMCAsmInfo());
   }
-  case SH::CPALIGN:
-    return MI.getOperand(0).getImm();
   default:
     if (MI.isMetaInstruction())
       return 0;

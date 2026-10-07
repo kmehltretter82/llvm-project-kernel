@@ -33,6 +33,7 @@
 #include "SHInstrInfo.h"
 #include "SHMachineFunctionInfo.h"
 #include "SHSubtarget.h"
+#include "llvm/CodeGen/CFIInstBuilder.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
@@ -116,19 +117,47 @@ void SHFrameLowering::emitPrologue(MachineFunction &MF,
   int64_t LocalSize = MFI.getStackSize() - SaveSize - PushSize;
   assert(LocalSize >= 0 && "the frame is smaller than what is saved in it");
 
+  // What an unwinder needs to know: where the frame of the caller ends,
+  // seen from the stack pointer or from r14, and where the registers are
+  // that were saved.
+  bool NeedsCFI = MF.needsFrameMoves();
+  auto DefCFAOffset = [&](int64_t Offset) {
+    if (NeedsCFI && Offset)
+      CFIInstBuilder(MBB, MBBI, MachineInstr::FrameSetup)
+          .buildDefCFAOffset(Offset);
+  };
+
   // The area for the argument registers lies above the pushes.  r1 is free
   // on entry: it carries neither an argument nor the address of a result.
   adjustStack(MBB, MBBI, DL, -SaveSize, SH::R1, MachineInstr::FrameSetup);
-  while (MBBI != MBB.end() && isPush(*MBBI))
+  DefCFAOffset(SaveSize);
+  int64_t Pushed = SaveSize;
+  while (MBBI != MBB.end() && isPush(*MBBI)) {
+    Register Reg = MBBI->getOpcode() == SH::PUSHPR
+                       ? Register(SH::PR)
+                       : MBBI->getOperand(0).getReg();
     ++MBBI;
+    Pushed += 4;
+    if (NeedsCFI) {
+      CFIInstBuilder Builder(MBB, MBBI, MachineInstr::FrameSetup);
+      Builder.buildDefCFAOffset(Pushed);
+      Builder.buildOffset(Reg, -Pushed);
+    }
+  }
   auto CopySP = [&](Register To) {
     BuildMI(MBB, MBBI, DL, TII.get(SH::MOVrr), To)
         .addReg(SH::R15)
         .setMIFlag(MachineInstr::FrameSetup);
   };
+  auto DefCFARegister = [&](Register Reg) {
+    if (NeedsCFI)
+      CFIInstBuilder(MBB, MBBI, MachineInstr::FrameSetup)
+          .buildDefCFARegister(Reg);
+  };
   if (realignsStack(MF)) {
     // r14 in front of the gap, then the stack pointer rounded down.
     CopySP(SH::R14);
+    DefCFARegister(SH::R14);
     adjustStack(MBB, MBBI, DL, -LocalSize, SH::R1, MachineInstr::FrameSetup);
     TII.loadImmediate(MBB, MBBI, DL, SH::R1,
                       -int64_t(MFI.getMaxAlign().value()));
@@ -141,8 +170,12 @@ void SHFrameLowering::emitPrologue(MachineFunction &MF,
     return;
   }
   adjustStack(MBB, MBBI, DL, -LocalSize, SH::R1, MachineInstr::FrameSetup);
-  if (hasFP(MF))
+  if (LocalSize)
+    DefCFAOffset(MFI.getStackSize());
+  if (hasFP(MF)) {
     CopySP(SH::R14);
+    DefCFARegister(SH::R14);
+  }
 }
 
 void SHFrameLowering::emitEpilogue(MachineFunction &MF,

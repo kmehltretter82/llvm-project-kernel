@@ -41,9 +41,6 @@ public:
 
   void emitInstruction(const MachineInstr *MI) override;
 
-  bool isBlockOnlyReachableByFallthrough(
-      const MachineBasicBlock *MBB) const override;
-
   bool PrintAsmOperand(const MachineInstr *MI, unsigned OpNo,
                        const char *ExtraCode, raw_ostream &O) override;
   bool PrintAsmMemoryOperand(const MachineInstr *MI, unsigned OpNo,
@@ -63,6 +60,7 @@ private:
   /// The jump through a literal: r0 is pushed, loaded, jumped through, and
   /// popped in the delay slot of the jump.
   void emitFarJump(const MachineInstr *MI);
+  void emitOne(const MachineInstr *MI);
 };
 
 } // namespace
@@ -158,12 +156,19 @@ void SHAsmPrinter::emitFarJump(const MachineInstr *MI) {
   emit(SH::POP, {R0});
 }
 
+// An instruction with a delay slot is one bundle with the instruction in
+// the slot.
 void SHAsmPrinter::emitInstruction(const MachineInstr *MI) {
+  MachineBasicBlock::const_instr_iterator I = MI->getIterator();
+  MachineBasicBlock::const_instr_iterator E = MI->getParent()->instr_end();
+  do
+    emitOne(&*I);
+  while (++I != E && I->isInsideBundle());
+}
+
+void SHAsmPrinter::emitOne(const MachineInstr *MI) {
   switch (MI->getOpcode()) {
-  // The literals.
-  case SH::CPALIGN:
-    OutStreamer->emitValueToAlignment(Align(4));
-    return;
+  // A literal.
   case SH::CPENTRY: {
     OutStreamer->emitLabel(MI->getOperand(0).getMCSymbol());
     const MachineOperand &Value = MI->getOperand(1);
@@ -173,13 +178,6 @@ void SHAsmPrinter::emitInstruction(const MachineInstr *MI) {
       OutStreamer->emitValue(lowerSymbol(Value), 4);
     return;
   }
-  case SH::CPJUMP:
-    emit(SH::BRA, {label(MI->getOperand(0).getMCSymbol())});
-    emit(SH::NOP);
-    return;
-  case SH::CPLABEL:
-    OutStreamer->emitLabel(MI->getOperand(0).getMCSymbol());
-    return;
 
   // The long forms of the branches.
   case SH::BTnear:
@@ -209,23 +207,6 @@ void SHAsmPrinter::emitInstruction(const MachineInstr *MI) {
   MCInst Inst;
   lower(MI, Inst);
   EmitToStreamer(*OutStreamer, Inst);
-}
-
-// A branch is not the last instruction of its block: its delay slot follows
-// it, and literals may.  So the question whether something jumps to a block
-// is asked of every instruction of its predecessors.
-bool SHAsmPrinter::isBlockOnlyReachableByFallthrough(
-    const MachineBasicBlock *MBB) const {
-  for (const MachineBasicBlock *Pred : MBB->predecessors())
-    for (const MachineInstr &MI : *Pred) {
-      // A jump through a table.
-      if (MI.isIndirectBranch())
-        return false;
-      for (const MachineOperand &MO : MI.operands())
-        if (MO.isJTI() || (MO.isMBB() && MO.getMBB() == MBB))
-          return false;
-    }
-  return AsmPrinter::isBlockOnlyReachableByFallthrough(MBB);
 }
 
 bool SHAsmPrinter::PrintAsmOperand(const MachineInstr *MI, unsigned OpNo,

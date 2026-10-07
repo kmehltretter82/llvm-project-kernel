@@ -147,6 +147,23 @@ SDValue SHTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
 static SDValue emitComparison(SDValue LHS, SDValue RHS, ISD::CondCode CC,
                               const SDLoc &DL, SelectionDAG &DAG,
                               bool &OnTrue) {
+  // There are instructions for "greater" and "greater or equal".  "Less"
+  // is one of them with the operands the other way round, unless the
+  // comparison is with zero, which has instructions of its own.
+  if (!isNullConstant(RHS)) {
+    switch (CC) {
+    case ISD::SETLT:
+    case ISD::SETLE:
+    case ISD::SETULT:
+    case ISD::SETULE:
+      std::swap(LHS, RHS);
+      CC = ISD::getSetCCSwappedOperands(CC);
+      break;
+    default:
+      break;
+    }
+  }
+
   unsigned Opc;
   OnTrue = true;
   switch (CC) {
@@ -238,11 +255,118 @@ SDValue SHTargetLowering::LowerSELECT_CC(SDValue Op, SelectionDAG &DAG) const {
   return DAG.getNode(SHISD::SELECT, DL, Op.getValueType(), TrueV, FalseV, Glue);
 }
 
-/// "dst = T ? a : b" as a branch around a copy.
 MachineBasicBlock *
 SHTargetLowering::EmitInstrWithCustomInserter(MachineInstr &MI,
                                               MachineBasicBlock *BB) const {
-  assert(MI.getOpcode() == SH::SELECT && "unexpected custom inserter");
+  switch (MI.getOpcode()) {
+  case SH::SELECT:
+    return emitSelect(MI, BB);
+  case SH::BLOCKCOPY:
+    return emitBlockCopy(MI, BB);
+  default:
+    llvm_unreachable("unexpected custom inserter");
+  }
+}
+
+/// A copy of a block of memory as a loop:
+///
+///   BB:    count = number of units
+///   Loop:  unit = *from; *to = unit; from += size; to += size;
+///          if (--count != 0) goto Loop
+///   Sink:  the bytes that are left over, one by one
+MachineBasicBlock *
+SHTargetLowering::emitBlockCopy(MachineInstr &MI, MachineBasicBlock *BB) const {
+  const SHInstrInfo &TII = *Subtarget.getInstrInfo();
+  DebugLoc DL = MI.getDebugLoc();
+  MachineFunction *MF = BB->getParent();
+  MachineRegisterInfo &MRI = MF->getRegInfo();
+  const TargetRegisterClass *RC = &SH::GPRRegClass;
+
+  Register Dst = MI.getOperand(0).getReg();
+  Register Src = MI.getOperand(1).getReg();
+  unsigned Size = MI.getOperand(2).getImm();
+  // A word is moved only between addresses that four divides.
+  unsigned Unit = MI.getOperand(3).getImm() >= 4 ? 4 : 1;
+  unsigned Count = Size / Unit;
+  unsigned Load = Unit == 4 ? SH::MOVLld : SH::MOVBld;
+  unsigned Store = Unit == 4 ? SH::MOVLst : SH::MOVBst;
+
+  MachineBasicBlock *Sink = BB;
+  MachineBasicBlock::iterator At = MI.getIterator();
+  Register DstEnd = Dst, SrcEnd = Src;
+  if (Count) {
+    const BasicBlock *LLVMBB = BB->getBasicBlock();
+    MachineFunction::iterator It = ++BB->getIterator();
+    MachineBasicBlock *Loop = MF->CreateMachineBasicBlock(LLVMBB);
+    Sink = MF->CreateMachineBasicBlock(LLVMBB);
+    MF->insert(It, Loop);
+    MF->insert(It, Sink);
+    Sink->splice(Sink->begin(), BB, std::next(MachineBasicBlock::iterator(MI)),
+                 BB->end());
+    Sink->transferSuccessorsAndUpdatePHIs(BB);
+    BB->addSuccessor(Loop);
+    Loop->addSuccessor(Loop);
+    Loop->addSuccessor(Sink);
+    // The copy stands between the arguments of a call.
+    unsigned CallFrameSize = TII.getCallFrameSizeAt(MI);
+    Loop->setCallFrameSize(CallFrameSize);
+    Sink->setCallFrameSize(CallFrameSize);
+
+    Register Count0 = MRI.createVirtualRegister(RC);
+    BuildMI(*BB, MI.getIterator(), DL,
+            TII.get(isInt<8>(Count) ? SH::MOVI : SH::MOVLpcrel), Count0)
+        .addImm(Count);
+
+    Register DstPhi = MRI.createVirtualRegister(RC);
+    Register SrcPhi = MRI.createVirtualRegister(RC);
+    Register CountPhi = MRI.createVirtualRegister(RC);
+    Register Value = MRI.createVirtualRegister(RC);
+    Register Count1 = MRI.createVirtualRegister(RC);
+    DstEnd = MRI.createVirtualRegister(RC);
+    SrcEnd = MRI.createVirtualRegister(RC);
+    auto Phi = [&](Register Reg, Register First, Register Next) {
+      BuildMI(Loop, DL, TII.get(SH::PHI), Reg)
+          .addReg(First)
+          .addMBB(BB)
+          .addReg(Next)
+          .addMBB(Loop);
+    };
+    Phi(DstPhi, Dst, DstEnd);
+    Phi(SrcPhi, Src, SrcEnd);
+    Phi(CountPhi, Count0, Count1);
+    BuildMI(Loop, DL, TII.get(Load), Value).addReg(SrcPhi).addImm(0);
+    BuildMI(Loop, DL, TII.get(Store)).addReg(Value).addReg(DstPhi).addImm(0);
+    BuildMI(Loop, DL, TII.get(SH::ADDri), SrcEnd).addReg(SrcPhi).addImm(Unit);
+    BuildMI(Loop, DL, TII.get(SH::ADDri), DstEnd).addReg(DstPhi).addImm(Unit);
+    BuildMI(Loop, DL, TII.get(SH::ADDri), Count1).addReg(CountPhi).addImm(-1);
+    BuildMI(Loop, DL, TII.get(SH::TST)).addReg(Count1).addReg(Count1);
+    BuildMI(Loop, DL, TII.get(SH::BF)).addMBB(Loop);
+    At = Sink->begin();
+  }
+
+  // What does not fill a word.
+  for (unsigned I = 0, E = Size - Count * Unit; I != E; ++I) {
+    Register From = SrcEnd, To = DstEnd;
+    if (I) {
+      From = MRI.createVirtualRegister(RC);
+      To = MRI.createVirtualRegister(RC);
+      BuildMI(*Sink, At, DL, TII.get(SH::ADDri), From).addReg(SrcEnd).addImm(I);
+      BuildMI(*Sink, At, DL, TII.get(SH::ADDri), To).addReg(DstEnd).addImm(I);
+    }
+    Register Value = MRI.createVirtualRegister(RC);
+    BuildMI(*Sink, At, DL, TII.get(SH::MOVBld), Value).addReg(From).addImm(0);
+    BuildMI(*Sink, At, DL, TII.get(SH::MOVBst))
+        .addReg(Value)
+        .addReg(To)
+        .addImm(0);
+  }
+  MI.eraseFromParent();
+  return Sink;
+}
+
+/// "dst = T ? a : b" as a branch around a copy.
+MachineBasicBlock *SHTargetLowering::emitSelect(MachineInstr &MI,
+                                                MachineBasicBlock *BB) const {
   const TargetInstrInfo &TII = *Subtarget.getInstrInfo();
   DebugLoc DL = MI.getDebugLoc();
   const BasicBlock *LLVMBB = BB->getBasicBlock();
@@ -262,6 +386,10 @@ SHTargetLowering::EmitInstrWithCustomInserter(MachineInstr &MI,
   BB->addSuccessor(Copy);
   BB->addSuccessor(Sink);
   Copy->addSuccessor(Sink);
+  // A selection can stand between the arguments of a call.
+  unsigned CallFrameSize = TII.getCallFrameSizeAt(MI);
+  Copy->setCallFrameSize(CallFrameSize);
+  Sink->setCallFrameSize(CallFrameSize);
 
   BuildMI(BB, DL, TII.get(SH::BT)).addMBB(Sink);
   BuildMI(*Sink, Sink->begin(), DL, TII.get(SH::PHI), MI.getOperand(0).getReg())
@@ -563,26 +691,35 @@ SDValue SHTargetLowering::LowerCall(TargetLowering::CallLoweringInfo &CLI,
         CCInfo.nextInRegsParam();
       }
       unsigned RegBytes = (End - Begin) * 4;
+      // The structure may be aligned to less than a word.
+      Align Alignment = std::min(Flags.getNonZeroByValAlign(), Align(4));
       for (unsigned R = Begin; R != End; ++R) {
         SDValue Word =
             DAG.getLoad(MVT::i32, DL, Chain,
                         DAG.getObjectPtrOffset(
                             DL, Arg, TypeSize::getFixed((R - Begin) * 4)),
-                        MachinePointerInfo());
+                        MachinePointerInfo(), Alignment);
         MemOps.push_back(Word.getValue(1));
         RegsToPass.push_back({ArgRegs[R], Word});
       }
       if (Flags.getByValSize() <= RegBytes)
         continue;
-      SDValue Size =
-          DAG.getConstant(Flags.getByValSize() - RegBytes, DL, MVT::i32);
-      Align Alignment = std::min(Flags.getNonZeroByValAlign(), Align(4));
-      MemOps.push_back(DAG.getMemcpy(
-          Chain, DL, Addr,
-          DAG.getObjectPtrOffset(DL, Arg, TypeSize::getFixed(RegBytes)), Size,
-          Alignment, Alignment, /*isVol=*/false, /*AlwaysInline=*/false,
-          /*CI=*/nullptr, std::nullopt, MachinePointerInfo(),
-          MachinePointerInfo()));
+      // No call of memcpy here, between the arguments of another call: a
+      // few loads and stores if that is enough, and a loop otherwise.
+      unsigned Rest = Flags.getByValSize() - RegBytes;
+      SDValue From =
+          DAG.getObjectPtrOffset(DL, Arg, TypeSize::getFixed(RegBytes));
+      if (Rest <= 32)
+        MemOps.push_back(DAG.getMemcpy(
+            Chain, DL, Addr, From, DAG.getConstant(Rest, DL, MVT::i32),
+            Alignment, Alignment, /*isVol=*/false, /*AlwaysInline=*/true,
+            /*CI=*/nullptr, std::nullopt, MachinePointerInfo(),
+            MachinePointerInfo()));
+      else
+        MemOps.push_back(DAG.getNode(
+            SHISD::BLOCKCOPY, DL, MVT::Other, Chain, Addr, From,
+            DAG.getTargetConstant(Rest, DL, MVT::i32),
+            DAG.getTargetConstant(Alignment.value(), DL, MVT::i32)));
       continue;
     }
     MemOps.push_back(

@@ -40,8 +40,10 @@ public:
       for (auto I = MBB.begin(); I != MBB.end(); ++I) {
         if (!I->hasDelaySlot())
           continue;
+        // The two are one bundle, so that the branch stays the last thing
+        // in its block for everyone who looks.
         BuildMI(MBB, std::next(I), I->getDebugLoc(), TII.get(SH::NOP));
-        ++I;
+        MIBundleBuilder(MBB, I, std::next(I, 2));
         Changed = true;
       }
     return Changed;

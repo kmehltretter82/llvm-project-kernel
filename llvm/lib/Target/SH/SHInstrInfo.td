@@ -42,6 +42,9 @@ def SDT_SHSelect
                            SDTCisSameAs<1, 2>]>;
 def SDT_SHMovT : SDTypeProfile<1, 0, [SDTCisVT<0, i32>]>;
 def SDT_SHLoadAddr : SDTypeProfile<1, 1, [SDTCisVT<0, i32>, SDTCisPtrTy<1>]>;
+def SDT_SHBlockCopy
+    : SDTypeProfile<0, 4, [SDTCisVT<0, i32>, SDTCisVT<1, i32>,
+                           SDTCisVT<2, i32>, SDTCisVT<3, i32>]>;
 
 def SHcall : SDNode<"SHISD::CALL", SDT_SHCall,
                     [SDNPHasChain, SDNPOptInGlue, SDNPOutGlue, SDNPVariadic]>;
@@ -75,6 +78,13 @@ def SHmovrt : SDNode<"SHISD::MOVRT", SDT_SHMovT, [SDNPInGlue]>;
 // The address of a global, a function, a block, a jump table or a constant
 // pool entry, which is loaded from a literal.
 def SHloadaddr : SDNode<"SHISD::LOADADDR", SDT_SHLoadAddr>;
+
+// A copy of a block of memory without a call: to, from, the number of bytes
+// and what both addresses are aligned to.  It is for a structure that is
+// passed by value, whose copy stands between the arguments of a call, where
+// a call of memcpy cannot be.
+def SHblockcopy : SDNode<"SHISD::BLOCKCOPY", SDT_SHBlockCopy,
+                         [SDNPHasChain, SDNPMayLoad, SDNPMayStore]>;
 
 //===----------------------------------------------------------------------===//
 // Operands and patterns
@@ -430,6 +440,14 @@ def RTS : SHInst<(outs), (ins variable_ops), "rts", [(SHret)]>;
 
 def NOP : SHInst<(outs), (ins), "nop", []>;
 
+// The block copy becomes a loop over words, or over bytes where the
+// alignment does not allow words.
+let usesCustomInserter = 1, Defs = [T] in
+def BLOCKCOPY : SHPseudo<(outs),
+                         (ins GPR:$dst, GPR:$src, i32imm:$size, i32imm:$align),
+                         [(SHblockcopy GPR:$dst, GPR:$src, timm:$size,
+                                       timm:$align)]>;
+
 let Defs = [R15], Uses = [R15] in {
 def ADJCALLSTACKDOWN : SHPseudo<(outs), (ins i32imm:$amt1, i32imm:$amt2),
                                 [(SHcallseq_start timm:$amt1, timm:$amt2)]>;
@@ -441,16 +459,7 @@ def ADJCALLSTACKUP : SHPseudo<(outs), (ins i32imm:$amt1, i32imm:$amt2),
 // Literals in the code (see SHConstantIslands.cpp)
 //===----------------------------------------------------------------------===//
 
-// A literal: its label and its value.
+// A literal: its label and its value.  The literals of one place are a
+// block of their own, which is aligned to four bytes.
 let Size = 4 in
 def CPENTRY : SHPseudo<(outs), (ins labelop:$label, i32imm:$value), []>;
-// The alignment in front of the literals.  The operand is the number of
-// bytes that it takes, 0 or 2.
-let Size = 0 in
-def CPALIGN : SHPseudo<(outs), (ins i32imm:$bytes), []>;
-// A jump around literals that are placed where the code runs on:
-// "bra label; nop".  CPLABEL is where it goes to.
-let Size = 4 in
-def CPJUMP : SHPseudo<(outs), (ins labelop:$label), []>;
-let Size = 0 in
-def CPLABEL : SHPseudo<(outs), (ins labelop:$label), []>;
