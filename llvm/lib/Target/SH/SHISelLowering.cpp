@@ -30,6 +30,10 @@ using namespace llvm;
 
 #define DEBUG_TYPE "sh-lower"
 
+static bool CC_SH_FPU_Custom(unsigned &ValNo, MVT &ValVT, MVT &LocVT,
+                             CCValAssign::LocInfo &LocInfo,
+                             ISD::ArgFlagsTy &ArgFlags, CCState &State);
+
 #define GET_CALLING_CONV_IMPL
 #include "SHGenCallingConv.inc"
 
@@ -37,6 +41,10 @@ SHTargetLowering::SHTargetLowering(const TargetMachine &TM,
                                    const SHSubtarget &STI)
     : TargetLowering(TM, STI), Subtarget(STI) {
   addRegisterClass(MVT::i32, &SH::GPRRegClass);
+  if (STI.hasFPU())
+    addRegisterClass(MVT::f32, &SH::FPRRegClass);
+  if (STI.hasFPUDouble())
+    addRegisterClass(MVT::f64, &SH::DFPRRegClass);
   computeRegisterProperties(STI.getRegisterInfo());
 
   setStackPointerRegisterToSaveRestore(SH::R15);
@@ -105,6 +113,47 @@ SHTargetLowering::SHTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::STACKRESTORE, MVT::Other, Expand);
   setOperationAction(ISD::TRAP, MVT::Other, Expand);
 
+  // The floating point unit compares for "equal" and "greater".  Both are
+  // false if an operand is not a number, so they and their opposites are
+  // six of the conditions, and the legalizer makes the others from them.
+  for (MVT VT : {MVT::f32, MVT::f64}) {
+    if (!isTypeLegal(VT))
+      continue;
+    setOperationAction(ISD::BR_CC, VT, Custom);
+    setOperationAction(ISD::SETCC, VT, Custom);
+    setOperationAction(ISD::SELECT_CC, VT, Custom);
+    setOperationAction(ISD::SELECT, VT, Expand);
+    for (ISD::CondCode CC : {ISD::SETOGE, ISD::SETOLE, ISD::SETONE, ISD::SETUEQ,
+                             ISD::SETUGT, ISD::SETULT, ISD::SETO, ISD::SETUO})
+      setCondCodeAction(CC, VT, Expand);
+    setOperationAction(
+        {ISD::FREM,   ISD::FMA,       ISD::FCOPYSIGN, ISD::FSIN,
+         ISD::FCOS,   ISD::FSINCOS,   ISD::FPOW,      ISD::FPOWI,
+         ISD::FEXP,   ISD::FEXP2,     ISD::FLOG,      ISD::FLOG2,
+         ISD::FLOG10, ISD::FMINNUM,   ISD::FMAXNUM,   ISD::FCEIL,
+         ISD::FFLOOR, ISD::FTRUNC,    ISD::FRINT,     ISD::FNEARBYINT,
+         ISD::FROUND, ISD::FROUNDEVEN},
+        VT, Expand);
+  }
+  // ftrc and float are for signed integers.
+  setOperationAction(ISD::UINT_TO_FP, MVT::i32, Expand);
+  setOperationAction(ISD::FP_TO_UINT, MVT::i32, Expand);
+  if (isTypeLegal(MVT::f64)) {
+    setLoadExtAction(ISD::EXTLOAD, MVT::f64, MVT::f32, Expand);
+    setTruncStoreAction(MVT::f64, MVT::f32, Expand);
+  }
+
+  // The SH-2 shifts by one, two, eight and sixteen bits.  A shift by another
+  // number is a row of those, and one by a variable amount is a function
+  // of libgcc.
+  if (!STI.hasDynShift())
+    setOperationAction({ISD::SHL, ISD::SRL, ISD::SRA}, MVT::i32, Custom);
+
+  // va_list is a structure with a floating point unit, and the expansion
+  // copies a pointer.
+  if (STI.hasFPU())
+    setOperationAction(ISD::VACOPY, MVT::Other, Custom);
+
   // Atomic operations are library calls.
   setMaxAtomicSizeInBitsSupported(0);
 }
@@ -128,6 +177,12 @@ SDValue SHTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
     return LowerDivision(Op, DAG);
   case ISD::VASTART:
     return LowerVASTART(Op, DAG);
+  case ISD::VACOPY:
+    return LowerVACOPY(Op, DAG);
+  case ISD::SHL:
+  case ISD::SRL:
+  case ISD::SRA:
+    return LowerShift(Op, DAG);
   case ISD::FRAMEADDR:
     return LowerFRAMEADDR(Op, DAG);
   case ISD::RETURNADDR:
@@ -147,6 +202,37 @@ SDValue SHTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
 static SDValue emitComparison(SDValue LHS, SDValue RHS, ISD::CondCode CC,
                               const SDLoc &DL, SelectionDAG &DAG,
                               bool &OnTrue) {
+  // Floating point numbers: fcmp/eq and fcmp/gt, which are false for what
+  // is not a number.  So "less or equal, or unordered" is "not greater".
+  if (LHS.getValueType().isFloatingPoint()) {
+    OnTrue = true;
+    switch (CC) {
+    default:
+      llvm_unreachable("a floating point condition that was to be expanded");
+    case ISD::SETUNE:
+    case ISD::SETNE:
+      OnTrue = false;
+      [[fallthrough]];
+    case ISD::SETOEQ:
+    case ISD::SETEQ:
+      return DAG.getNode(SHISD::FCMPEQ, DL, MVT::Glue, LHS, RHS);
+    case ISD::SETULE:
+    case ISD::SETLE:
+      OnTrue = false;
+      [[fallthrough]];
+    case ISD::SETOGT:
+    case ISD::SETGT:
+      return DAG.getNode(SHISD::FCMPGT, DL, MVT::Glue, LHS, RHS);
+    case ISD::SETUGE:
+    case ISD::SETGE:
+      OnTrue = false;
+      [[fallthrough]];
+    case ISD::SETOLT:
+    case ISD::SETLT:
+      return DAG.getNode(SHISD::FCMPGT, DL, MVT::Glue, RHS, LHS);
+    }
+  }
+
   // There are instructions for "greater" and "greater or equal".  "Less"
   // is one of them with the operands the other way round, unless the
   // comparison is with zero, which has instructions of its own.
@@ -260,6 +346,8 @@ SHTargetLowering::EmitInstrWithCustomInserter(MachineInstr &MI,
                                               MachineBasicBlock *BB) const {
   switch (MI.getOpcode()) {
   case SH::SELECT:
+  case SH::SELECTF:
+  case SH::SELECTD:
     return emitSelect(MI, BB);
   case SH::BLOCKCOPY:
     return emitBlockCopy(MI, BB);
@@ -441,16 +529,74 @@ SDValue SHTargetLowering::LowerDivision(SDValue Op, SelectionDAG &DAG) const {
       .first;
 }
 
-// va_list is a pointer to the next argument.
+// Without a floating point unit va_list is a pointer to the next argument.
+// With one it is what GCC has:
+//
+//   struct { void *next_o, *next_o_limit;    the integer registers
+//            void *next_fp, *next_fp_limit;  the floating point registers
+//            void *next_stack; }             the arguments on the stack
+//
+// The registers are in the buffer that LowerFormalArguments() filled, the
+// floating point ones first.
 SDValue SHTargetLowering::LowerVASTART(SDValue Op, SelectionDAG &DAG) const {
   MachineFunction &MF = DAG.getMachineFunction();
   SHMachineFunctionInfo *FI = MF.getInfo<SHMachineFunctionInfo>();
   SDLoc DL(Op);
-  SDValue Addr = DAG.getFrameIndex(FI->getVarArgsFrameIndex(),
-                                   getPointerTy(DAG.getDataLayout()));
+  EVT PtrVT = getPointerTy(DAG.getDataLayout());
+  SDValue Chain = Op.getOperand(0);
+  SDValue List = Op.getOperand(1);
   const Value *SV = cast<SrcValueSDNode>(Op.getOperand(2))->getValue();
-  return DAG.getStore(Op.getOperand(0), DL, Addr, Op.getOperand(1),
-                      MachinePointerInfo(SV));
+  SDValue Stack = DAG.getFrameIndex(FI->getVarArgsFrameIndex(), PtrVT);
+  if (!Subtarget.hasFPU())
+    return DAG.getStore(Chain, DL, Stack, List, MachinePointerInfo(SV));
+
+  // Where nothing was saved, the two rows are empty: any address will do.
+  SDValue Float = Stack;
+  if (FI->getVarArgsNumFloat() || FI->getVarArgsNumInt())
+    Float = DAG.getObjectPtrOffset(
+        DL, DAG.getFrameIndex(FI->getVarArgsRegSaveIndex(), PtrVT),
+        TypeSize::getFixed(FI->getVarArgsRegSaveOffset()));
+  SDValue FloatEnd = DAG.getObjectPtrOffset(
+      DL, Float, TypeSize::getFixed(FI->getVarArgsNumFloat() * 4));
+  SDValue IntEnd = DAG.getObjectPtrOffset(
+      DL, FloatEnd, TypeSize::getFixed(FI->getVarArgsNumInt() * 4));
+  SDValue Fields[] = {FloatEnd, IntEnd, Float, FloatEnd, Stack};
+  SmallVector<SDValue, 5> Stores;
+  for (unsigned I = 0; I != std::size(Fields); ++I)
+    Stores.push_back(DAG.getStore(
+        Chain, DL, Fields[I],
+        DAG.getObjectPtrOffset(DL, List, TypeSize::getFixed(I * 4)),
+        MachinePointerInfo(SV, I * 4)));
+  return DAG.getNode(ISD::TokenFactor, DL, MVT::Other, Stores);
+}
+
+// Without shad and shld.  A shift by a constant is selected as a row of the
+// shifts that there are (SHISelDAGToDAG.cpp).  Only shar shifts to the
+// right with the sign, by one bit, so from a few bits on that is a call as
+// well.
+SDValue SHTargetLowering::LowerShift(SDValue Op, SelectionDAG &DAG) const {
+  bool IsArithmetic = Op.getOpcode() == ISD::SRA;
+  if (const auto *C = dyn_cast<ConstantSDNode>(Op.getOperand(1)))
+    if (!IsArithmetic || C->getZExtValue() <= 5)
+      return Op;
+  RTLIB::Libcall LC = Op.getOpcode() == ISD::SHL   ? RTLIB::SHL_I32
+                      : Op.getOpcode() == ISD::SRL ? RTLIB::SRL_I32
+                                                   : RTLIB::SRA_I32;
+  SDValue Ops[] = {Op.getOperand(0), Op.getOperand(1)};
+  MakeLibCallOptions Options;
+  return makeLibCall(DAG, LC, MVT::i32, Ops, Options, SDLoc(Op)).first;
+}
+
+// The five pointers of the va_list that LowerVASTART() describes.
+SDValue SHTargetLowering::LowerVACOPY(SDValue Op, SelectionDAG &DAG) const {
+  SDLoc DL(Op);
+  const Value *DstSV = cast<SrcValueSDNode>(Op.getOperand(3))->getValue();
+  const Value *SrcSV = cast<SrcValueSDNode>(Op.getOperand(4))->getValue();
+  return DAG.getMemcpy(Op.getOperand(0), DL, Op.getOperand(1), Op.getOperand(2),
+                       DAG.getConstant(20, DL, MVT::i32), Align(4), Align(4),
+                       /*isVol=*/false, /*AlwaysInline=*/true, /*CI=*/nullptr,
+                       std::nullopt, MachinePointerInfo(DstSV),
+                       MachinePointerInfo(SrcSV));
 }
 
 // __builtin_frame_address(0) is r14, which has the value that the stack
@@ -482,14 +628,135 @@ SDValue SHTargetLowering::LowerRETURNADDR(SDValue Op, SelectionDAG &DAG) const {
 
 static const MCPhysReg ArgRegs[] = {SH::R4, SH::R5, SH::R6, SH::R7};
 
+// The registers for float arguments, in the order in which they are taken.
+// On a little-endian SH-4 the two registers of a pair change places.  That
+// way a function with variable arguments can store the pairs as doubles,
+// and va_arg finds floats in the order of the arguments.
+static const MCPhysReg FloatArgRegs[] = {SH::FR4, SH::FR5, SH::FR6,  SH::FR7,
+                                         SH::FR8, SH::FR9, SH::FR10, SH::FR11};
+static const MCPhysReg FloatArgRegsSwapped[] = {
+    SH::FR5, SH::FR4, SH::FR7, SH::FR6, SH::FR9, SH::FR8, SH::FR11, SH::FR10};
+static const MCPhysReg DoubleArgRegs[] = {SH::DR4, SH::DR6, SH::DR8, SH::DR10};
+
+static bool swapsFloatPairs(const SHSubtarget &STI) {
+  return STI.isSH4FPU() && STI.isLittleEndian();
+}
+
+static ArrayRef<MCPhysReg> floatArgRegs(const SHSubtarget &STI) {
+  if (swapsFloatPairs(STI))
+    return FloatArgRegsSwapped;
+  return FloatArgRegs;
+}
+
+// The convention with a floating point unit.  An argument comes here part by
+// part: the halves of a 64-bit integer, the words of a structure, the parts
+// of a complex number.  It is placed when its last part is here, in
+// registers if all of it fits and on the stack otherwise.
+static bool CC_SH_FPU_Custom(unsigned &ValNo, MVT &ValVT, MVT &LocVT,
+                             CCValAssign::LocInfo &LocInfo,
+                             ISD::ArgFlagsTy &ArgFlags, CCState &State) {
+  const SHSubtarget &STI =
+      State.getMachineFunction().getSubtarget<SHSubtarget>();
+  SmallVectorImpl<CCValAssign> &Pending = State.getPendingLocs();
+  Pending.push_back(CCValAssign::getPending(ValNo, ValVT, LocVT, LocInfo));
+  if (ArgFlags.isInConsecutiveRegs() && !ArgFlags.isInConsecutiveRegsLast())
+    return true;
+
+  ArrayRef<MCPhysReg> FloatRegs = floatArgRegs(STI);
+  unsigned Parts = Pending.size();
+  SmallVector<MCPhysReg, 4> Regs;
+  auto Exhaust = [&](ArrayRef<MCPhysReg> List) {
+    // Where an argument that does not fit takes the registers with it.
+    if (!STI.leavesRegistersFree())
+      for (MCPhysReg Reg : List)
+        State.AllocateReg(Reg);
+  };
+
+  if (LocVT == MVT::f32) {
+    unsigned Count = State.getFirstUnallocated(FloatRegs);
+    if (Count + Parts <= FloatRegs.size()) {
+      for (unsigned I = 0; I != Parts; ++I)
+        Regs.push_back(FloatRegs[Count + I]);
+      // A complex number that starts at an even place has its real part
+      // in the register with the lower number, not in the one that a float
+      // would get there.
+      if (Parts == 2 && swapsFloatPairs(STI) && Count % 2 == 0)
+        std::swap(Regs[0], Regs[1]);
+    } else {
+      Exhaust(FloatRegs);
+    }
+  } else if (LocVT == MVT::f64) {
+    // A double starts at an even place.  The odd one in front of it stays
+    // empty.
+    unsigned Count = State.getFirstUnallocated(FloatRegs);
+    unsigned Even = alignTo(Count, 2);
+    if (Even + 2 * Parts <= FloatRegs.size()) {
+      if (Even != Count)
+        State.AllocateReg(FloatRegs[Count]);
+      for (unsigned I = 0; I != Parts; ++I)
+        Regs.push_back(DoubleArgRegs[Even / 2 + I]);
+    } else {
+      Exhaust(FloatRegs);
+    }
+  } else {
+    unsigned Count = State.getFirstUnallocated(ArgRegs);
+    if (Count + Parts <= std::size(ArgRegs))
+      for (unsigned I = 0; I != Parts; ++I)
+        Regs.push_back(ArgRegs[Count + I]);
+    else
+      Exhaust(ArgRegs);
+  }
+
+  for (unsigned I = 0; I != Parts; ++I) {
+    const CCValAssign &VA = Pending[I];
+    if (!Regs.empty()) {
+      State.AllocateReg(Regs[I]);
+      State.addLoc(CCValAssign::getReg(VA.getValNo(), VA.getValVT(), Regs[I],
+                                       VA.getLocVT(), VA.getLocInfo()));
+      continue;
+    }
+    int64_t Offset =
+        State.AllocateStack(VA.getLocVT().getStoreSize(), Align(4));
+    State.addLoc(CCValAssign::getMem(VA.getValNo(), VA.getValVT(), Offset,
+                                     VA.getLocVT(), VA.getLocInfo()));
+  }
+  Pending.clear();
+  return true;
+}
+
+CCAssignFn *SHTargetLowering::getArgConvention() const {
+  return Subtarget.hasFPU() ? CC_SH_FPU : CC_SH;
+}
+
+bool SHTargetLowering::functionArgumentNeedsConsecutiveRegisters(
+    Type *Ty, CallingConv::ID CallConv, bool IsVarArg,
+    const DataLayout &DL) const {
+  return Subtarget.hasFPU();
+}
+
+static const TargetRegisterClass *getArgRegClass(MVT VT) {
+  switch (VT.SimpleTy) {
+  case MVT::f32:
+    return &SH::FPRRegClass;
+  case MVT::f64:
+    return &SH::DFPRRegClass;
+  default:
+    return &SH::GPRRegClass;
+  }
+}
+
 // Without a floating point unit the arguments are one row of words, and a
 // structure starts in the registers that are left and goes on on the stack.
 // With one it is in registers only if all of it fits, and a structure that
 // comes here is larger than the four registers.
 void SHTargetLowering::HandleByVal(CCState *State, unsigned &Size,
                                    Align Alignment) const {
-  if (Subtarget.hasFPU())
+  if (Subtarget.hasFPU()) {
+    if (!Subtarget.leavesRegistersFree())
+      for (MCPhysReg Reg : ArgRegs)
+        State->AllocateReg(Reg);
     return;
+  }
   unsigned First = State->getFirstUnallocated(ArgRegs);
   unsigned Count =
       std::min<unsigned>(std::size(ArgRegs) - First, (Size + 3) / 4);
@@ -549,14 +816,15 @@ SDValue SHTargetLowering::LowerFormalArguments(
 
   SmallVector<CCValAssign, 16> ArgLocs;
   CCState CCInfo(CallConv, IsVarArg, MF, ArgLocs, *DAG.getContext());
-  CCInfo.AnalyzeFormalArguments(Ins, CC_SH);
+  CCInfo.AnalyzeFormalArguments(Ins, getArgConvention());
 
   unsigned SaveSize = 0;
   SmallVector<SDValue, 4> Stores;
   for (unsigned I = 0, E = ArgLocs.size(); I != E; ++I) {
     const CCValAssign &VA = ArgLocs[I];
     if (VA.isRegLoc()) {
-      Register VReg = MF.addLiveIn(VA.getLocReg(), &SH::GPRRegClass);
+      Register VReg =
+          MF.addLiveIn(VA.getLocReg(), getArgRegClass(VA.getLocVT()));
       SDValue Value = DAG.getCopyFromReg(Chain, DL, VReg, VA.getLocVT());
       // The address for a result in memory is returned as well.
       if (Ins[I].Flags.isSRet()) {
@@ -605,14 +873,48 @@ SDValue SHTargetLowering::LowerFormalArguments(
       InVals.push_back(Addr);
       continue;
     }
-    int Index = MFI.CreateFixedObject(4, VA.getLocMemOffset(), true);
+    int Index = MFI.CreateFixedObject(VA.getLocVT().getStoreSize(),
+                                      VA.getLocMemOffset(), true);
     SDValue Value =
         DAG.getLoad(VA.getLocVT(), DL, Chain, DAG.getFrameIndex(Index, PtrVT),
                     MachinePointerInfo::getFixedStack(MF, Index));
     InVals.push_back(truncateValue(Value, VA, DL, DAG));
   }
 
-  if (IsVarArg) {
+  if (IsVarArg && Subtarget.hasFPU()) {
+    // The registers that hold no named parameter go to a buffer among the
+    // local variables: the floating point ones in the order in which
+    // arguments take them, then the integer ones.  va_arg takes a double
+    // from an address that eight divides, so the buffer starts four bytes
+    // behind such an address if the number of float registers is odd.
+    ArrayRef<MCPhysReg> FloatRegs = floatArgRegs(Subtarget);
+    unsigned FirstFloat = CCInfo.getFirstUnallocated(FloatRegs);
+    unsigned FirstInt = CCInfo.getFirstUnallocated(ArgRegs);
+    unsigned NumFloat = FloatRegs.size() - FirstFloat;
+    unsigned NumInt = std::size(ArgRegs) - FirstInt;
+    if (NumFloat || NumInt) {
+      bool Doubles = Subtarget.hasFPUDouble() && NumFloat;
+      unsigned Skip = Doubles && NumFloat % 2 ? 4 : 0;
+      int Index = MFI.CreateStackObject((NumFloat + NumInt) * 4 + Skip,
+                                        Doubles ? Align(8) : Align(4), false);
+      SDValue Base = DAG.getFrameIndex(Index, PtrVT);
+      auto Save = [&](MCPhysReg Reg, MVT VT, unsigned Offset) {
+        Register VReg = MF.addLiveIn(Reg, getArgRegClass(VT));
+        SDValue Value = DAG.getCopyFromReg(Chain, DL, VReg, VT);
+        Stores.push_back(DAG.getStore(
+            Value.getValue(1), DL, Value,
+            DAG.getObjectPtrOffset(DL, Base, TypeSize::getFixed(Offset)),
+            MachinePointerInfo::getFixedStack(MF, Index, Offset)));
+      };
+      for (unsigned I = 0; I != NumFloat; ++I)
+        Save(FloatRegs[FirstFloat + I], MVT::f32, Skip + I * 4);
+      for (unsigned I = 0; I != NumInt; ++I)
+        Save(ArgRegs[FirstInt + I], MVT::i32, Skip + (NumFloat + I) * 4);
+      FI->setVarArgsRegSave(Index, Skip, NumFloat, NumInt);
+    }
+    FI->setVarArgsFrameIndex(
+        MFI.CreateFixedObject(4, CCInfo.getStackSize(), true));
+  } else if (IsVarArg) {
     // The argument registers that hold no named parameter are stored right
     // below the arguments that came on the stack, in the order of their
     // numbers, so that va_arg walks one row of words.
@@ -659,7 +961,7 @@ SDValue SHTargetLowering::LowerCall(TargetLowering::CallLoweringInfo &CLI,
 
   SmallVector<CCValAssign, 16> ArgLocs;
   CCState CCInfo(CLI.CallConv, CLI.IsVarArg, MF, ArgLocs, *DAG.getContext());
-  CCInfo.AnalyzeCallOperands(Outs, CC_SH);
+  CCInfo.AnalyzeCallOperands(Outs, getArgConvention());
   unsigned NumBytes = CCInfo.getStackSize();
 
   Chain = DAG.getCALLSEQ_START(Chain, NumBytes, 0, DL);

@@ -37,9 +37,9 @@ def SDT_SHCallSeqEnd : SDCallSeqEnd<[SDTCisVT<0, i32>, SDTCisVT<1, i32>]>;
 def SDT_SHCmp : SDTypeProfile<0, 2, [SDTCisVT<0, i32>, SDTCisSameAs<0, 1>]>;
 def SDT_SHCmp1 : SDTypeProfile<0, 1, [SDTCisVT<0, i32>]>;
 def SDT_SHBr : SDTypeProfile<0, 1, [SDTCisVT<0, OtherVT>]>;
+def SDT_SHFCmp : SDTypeProfile<0, 2, [SDTCisFP<0>, SDTCisSameAs<0, 1>]>;
 def SDT_SHSelect
-    : SDTypeProfile<1, 2, [SDTCisVT<0, i32>, SDTCisSameAs<0, 1>,
-                           SDTCisSameAs<1, 2>]>;
+    : SDTypeProfile<1, 2, [SDTCisSameAs<0, 1>, SDTCisSameAs<1, 2>]>;
 def SDT_SHMovT : SDTypeProfile<1, 0, [SDTCisVT<0, i32>]>;
 def SDT_SHLoadAddr : SDTypeProfile<1, 1, [SDTCisVT<0, i32>, SDTCisPtrTy<1>]>;
 def SDT_SHBlockCopy
@@ -66,6 +66,10 @@ def SHtst : SDNode<"SHISD::TST", SDT_SHCmp, [SDNPOutGlue]>;
 // T = (operand > 0) and T = (operand >= 0)
 def SHcmppl : SDNode<"SHISD::CMPPL", SDT_SHCmp1, [SDNPOutGlue]>;
 def SHcmppz : SDNode<"SHISD::CMPPZ", SDT_SHCmp1, [SDNPOutGlue]>;
+// The two comparisons of the floating point unit.  Both are false if an
+// operand is not a number.
+def SHfcmpeq : SDNode<"SHISD::FCMPEQ", SDT_SHFCmp, [SDNPOutGlue]>;
+def SHfcmpgt : SDNode<"SHISD::FCMPGT", SDT_SHFCmp, [SDNPOutGlue]>;
 
 // What uses T: a branch if it is set or clear, a choice between two values
 // (the first if it is set), and its value or the opposite as a number.
@@ -453,6 +457,170 @@ def ADJCALLSTACKDOWN : SHPseudo<(outs), (ins i32imm:$amt1, i32imm:$amt2),
                                 [(SHcallseq_start timm:$amt1, timm:$amt2)]>;
 def ADJCALLSTACKUP : SHPseudo<(outs), (ins i32imm:$amt1, i32imm:$amt2),
                               [(SHcallseq_end timm:$amt1, timm:$amt2)]>;
+}
+
+//===----------------------------------------------------------------------===//
+// The floating point unit
+//===----------------------------------------------------------------------===//
+//
+// One instruction is an operation on float or on double, depending on the PR
+// bit of FPSCR.  The instructions here say which they are by their name, and
+// SHFPModeSwitch.cpp puts the changes of the bit in front of them: a
+// function is entered and left with the precision of its convention, and so
+// is every block.
+//
+// A value moves between the unit and the general registers through FPUL.
+// That is hidden in pseudo instructions, so that nothing sees FPUL alive.
+//
+// There is no displacement: the address of a load or a store is in a
+// register.  A double is loaded and stored as two halves.
+
+def HasFPU : Predicate<"Subtarget->hasFPU()">;
+def HasFPUDouble : Predicate<"Subtarget->hasFPUDouble()">;
+
+let isMoveReg = 1 in
+def FMOV : SHInst<(outs FPR:$dst), (ins FPR:$src), "fmov\t$src,$dst", []>;
+
+let canFoldAsLoad = 1 in
+def FMOVSld : SHInst<(outs FPR:$dst), (ins GPR:$base), "fmov.s\t@$base,$dst",
+                     [(set FPR:$dst, (load GPR:$base))]>;
+def FMOVSst : SHInst<(outs), (ins FPR:$src, GPR:$base), "fmov.s\t$src,@$base",
+                     [(store FPR:$src, GPR:$base)]>;
+// With the address moving on, for the halves of a double.
+let Constraints = "$base = $wb" in {
+def FMOVSldinc : SHInst<(outs FPR:$dst, GPR:$wb), (ins GPR:$base),
+                        "fmov.s\t@$base+,$dst", []>;
+def FMOVSstdec : SHInst<(outs GPR:$wb), (ins FPR:$src, GPR:$base),
+                        "fmov.s\t$src,@-$base", []>;
+}
+let Uses = [R15], Defs = [R15] in {
+def FPUSH : SHInst<(outs), (ins FPR:$src), "fmov.s\t$src,@-r15", []>;
+def FPOP : SHInst<(outs FPR:$dst), (ins), "fmov.s\t@r15+,$dst", []>;
+}
+
+// A double through a register: two loads or stores that move the register
+// and put it back.
+let Size = 6 in {
+def FMOVDld : SHPseudo<(outs DFPR:$dst), (ins GPR:$base),
+                       [(set DFPR:$dst, (load GPR:$base))]>;
+def FMOVDst : SHPseudo<(outs), (ins DFPR:$src, GPR:$base),
+                       [(store DFPR:$src, GPR:$base)]>;
+}
+
+// A stack slot, until the frame is laid out.  Its address goes into a
+// register then.
+def FLDFI : SHPseudo<(outs FPR:$dst), (ins memop:$addr),
+                     [(set FPR:$dst, (load addrfi:$addr))]>;
+def FSTFI : SHPseudo<(outs), (ins FPR:$src, memop:$addr),
+                     [(store FPR:$src, addrfi:$addr)]>;
+def DLDFI : SHPseudo<(outs DFPR:$dst), (ins memop:$addr),
+                     [(set DFPR:$dst, (load addrfi:$addr))]>;
+def DSTFI : SHPseudo<(outs), (ins DFPR:$src, memop:$addr),
+                     [(store DFPR:$src, addrfi:$addr)]>;
+
+// Arithmetic: "op FRm,FRn" is FRn = FRn op FRm.
+class SHFBin<string mnemonic, SDPatternOperator node, RegisterClass RC>
+    : SHInst<(outs RC:$dst), (ins RC:$src1, RC:$src2),
+             mnemonic # "\t$src2,$dst",
+             [(set RC:$dst, (node RC:$src1, RC:$src2))]> {
+  let Constraints = "$src1 = $dst";
+  let Uses = [FPSCR];
+}
+class SHFUn<string mnemonic, SDPatternOperator node, RegisterClass RC>
+    : SHInst<(outs RC:$dst), (ins RC:$src), mnemonic # "\t$dst",
+             [(set RC:$dst, (node RC:$src))]> {
+  let Constraints = "$src = $dst";
+}
+
+let isCommutable = 1 in {
+def FADDS : SHFBin<"fadd", fadd, FPR>;
+def FMULS : SHFBin<"fmul", fmul, FPR>;
+def FADDD : SHFBin<"fadd", fadd, DFPR>;
+def FMULD : SHFBin<"fmul", fmul, DFPR>;
+}
+def FSUBS : SHFBin<"fsub", fsub, FPR>;
+def FDIVS : SHFBin<"fdiv", fdiv, FPR>;
+def FSUBD : SHFBin<"fsub", fsub, DFPR>;
+def FDIVD : SHFBin<"fdiv", fdiv, DFPR>;
+
+// The sign is one bit of the first register in either precision.
+def FNEGS : SHFUn<"fneg", fneg, FPR>;
+def FABSS : SHFUn<"fabs", fabs, FPR>;
+def FNEGD : SHFUn<"fneg", fneg, DFPR>;
+def FABSD : SHFUn<"fabs", fabs, DFPR>;
+let Uses = [FPSCR] in {
+def FSQRTS : SHFUn<"fsqrt", fsqrt, FPR>;
+def FSQRTD : SHFUn<"fsqrt", fsqrt, DFPR>;
+}
+
+// "fcmp/gt FRm,FRn" is T = FRn > FRm.
+let Defs = [T], Uses = [FPSCR] in {
+let isCommutable = 1 in {
+def FCMPEQS : SHInst<(outs), (ins FPR:$rn, FPR:$rm), "fcmp/eq\t$rm,$rn",
+                     [(SHfcmpeq FPR:$rn, FPR:$rm)]>;
+def FCMPEQD : SHInst<(outs), (ins DFPR:$rn, DFPR:$rm), "fcmp/eq\t$rm,$rn",
+                     [(SHfcmpeq DFPR:$rn, DFPR:$rm)]>;
+}
+def FCMPGTS : SHInst<(outs), (ins FPR:$rn, FPR:$rm), "fcmp/gt\t$rm,$rn",
+                     [(SHfcmpgt FPR:$rn, FPR:$rm)]>;
+def FCMPGTD : SHInst<(outs), (ins DFPR:$rn, DFPR:$rm), "fcmp/gt\t$rm,$rn",
+                     [(SHfcmpgt DFPR:$rn, DFPR:$rm)]>;
+}
+
+// Through FPUL.  Each becomes two instructions behind register allocation.
+let Defs = [FPUL], Size = 4 in {
+// The bits of a float in a general register and back.
+def MOVR2F : SHPseudo<(outs FPR:$dst), (ins GPR:$src),
+                      [(set FPR:$dst, (bitconvert GPR:$src))]>;
+def MOVF2R : SHPseudo<(outs GPR:$dst), (ins FPR:$src),
+                      [(set GPR:$dst, (bitconvert FPR:$src))]>;
+let Uses = [FPSCR] in {
+// "lds Rm,fpul; float fpul,FRn" and "ftrc FRm,fpul; sts fpul,Rn".
+def FLOATS : SHPseudo<(outs FPR:$dst), (ins GPR:$src),
+                      [(set FPR:$dst, (sint_to_fp GPR:$src))]>;
+def FLOATD : SHPseudo<(outs DFPR:$dst), (ins GPR:$src),
+                      [(set DFPR:$dst, (sint_to_fp GPR:$src))]>;
+def FTRCS : SHPseudo<(outs GPR:$dst), (ins FPR:$src),
+                     [(set GPR:$dst, (fp_to_sint FPR:$src))]>;
+def FTRCD : SHPseudo<(outs GPR:$dst), (ins DFPR:$src),
+                     [(set GPR:$dst, (fp_to_sint DFPR:$src))]>;
+// "flds FRm,fpul; fcnvsd fpul,DRn" and "fcnvds DRm,fpul; fsts fpul,FRn".
+def FCNVSD : SHPseudo<(outs DFPR:$dst), (ins FPR:$src),
+                      [(set DFPR:$dst, (fpextend FPR:$src))]>;
+def FCNVDS : SHPseudo<(outs FPR:$dst), (ins DFPR:$src),
+                      [(set FPR:$dst, (fpround DFPR:$src))]>;
+}
+}
+
+// What those are made of.
+let Defs = [FPUL] in {
+def LDSFPUL : SHInst<(outs), (ins GPR:$src), "lds\t$src,fpul", []>;
+def FLDS : SHInst<(outs), (ins FPR:$src), "flds\t$src,fpul", []>;
+def FTRCfpulS : SHInst<(outs), (ins FPR:$src), "ftrc\t$src,fpul", []>;
+def FTRCfpulD : SHInst<(outs), (ins DFPR:$src), "ftrc\t$src,fpul", []>;
+def FCNVDSfpul : SHInst<(outs), (ins DFPR:$src), "fcnvds\t$src,fpul", []>;
+}
+let Uses = [FPUL] in {
+def STSFPUL : SHInst<(outs GPR:$dst), (ins), "sts\tfpul,$dst", []>;
+def FSTS : SHInst<(outs FPR:$dst), (ins), "fsts\tfpul,$dst", []>;
+def FLOATfpulS : SHInst<(outs FPR:$dst), (ins), "float\tfpul,$dst", []>;
+def FLOATfpulD : SHInst<(outs DFPR:$dst), (ins), "float\tfpul,$dst", []>;
+def FCNVSDfpul : SHInst<(outs DFPR:$dst), (ins), "fcnvsd\tfpul,$dst", []>;
+}
+
+// The precision: FPSCR through a general register, or fpchg on an SH-4A.
+let Uses = [FPSCR] in
+def STSFPSCR : SHInst<(outs GPR:$dst), (ins), "sts\tfpscr,$dst", []>;
+let Defs = [FPSCR] in
+def LDSFPSCR : SHInst<(outs), (ins GPR:$src), "lds\t$src,fpscr", []>;
+let Uses = [FPSCR], Defs = [FPSCR] in
+def FPCHG : SHInst<(outs), (ins), "fpchg", []>;
+
+let usesCustomInserter = 1, Uses = [T] in {
+def SELECTF : SHPseudo<(outs FPR:$dst), (ins FPR:$t, FPR:$f),
+                       [(set FPR:$dst, (SHselect FPR:$t, FPR:$f))]>;
+def SELECTD : SHPseudo<(outs DFPR:$dst), (ins DFPR:$t, DFPR:$f),
+                       [(set DFPR:$dst, (SHselect DFPR:$t, DFPR:$f))]>;
 }
 
 //===----------------------------------------------------------------------===//

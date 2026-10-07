@@ -60,6 +60,11 @@ public:
 
   bool expandPostRAPseudo(MachineInstr &MI) const override;
 
+  /// The half of a double that has the lower address in memory, and the
+  /// other one.
+  Register firstHalf(const MachineBasicBlock &MBB, Register Reg) const;
+  Register secondHalf(const MachineBasicBlock &MBB, Register Reg) const;
+
   /// Put the number \p Value into \p Reg, in front of \p I, without a
   /// change to the T bit.
   void loadImmediate(MachineBasicBlock &MBB, MachineBasicBlock::iterator I,

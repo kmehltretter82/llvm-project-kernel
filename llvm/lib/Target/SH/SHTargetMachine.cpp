@@ -81,6 +81,7 @@ public:
 
   void addIRPasses() override;
   bool addInstSelector() override;
+  void addPreRegAlloc() override;
   void addPreEmitPass() override;
 };
 
@@ -95,6 +96,10 @@ bool SHPassConfig::addInstSelector() {
   addPass(createSHISelDag(getSHTargetMachine(), getOptLevel()));
   return false;
 }
+
+// The precision of the floating point unit is set while there are virtual
+// registers to do it with.
+void SHPassConfig::addPreRegAlloc() { addPass(createSHFPModeSwitchPass()); }
 
 // The two passes that need the final order and size of the code: the
 // places of the literals, and the instruction behind a delayed branch.

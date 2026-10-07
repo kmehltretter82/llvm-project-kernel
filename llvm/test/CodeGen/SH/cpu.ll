@@ -4,14 +4,19 @@
 ; RUN: llc -mtriple=sh3-unknown-linux-gnu < %s | FileCheck --check-prefix=DYN %s
 ; RUN: llc -mtriple=sh2-unknown-linux-gnu -mcpu=j2 < %s | FileCheck --check-prefix=DYN %s
 ; RUN: llc -mtriple=sh4eb-unknown-linux-gnu -mcpu=sh4a-nofpu < %s | FileCheck --check-prefix=DYN %s
-; RUN: not llc -mtriple=sh4-unknown-linux-gnu < %s 2>&1 | FileCheck --check-prefix=FPU %s
-; RUN: not llc -mtriple=sh4-unknown-linux-gnu -mcpu=sh4-single-only < %s 2>&1 | FileCheck --check-prefix=FPU %s
+; RUN: llc -mtriple=sh4-unknown-linux-gnu < %s | FileCheck --check-prefixes=DYN,FPU %s
+; RUN: llc -mtriple=sh4-unknown-linux-gnu -mcpu=sh4-nofpu < %s | FileCheck --check-prefix=NOFPU %s
+; RUN: llc -mtriple=sh3-unknown-linux-gnu < %s | FileCheck --check-prefix=NOFPU %s
 ; RUN: not llc -mtriple=sh4-unknown-linux-gnu -mcpu=sh4-nofpu -relocation-model=pic < %s 2>&1 | FileCheck --check-prefix=PIC %s
 
 ; DYN-LABEL: shift:
 ; DYN: shld r5,r0
 
-; FPU: the floating point unit of SuperH is not supported yet
+; A triple with "sh4" is an SH-4 with its floating point unit, as for GCC.
+; FPU-LABEL: twice:
+; FPU: fadd dr0,dr0
+; NOFPU-LABEL: twice:
+; NOFPU: __adddf3
 ; PIC: position independent code is not supported for SuperH yet
 
 @g = global i32 0
@@ -23,4 +28,9 @@ define i32 @shift(i32 %a, i32 %n) {
 
 define ptr @addr() {
   ret ptr @g
+}
+
+define double @twice(double %a) {
+  %r = fadd double %a, %a
+  ret double %r
 }

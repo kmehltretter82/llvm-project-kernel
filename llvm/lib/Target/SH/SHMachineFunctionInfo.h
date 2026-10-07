@@ -26,6 +26,14 @@ class SHMachineFunctionInfo : public MachineFunctionInfo {
   unsigned ArgRegSaveSize = 0;
   /// The register with the address for a result that is returned in memory.
   Register SRetReturnReg;
+  /// With a floating point unit: the buffer in which a function with
+  /// variable arguments stores the registers that hold none of its named
+  /// parameters, where the registers start in it, and how many of each
+  /// kind there are.
+  int VarArgsRegSaveIndex = 0;
+  unsigned VarArgsRegSaveOffset = 0;
+  unsigned VarArgsNumFloat = 0;
+  unsigned VarArgsNumInt = 0;
 
 public:
   SHMachineFunctionInfo(const Function &F, const TargetSubtargetInfo *STI) {}
@@ -43,6 +51,18 @@ public:
   void setArgRegSaveSize(unsigned Size) { ArgRegSaveSize = Size; }
   Register getSRetReturnReg() const { return SRetReturnReg; }
   void setSRetReturnReg(Register Reg) { SRetReturnReg = Reg; }
+
+  void setVarArgsRegSave(int Index, unsigned Offset, unsigned NumFloat,
+                         unsigned NumInt) {
+    VarArgsRegSaveIndex = Index;
+    VarArgsRegSaveOffset = Offset;
+    VarArgsNumFloat = NumFloat;
+    VarArgsNumInt = NumInt;
+  }
+  int getVarArgsRegSaveIndex() const { return VarArgsRegSaveIndex; }
+  unsigned getVarArgsRegSaveOffset() const { return VarArgsRegSaveOffset; }
+  unsigned getVarArgsNumFloat() const { return VarArgsNumFloat; }
+  unsigned getVarArgsNumInt() const { return VarArgsNumInt; }
 };
 
 } // namespace llvm

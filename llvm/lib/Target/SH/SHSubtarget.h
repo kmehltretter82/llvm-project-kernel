@@ -54,6 +54,10 @@ public:
   bool hasFPU() const { return HasFPU; }
   /// double as well.
   bool hasFPUDouble() const { return HasFPUDouble; }
+  /// A function is entered with the unit computing float, not double.
+  bool hasFPUSingleMode() const { return HasFPUSingleMode; }
+  /// fpchg changes the precision.
+  bool hasSH4A() const { return HasSH4A; }
   /// An SH-4 that uses its unit for double.  GCC has two rules for it
   /// alone: see llvm/TargetParser/SHTargetParser.h.
   bool isSH4FPU() const { return HasSH4 && HasFPUDouble; }

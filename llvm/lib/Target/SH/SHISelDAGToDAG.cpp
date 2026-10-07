@@ -34,6 +34,7 @@ public:
   }
 
   void Select(SDNode *Node) override;
+  bool selectConstantShift(SDNode *Node);
 
   bool SelectInlineAsmMemoryOperand(const SDValue &Op,
                                     InlineAsm::ConstraintCode ConstraintID,
@@ -135,10 +136,72 @@ bool SHDAGToDAGISel::SelectInlineAsmMemoryOperand(
   return false;
 }
 
+/// A shift by a constant on a processor without shad and shld: a row of the
+/// shifts by sixteen, eight, two and one.
+bool SHDAGToDAGISel::selectConstantShift(SDNode *Node) {
+  if (Subtarget->hasDynShift())
+    return false;
+  const auto *C = dyn_cast<ConstantSDNode>(Node->getOperand(1));
+  if (!C || C->getZExtValue() == 0 || C->getZExtValue() > 31)
+    return false;
+  unsigned Amount = C->getZExtValue();
+  SDLoc DL(Node);
+  SDValue Value = Node->getOperand(0);
+  auto Emit = [&](unsigned Opc, unsigned Bits) {
+    SDValue Ops[] = {Value, Value};
+    // "add Rn,Rn" is the shift to the left by one that leaves T alone.
+    Value =
+        SDValue(CurDAG->getMachineNode(Opc, DL, MVT::i32,
+                                       ArrayRef(Ops, Opc == SH::ADDrr ? 2 : 1)),
+                0);
+    Amount -= Bits;
+  };
+  switch (Node->getOpcode()) {
+  case ISD::SHL:
+    while (Amount >= 16)
+      Emit(SH::SHLL16, 16);
+    while (Amount >= 8)
+      Emit(SH::SHLL8, 8);
+    while (Amount >= 2)
+      Emit(SH::SHLL2, 2);
+    while (Amount)
+      Emit(SH::ADDrr, 1);
+    break;
+  case ISD::SRL:
+    while (Amount >= 16)
+      Emit(SH::SHLR16, 16);
+    while (Amount >= 8)
+      Emit(SH::SHLR8, 8);
+    while (Amount >= 2)
+      Emit(SH::SHLR2, 2);
+    while (Amount)
+      Emit(SH::SHLR, 1);
+    break;
+  case ISD::SRA:
+    while (Amount)
+      Emit(SH::SHAR, 1);
+    break;
+  default:
+    return false;
+  }
+  ReplaceNode(Node, Value.getNode());
+  return true;
+}
+
 void SHDAGToDAGISel::Select(SDNode *Node) {
   if (Node->isMachineOpcode()) {
     Node->setNodeId(-1);
     return;
+  }
+  switch (Node->getOpcode()) {
+  case ISD::SHL:
+  case ISD::SRL:
+  case ISD::SRA:
+    if (selectConstantShift(Node))
+      return;
+    break;
+  default:
+    break;
   }
   SelectCode(Node);
 }

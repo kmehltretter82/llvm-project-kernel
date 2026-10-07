@@ -25,10 +25,6 @@ SHSubtarget &SHSubtarget::initializeSubtargetDependencies(StringRef CPU,
   if (CPU.empty())
     CPU = SH::getDefaultCPU(TargetTriple);
   ParseSubtargetFeatures(CPU, /*TuneCPU=*/CPU, FS);
-  if (HasFPU)
-    reportFatalUsageError(
-        "the floating point unit of SuperH is not supported yet: select a "
-        "processor without one, such as sh4-nofpu (-m4-nofpu)");
   return *this;
 }
 

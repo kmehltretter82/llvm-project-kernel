@@ -95,12 +95,14 @@ void SHFrameLowering::adjustStack(MachineBasicBlock &MBB,
 }
 
 static bool isPush(const MachineInstr &MI) {
-  return (MI.getOpcode() == SH::PUSH || MI.getOpcode() == SH::PUSHPR) &&
+  return (MI.getOpcode() == SH::PUSH || MI.getOpcode() == SH::PUSHPR ||
+          MI.getOpcode() == SH::FPUSH) &&
          MI.getFlag(MachineInstr::FrameSetup);
 }
 
 static bool isPop(const MachineInstr &MI) {
-  return (MI.getOpcode() == SH::POP || MI.getOpcode() == SH::POPPR) &&
+  return (MI.getOpcode() == SH::POP || MI.getOpcode() == SH::POPPR ||
+          MI.getOpcode() == SH::FPOP) &&
          MI.getFlag(MachineInstr::FrameDestroy);
 }
 
@@ -248,7 +250,8 @@ bool SHFrameLowering::spillCalleeSavedRegisters(
       continue;
     }
     MBB.addLiveIn(Reg);
-    BuildMI(MBB, MI, DL, TII.get(SH::PUSH))
+    BuildMI(MBB, MI, DL,
+            TII.get(SH::FPRRegClass.contains(Reg) ? SH::FPUSH : SH::PUSH))
         .addReg(Reg, RegState::Kill)
         .setMIFlag(MachineInstr::FrameSetup);
   }
@@ -270,7 +273,8 @@ bool SHFrameLowering::restoreCalleeSavedRegisters(
       BuildMI(MBB, MI, DL, TII.get(SH::POPPR))
           .setMIFlag(MachineInstr::FrameDestroy);
     else
-      BuildMI(MBB, MI, DL, TII.get(SH::POP), Reg)
+      BuildMI(MBB, MI, DL,
+              TII.get(SH::FPRRegClass.contains(Reg) ? SH::FPOP : SH::POP), Reg)
           .setMIFlag(MachineInstr::FrameDestroy);
   }
   return true;

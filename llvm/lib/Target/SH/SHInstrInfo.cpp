@@ -37,6 +37,18 @@ void SHInstrInfo::copyPhysReg(MachineBasicBlock &MBB,
         .addReg(SrcReg, getKillRegState(KillSrc));
     return;
   }
+  if (SH::FPRRegClass.contains(DestReg, SrcReg)) {
+    BuildMI(MBB, I, DL, get(SH::FMOV), DestReg)
+        .addReg(SrcReg, getKillRegState(KillSrc));
+    return;
+  }
+  // A double is two registers, and fmov moves one.
+  if (SH::DFPRRegClass.contains(DestReg, SrcReg)) {
+    for (unsigned Half : {SH::sub_fhi, SH::sub_flo})
+      BuildMI(MBB, I, DL, get(SH::FMOV), RI.getSubReg(DestReg, Half))
+          .addReg(RI.getSubReg(SrcReg, Half));
+    return;
+  }
   // To and from the system registers.
   unsigned Opc = 0;
   if (DestGPR) {
@@ -70,8 +82,12 @@ void SHInstrInfo::storeRegToStackSlot(
   DebugLoc DL;
   if (MI != MBB.end())
     DL = MI->getDebugLoc();
-  assert(SH::GPRRegClass.hasSubClassEq(RC) && "cannot store this register");
-  BuildMI(MBB, MI, DL, get(SH::MOVLst))
+  unsigned Opc = SH::GPRRegClass.hasSubClassEq(RC)    ? SH::MOVLst
+                 : SH::FPRRegClass.hasSubClassEq(RC)  ? SH::FSTFI
+                 : SH::DFPRRegClass.hasSubClassEq(RC) ? SH::DSTFI
+                                                      : 0;
+  assert(Opc && "cannot store this register");
+  BuildMI(MBB, MI, DL, get(Opc))
       .addReg(SrcReg, getKillRegState(IsKill))
       .addFrameIndex(FrameIndex)
       .addImm(0)
@@ -87,8 +103,12 @@ void SHInstrInfo::loadRegFromStackSlot(MachineBasicBlock &MBB,
   DebugLoc DL;
   if (MI != MBB.end())
     DL = MI->getDebugLoc();
-  assert(SH::GPRRegClass.hasSubClassEq(RC) && "cannot load this register");
-  BuildMI(MBB, MI, DL, get(SH::MOVLld), DestReg)
+  unsigned Opc = SH::GPRRegClass.hasSubClassEq(RC)    ? SH::MOVLld
+                 : SH::FPRRegClass.hasSubClassEq(RC)  ? SH::FLDFI
+                 : SH::DFPRRegClass.hasSubClassEq(RC) ? SH::DLDFI
+                                                      : 0;
+  assert(Opc && "cannot load this register");
+  BuildMI(MBB, MI, DL, get(Opc), DestReg)
       .addFrameIndex(FrameIndex)
       .addImm(0)
       .setMIFlag(Flags);
@@ -209,6 +229,20 @@ bool SHInstrInfo::reverseBranchCondition(
 // Pseudo instructions
 //===----------------------------------------------------------------------===//
 
+// The half of a double that has the lower address in memory, and the
+// other one.
+Register SHInstrInfo::firstHalf(const MachineBasicBlock &MBB,
+                                Register Reg) const {
+  bool Little = MBB.getParent()->getDataLayout().isLittleEndian();
+  return RI.getSubReg(Reg, Little ? SH::sub_flo : SH::sub_fhi);
+}
+
+Register SHInstrInfo::secondHalf(const MachineBasicBlock &MBB,
+                                 Register Reg) const {
+  bool Little = MBB.getParent()->getDataLayout().isLittleEndian();
+  return RI.getSubReg(Reg, Little ? SH::sub_fhi : SH::sub_flo);
+}
+
 bool SHInstrInfo::expandPostRAPseudo(MachineInstr &MI) const {
   MachineBasicBlock &MBB = *MI.getParent();
   DebugLoc DL = MI.getDebugLoc();
@@ -238,6 +272,58 @@ bool SHInstrInfo::expandPostRAPseudo(MachineInstr &MI) const {
     Register Dst = MI.getOperand(0).getReg();
     BuildMI(MBB, MI, DL, get(SH::MOVI), Dst).addImm(-1);
     BuildMI(MBB, MI, DL, get(SH::NEGC), Dst).addReg(Dst, RegState::Kill);
+    break;
+  }
+
+  // Between the floating point unit and the general registers, and
+  // between float and double: through FPUL.
+  case SH::MOVR2F:
+  case SH::FLOATS:
+  case SH::FLOATD: {
+    unsigned Out = MI.getOpcode() == SH::MOVR2F   ? SH::FSTS
+                   : MI.getOpcode() == SH::FLOATS ? SH::FLOATfpulS
+                                                  : SH::FLOATfpulD;
+    BuildMI(MBB, MI, DL, get(SH::LDSFPUL)).add(MI.getOperand(1));
+    BuildMI(MBB, MI, DL, get(Out), MI.getOperand(0).getReg());
+    break;
+  }
+  case SH::MOVF2R:
+  case SH::FTRCS:
+  case SH::FTRCD: {
+    unsigned In = MI.getOpcode() == SH::MOVF2R  ? SH::FLDS
+                  : MI.getOpcode() == SH::FTRCS ? SH::FTRCfpulS
+                                                : SH::FTRCfpulD;
+    BuildMI(MBB, MI, DL, get(In)).add(MI.getOperand(1));
+    BuildMI(MBB, MI, DL, get(SH::STSFPUL), MI.getOperand(0).getReg());
+    break;
+  }
+  case SH::FCNVSD:
+    BuildMI(MBB, MI, DL, get(SH::FLDS)).add(MI.getOperand(1));
+    BuildMI(MBB, MI, DL, get(SH::FCNVSDfpul), MI.getOperand(0).getReg());
+    break;
+  case SH::FCNVDS:
+    BuildMI(MBB, MI, DL, get(SH::FCNVDSfpul)).add(MI.getOperand(1));
+    BuildMI(MBB, MI, DL, get(SH::FSTS), MI.getOperand(0).getReg());
+    break;
+
+  // A double in memory: the half with the lower address first.  The
+  // register with the address moves and comes back.
+  case SH::FMOVDld: {
+    Register Dst = MI.getOperand(0).getReg();
+    Register Base = MI.getOperand(1).getReg();
+    BuildMI(MBB, MI, DL, get(SH::FMOVSldinc), firstHalf(MBB, Dst))
+        .addReg(Base, RegState::Define)
+        .addReg(Base);
+    BuildMI(MBB, MI, DL, get(SH::FMOVSld), secondHalf(MBB, Dst)).addReg(Base);
+    BuildMI(MBB, MI, DL, get(SH::ADDri), Base).addReg(Base).addImm(-4);
+    break;
+  }
+  case SH::FMOVDst: {
+    Register Src = MI.getOperand(0).getReg();
+    Register Base = MI.getOperand(1).getReg();
+    BuildMI(MBB, MI, DL, get(SH::ADDri), Base).addReg(Base).addImm(8);
+    for (Register Half : {secondHalf(MBB, Src), firstHalf(MBB, Src)})
+      BuildMI(MBB, MI, DL, get(SH::FMOVSstdec), Base).addReg(Half).addReg(Base);
     break;
   }
   }

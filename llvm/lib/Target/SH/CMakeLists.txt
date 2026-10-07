@@ -16,6 +16,7 @@ add_llvm_target(SHCodeGen
   SHAsmPrinter.cpp
   SHConstantIslands.cpp
   SHDelaySlotFiller.cpp
+  SHFPModeSwitch.cpp
   SHFrameLowering.cpp
   SHISelDAGToDAG.cpp
   SHISelLowering.cpp

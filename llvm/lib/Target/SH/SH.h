@@ -20,6 +20,7 @@ class SHTargetMachine;
 
 FunctionPass *createSHISelDag(SHTargetMachine &TM, CodeGenOptLevel OptLevel);
 FunctionPass *createSHDelaySlotFillerPass();
+FunctionPass *createSHFPModeSwitchPass();
 FunctionPass *createSHConstantIslandsPass();
 
 void initializeSHAsmPrinterPass(PassRegistry &);

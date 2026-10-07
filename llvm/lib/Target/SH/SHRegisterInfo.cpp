@@ -32,14 +32,17 @@ static const SHFrameLowering *getSHFrameLowering(const MachineFunction &MF) {
       MF.getSubtarget().getFrameLowering());
 }
 
+// With a floating point unit fr12 to fr15 are saved by the callee.
 const MCPhysReg *
 SHRegisterInfo::getCalleeSavedRegs(const MachineFunction *MF) const {
-  return CSR_SH_SaveList;
+  return MF->getSubtarget<SHSubtarget>().hasFPU() ? CSR_SH_FPU_SaveList
+                                                  : CSR_SH_SaveList;
 }
 
 const uint32_t *SHRegisterInfo::getCallPreservedMask(const MachineFunction &MF,
                                                      CallingConv::ID) const {
-  return CSR_SH_RegMask;
+  return MF.getSubtarget<SHSubtarget>().hasFPU() ? CSR_SH_FPU_RegMask
+                                                 : CSR_SH_RegMask;
 }
 
 BitVector SHRegisterInfo::getReservedRegs(const MachineFunction &MF) const {
@@ -50,6 +53,8 @@ BitVector SHRegisterInfo::getReservedRegs(const MachineFunction &MF) const {
   Reserved.set(SH::MACH);
   Reserved.set(SH::MACL);
   Reserved.set(SH::T);
+  Reserved.set(SH::FPUL);
+  Reserved.set(SH::FPSCR);
   const SHFrameLowering *TFI = getSHFrameLowering(MF);
   if (TFI->hasFP(MF))
     Reserved.set(SH::R14);
@@ -100,6 +105,81 @@ bool SHRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
     Offset += SPAdj;
 
   unsigned Opc = MI.getOpcode();
+
+  // The floating point unit has no displacement at all.  The address goes
+  // into a general register, one that is free or one that is pushed and
+  // popped.
+  if (Opc == SH::FLDFI || Opc == SH::FSTFI || Opc == SH::DLDFI ||
+      Opc == SH::DSTFI) {
+    Register Value = MI.getOperand(0).getReg();
+    bool IsDouble = Opc == SH::DLDFI || Opc == SH::DSTFI;
+    bool IsLoad = Opc == SH::FLDFI || Opc == SH::DLDFI;
+    if (!IsDouble && Offset == 0) {
+      if (IsLoad)
+        BuildMI(MBB, II, DL, TII.get(SH::FMOVSld), Value).addReg(FrameReg);
+      else
+        BuildMI(MBB, II, DL, TII.get(SH::FMOVSst))
+            .addReg(Value, getKillRegState(MI.getOperand(0).isKill()))
+            .addReg(FrameReg);
+      MI.eraseFromParent();
+      return true;
+    }
+    Register Scratch;
+    bool Pushed = false;
+    if (RS)
+      Scratch = RS->scavengeRegisterBackwards(SH::GPRRegClass, II,
+                                              /*RestoreAfter=*/false, SPAdj,
+                                              /*AllowSpill=*/false);
+    if (!Scratch) {
+      Scratch = SH::R1;
+      BuildMI(MBB, II, DL, TII.get(SH::PUSH)).addReg(Scratch);
+      Pushed = true;
+      if (FrameReg == SH::R15)
+        Offset += 4;
+    }
+    if (isInt<8>(Offset)) {
+      BuildMI(MBB, II, DL, TII.get(SH::MOVrr), Scratch).addReg(FrameReg);
+      if (Offset)
+        BuildMI(MBB, II, DL, TII.get(SH::ADDri), Scratch)
+            .addReg(Scratch)
+            .addImm(Offset);
+    } else {
+      TII.loadImmediate(MBB, II, DL, Scratch, Offset);
+      BuildMI(MBB, II, DL, TII.get(SH::ADDrr), Scratch)
+          .addReg(Scratch)
+          .addReg(FrameReg);
+    }
+    if (!IsDouble) {
+      if (IsLoad)
+        BuildMI(MBB, II, DL, TII.get(SH::FMOVSld), Value).addReg(Scratch);
+      else
+        BuildMI(MBB, II, DL, TII.get(SH::FMOVSst))
+            .addReg(Value)
+            .addReg(Scratch);
+    } else if (IsLoad) {
+      // The half with the lower address first.
+      BuildMI(MBB, II, DL, TII.get(SH::FMOVSldinc), TII.firstHalf(MBB, Value))
+          .addReg(Scratch, RegState::Define)
+          .addReg(Scratch);
+      BuildMI(MBB, II, DL, TII.get(SH::FMOVSld), TII.secondHalf(MBB, Value))
+          .addReg(Scratch);
+    } else {
+      BuildMI(MBB, II, DL, TII.get(SH::FMOVSst))
+          .addReg(TII.firstHalf(MBB, Value))
+          .addReg(Scratch);
+      BuildMI(MBB, II, DL, TII.get(SH::ADDri), Scratch)
+          .addReg(Scratch)
+          .addImm(4);
+      BuildMI(MBB, II, DL, TII.get(SH::FMOVSst))
+          .addReg(TII.secondHalf(MBB, Value))
+          .addReg(Scratch);
+    }
+    if (Pushed)
+      BuildMI(MBB, II, DL, TII.get(SH::POP), Scratch);
+    MI.eraseFromParent();
+    return true;
+  }
+
   if (Opc == SH::LEAFI) {
     Register Dst = MI.getOperand(0).getReg();
     if (isInt<8>(Offset)) {

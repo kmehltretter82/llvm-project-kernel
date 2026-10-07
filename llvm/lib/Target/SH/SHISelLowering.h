@@ -9,6 +9,7 @@
 #ifndef LLVM_LIB_TARGET_SH_SHISELLOWERING_H
 #define LLVM_LIB_TARGET_SH_SHISELLOWERING_H
 
+#include "llvm/CodeGen/CallingConvLower.h"
 #include "llvm/CodeGen/SelectionDAG.h"
 #include "llvm/CodeGen/TargetLowering.h"
 
@@ -51,6 +52,12 @@ public:
   void HandleByVal(CCState *State, unsigned &Size,
                    Align Alignment) const override;
 
+  /// With a floating point unit an argument is in registers only if all of
+  /// it fits, so the parts of one are placed together.
+  bool functionArgumentNeedsConsecutiveRegisters(
+      Type *Ty, CallingConv::ID CallConv, bool IsVarArg,
+      const DataLayout &DL) const override;
+
 private:
   MachineBasicBlock *emitSelect(MachineInstr &MI, MachineBasicBlock *BB) const;
   MachineBasicBlock *emitBlockCopy(MachineInstr &MI,
@@ -62,6 +69,9 @@ private:
   SDValue LowerAddress(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerDivision(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerVASTART(SDValue Op, SelectionDAG &DAG) const;
+  SDValue LowerVACOPY(SDValue Op, SelectionDAG &DAG) const;
+  SDValue LowerShift(SDValue Op, SelectionDAG &DAG) const;
+  CCAssignFn *getArgConvention() const;
   SDValue LowerFRAMEADDR(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerRETURNADDR(SDValue Op, SelectionDAG &DAG) const;
 

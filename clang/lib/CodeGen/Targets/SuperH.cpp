@@ -389,14 +389,17 @@ RValue SuperHABIInfo::EmitVAArg(CodeGenFunction &CGF, Address VAListAddr,
         !BigEndian) {
       Address Temp = CGF.CreateMemTemp(Ty, "vaarg.complex");
       CharUnits Four = CharUnits::fromQuantity(4);
-      Address Saved(Ptr, CGF.FloatTy, Four);
-      llvm::Value *Imag = Builder.CreateLoad(Saved, "vaarg.imag");
-      llvm::Value *Real = Builder.CreateLoad(
-          Builder.CreateConstInBoundsByteGEP(Saved, Four), "vaarg.real");
-      Address Parts = Temp.withElementType(CGF.FloatTy);
-      Builder.CreateStore(Real, Parts);
-      Builder.CreateStore(Imag,
-                          Builder.CreateConstInBoundsByteGEP(Parts, Four));
+      auto Float = [&](Address Bytes, bool Second) {
+        if (Second)
+          Bytes = Builder.CreateConstInBoundsByteGEP(Bytes, Four);
+        return Bytes.withElementType(CGF.FloatTy);
+      };
+      Address Saved(Ptr, CGF.Int8Ty, Four);
+      Address Parts = Temp.withElementType(CGF.Int8Ty);
+      llvm::Value *Imag = Builder.CreateLoad(Float(Saved, false), "vaarg.imag");
+      llvm::Value *Real = Builder.CreateLoad(Float(Saved, true), "vaarg.real");
+      Builder.CreateStore(Real, Float(Parts, false));
+      Builder.CreateStore(Imag, Float(Parts, true));
       RegAddr = Temp.emitRawPointer(CGF);
     }
   } else {
