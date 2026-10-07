@@ -90,9 +90,9 @@ define i32 @catcher(i32 %x) personality ptr @__gxx_personality_v0 {
 ; PIC-NEXT:    add r0,r9
 ; PIC-NEXT:    mov.l .Ltmp4,r1
 ; PIC-NEXT:    add r9,r1
-; PIC-NEXT:    mov.l @r1,r1
+; PIC-NEXT:    mov.l @r1,r2
 ; PIC-NEXT:  .Ltmp0: ! EH_LABEL
-; PIC-NEXT:    jsr @r1
+; PIC-NEXT:    jsr @r2
 ; PIC-NEXT:    nop
 ; PIC-NEXT:  .Ltmp1: ! EH_LABEL
 ; PIC-NEXT:  ! %bb.1: ! %done
@@ -110,22 +110,22 @@ define i32 @catcher(i32 %x) personality ptr @__gxx_personality_v0 {
 ; PIC-NEXT:  ! %bb.4: ! %catch
 ; PIC-NEXT:    mov.l .Ltmp5,r1
 ; PIC-NEXT:    add r9,r1
-; PIC-NEXT:    mov.l @r1,r1
-; PIC-NEXT:    jsr @r1
+; PIC-NEXT:    mov.l @r1,r2
+; PIC-NEXT:    jsr @r2
 ; PIC-NEXT:    nop
 ; PIC-NEXT:    mov.l @r0,r8
 ; PIC-NEXT:    mov.l .Ltmp6,r1
 ; PIC-NEXT:    add r9,r1
-; PIC-NEXT:    mov.l @r1,r1
-; PIC-NEXT:    jsr @r1
+; PIC-NEXT:    mov.l @r1,r2
+; PIC-NEXT:    jsr @r2
 ; PIC-NEXT:    nop
 ; PIC-NEXT:    bra .LBB0_2
 ; PIC-NEXT:    mov r8,r0
 ; PIC-NEXT:  .LBB0_5: ! %resume
 ; PIC-NEXT:    mov.l .Ltmp7,r1
 ; PIC-NEXT:    add r1,r9
-; PIC-NEXT:    mov.l @r9,r1
-; PIC-NEXT:    jsr @r1
+; PIC-NEXT:    mov.l @r9,r2
+; PIC-NEXT:    jsr @r2
 ; PIC-NEXT:    nop
 ; PIC-NEXT:    .p2align 2
 ; PIC-NEXT:  ! %bb.6:

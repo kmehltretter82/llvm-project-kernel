@@ -220,8 +220,8 @@ define i32 @indirect(ptr %f, i32 %a) {
 ; CHECK-NEXT:    sts.l pr,@-r15
 ; CHECK-NEXT:    .cfi_def_cfa_offset 4
 ; CHECK-NEXT:    .cfi_offset pr, -4
-; CHECK-NEXT:    mov r4,r1
-; CHECK-NEXT:    jsr @r1
+; CHECK-NEXT:    mov r4,r2
+; CHECK-NEXT:    jsr @r2
 ; CHECK-NEXT:    mov r5,r4
 ; CHECK-NEXT:    lds.l @r15+,pr
 ; CHECK-NEXT:    rts

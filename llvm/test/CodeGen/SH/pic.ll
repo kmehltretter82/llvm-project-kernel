@@ -141,8 +141,8 @@ define i32 @call_ext(i32 %x) {
 ; CHECK-NEXT:    add r0,r1
 ; CHECK-NEXT:    mov.l .Ltmp11,r2
 ; CHECK-NEXT:    add r1,r2
-; CHECK-NEXT:    mov.l @r2,r1
-; CHECK-NEXT:    jsr @r1
+; CHECK-NEXT:    mov.l @r2,r2
+; CHECK-NEXT:    jsr @r2
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    lds.l @r15+,pr
 ; CHECK-NEXT:    rts
@@ -210,34 +210,34 @@ define i32 @switch(i32 %x) {
 ; CHECK-NEXT:  .LBB7_2: ! %a
 ; CHECK-NEXT:    mov.l .Ltmp16,r2
 ; CHECK-NEXT:    add r2,r1
-; CHECK-NEXT:    mov.l @r1,r1
+; CHECK-NEXT:    mov.l @r1,r2
 ; CHECK-NEXT:    bra .LBB7_3
 ; CHECK-NEXT:    mov #10,r4
 ; CHECK-NEXT:  .LBB7_7: ! %e
 ; CHECK-NEXT:    mov.l .Ltmp16,r2
 ; CHECK-NEXT:    add r2,r1
-; CHECK-NEXT:    mov.l @r1,r1
+; CHECK-NEXT:    mov.l @r1,r2
 ; CHECK-NEXT:    bra .LBB7_3
 ; CHECK-NEXT:    mov #54,r4
 ; CHECK-NEXT:  .LBB7_5: ! %c
 ; CHECK-NEXT:    mov.l .Ltmp16,r2
 ; CHECK-NEXT:    add r2,r1
-; CHECK-NEXT:    mov.l @r1,r1
+; CHECK-NEXT:    mov.l @r1,r2
 ; CHECK-NEXT:    bra .LBB7_3
 ; CHECK-NEXT:    mov #32,r4
 ; CHECK-NEXT:  .LBB7_6: ! %d
 ; CHECK-NEXT:    mov.l .Ltmp16,r2
 ; CHECK-NEXT:    add r2,r1
-; CHECK-NEXT:    mov.l @r1,r1
+; CHECK-NEXT:    mov.l @r1,r2
 ; CHECK-NEXT:    bra .LBB7_3
 ; CHECK-NEXT:    mov #43,r4
 ; CHECK-NEXT:  .LBB7_4: ! %b
 ; CHECK-NEXT:    mov.l .Ltmp16,r2
 ; CHECK-NEXT:    add r2,r1
-; CHECK-NEXT:    mov.l @r1,r1
+; CHECK-NEXT:    mov.l @r1,r2
 ; CHECK-NEXT:    mov #21,r4
 ; CHECK-NEXT:  .LBB7_3: ! %a
-; CHECK-NEXT:    jsr @r1
+; CHECK-NEXT:    jsr @r2
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    lds.l @r15+,pr
 ; CHECK-NEXT:    rts

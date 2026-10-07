@@ -194,8 +194,9 @@ void SHFrameLowering::emitEpilogue(MachineFunction &MF,
   int64_t PushSize = MFI.getCalleeSavedInfo().size() * 4;
   int64_t LocalSize = MFI.getStackSize() - SaveSize - PushSize;
 
-  // The return is behind the pops, the locals go in front of them.  r3 is
-  // free here: r0 and r1 may hold the result.
+  // The return is behind the pops, the locals go in front of them.  r7 is
+  // free here: r0 to r3 may hold the result, a complex number of two 64-bit
+  // integers fills all four.
   MachineBasicBlock::iterator Return = MBBI;
   MachineBasicBlock::iterator FirstPop = MBBI;
   while (FirstPop != MBB.begin() && isPop(*std::prev(FirstPop)))
@@ -207,9 +208,9 @@ void SHFrameLowering::emitEpilogue(MachineFunction &MF,
   // r14 was the stack pointer behind the pushes if the stack was realigned,
   // and at the end of the frame otherwise.
   if (!realignsStack(MF))
-    adjustStack(MBB, FirstPop, DL, LocalSize, SH::R3,
+    adjustStack(MBB, FirstPop, DL, LocalSize, SH::R7,
                 MachineInstr::FrameDestroy);
-  adjustStack(MBB, Return, DL, SaveSize, SH::R3, MachineInstr::FrameDestroy);
+  adjustStack(MBB, Return, DL, SaveSize, SH::R7, MachineInstr::FrameDestroy);
 }
 
 MachineBasicBlock::iterator SHFrameLowering::eliminateCallFramePseudoInstr(
@@ -222,9 +223,10 @@ MachineBasicBlock::iterator SHFrameLowering::eliminateCallFramePseudoInstr(
       Amount = -Amount;
     // Between the arguments and the call nothing is free but the registers
     // that a call destroys and that carry nothing: r1 before the call,
-    // r3 after it, as in the prologue and the epilogue.
+    // r7 after it, as in the prologue and the epilogue.  The two pseudo
+    // instructions say that they write these registers.
     adjustStack(MBB, I, I->getDebugLoc(), Amount,
-                I->getOpcode() == SH::ADJCALLSTACKDOWN ? SH::R1 : SH::R3,
+                I->getOpcode() == SH::ADJCALLSTACKDOWN ? SH::R1 : SH::R7,
                 MachineInstr::NoFlags);
   }
   (void)TII;

@@ -84,8 +84,8 @@ define i32 @large(i32 %v) {
 ; CHECK-NEXT:    mov.l .Ltmp3,r0
 ; CHECK-NEXT:    add r15,r0
 ; CHECK-NEXT:    mov.l @r0,r0
-; CHECK-NEXT:    mov.l .Ltmp5,r3
-; CHECK-NEXT:    add r3,r15
+; CHECK-NEXT:    mov.l .Ltmp5,r7
+; CHECK-NEXT:    add r7,r15
 ; CHECK-NEXT:    lds.l @r15+,pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop
@@ -121,12 +121,12 @@ define i32 @dynamic(i32 %n) {
 ; CHECK-NEXT:    mov r15,r14
 ; CHECK-NEXT:    .cfi_def_cfa_register r14
 ; CHECK-NEXT:    shll2 r4
-; CHECK-NEXT:    mov r15,r1
-; CHECK-NEXT:    sub r4,r1
-; CHECK-NEXT:    mov r1,r15
-; CHECK-NEXT:    mov.l .Ltmp6,r2
-; CHECK-NEXT:    jsr @r2
-; CHECK-NEXT:    mov r1,r4
+; CHECK-NEXT:    mov r15,r2
+; CHECK-NEXT:    sub r4,r2
+; CHECK-NEXT:    mov r2,r15
+; CHECK-NEXT:    mov.l .Ltmp6,r1
+; CHECK-NEXT:    jsr @r1
+; CHECK-NEXT:    mov r2,r4
 ; CHECK-NEXT:    add #-8,r15
 ; CHECK-NEXT:    mov #6,r1
 ; CHECK-NEXT:    mov.l r1,@(4,r15)
@@ -270,3 +270,42 @@ define ptr @return_address() {
 
 declare ptr @llvm.frameaddress(i32)
 declare ptr @llvm.returnaddress(i32)
+
+; A result of four words is in r0 to r3, so the epilogue of a frame that is
+; too large for "add #imm,r15" loads the size into r7.
+declare void @fill(ptr)
+
+define { i64, i64 } @large_frame_four_words() {
+; CHECK-LABEL: large_frame_four_words:
+; CHECK:         .cfi_startproc
+; CHECK-NEXT:  ! %bb.0:
+; CHECK-NEXT:    sts.l pr,@-r15
+; CHECK-NEXT:    .cfi_def_cfa_offset 4
+; CHECK-NEXT:    .cfi_offset pr, -4
+; CHECK-NEXT:    mov #-100,r1
+; CHECK-NEXT:    shll2 r1
+; CHECK-NEXT:    add r1,r15
+; CHECK-NEXT:    .cfi_def_cfa_offset 404
+; CHECK-NEXT:    mov.l .Ltmp10,r1
+; CHECK-NEXT:    jsr @r1
+; CHECK-NEXT:    mov r15,r4
+; CHECK-NEXT:    mov.l @r15,r0
+; CHECK-NEXT:    mov.l @(4,r15),r1
+; CHECK-NEXT:    mov r0,r2
+; CHECK-NEXT:    mov #100,r7
+; CHECK-NEXT:    shll2 r7
+; CHECK-NEXT:    add r7,r15
+; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    rts
+; CHECK-NEXT:    mov r1,r3
+; CHECK-NEXT:    .p2align 2
+; CHECK-NEXT:  ! %bb.1:
+; CHECK-NEXT:  .Ltmp10:
+; CHECK-NEXT:    .ualong fill
+  %buf = alloca [400 x i8]
+  call void @fill(ptr %buf)
+  %a = load i64, ptr %buf
+  %b = insertvalue { i64, i64 } undef, i64 %a, 0
+  %c = insertvalue { i64, i64 } %b, i64 %a, 1
+  ret { i64, i64 } %c
+}

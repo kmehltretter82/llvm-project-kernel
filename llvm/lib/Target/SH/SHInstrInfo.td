@@ -519,9 +519,15 @@ def BLOCKCOPY : SHPseudo<(outs),
                          [(SHblockcopy GPR:$dst, GPR:$src, timm:$size,
                                        timm:$align)]>;
 
-let Defs = [R15], Uses = [R15] in {
+// The stack pointer moves for the arguments of a call only in a function
+// with objects of variable size.  A large distance is loaded into a
+// register first: r1 in front of the call, which carries nothing into a
+// function, and r7 behind it, which carries nothing out.
+let Uses = [R15] in {
+let Defs = [R15, R1] in
 def ADJCALLSTACKDOWN : SHPseudo<(outs), (ins i32imm:$amt1, i32imm:$amt2),
                                 [(SHcallseq_start timm:$amt1, timm:$amt2)]>;
+let Defs = [R15, R7] in
 def ADJCALLSTACKUP : SHPseudo<(outs), (ins i32imm:$amt1, i32imm:$amt2),
                               [(SHcallseq_end timm:$amt1, timm:$amt2)]>;
 }
