@@ -12,9 +12,18 @@
 //===----------------------------------------------------------------------===//
 
 #include "SHMCAsmInfo.h"
+#include "llvm/ADT/Enum.h"
 #include "llvm/TargetParser/Triple.h"
 
 using namespace llvm;
+
+constexpr EnumStringDef<MCAsmInfo::AtSpecifierKind> AtSpecifierDefs[] = {
+    {{"GOT"}, SH::S_GOT},           {{"GOTOFF"}, SH::S_GOTOFF},
+    {{"PLT"}, SH::S_PLT},           {{"TPOFF"}, SH::S_TPOFF},
+    {{"GOTTPOFF"}, SH::S_GOTTPOFF}, {{"TLSGD"}, SH::S_TLSGD},
+    {{"TLSLDM"}, SH::S_TLSLDM},     {{"DTPOFF"}, SH::S_DTPOFF},
+};
+constexpr auto AtSpecifiers = BUILD_ENUM_STRINGS(AtSpecifierDefs);
 
 void SHMCAsmInfo::anchor() {}
 
@@ -43,4 +52,6 @@ SHMCAsmInfo::SHMCAsmInfo(const Triple &TT, const MCTargetOptions &Options)
 
   // There is no assembler in the library: the text goes to GNU as.
   UseIntegratedAssembler = false;
+
+  initializeAtSpecifiers(AtSpecifiers);
 }

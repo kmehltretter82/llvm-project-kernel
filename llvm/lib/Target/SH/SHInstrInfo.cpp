@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "SHInstrInfo.h"
+#include "MCTargetDesc/SHMCAsmInfo.h"
 #include "SHSubtarget.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
@@ -353,4 +354,24 @@ void SHInstrInfo::loadImmediate(MachineBasicBlock &MBB,
     }
   }
   BuildMI(MBB, I, DL, get(SH::MOVLpcrel), Reg).addImm(Value);
+}
+
+//===----------------------------------------------------------------------===//
+// Target flags: what stands behind the "@" of a symbol in a literal.
+//===----------------------------------------------------------------------===//
+
+std::pair<unsigned, unsigned>
+SHInstrInfo::decomposeMachineOperandsTargetFlags(unsigned TF) const {
+  return {TF, 0u};
+}
+
+ArrayRef<std::pair<unsigned, const char *>>
+SHInstrInfo::getSerializableDirectMachineOperandTargetFlags() const {
+  static const std::pair<unsigned, const char *> Flags[] = {
+      {SH::S_GOT, "sh-got"},           {SH::S_GOTOFF, "sh-gotoff"},
+      {SH::S_PLT, "sh-plt"},           {SH::S_TPOFF, "sh-tpoff"},
+      {SH::S_GOTTPOFF, "sh-gottpoff"}, {SH::S_TLSGD, "sh-tlsgd"},
+      {SH::S_TLSLDM, "sh-tlsldm"},     {SH::S_DTPOFF, "sh-dtpoff"},
+  };
+  return ArrayRef(Flags);
 }

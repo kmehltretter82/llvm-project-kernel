@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "SHISelLowering.h"
+#include "MCTargetDesc/SHMCAsmInfo.h"
 #include "SH.h"
 #include "SHMachineFunctionInfo.h"
 #include "SHSelectionDAGInfo.h"
@@ -26,6 +27,7 @@
 #include "llvm/CodeGen/SelectionDAGNodes.h"
 #include "llvm/IR/DiagnosticInfo.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Target/TargetMachine.h"
 
 using namespace llvm;
 
@@ -81,6 +83,7 @@ SHTargetLowering::SHTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::BlockAddress, MVT::i32, Custom);
   setOperationAction(ISD::JumpTable, MVT::i32, Custom);
   setOperationAction(ISD::ConstantPool, MVT::i32, Custom);
+  setOperationAction(ISD::GlobalTLSAddress, MVT::i32, Custom);
 
   // There is no instruction that divides.  The division is a library call,
   // and the remainder is computed from the quotient: libgcc has no function
@@ -204,6 +207,8 @@ SDValue SHTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
   case ISD::JumpTable:
   case ISD::ConstantPool:
     return LowerAddress(Op, DAG);
+  case ISD::GlobalTLSAddress:
+    return LowerGlobalTLSAddress(Op, DAG);
   case ISD::SDIV:
   case ISD::UDIV:
     return LowerDivision(Op, DAG);
@@ -530,29 +535,144 @@ MachineBasicBlock *SHTargetLowering::emitSelect(MachineInstr &MI,
 // Addresses, division, variable arguments
 //===----------------------------------------------------------------------===//
 
+// An address comes from a literal.  In position independent code the
+// literal cannot be the address, which is only known when the program is
+// loaded.  Such code has the address of the global offset table in a
+// register (LOADGOT at the start of the function, see SHInstrInfo.td) and
+// finds everything from there:
+//
+// - what this module defines for itself is at a fixed distance from the
+//   table, which is the literal (sym@GOTOFF);
+// - of anything else the table has the address, and the literal says where
+//   in the table (sym@GOT).
+//
+// A function is called through the address that this gives.  GCC calls
+// through the procedure linkage table instead, which finds the function
+// when it is first called and wants the table's address in r12 for that.
 SDValue SHTargetLowering::LowerAddress(SDValue Op, SelectionDAG &DAG) const {
   SDLoc DL(Op);
   EVT VT = Op.getValueType();
-  if (isPositionIndependent())
-    reportFatalUsageError(
-        "position independent code is not supported for SuperH yet");
+  bool IsPIC = isPositionIndependent();
+  unsigned Flags = IsPIC ? SH::S_GOTOFF : SH::S_None;
+  int64_t Offset = 0;
   SDValue Target;
-  if (const auto *GA = dyn_cast<GlobalAddressSDNode>(Op))
-    Target =
-        DAG.getTargetGlobalAddress(GA->getGlobal(), DL, VT, GA->getOffset());
-  else if (const auto *ES = dyn_cast<ExternalSymbolSDNode>(Op))
-    Target = DAG.getTargetExternalSymbol(ES->getSymbol(), VT);
-  else if (const auto *BA = dyn_cast<BlockAddressSDNode>(Op))
-    Target =
-        DAG.getTargetBlockAddress(BA->getBlockAddress(), VT, BA->getOffset());
-  else if (const auto *JT = dyn_cast<JumpTableSDNode>(Op))
-    Target = DAG.getTargetJumpTable(JT->getIndex(), VT);
-  else if (const auto *CP = dyn_cast<ConstantPoolSDNode>(Op))
+  if (const auto *GA = dyn_cast<GlobalAddressSDNode>(Op)) {
+    const GlobalValue *GV = GA->getGlobal();
+    if (IsPIC && !getTargetMachine().shouldAssumeDSOLocal(GV))
+      Flags = SH::S_GOT;
+    // An offset is added to what the table gives.
+    if (IsPIC)
+      Offset = GA->getOffset();
+    Target = DAG.getTargetGlobalAddress(GV, DL, VT, IsPIC ? 0 : GA->getOffset(),
+                                        Flags);
+  } else if (const auto *ES = dyn_cast<ExternalSymbolSDNode>(Op)) {
+    if (IsPIC)
+      Flags = SH::S_GOT;
+    Target = DAG.getTargetExternalSymbol(ES->getSymbol(), VT, Flags);
+  } else if (const auto *BA = dyn_cast<BlockAddressSDNode>(Op)) {
+    Target = DAG.getTargetBlockAddress(BA->getBlockAddress(), VT,
+                                       BA->getOffset(), Flags);
+  } else if (const auto *JT = dyn_cast<JumpTableSDNode>(Op)) {
+    Target = DAG.getTargetJumpTable(JT->getIndex(), VT, Flags);
+  } else if (const auto *CP = dyn_cast<ConstantPoolSDNode>(Op)) {
     Target = DAG.getTargetConstantPool(CP->getConstVal(), VT, CP->getAlign(),
-                                       CP->getOffset());
-  else
+                                       CP->getOffset(), Flags);
+  } else {
     llvm_unreachable("not an address");
-  return DAG.getNode(SHISD::LOADADDR, DL, VT, Target);
+  }
+  SDValue Addr = DAG.getNode(SHISD::LOADADDR, DL, VT, Target);
+  if (!IsPIC)
+    return Addr;
+
+  Addr = DAG.getNode(ISD::ADD, DL, VT, getGlobalBase(DAG, DL), Addr);
+  if (Flags == SH::S_GOT)
+    Addr = DAG.getLoad(
+        VT, DL, DAG.getEntryNode(), Addr,
+        MachinePointerInfo::getGOT(DAG.getMachineFunction()), Align(4),
+        MachineMemOperand::MODereferenceable | MachineMemOperand::MOInvariant);
+  if (Offset)
+    Addr = DAG.getNode(ISD::ADD, DL, VT, Addr,
+                       DAG.getSignedConstant(Offset, DL, VT));
+  return Addr;
+}
+
+SDValue SHTargetLowering::getGlobalBase(SelectionDAG &DAG,
+                                        const SDLoc &DL) const {
+  MachineFunction &MF = DAG.getMachineFunction();
+  SHMachineFunctionInfo *FuncInfo = MF.getInfo<SHMachineFunctionInfo>();
+  Register Base = FuncInfo->getGlobalBaseReg();
+  if (!Base) {
+    Base = MF.getRegInfo().createVirtualRegister(&SH::GPRRegClass);
+    FuncInfo->setGlobalBaseReg(Base);
+  }
+  return DAG.getCopyFromReg(DAG.getEntryNode(), DL, Base, MVT::i32);
+}
+
+// A variable that every thread has its own copy of.  gbr is the thread
+// pointer, and the copy of the thread is at a distance from it that depends
+// on how much is known where the code is compiled:
+//
+// - In the program itself the distance is a number for the linker
+//   (sym@TPOFF).
+// - For a variable of a library that is loaded with the program the
+//   distance is a number that the loader puts into the global offset table
+//   (sym@GOTTPOFF).
+// - Anywhere else __tls_get_addr() finds the address from what the table
+//   has under sym@TLSGD, or the start of this module's variables from what
+//   it has under sym@TLSLDM, which the variable is sym@DTPOFF behind.
+//
+// The last two are the sequences of instructions that the linker knows,
+// see TLSCALL and TLSIE in SHInstrInfo.td.
+SDValue SHTargetLowering::LowerGlobalTLSAddress(SDValue Op,
+                                                SelectionDAG &DAG) const {
+  const auto *GA = cast<GlobalAddressSDNode>(Op);
+  if (DAG.getTarget().useEmulatedTLS())
+    return LowerToTLSEmulatedModel(GA, DAG);
+
+  SDLoc DL(Op);
+  EVT VT = Op.getValueType();
+  const GlobalValue *GV = GA->getGlobal();
+  auto Symbol = [&](unsigned Flags) {
+    return DAG.getTargetGlobalAddress(GV, DL, VT, 0, Flags);
+  };
+  auto Literal = [&](unsigned Flags) {
+    return DAG.getNode(SHISD::LOADADDR, DL, VT, Symbol(Flags));
+  };
+
+  SDValue Addr;
+  TLSModel::Model Model = getTargetMachine().getTLSModel(GV);
+  switch (Model) {
+  case TLSModel::LocalExec:
+    Addr = DAG.getNode(ISD::ADD, DL, VT,
+                       DAG.getCopyFromReg(DAG.getEntryNode(), DL, SH::GBR, VT),
+                       Literal(SH::S_TPOFF));
+    break;
+  case TLSModel::InitialExec:
+    Addr = DAG.getNode(SHISD::TLSIE, DL, VT, getGlobalBase(DAG, DL),
+                       Symbol(SH::S_GOTTPOFF));
+    break;
+  case TLSModel::GeneralDynamic:
+  case TLSModel::LocalDynamic: {
+    bool IsLocal = Model == TLSModel::LocalDynamic;
+    MachineFunction &MF = DAG.getMachineFunction();
+    const uint32_t *Mask =
+        Subtarget.getRegisterInfo()->getCallPreservedMask(MF, CallingConv::C);
+    SDValue Ops[] = {DAG.getEntryNode(), getGlobalBase(DAG, DL),
+                     Symbol(IsLocal ? SH::S_TLSLDM : SH::S_TLSGD),
+                     DAG.getRegisterMask(Mask)};
+    SDValue Call = DAG.getNode(SHISD::TLSCALL, DL,
+                               DAG.getVTList(MVT::Other, MVT::Glue), Ops);
+    Addr = DAG.getCopyFromReg(Call, DL, SH::R0, VT, Call.getValue(1));
+    if (IsLocal)
+      Addr = DAG.getNode(ISD::ADD, DL, VT, Addr, Literal(SH::S_DTPOFF));
+    MF.getFrameInfo().setHasCalls(true);
+    break;
+  }
+  }
+  if (GA->getOffset())
+    Addr = DAG.getNode(ISD::ADD, DL, VT, Addr,
+                       DAG.getSignedConstant(GA->getOffset(), DL, VT));
+  return Addr;
 }
 
 SDValue SHTargetLowering::LowerDivision(SDValue Op, SelectionDAG &DAG) const {
@@ -1101,13 +1221,8 @@ SDValue SHTargetLowering::LowerCall(TargetLowering::CallLoweringInfo &CLI,
 
   // The address of the function comes from a literal: bsr reaches only
   // four kilobytes.
-  if (const auto *GA = dyn_cast<GlobalAddressSDNode>(Callee))
-    Callee = DAG.getNode(SHISD::LOADADDR, DL, PtrVT,
-                         DAG.getTargetGlobalAddress(GA->getGlobal(), DL, PtrVT,
-                                                    GA->getOffset()));
-  else if (const auto *ES = dyn_cast<ExternalSymbolSDNode>(Callee))
-    Callee = DAG.getNode(SHISD::LOADADDR, DL, PtrVT,
-                         DAG.getTargetExternalSymbol(ES->getSymbol(), PtrVT));
+  if (isa<GlobalAddressSDNode>(Callee) || isa<ExternalSymbolSDNode>(Callee))
+    Callee = LowerAddress(Callee, DAG);
 
   SmallVector<SDValue, 8> Ops;
   Ops.push_back(Chain);

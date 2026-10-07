@@ -89,8 +89,11 @@ private:
   struct Literal {
     MachineOperand Value;
     /// The instructions that load it.  A MOVLpcrel is replaced by the real
-    /// load, a far branch gets the label as its second operand.
+    /// load, any other gets the label as its second operand.
     SmallVector<MachineInstr *, 2> Users;
+    /// The literal of a far branch: not where its target is but how far it
+    /// is from the branch, so no other instruction can share it.
+    bool Distance = false;
   };
 
   MachineFunction *MF = nullptr;
@@ -115,7 +118,8 @@ private:
     return TII->getInstSizeInBytes(MI) + (MI.hasDelaySlot() ? 2 : 0);
   }
 
-  void addLiteral(const MachineOperand &Value, int UseAddr, MachineInstr *User);
+  void addLiteral(const MachineOperand &Value, int UseAddr, MachineInstr *User,
+                  bool Distance = false);
   MachineBasicBlock *flush(MachineBasicBlock &MBB,
                            MachineBasicBlock::iterator Before, bool Inline,
                            bool Materialize);
@@ -135,14 +139,15 @@ FunctionPass *llvm::createSHConstantIslandsPass() {
 }
 
 void SHConstantIslands::addLiteral(const MachineOperand &Value, int UseAddr,
-                                   MachineInstr *User) {
-  for (Literal &L : Pool)
-    if (L.Value.isIdenticalTo(Value)) {
-      L.Users.push_back(User);
-      return;
-    }
+                                   MachineInstr *User, bool Distance) {
+  if (!Distance)
+    for (Literal &L : Pool)
+      if (!L.Distance && L.Value.isIdenticalTo(Value)) {
+        L.Users.push_back(User);
+        return;
+      }
   Worst = std::max(Worst, int(4 * Pool.size()) - UseAddr);
-  Pool.push_back({Value, {User}});
+  Pool.push_back({Value, {User}, Distance});
 }
 
 /// Put the waiting literals behind \p MBB.  \p Inline: the code runs on
@@ -177,7 +182,17 @@ MachineBasicBlock *SHConstantIslands::flush(MachineBasicBlock &MBB,
     Addr += 4;
   Addr += Addr & 2;
   for (Literal &L : Pool) {
-    if (Materialize) {
+    if (Materialize && L.Distance) {
+      MCSymbol *Label = Ctx.createTempSymbol();
+      MCSymbol *Anchor = Ctx.createTempSymbol();
+      BuildMI(Island, DL, TII->get(SH::CPENTRYrel))
+          .addSym(Label)
+          .add(L.Value)
+          .addSym(Anchor);
+      MachineInstr *User = L.Users.front();
+      User->getOperand(1).ChangeToMCSymbol(Label);
+      User->getOperand(2).ChangeToMCSymbol(Anchor);
+    } else if (Materialize) {
       MCSymbol *Label = Ctx.createTempSymbol();
       BuildMI(Island, DL, TII->get(SH::CPENTRY)).addSym(Label).add(L.Value);
       for (MachineInstr *User : L.Users) {
@@ -244,19 +259,21 @@ void SHConstantIslands::place(bool Materialize) {
 
       InstAddr[&MI] = Addr;
       switch (MI.getOpcode()) {
+      // The first of the three instructions has the longest way.
       case SH::MOVLpcrel:
+      case SH::LOADGOT:
         addLiteral(MI.getOperand(1), Addr, &MI);
         break;
       // The load is the second instruction of the sequence, and the third
       // behind the conditional branch.
       case SH::BRAfar:
         addLiteral(MachineOperand::CreateMBB(MI.getOperand(0).getMBB()),
-                   Addr + 2, &MI);
+                   Addr + 2, &MI, /*Distance=*/true);
         break;
       case SH::BTfar:
       case SH::BFfar:
         addLiteral(MachineOperand::CreateMBB(MI.getOperand(0).getMBB()),
-                   Addr + 4, &MI);
+                   Addr + 4, &MI, /*Distance=*/true);
         break;
       default:
         break;
@@ -309,11 +326,13 @@ bool SHConstantIslands::relaxBranches() {
           continue;
         MI.setDesc(TII->get(IsTrue ? SH::BTfar : SH::BFfar));
         MI.addOperand(*MF, MachineOperand::CreateImm(0));
+        MI.addOperand(*MF, MachineOperand::CreateImm(0));
         break;
       case SH::BRA:
         if (Reaches(From, BraReach))
           continue;
         MI.setDesc(TII->get(SH::BRAfar));
+        MI.addOperand(*MF, MachineOperand::CreateImm(0));
         MI.addOperand(*MF, MachineOperand::CreateImm(0));
         break;
       }

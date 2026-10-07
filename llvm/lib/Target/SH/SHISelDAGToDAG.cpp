@@ -7,10 +7,12 @@
 //===----------------------------------------------------------------------===//
 
 #include "SH.h"
+#include "SHMachineFunctionInfo.h"
 #include "SHSelectionDAGInfo.h"
 #include "SHSubtarget.h"
 #include "SHTargetMachine.h"
 #include "llvm/CodeGen/MachineFunction.h"
+#include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/SelectionDAGISel.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
@@ -30,7 +32,19 @@ public:
 
   bool runOnMachineFunction(MachineFunction &MF) override {
     Subtarget = &MF.getSubtarget<SHSubtarget>();
-    return SelectionDAGISel::runOnMachineFunction(MF);
+    bool Changed = SelectionDAGISel::runOnMachineFunction(MF);
+    // If the function asked for the address of the global offset table, the
+    // register that has it is set where the function starts.  That
+    // overwrites r0, which holds nothing there.
+    if (Register Base =
+            MF.getInfo<SHMachineFunctionInfo>()->getGlobalBaseReg()) {
+      MachineBasicBlock &Entry = MF.front();
+      BuildMI(Entry, Entry.begin(), DebugLoc(),
+              Subtarget->getInstrInfo()->get(SH::LOADGOT), Base)
+          .addExternalSymbol("_GLOBAL_OFFSET_TABLE_");
+      Changed = true;
+    }
+    return Changed;
   }
 
   void Select(SDNode *Node) override;

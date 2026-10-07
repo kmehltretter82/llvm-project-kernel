@@ -61,6 +61,18 @@
 // LINK: "-dynamic-linker" "/lib/ld-linux.so.2"
 // LINK-EB: "-m" "shelf_linux"
 
+// Position independent code where it is asked for.
+//
+// RUN: %clang -### --target=sh4-linux-gnu -fPIC -c %s 2>&1 | FileCheck --check-prefix=PIC %s
+// RUN: %clang -### --target=sh4-linux-gnu -fPIE -pie %s 2>&1 | FileCheck --check-prefix=PIE %s
+// RUN: %clang -### --target=sh4-linux-gnu -fPIC -shared %s 2>&1 | FileCheck --check-prefix=SHARED %s
+//
+// PIC: "-mrelocation-model" "pic" "-pic-level" "2"
+// PIE: "-mrelocation-model" "pic" "-pic-level" "2" "-pic-is-pie"
+// PIE: "-m" "shlelf_linux" "-pie"
+// SHARED: "-mrelocation-model" "pic" "-pic-level" "2"
+// SHARED: "-m" "shlelf_linux" "-shared"
+
 // The dynamic linker of musl says whether there is a floating point unit.
 //
 // RUN: %clang -### --target=sh4-linux-musl %s 2>&1 | FileCheck --check-prefix=MUSL %s

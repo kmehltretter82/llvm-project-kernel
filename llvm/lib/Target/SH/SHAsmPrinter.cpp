@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "MCTargetDesc/SHInstPrinter.h"
+#include "MCTargetDesc/SHMCAsmInfo.h"
 #include "SH.h"
 #include "SHInstrInfo.h"
 #include "SHSubtarget.h"
@@ -57,8 +58,8 @@ private:
   MCOperand label(const MCSymbol *Symbol) const {
     return MCOperand::createExpr(MCSymbolRefExpr::create(Symbol, OutContext));
   }
-  /// The jump through a literal: r0 is pushed, loaded, jumped through, and
-  /// popped in the delay slot of the jump.
+  /// The jump over a distance from a literal: r0 is pushed, loaded, added
+  /// to the program counter by braf, and popped in the delay slot of that.
   void emitFarJump(const MachineInstr *MI);
   void emitOne(const MachineInstr *MI);
 };
@@ -101,7 +102,9 @@ const MCExpr *SHAsmPrinter::lowerSymbol(const MachineOperand &MO) const {
   default:
     return nullptr;
   }
-  const MCExpr *Expr = MCSymbolRefExpr::create(Symbol, OutContext);
+  // The target flags are what stands behind the "@".
+  const MCExpr *Expr =
+      MCSymbolRefExpr::create(Symbol, MO.getTargetFlags(), OutContext);
   if (Offset)
     Expr = MCBinaryExpr::createAdd(
         Expr, MCConstantExpr::create(Offset, OutContext), OutContext);
@@ -152,7 +155,8 @@ void SHAsmPrinter::emitFarJump(const MachineInstr *MI) {
   MCOperand R0 = MCOperand::createReg(SH::R0);
   emit(SH::PUSH, {R0});
   emit(SH::MOVLpc, {R0, label(MI->getOperand(1).getMCSymbol())});
-  emit(SH::JMP, {R0});
+  OutStreamer->emitLabel(MI->getOperand(2).getMCSymbol());
+  emit(SH::BRAF, {R0});
   emit(SH::POP, {R0});
 }
 
@@ -184,6 +188,76 @@ void SHAsmPrinter::emitOne(const MachineInstr *MI) {
       OutStreamer->emitIntValue(uint32_t(Value.getImm()), 4);
     else
       OutStreamer->emitValue(lowerSymbol(Value), 4);
+    return;
+  }
+
+  // The literal of a far branch.  braf adds to the address that is four
+  // bytes behind itself.
+  case SH::CPENTRYrel: {
+    OutStreamer->emitLabel(MI->getOperand(0).getMCSymbol());
+    const MCExpr *Target = MCSymbolRefExpr::create(
+        MI->getOperand(1).getMBB()->getSymbol(), OutContext);
+    const MCExpr *From = MCBinaryExpr::createAdd(
+        MCSymbolRefExpr::create(MI->getOperand(2).getMCSymbol(), OutContext),
+        MCConstantExpr::create(4, OutContext), OutContext);
+    OutStreamer->emitValue(MCBinaryExpr::createSub(Target, From, OutContext),
+                           4);
+    return;
+  }
+
+  // The address of the global offset table: the address of a literal and
+  // what the literal says.
+  case SH::LOADGOT: {
+    MCOperand R0 = MCOperand::createReg(SH::R0);
+    MCOperand Dst = MCOperand::createReg(MI->getOperand(0).getReg());
+    MCOperand Literal = label(MI->getOperand(1).getMCSymbol());
+    emit(SH::MOVA, {Literal});
+    emit(SH::MOVLpc, {Dst, Literal});
+    emit(SH::ADDrr, {Dst, Dst, R0});
+    return;
+  }
+
+  // Thread-local storage: the two sequences that the linker rewrites.
+  case SH::TLSCALL: {
+    MCOperand R0 = MCOperand::createReg(SH::R0);
+    MCOperand R1 = MCOperand::createReg(SH::R1);
+    MCOperand R4 = MCOperand::createReg(SH::R4);
+    MCSymbol *Argument = OutContext.createTempSymbol();
+    MCSymbol *Function = OutContext.createTempSymbol();
+    MCSymbol *Behind = OutContext.createTempSymbol();
+    emit(SH::MOVLpc, {R4, label(Argument)});
+    emit(SH::MOVA, {label(Function)});
+    emit(SH::MOVLpc, {R1, label(Function)});
+    emit(SH::ADDrr, {R1, R1, R0});
+    emit(SH::JSR, {R1});
+    emit(SH::ADDrr, {R4, R4, MCOperand::createReg(SH::R12)});
+    emit(SH::BRA, {label(Behind)});
+    emit(SH::NOP);
+    OutStreamer->emitCodeAlignment(Align(4), getSubtargetInfo());
+    OutStreamer->emitLabel(Argument);
+    OutStreamer->emitValue(lowerSymbol(MI->getOperand(1)), 4);
+    OutStreamer->emitLabel(Function);
+    OutStreamer->emitValue(
+        MCSymbolRefExpr::create(GetExternalSymbolSymbol("__tls_get_addr"),
+                                SH::S_PLT, OutContext),
+        4);
+    OutStreamer->emitLabel(Behind);
+    return;
+  }
+  case SH::TLSIE: {
+    MCOperand R0 = MCOperand::createReg(SH::R0);
+    MCOperand Dst = MCOperand::createReg(MI->getOperand(0).getReg());
+    MCSymbol *Offset = OutContext.createTempSymbol();
+    MCSymbol *Behind = OutContext.createTempSymbol();
+    emit(SH::MOVLpc, {R0, label(Offset)});
+    emit(SH::STCGBR, {Dst});
+    emit(SH::MOVLldr0, {R0, MCOperand::createReg(SH::R12)});
+    emit(SH::BRA, {label(Behind)});
+    emit(SH::ADDrr, {Dst, Dst, R0});
+    OutStreamer->emitCodeAlignment(Align(4), getSubtargetInfo());
+    OutStreamer->emitLabel(Offset);
+    OutStreamer->emitValue(lowerSymbol(MI->getOperand(2)), 4);
+    OutStreamer->emitLabel(Behind);
     return;
   }
 

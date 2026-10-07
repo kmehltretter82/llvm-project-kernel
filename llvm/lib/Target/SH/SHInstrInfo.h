@@ -60,6 +60,12 @@ public:
 
   bool expandPostRAPseudo(MachineInstr &MI) const override;
 
+  /// The names of the target flags of an operand, for machine code as text.
+  std::pair<unsigned, unsigned>
+  decomposeMachineOperandsTargetFlags(unsigned TF) const override;
+  ArrayRef<std::pair<unsigned, const char *>>
+  getSerializableDirectMachineOperandTargetFlags() const override;
+
   /// The half of a double that has the lower address in memory, and the
   /// other one.
   Register firstHalf(const MachineBasicBlock &MBB, Register Reg) const;

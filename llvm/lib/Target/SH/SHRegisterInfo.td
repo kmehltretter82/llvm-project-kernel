@@ -33,6 +33,9 @@ def GPR : RegisterClass<"SH", [i32], 32,
                              R12, R13, R14, R15)>;
 
 def R0Reg : RegisterClass<"SH", [i32], 32, (add R0)>;
+// The register that GCC keeps the address of the global offset table in.
+// The sequences for thread-local storage that the linker knows use it.
+def R12Reg : RegisterClass<"SH", [i32], 32, (add R12)>;
 
 def SysReg : RegisterClass<"SH", [i32], 32, (add PR, MACH, MACL, GBR)> {
   let isAllocatable = 0;

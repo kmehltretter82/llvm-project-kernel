@@ -26,6 +26,9 @@ class SHMachineFunctionInfo : public MachineFunctionInfo {
   unsigned ArgRegSaveSize = 0;
   /// The register with the address for a result that is returned in memory.
   Register SRetReturnReg;
+  /// The register with the address of the global offset table, if position
+  /// independent code needs it.
+  Register GlobalBaseReg;
   /// With a floating point unit: the buffer in which a function with
   /// variable arguments stores the registers that hold none of its named
   /// parameters, where the registers start in it, and how many of each
@@ -51,6 +54,8 @@ public:
   void setArgRegSaveSize(unsigned Size) { ArgRegSaveSize = Size; }
   Register getSRetReturnReg() const { return SRetReturnReg; }
   void setSRetReturnReg(Register Reg) { SRetReturnReg = Reg; }
+  Register getGlobalBaseReg() const { return GlobalBaseReg; }
+  void setGlobalBaseReg(Register Reg) { GlobalBaseReg = Reg; }
 
   void setVarArgsRegSave(int Index, unsigned Offset, unsigned NumFloat,
                          unsigned NumInt) {

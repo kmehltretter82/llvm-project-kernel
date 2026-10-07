@@ -90,6 +90,16 @@ def SHloadaddr : SDNode<"SHISD::LOADADDR", SDT_SHLoadAddr>;
 def SHblockcopy : SDNode<"SHISD::BLOCKCOPY", SDT_SHBlockCopy,
                          [SDNPHasChain, SDNPMayLoad, SDNPMayStore]>;
 
+// Thread-local storage: the call of __tls_get_addr() and the offset of a
+// variable from the global offset table.  The first operand of both is the
+// address of that table.
+def SDT_SHTLSCall : SDTypeProfile<0, 2, [SDTCisVT<0, i32>, SDTCisPtrTy<1>]>;
+def SDT_SHTLSIE
+    : SDTypeProfile<1, 2, [SDTCisVT<0, i32>, SDTCisVT<1, i32>, SDTCisPtrTy<2>]>;
+def SHtlscall : SDNode<"SHISD::TLSCALL", SDT_SHTLSCall,
+                       [SDNPHasChain, SDNPOutGlue, SDNPVariadic]>;
+def SHtlsie : SDNode<"SHISD::TLSIE", SDT_SHTLSIE>;
+
 //===----------------------------------------------------------------------===//
 // Operands and patterns
 //===----------------------------------------------------------------------===//
@@ -194,7 +204,23 @@ let mayLoad = 1 in
 def MOVLpc : SHPlain<(outs GPR:$dst), (ins labelop:$label),
                     "mov.l\t$label,$dst">;
 
+// The address of the global offset table, which position independent code
+// finds everything through:
+//
+//   mova .L,r0; mov.l .L,Rn; add r0,Rn
+//
+// The literal .L has the distance from itself to the table.  The operand is
+// the symbol of the table until the literal is placed, and the label of the
+// literal from then on.
+let Defs = [R0], Size = 6, hasSideEffects = 0 in
+def LOADGOT : SHPseudo<(outs GPR:$dst), (ins i32imm:$literal), []>;
+
+// "mova .L,r0": the address of a literal.
+let Defs = [R0] in
+def MOVA : SHPlain<(outs), (ins labelop:$label), "mova\t$label,r0">;
+
 def : Pat<(SHloadaddr tglobaladdr:$a), (MOVLpcrel tglobaladdr:$a)>;
+def : Pat<(SHloadaddr tglobaltlsaddr:$a), (MOVLpcrel tglobaltlsaddr:$a)>;
 def : Pat<(SHloadaddr texternalsym:$a), (MOVLpcrel texternalsym:$a)>;
 def : Pat<(SHloadaddr tblockaddress:$a), (MOVLpcrel tblockaddress:$a)>;
 def : Pat<(SHloadaddr tjumptable:$a), (MOVLpcrel tjumptable:$a)>;
@@ -230,6 +256,12 @@ def MOVBst : SHInst<(outs), (ins GPR:$src, memop:$addr), "mov.b\t$src,$addr",
 def : Pat<(extloadi16 addrbw:$addr), (MOVWld addrbw:$addr)>;
 def : Pat<(extloadi8 addrbw:$addr), (MOVBld addrbw:$addr)>;
 def : Pat<(extloadi1 addrbw:$addr), (MOVBld addrbw:$addr)>;
+
+// "mov.l @(r0,Rm),Rn": the address is the sum of r0 and a register.  Only
+// the sequence for thread-local storage uses it so far.
+let Uses = [R0], mayLoad = 1 in
+def MOVLldr0 : SHPlain<(outs GPR:$dst), (ins GPR:$base),
+                       "mov.l\t@(r0,$base),$dst">;
 
 // Push and pop, for the registers that a function saves.
 let Uses = [R15], Defs = [R15] in {
@@ -429,22 +461,31 @@ def JMP : SHInst<(outs), (ins GPR:$target), "jmp\t@$target",
 }
 
 // What a branch becomes when its target is out of reach: a conditional
-// branch around a bra ("bf 1f; bra target; nop; 1:"), and a jump through a
-// literal with r0 saved around it ("mov.l r0,@-r15; mov.l .L,r0; jmp @r0;
-// mov.l @r15+,r0").  The second operand of the far forms is the label of
-// the literal.
+// branch around a bra ("bf 1f; bra target; nop; 1:"), and a jump over a
+// distance from a literal with r0 saved around it ("mov.l r0,@-r15;
+// mov.l .L,r0; braf r0; mov.l @r15+,r0").  The second operand of the far
+// forms is the label of the literal, the third the label of the braf, which
+// the distance is counted from.  That is the same code wherever it runs.
 let Uses = [T] in {
 let Size = 6 in {
 def BTnear : SHPseudo<(outs), (ins brtarget:$dst), []>;
 def BFnear : SHPseudo<(outs), (ins brtarget:$dst), []>;
 }
 let Size = 10 in {
-def BTfar : SHPseudo<(outs), (ins brtarget:$dst, labelop:$label), []>;
-def BFfar : SHPseudo<(outs), (ins brtarget:$dst, labelop:$label), []>;
+def BTfar : SHPseudo<(outs),
+                     (ins brtarget:$dst, labelop:$label, labelop:$anchor), []>;
+def BFfar : SHPseudo<(outs),
+                     (ins brtarget:$dst, labelop:$label, labelop:$anchor), []>;
 }
 }
 let isBarrier = 1, Size = 8 in
-def BRAfar : SHPseudo<(outs), (ins brtarget:$dst, labelop:$label), []>;
+def BRAfar : SHPseudo<(outs),
+                      (ins brtarget:$dst, labelop:$label, labelop:$anchor), []>;
+
+// A jump over the distance in a register, which counts from four bytes
+// behind the instruction.
+let isBarrier = 1, isIndirectBranch = 1, hasDelaySlot = 1 in
+def BRAF : SHPlain<(outs), (ins GPR:$distance), "braf\t$distance">;
 }
 
 let isCall = 1, hasDelaySlot = 1, Defs = [PR, T, MACH, MACL] in
@@ -646,10 +687,55 @@ def SELECTD : SHPseudo<(outs DFPR:$dst), (ins DFPR:$t, DFPR:$f),
 }
 
 //===----------------------------------------------------------------------===//
+// Thread-local storage
+//===----------------------------------------------------------------------===//
+//
+// The linker turns the general forms of an access into the simpler ones
+// when it sees that it can, and does that by writing other instructions
+// over the ones that GCC emits, at fixed distances in front of the literal.
+// So these two are GCC's sequences to the letter, with their literals in
+// the code behind them and the address of the global offset table in r12.
+
+// The address of a variable, or of the thread-local storage of this module,
+// from __tls_get_addr():
+//
+//   mov.l 1f,r4; mova 2f,r0; mov.l 2f,r1; add r0,r1; jsr @r1; add r12,r4
+//   bra 3f; nop; .align 2
+//   1: .long sym@TLSGD        (or sym@TLSLDM)
+//   2: .long __tls_get_addr@PLT
+//   3:
+//
+// The result is in r0.  With the padding it is 26 bytes.
+let isCall = 1, Defs = [R0, R1, R4, PR, T, MACH, MACL], Size = 26 in
+def TLSCALL : SHPseudo<(outs), (ins R12Reg:$got, i32imm:$sym, variable_ops),
+                       [(SHtlscall R12Reg:$got, tglobaltlsaddr:$sym)]>;
+
+// The address of a variable whose offset from the thread pointer is in the
+// global offset table:
+//
+//   mov.l 1f,r0; stc gbr,Rn; mov.l @(r0,r12),r0; bra 2f; add r0,Rn
+//   .align 2
+//   1: .long sym@GOTTPOFF
+//   2:
+//
+// Rn is written while r12 is still needed.
+let Defs = [R0], Uses = [GBR], Size = 16, mayLoad = 1,
+    Constraints = "@earlyclobber $dst" in
+def TLSIE : SHPseudo<(outs GPR:$dst), (ins R12Reg:$got, i32imm:$sym),
+                     [(set GPR:$dst,
+                           (SHtlsie R12Reg:$got, tglobaltlsaddr:$sym))]>;
+
+//===----------------------------------------------------------------------===//
 // Literals in the code (see SHConstantIslands.cpp)
 //===----------------------------------------------------------------------===//
 
 // A literal: its label and its value.  The literals of one place are a
 // block of their own, which is aligned to four bytes.
-let Size = 4 in
+let Size = 4 in {
 def CPENTRY : SHPseudo<(outs), (ins labelop:$label, i32imm:$value), []>;
+// The literal of a far branch: the distance to the target from four bytes
+// behind the braf, which has the label that is the third operand.
+def CPENTRYrel : SHPseudo<(outs),
+                          (ins labelop:$label, brtarget:$target,
+                               labelop:$anchor), []>;
+}
