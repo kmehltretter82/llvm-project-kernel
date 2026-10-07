@@ -14221,11 +14221,23 @@ class LinuxIteratorRefChecker : LinuxPathSearch::Client {
   LinuxPathSearch &Search;
 
   struct Candidate {
+    /// The loop, or null for a reference that a single call took.
     const Stmt *Loop = nullptr;
     const VarDecl *Var = nullptr;
+    /// The call of the iterator in the loop, or the call that took the
+    /// reference.
     const CallExpr *Next = nullptr;
+    /// For a single call: where its result has been assigned.
+    const CFGBlock *Block = nullptr;
+    unsigned Element = 0;
+    /// For a single call: the function drops the reference somewhere, or
+    /// stores the pointer somewhere.
+    bool Puts = false;
+    bool Keeps = false;
   };
   llvm::SmallVector<Candidate, 2> Candidates;
+  /// The ways out that were reported, for whatever reference.
+  llvm::SmallPtrSet<const CFGBlock *, 4> ReportedExits;
 
   // Per search.
   const Candidate *Active = nullptr;
@@ -14236,6 +14248,16 @@ class LinuxIteratorRefChecker : LinuxPathSearch::Client {
   /// The last place where a path stored the pointer.  Paths that differ in
   /// it are one state, so this is the place of one of them.
   const Stmt *LastStore = nullptr;
+  /// The loops with a statement that stores the pointer, with their
+  /// condition and the block that the loop is left for.  A path that has
+  /// been through one may have stored it: "for_each_link(card, link) if
+  /// (!link->name) link->of_node = np;".
+  struct StoringLoop {
+    const Stmt *Loop;
+    const Expr *Cond;
+    const CFGBlock *Exit = nullptr;
+  };
+  llvm::SmallVector<StoringLoop, 2> StoringLoops;
 
   /// The path has stored the pointer in memory, with nothing but the
   /// reference of the pass to keep the node there.
@@ -14276,29 +14298,114 @@ class LinuxIteratorRefChecker : LinuxPathSearch::Client {
         .Default(false);
   }
 
+  /// The functions that return a node, or the device of one, with a
+  /// reference that the caller has to drop.
+  static bool isGetter(const FunctionDecl *Callee) {
+    if (!Callee || !Callee->getIdentifier())
+      return false;
+    return llvm::StringSwitch<bool>(Callee->getName())
+        .Cases({"of_parse_phandle", "of_get_child_by_name",
+                "of_get_available_child_by_name", "of_get_compatible_child",
+                "of_get_parent", "of_node_get"},
+               true)
+        .Cases({"of_find_node_by_path", "of_find_node_by_phandle",
+                "of_find_node_opts_by_path", "of_get_cpu_node",
+                "of_cpu_device_node_get", "of_irq_find_parent"},
+               true)
+        .Cases({"of_graph_get_remote_port_parent", "of_graph_get_remote_port",
+                "of_graph_get_remote_endpoint", "of_graph_get_remote_node",
+                "of_graph_get_port_parent", "of_graph_get_port_by_id",
+                "of_graph_get_endpoint_by_regs"},
+               true)
+        .Cases({"device_get_named_child_node", "fwnode_get_named_child_node",
+                "fwnode_get_parent", "fwnode_graph_get_remote_endpoint",
+                "fwnode_graph_get_remote_port_parent",
+                "fwnode_graph_get_port_parent"},
+               true)
+        .Case("of_find_device_by_node", true)
+        // Used once, with NULL for the node to go on from.
+        .Cases({"of_find_compatible_node", "of_find_matching_node",
+                "of_find_matching_node_and_match", "of_find_node_by_name",
+                "of_find_node_by_type", "of_find_node_with_property"},
+               true)
+        .Default(false);
+  }
+
   /// The function that drops the reference which \p Next takes.
   static StringRef getPutName(const FunctionDecl *Next) {
     StringRef Name = Next->getName();
-    return Name.starts_with("of_")     ? "of_node_put"
-           : Name.starts_with("pci_")  ? "pci_dev_put"
-           : Name.starts_with("acpi_") ? "acpi_dev_put"
-                                       : "fwnode_handle_put";
+    return Name == "of_find_device_by_node" ? "put_device"
+           : Name.starts_with("of_")        ? "of_node_put"
+           : Name.starts_with("pci_")       ? "pci_dev_put"
+           : Name.starts_with("acpi_")      ? "acpi_dev_put"
+                                            : "fwnode_handle_put";
   }
 
+  /// The functions that drop a reference: the ones of the kernel for nodes
+  /// and devices, and whatever a subsystem has made of them
+  /// ("of_node_put_kunit", "tegra_dc_of_node_put").
   static bool isPut(const FunctionDecl *Callee) {
-    return Callee && Callee->getIdentifier() &&
-           llvm::StringSwitch<bool>(Callee->getName())
-               .Cases({"of_node_put", "fwnode_handle_put", "pci_dev_put",
-                       "acpi_dev_put"},
-                      true)
-               .Default(false);
+    if (!Callee || !Callee->getIdentifier())
+      return false;
+    StringRef Name = Callee->getName();
+    return Name.contains("_put") || Name.starts_with("put_");
+  }
+
+  /// "devm_add_action_or_reset(dev, action, data)" and its relatives, which
+  /// are macros around functions with the same parameters, and the same for
+  /// a KUnit test.
+  static bool isDeferredAction(const FunctionDecl *Callee) {
+    if (!Callee || !Callee->getIdentifier())
+      return false;
+    StringRef Name = Callee->getName().ltrim('_');
+    return Name.starts_with("devm_add_action") ||
+           Name.starts_with("kunit_add_action");
+  }
+
+  /// Whether the reference of the search is to a device and not to a node.
+  bool isDeviceReference() const {
+    return !Active->Loop &&
+           Active->Next->getDirectCallee()->getName() == "of_find_device_by_node";
+  }
+
+  /// A return that reports a failure, as far as the path says.
+  bool isErrorReturn(const ReturnStmt *RS, const LinuxPathSearch::State &St) {
+    const Expr *E = RS ? RS->getRetValue() : nullptr;
+    if (!E)
+      return false;
+    if (const auto *CE = dyn_cast<CallExpr>(E->IgnoreParenCasts())) {
+      const FunctionDecl *Callee = CE->getDirectCallee();
+      if (Callee && Callee->getIdentifier() &&
+          llvm::StringSwitch<bool>(Callee->getName())
+              .Cases({"PTR_ERR", "ERR_PTR", "ERR_CAST", "dev_err_probe"}, true)
+              .Default(false))
+        return true;
+    }
+    LinuxPathValue V = Search.value(E, St);
+    QualType RT = FD->getReturnType();
+    if (RT->isPointerType())
+      return !(V.Mask & LinuxPathValue::Pos);
+    if (!RT->isSignedIntegerType() || RT->isBooleanType())
+      return false;
+    if (V.HasConst)
+      return V.Const < 0;
+    return !(V.Mask & LinuxPathValue::Zero);
+  }
+
+  static const ReturnStmt *getReturn(const CFGBlock *B) {
+    const ReturnStmt *RS = nullptr;
+    for (const CFGElement &Elem : *B)
+      if (std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>())
+        if (const auto *R = dyn_cast<ReturnStmt>(CS->getStmt()))
+          RS = R;
+    return RS;
   }
 
   static bool isGet(const FunctionDecl *Callee) {
     return Callee && Callee->getIdentifier() &&
            llvm::StringSwitch<bool>(Callee->getName())
                .Cases({"of_node_get", "fwnode_handle_get", "pci_dev_get",
-                       "acpi_dev_get"},
+                       "acpi_dev_get", "get_device"},
                       true)
                .Default(false);
   }
@@ -14325,13 +14432,29 @@ class LinuxIteratorRefChecker : LinuxPathSearch::Client {
     return false;
   }
 
+  /// A function that a driver declares for itself: in a header next to its
+  /// sources, not in the source file and not under an "include" directory,
+  /// where the interfaces of the kernel are.
+  bool isDriverPrivate(const FunctionDecl *Callee) const {
+    const SourceManager &SM = S.getSourceManager();
+    SourceLocation Loc =
+        SM.getExpansionLoc(Callee->getCanonicalDecl()->getLocation());
+    if (Loc.isInvalid() || SM.isInMainFile(Loc))
+      return false;
+    StringRef File = SM.getFilename(Loc);
+    return !File.empty() && !File.contains("/include/");
+  }
+
   /// Whether the function keeps the pointer that it gets as argument
   /// \p I, with the reference that the caller holds: device_set_node()
   /// stores the node in the device and takes no reference, unlike
   /// platform_device_set_of_node(), which takes its own.  A function with
   /// a body here keeps it if the body stores it.  One that only hands it
   /// to a function of another file does not: whoever keeps a node there
-  /// takes a reference.
+  /// takes a reference.  That convention is one of the interfaces of the
+  /// kernel.  The other half of a driver, in another file, is free to
+  /// store what it is given ("ams_info.of_node = np;" in ams_i2c_init()),
+  /// and what cannot be seen is taken to be kept.
   bool keeps(const FunctionDecl *Callee, unsigned I, unsigned Depth = 0) {
     if (!Callee || !Callee->getIdentifier())
       return false;
@@ -14339,8 +14462,13 @@ class LinuxIteratorRefChecker : LinuxPathSearch::Client {
         Callee->getName() == "set_primary_fwnode" ||
         Callee->getName() == "set_secondary_fwnode")
       return true;
+    // The node that a component is matched by stays with the match.
+    if (Callee->getName().contains("component_match_add"))
+      return true;
     const FunctionDecl *Def = nullptr;
-    if (Depth > 3 || !Callee->hasBody(Def) || I >= Def->getNumParams())
+    if (!Callee->hasBody(Def))
+      return isDriverPrivate(Callee);
+    if (Depth > 3 || I >= Def->getNumParams())
       return false;
     return stores(Def->getBody(), Def->getParamDecl(I), Depth);
   }
@@ -14439,6 +14567,160 @@ class LinuxIteratorRefChecker : LinuxPathSearch::Client {
     return VD && VD->hasLocalStorage() && !isa<ParmVarDecl>(VD);
   }
 
+  /// Whether \p St has "VD = next(..., VD, ...)", which makes the variable
+  /// the cursor of a loop.  The call that starts the loop is no reference
+  /// of its own kind: "for (np = of_find_compatible_node(NULL, ...); np; np
+  /// = of_find_compatible_node(np, ...))".
+  static bool advances(const Stmt *St, const VarDecl *VD) {
+    if (!St)
+      return false;
+    if (const auto *BO = dyn_cast<BinaryOperator>(St))
+      if (BO->getOpcode() == BO_Assign &&
+          getDirectLinuxVariable(BO->getLHS()) == VD) {
+        const auto *CE = dyn_cast<CallExpr>(BO->getRHS()->IgnoreParenCasts());
+        if (CE && isIterator(CE->getDirectCallee()) &&
+            llvm::any_of(CE->arguments(),
+                         [&](const Expr *Arg) { return refersTo(Arg, VD); }))
+          return true;
+      }
+    for (const Stmt *Child : St->children())
+      if (advances(Child, VD))
+        return true;
+    return false;
+  }
+
+  /// Whether \p St has a call that drops the reference which \p VD holds.
+  static bool puts(const Stmt *St, const VarDecl *VD) {
+    if (!St)
+      return false;
+    if (const auto *CE = dyn_cast<CallExpr>(St))
+      if (isPut(CE->getDirectCallee()) &&
+          llvm::any_of(CE->arguments(),
+                       [&](const Expr *Arg) { return refersTo(Arg, VD); }))
+        return true;
+    for (const Stmt *Child : St->children())
+      if (puts(Child, VD))
+        return true;
+    return false;
+  }
+
+  void collectStoringLoops(const Stmt *St, const VarDecl *VD) {
+    if (!St)
+      return;
+    const Stmt *Body = nullptr;
+    const Expr *Cond = nullptr;
+    if (const auto *For = dyn_cast<ForStmt>(St)) {
+      Body = For->getBody();
+      Cond = For->getCond();
+    } else if (const auto *While = dyn_cast<WhileStmt>(St)) {
+      Body = While->getBody();
+      Cond = While->getCond();
+    } else if (const auto *Do = dyn_cast<DoStmt>(St)) {
+      Body = Do->getBody();
+      Cond = Do->getCond();
+    }
+    if (Body && stores(Body, VD, 0) && StoringLoops.size() < 4) {
+      StoringLoop L = {St, Cond};
+      // The block that decides last whether there is another pass.
+      for (const CFGBlock *B : Cfg)
+        if (B->getTerminatorStmt() == St && B->succ_size() == 2)
+          L.Exit = (B->succ_begin() + 1)->getReachableBlock();
+      StoringLoops.push_back(L);
+    }
+    for (const Stmt *Child : St->children())
+      collectStoringLoops(Child, VD);
+  }
+
+  static bool contains(const Stmt *St, const Stmt *Inner) {
+    if (!St)
+      return false;
+    if (St == Inner)
+      return true;
+    for (const Stmt *Child : St->children())
+      if (contains(Child, Inner))
+        return true;
+    return false;
+  }
+
+  /// The conditions under which the reference is taken: the branches that
+  /// lead to the block of the call and to nothing else.  "if (name) np =
+  /// of_parse_phandle(...); ... if (name) of_node_put(np);" relies on the
+  /// condition not changing, and so does the search.  What the condition
+  /// says about a value holds until that value changes: "if (ret == 0) np
+  /// = of_parse_phandle(...); if (ret < 0) goto out;".
+  void fixGuards(const CFGBlock *B, LinuxPathSearch::State &St) {
+    for (unsigned Depth = 0; Depth < 4 && B->pred_size() == 1; ++Depth) {
+      const CFGBlock *Pred = B->pred_begin()->getReachableBlock();
+      if (!Pred)
+        break;
+      if (LinuxPathSearch::isConditionalBranch(Pred)) {
+        const CFGBlock *OnTrue = Pred->succ_begin()->getReachableBlock();
+        const CFGBlock *OnFalse = (Pred->succ_begin() + 1)->getReachableBlock();
+        if (OnTrue != OnFalse) {
+          const Expr *Cond = LinuxPathSearch::getBranchCondition(Pred);
+          Search.fix(Cond, OnTrue == B, St);
+          Search.assume(Cond, OnTrue == B, St);
+        }
+      }
+      B = Pred;
+    }
+  }
+
+  /// "np = of_parse_phandle(...);" and the same as an initializer, for a
+  /// variable of the function that has no cleanup function.
+  void collectGetters() {
+    auto Add = [&](const VarDecl *VD, const Expr *Value, const CFGBlock *B,
+                   unsigned Index) {
+      const auto *CE = dyn_cast_or_null<CallExpr>(
+          Value ? Value->IgnoreParenCasts() : nullptr);
+      if (!VD || !CE || !isGetter(CE->getDirectCallee()) ||
+          !VD->hasLocalStorage() || !VD->getType()->isPointerType() ||
+          VD->hasAttr<CleanupAttr>() || Search.isAddressTaken(VD) ||
+          Candidates.size() >= 8)
+        return;
+      // The variable of a macro, as in of_fwnode_handle(of_node_get(np)):
+      // its value is what the macro is for.
+      if (VD->getLocation().isMacroID())
+        return;
+      // The nodes of ACPI are not counted, and the code that walks them has
+      // nothing to drop.
+      if (FD->getIdentifier() && FD->getName().starts_with("acpi_") &&
+          !CE->getDirectCallee()->getName().starts_with("of_"))
+        return;
+      // "np = of_find_compatible_node(np, ...)" is the step of a loop, and
+      // the variable of such a step is the cursor of that loop.
+      if (llvm::any_of(CE->arguments(),
+                       [&](const Expr *Arg) { return refersTo(Arg, VD); }) ||
+          advances(FD->getBody(), VD))
+        return;
+      Candidate C;
+      C.Var = VD;
+      C.Next = CE;
+      C.Block = B;
+      C.Element = Index;
+      C.Puts = puts(FD->getBody(), VD);
+      C.Keeps = stores(FD->getBody(), VD, 0);
+      Candidates.push_back(C);
+    };
+    for (const CFGBlock *B : Cfg) {
+      unsigned Index = 0;
+      for (const CFGElement &Elem : *B) {
+        unsigned This = Index++;
+        std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>();
+        if (!CS)
+          continue;
+        if (const auto *BO = dyn_cast<BinaryOperator>(CS->getStmt())) {
+          if (BO->getOpcode() == BO_Assign)
+            Add(getDirectLinuxVariable(BO->getLHS()), BO->getRHS(), B, This);
+        } else if (const auto *DS = dyn_cast<DeclStmt>(CS->getStmt())) {
+          for (const Decl *D : DS->decls())
+            if (const auto *VD = dyn_cast<VarDecl>(D))
+              Add(VD, VD->getInit(), B, This);
+        }
+      }
+    }
+  }
+
   bool statement(const Stmt *Node, LinuxPathSearch::State &St) override {
     const VarDecl *Var = Active->Var;
     auto Store = [&](const Stmt *Where) {
@@ -14458,6 +14740,19 @@ class LinuxIteratorRefChecker : LinuxPathSearch::Client {
     };
     if (const auto *CE = dyn_cast<CallExpr>(Node)) {
       const FunctionDecl *Callee = CE->getDirectCallee();
+      // An action for when the device goes: the reference is in its hands
+      // if it is given the pointer, and a device goes with whatever the
+      // action that puts one is given.
+      if (isDeferredAction(Callee) && CE->getNumArgs() >= 3) {
+        if (refersTo(CE->getArg(2), Var))
+          return Store(CE);
+        const auto *Action = dyn_cast<DeclRefExpr>(
+            CE->getArg(1)->IgnoreParenCasts());
+        const auto *ActionFn =
+            Action ? dyn_cast<FunctionDecl>(Action->getDecl()) : nullptr;
+        if (isDeviceReference() && isPut(ActionFn))
+          return Store(CE);
+      }
       for (unsigned I = 0, E = CE->getNumArgs(); I != E; ++I) {
         if (!refersTo(CE->getArg(I), Var))
           continue;
@@ -14490,19 +14785,84 @@ class LinuxIteratorRefChecker : LinuxPathSearch::Client {
             return false;
       return true;
     }
-    if (const auto *RS = dyn_cast<ReturnStmt>(Node))
-      return !refersTo(RS->getRetValue(), Var);
+    if (const auto *RS = dyn_cast<ReturnStmt>(Node)) {
+      if (refersTo(RS->getRetValue(), Var))
+        return false;
+      // "return pdev ? &pdev->dev : NULL;": the reference goes with what
+      // is returned.
+      return !(FD->getReturnType()->isPointerType() &&
+               mentions(RS->getRetValue(), Var));
+    }
     return true;
+  }
+
+  /// Whether \p St tests \p VD for NULL with "!np" or a comparison,
+  /// behind \p After in the source.
+  bool testsForNull(const Stmt *St, const VarDecl *VD, SourceLocation After) {
+    if (!St)
+      return false;
+    const Expr *Tested = nullptr;
+    if (const auto *UO = dyn_cast<UnaryOperator>(St)) {
+      if (UO->getOpcode() == UO_LNot)
+        Tested = UO->getSubExpr();
+    } else if (const auto *BO = dyn_cast<BinaryOperator>(St)) {
+      if (BO->isEqualityOp())
+        Tested = getDirectLinuxVariable(BO->getLHS()->IgnoreParenCasts()) == VD
+                     ? BO->getLHS()
+                     : BO->getRHS();
+    }
+    if (Tested && getDirectLinuxVariable(Tested->IgnoreParenCasts()) == VD &&
+        S.getSourceManager().isBeforeInTranslationUnit(
+            After, cast<Expr>(St)->getExprLoc()))
+      return true;
+    for (const Stmt *Child : St->children())
+      if (testsForNull(Child, VD, After))
+        return true;
+    return false;
+  }
+
+  /// "of_get_parent(np)" for a path on which np is NULL: there is no node
+  /// and nothing to drop.  The functions that search from a node take NULL
+  /// for "from the start".
+  bool foundNothing(const LinuxPathSearch::State &St) {
+    const CallExpr *CE = Active->Next;
+    StringRef Name = CE->getDirectCallee()->getName();
+    if (Active->Loop || CE->getNumArgs() == 0 ||
+        Name.starts_with("of_find_node") ||
+        Name.starts_with("of_find_compatible") ||
+        Name.starts_with("of_find_matching"))
+      return false;
+    const Expr *Arg = CE->getArg(0)->IgnoreParenCasts();
+    return getDirectLinuxVariable(Arg) &&
+           Search.value(Arg, St).Mask == LinuxPathValue::Zero;
   }
 
   bool edge(const CFGBlock *From, const CFGBlock *To,
             LinuxPathSearch::State &St) override {
+    // Out of a loop that stores the pointer, from its condition.  That
+    // can be several blocks: "for (i = 0; i < n && (link = &links[i]);
+    // i++)" is left from either half.
+    if (const Stmt *Term = From->getTerminatorStmt())
+      for (const StoringLoop &L : StoringLoops)
+        if (L.Exit == To && (Term == L.Loop || contains(L.Cond, Term)))
+          St.Client |= Stored;
     if (To != &Cfg.getExit())
       return true;
     // With the pointer stored, the reference went where the pointer went.
-    if (!(St.Client & Stored) && !From->hasNoReturnElement() &&
-        !llvm::is_contained(Leaks, From) && Leaks.size() < 4)
-      Leaks.push_back(From);
+    if ((St.Client & Stored) || From->hasNoReturnElement() ||
+        llvm::is_contained(Leaks, From) || Leaks.size() >= 8)
+      return false;
+    if (!Active->Loop) {
+      if (foundNothing(St))
+        return false;
+      // A function that looks up a device and drops it where it fails
+      // hands out something of that device where it succeeds, and whoever
+      // gets that has the reference.
+      if (isDeviceReference() && Active->Puts &&
+          !isErrorReturn(getReturn(From), St))
+        return false;
+    }
+    Leaks.push_back(From);
     return false;
   }
 
@@ -14528,15 +14888,54 @@ class LinuxIteratorRefChecker : LinuxPathSearch::Client {
         << "the reference is dropped here";
   }
 
+  SourceLocation getExitLoc(const CFGBlock *B) const {
+    const ReturnStmt *RS = getReturn(B);
+    return RS ? RS->getBeginLoc() : FD->getBody()->getEndLoc();
+  }
+
+  /// One report for a reference that a single call took: at the first way
+  /// out that has it, with a note for each of the others.
+  void reportReference() {
+    const Candidate &C = *Active;
+    const SourceManager &SM = S.getSourceManager();
+    llvm::SmallVector<SourceLocation, 8> Exits;
+    for (const CFGBlock *B : Leaks) {
+      SourceLocation Loc = getExitLoc(B);
+      if (!llvm::is_contained(Exits, Loc))
+        Exits.push_back(Loc);
+    }
+    llvm::sort(Exits, [&](SourceLocation A, SourceLocation B) {
+      return SM.isBeforeInTranslationUnit(A, B);
+    });
+    const FunctionDecl *Next = C.Next->getDirectCallee();
+    StringRef Put = getPutName(Next);
+    std::string Text;
+    llvm::raw_string_ostream OS(Text);
+    OS << "the function returns here with the reference to '"
+       << C.Var->getName() << "' that " << Next->getName() << "() took";
+    // Three cases: other paths drop it, other paths keep the pointer, or
+    // the function does neither anywhere.
+    bool Elsewhere = C.Puts || C.Keeps;
+    if (!C.Puts)
+      OS << (C.Keeps ? ", and the pointer is not kept here"
+                     : ", and nothing in the function drops it");
+    OS << ": " << Put << "(" << (Put == "put_device" ? "&" : "")
+       << C.Var->getName() << (Put == "put_device" ? "->dev" : "")
+       << ") is missing" << (Elsewhere ? " on this path" : "");
+    S.Diag(Exits.front(), diag::warn_linux_kernel_experimental)
+        << Text << "node-ref-leak";
+    S.Diag(C.Next->getExprLoc(), diag::note_linux_kernel_experimental)
+        << "the reference is taken here";
+    // Where nothing drops it, every way out behind the call is one.
+    if (Elsewhere)
+      for (SourceLocation Loc : llvm::drop_begin(Exits))
+        S.Diag(Loc, diag::note_linux_kernel_experimental)
+            << "this way out has the reference as well";
+  }
+
   void report(const CFGBlock *B) {
     const Candidate &C = *Active;
-    const ReturnStmt *RS = nullptr;
-    for (const CFGElement &Elem : *B)
-      if (std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>())
-        if (const auto *R = dyn_cast<ReturnStmt>(CS->getStmt()))
-          RS = R;
-    SourceLocation Loc =
-        RS ? RS->getBeginLoc() : FD->getBody()->getEndLoc();
+    SourceLocation Loc = getExitLoc(B);
     const FunctionDecl *Next = C.Next->getDirectCallee();
     StringRef Put = getPutName(Next);
     std::string Text;
@@ -14559,34 +14958,65 @@ public:
       : S(S), FD(FD), Cfg(Cfg), Search(Search) {}
 
   static bool wanted(const Sema &S, SourceLocation Loc) {
-    return isLinuxExperimentEnabled(S, "iterator-ref-leak", Loc);
+    return isLinuxExperimentEnabled(S, "iterator-ref-leak", Loc) ||
+           isLinuxExperimentEnabled(S, "node-ref-leak", Loc);
   }
 
   void run() {
-    collect(FD->getBody());
+    SourceLocation Where = FD->getBeginLoc();
+    if (isLinuxExperimentEnabled(S, "iterator-ref-leak", Where))
+      collect(FD->getBody());
+    if (isLinuxExperimentEnabled(S, "node-ref-leak", Where))
+      collectGetters();
     for (const Candidate &C : Candidates) {
       Active = &C;
       Leaks.clear();
       Unreferenced.clear();
       LastStore = nullptr;
+      StoringLoops.clear();
+      if (!C.Loop)
+        collectStoringLoops(FD->getBody(), C.Var);
       int Loc = Search.locate(C.Var);
+      if (Loc >= 0)
+        Search.pin(Loc);
+      // What the call was given says whether there is a reference at all,
+      // where the function asks afterwards: "parent = of_get_parent(np); if
+      // (!np || !parent)".  The value is kept for that case only.  A value
+      // that every state carries makes more states than the search has room
+      // for in a long function.
+      if (!C.Loop && C.Next->getNumArgs())
+        if (const VarDecl *Arg = getDirectLinuxVariable(
+                C.Next->getArg(0)->IgnoreParenCasts());
+            Arg && Arg->hasLocalStorage() &&
+            testsForNull(FD->getBody(), Arg, C.Next->getBeginLoc()))
+          if (int ArgLoc = Search.locate(Arg); ArgLoc >= 0)
+            Search.pin(ArgLoc);
+      LinuxPathSearch::State Init;
+      // There is a node, or there would be no pass, and nothing to drop
+      // behind a call that found none.
+      if (Loc >= 0)
+        LinuxPathSearch::set(Init, Loc,
+                             LinuxPathValue::ofMask(LinuxPathValue::Pos));
+      if (!C.Loop) {
+        fixGuards(C.Block, Init);
+        Search.run(C.Block, C.Element + 1, Init, *this);
+        if (!Leaks.empty())
+          reportReference();
+        continue;
+      }
       for (const CFGBlock *B : Cfg) {
         // The block that decides whether there is another pass.
-        if (B->getTerminatorStmt() != C.Loop ||
+        if (!C.Loop || B->getTerminatorStmt() != C.Loop ||
             !LinuxPathSearch::isConditionalBranch(B))
           continue;
         const CFGBlock *Body = B->succ_begin()->getReachableBlock();
         if (!Body)
           continue;
-        LinuxPathSearch::State Init;
-        // There is a node, or there would be no pass.
-        if (Loc >= 0)
-          LinuxPathSearch::set(Init, Loc,
-                               LinuxPathValue::ofMask(LinuxPathValue::Pos));
         Search.run(Body, 0, Init, *this);
       }
       for (const CFGBlock *B : Leaks)
-        report(B);
+        if (ReportedExits.insert(B).second)
+          report(B);
       // Most drivers that keep a node from such a loop take no reference
       // for it, and little comes of that as long as nodes are not removed.
       // The reports are there for whoever asks.

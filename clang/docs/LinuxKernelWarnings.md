@@ -512,9 +512,43 @@ group of its own once a kernel scan has shown what it finds. The names:
   `of_node_get()`. A function that is only passed the node does not take
   the reference over, by the convention that whoever keeps a node takes a
   reference of its own. `device_set_node()` is the exception, and so is a
-  function whose body is at hand and stores the pointer. A loop variable
-  with a cleanup function (`for_each_child_of_node_scoped()`) is not
-  looked at.
+  function whose body is at hand and stores the pointer. The convention is
+  one of the interfaces of the kernel. A function that a driver declares
+  for itself, in a header next to its sources, and defines in another file
+  is free to store what it is given, and is taken to: `return
+  ams_i2c_init(np);`. A function that drops a reference is known by `_put`
+  in its name. A loop variable with a cleanup function
+  (`for_each_child_of_node_scoped()`) is not looked at.
+- `node-ref-leak`: the same for the reference that a single call took and
+  a local variable holds: `np = of_parse_phandle(...)`,
+  `of_get_child_by_name()`, `of_get_parent()`, `of_node_get()`,
+  `of_find_node_by_path()`, `of_find_compatible_node(NULL, ...)`, the
+  `of_graph_get_*()` and `fwnode_*()` functions that return one node, and
+  `of_find_device_by_node()` for a device. The function returns on a path
+  that has neither dropped the reference nor kept the pointer. Each call
+  gets one report, at the first such way out, with a note at each of the
+  others, and the text says whether other paths drop the reference or
+  nothing in the function does. A path ends where one of
+  `iterator-ref-leak` does, and also where the pointer becomes the data of
+  `devm_add_action_or_reset()` or of a KUnit action, where it goes into a
+  component match, and where the path leaves a loop that stores it (`for
+  each link: if (!link->name) link->of_node = np;` stores it as far as
+  anyone can tell). Not reported:
+  - a function that looks up a device, drops it where it fails and returns
+    with it where it succeeds. `foo_get()` hands out something of that
+    device, and `foo_put()` drops the reference;
+  - a path on which the node that the call was given is NULL, because the
+    call found nothing then;
+  - a reference that is taken under a condition and dropped under the same
+    one;
+  - the variable of a macro, as in `of_fwnode_handle(of_node_get(np))`;
+  - the `fwnode_*()` functions in a function whose name starts with
+    `acpi_`: ACPI nodes are not counted.
+
+  The reports are many and each is small: a reference to a node of the
+  device tree that a probe function or one of its error paths does not
+  give back. On the 1,092 sources of an x86_64 allmodconfig that call such
+  a function there are about sixty.
 
 Some names change how the path checks work and are not part of `all`.
 `path-notes` adds a note for each branch between the test and the misuse,
