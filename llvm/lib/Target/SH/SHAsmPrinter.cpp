@@ -209,20 +209,59 @@ void SHAsmPrinter::emitOne(const MachineInstr *MI) {
   EmitToStreamer(*OutStreamer, Inst);
 }
 
+// An operand of inline assembly, as GCC prints it: a register by its name
+// and a constant with "#" in front of it.  The modifiers that GCC has:
+//
+//   %O   a constant without the "#"
+//   %R   the register or the word in memory with the low half of a 64-bit
+//        value, %S the one with the high half
+//   %T   the second register or word, whichever half that is
+//
+// A 64-bit value in registers is two operands here, the first of which has
+// the half that comes first in memory.
 bool SHAsmPrinter::PrintAsmOperand(const MachineInstr *MI, unsigned OpNo,
                                    const char *ExtraCode, raw_ostream &O) {
-  if (ExtraCode && ExtraCode[0])
-    return AsmPrinter::PrintAsmOperand(MI, OpNo, ExtraCode, O);
+  bool Hash = true;
+  bool Little = MF->getDataLayout().isLittleEndian();
+  if (ExtraCode && ExtraCode[0]) {
+    if (ExtraCode[1])
+      return true;
+    switch (ExtraCode[0]) {
+    case 'O':
+      Hash = false;
+      break;
+    case 'R':
+      OpNo += Little ? 0 : 1;
+      break;
+    case 'S':
+      OpNo += Little ? 1 : 0;
+      break;
+    case 'T':
+      OpNo += 1;
+      break;
+    default:
+      return AsmPrinter::PrintAsmOperand(MI, OpNo, ExtraCode, O);
+    }
+    // The second half of a value that has one register: GCC names the
+    // register with the next number there, which belongs to someone else.
+    if (ExtraCode[0] != 'O' &&
+        (OpNo >= MI->getNumOperands() || !MI->getOperand(OpNo).isReg()))
+      return true;
+  }
   const MachineOperand &MO = MI->getOperand(OpNo);
   switch (MO.getType()) {
   case MachineOperand::MO_Register:
     O << SHInstPrinter::getRegisterName(MO.getReg());
     return false;
   case MachineOperand::MO_Immediate:
+    if (Hash)
+      O << '#';
     O << MO.getImm();
     return false;
   default:
     if (const MCExpr *Expr = lowerSymbol(MO)) {
+      if (Hash)
+        O << '#';
       MAI.printExpr(O, *Expr);
       return false;
     }
@@ -230,16 +269,38 @@ bool SHAsmPrinter::PrintAsmOperand(const MachineInstr *MI, unsigned OpNo,
   }
 }
 
-// The address is in a register: "@r1".
+// The address is in a register: "@r1".  %R, %S and %T ask for one of the
+// two words of a 64-bit value there.
 bool SHAsmPrinter::PrintAsmMemoryOperand(const MachineInstr *MI, unsigned OpNo,
                                          const char *ExtraCode,
                                          raw_ostream &O) {
-  if (ExtraCode && ExtraCode[0])
-    return true;
+  bool Little = MF->getDataLayout().isLittleEndian();
+  int Offset = 0;
+  if (ExtraCode && ExtraCode[0]) {
+    if (ExtraCode[1])
+      return true;
+    switch (ExtraCode[0]) {
+    case 'R':
+      Offset = Little ? 0 : 4;
+      break;
+    case 'S':
+      Offset = Little ? 4 : 0;
+      break;
+    case 'T':
+      Offset = 4;
+      break;
+    default:
+      return true;
+    }
+  }
   const MachineOperand &Base = MI->getOperand(OpNo);
   if (!Base.isReg())
     return true;
-  O << '@' << SHInstPrinter::getRegisterName(Base.getReg());
+  if (Offset)
+    O << "@(" << Offset << ',' << SHInstPrinter::getRegisterName(Base.getReg())
+      << ')';
+  else
+    O << '@' << SHInstPrinter::getRegisterName(Base.getReg());
   return false;
 }
 

@@ -34,6 +34,11 @@ public:
   getRegForInlineAsmConstraint(const TargetRegisterInfo *TRI,
                                StringRef Constraint, MVT VT) const override;
 
+  /// "register unsigned long sp asm("r15")": the registers that a global
+  /// variable can be, which are the ones that the allocator never uses.
+  Register getRegisterByName(const char *RegName, LLT VT,
+                             const MachineFunction &MF) const override;
+
   // shad and shld take the amount from a whole register.
   MVT getScalarShiftAmountTy(const DataLayout &, EVT) const override {
     return MVT::i32;

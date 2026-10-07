@@ -16,6 +16,7 @@
 #include "SHMachineFunctionInfo.h"
 #include "SHSelectionDAGInfo.h"
 #include "SHSubtarget.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/CodeGen/CallingConvLower.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
@@ -638,6 +639,14 @@ SDValue SHTargetLowering::LowerAtomicLoadStore(SDValue Op,
   return DAG.getExtLoad(Ext, DL, Op.getValueType(), Node->getChain(),
                         Node->getBasePtr(), Node->getMemoryVT(),
                         Node->getMemOperand());
+}
+
+Register SHTargetLowering::getRegisterByName(const char *RegName, LLT VT,
+                                             const MachineFunction &MF) const {
+  return StringSwitch<Register>(RegName)
+      .Cases({"r15", "sp"}, SH::R15)
+      .Case("gbr", SH::GBR)
+      .Default(Register());
 }
 
 // The five pointers of the va_list that LowerVASTART() describes.
