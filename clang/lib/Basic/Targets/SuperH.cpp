@@ -41,9 +41,9 @@ SuperHTargetInfo::SuperHTargetInfo(const llvm::Triple &Triple,
   TLSSupported = true;
   HasFloat128 = false;
 
-  // The operations on up to 32 bits are calls of the __sync functions of
-  // libgcc, which the kernel makes atomic by restarting them.
-  MaxAtomicPromoteWidth = MaxAtomicInlineWidth = 32;
+  // On Linux the operations on up to 32 bits are calls of the __sync
+  // functions of libgcc, which the kernel makes atomic by restarting them.
+  MaxAtomicPromoteWidth = MaxAtomicInlineWidth = Triple.isOSLinux() ? 32 : 0;
 
   resetDataLayout();
 }
@@ -142,6 +142,13 @@ void SuperHTargetInfo::getTargetDefines(const LangOptions &Opts,
                      CPU->Arch != AK_SH2A;
   Builder.defineMacro(Restartable ? "__SH_ATOMIC_MODEL_SOFT_GUSA__"
                                   : "__SH_ATOMIC_MODEL_SOFT_IMASK__");
+  // On Linux libgcc has the operations on up to 32 bits, and the code
+  // generator calls them.
+  if (getTriple().isOSLinux()) {
+    Builder.defineMacro("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1");
+    Builder.defineMacro("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2");
+    Builder.defineMacro("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4");
+  }
 }
 
 // The names that GCC knows, in its order as far as the registers exist

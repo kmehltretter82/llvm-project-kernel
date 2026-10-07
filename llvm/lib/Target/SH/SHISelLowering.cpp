@@ -154,8 +154,39 @@ SHTargetLowering::SHTargetLowering(const TargetMachine &TM,
   if (STI.hasFPU())
     setOperationAction(ISD::VACOPY, MVT::Other, Custom);
 
-  // Atomic operations are library calls.
-  setMaxAtomicSizeInBitsSupported(0);
+  // Atomic operations.  On Linux those on up to 32 bits are the __sync
+  // functions of libgcc: sequences that the kernel starts again if it
+  // interrupted them, which is what GCC makes inline by default.  A load
+  // and a store of a word are atomic as they are, and nothing has to be
+  // fenced on one processor.  Everything else is a call of __atomic_*.
+  if (STI.getTargetTriple().isOSLinux()) {
+    setMaxAtomicSizeInBitsSupported(32);
+    setOperationAction({ISD::ATOMIC_CMP_SWAP, ISD::ATOMIC_SWAP,
+                        ISD::ATOMIC_LOAD_ADD, ISD::ATOMIC_LOAD_SUB,
+                        ISD::ATOMIC_LOAD_AND, ISD::ATOMIC_LOAD_OR,
+                        ISD::ATOMIC_LOAD_XOR, ISD::ATOMIC_LOAD_NAND},
+                       MVT::i32, LibCall);
+    setOperationAction({ISD::ATOMIC_LOAD, ISD::ATOMIC_STORE}, MVT::i32, Custom);
+    setOperationAction(ISD::ATOMIC_FENCE, MVT::Other, Custom);
+  } else {
+    setMaxAtomicSizeInBitsSupported(0);
+  }
+}
+
+TargetLowering::AtomicExpansionKind
+SHTargetLowering::shouldExpandAtomicRMWInIR(const AtomicRMWInst *RMW) const {
+  switch (RMW->getOperation()) {
+  case AtomicRMWInst::Xchg:
+  case AtomicRMWInst::Add:
+  case AtomicRMWInst::Sub:
+  case AtomicRMWInst::And:
+  case AtomicRMWInst::Or:
+  case AtomicRMWInst::Xor:
+  case AtomicRMWInst::Nand:
+    return AtomicExpansionKind::None;
+  default:
+    return AtomicExpansionKind::CmpXChg;
+  }
 }
 
 SDValue SHTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
@@ -183,6 +214,11 @@ SDValue SHTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
   case ISD::SRL:
   case ISD::SRA:
     return LowerShift(Op, DAG);
+  case ISD::ATOMIC_LOAD:
+  case ISD::ATOMIC_STORE:
+    return LowerAtomicLoadStore(Op, DAG);
+  case ISD::ATOMIC_FENCE:
+    return Op.getOperand(0);
   case ISD::FRAMEADDR:
     return LowerFRAMEADDR(Op, DAG);
   case ISD::RETURNADDR:
@@ -585,6 +621,23 @@ SDValue SHTargetLowering::LowerShift(SDValue Op, SelectionDAG &DAG) const {
   SDValue Ops[] = {Op.getOperand(0), Op.getOperand(1)};
   MakeLibCallOptions Options;
   return makeLibCall(DAG, LC, MVT::i32, Ops, Options, SDLoc(Op)).first;
+}
+
+// An atomic load or store of up to a word is a load or a store.
+SDValue SHTargetLowering::LowerAtomicLoadStore(SDValue Op,
+                                               SelectionDAG &DAG) const {
+  const auto *Node = cast<AtomicSDNode>(Op);
+  SDLoc DL(Op);
+  if (Op.getOpcode() == ISD::ATOMIC_STORE)
+    return DAG.getTruncStore(Node->getChain(), DL, Node->getVal(),
+                             Node->getBasePtr(), Node->getMemoryVT(),
+                             Node->getMemOperand());
+  ISD::LoadExtType Ext = Node->getExtensionType();
+  if (Ext == ISD::NON_EXTLOAD && Node->getMemoryVT() != Op.getValueType())
+    Ext = ISD::EXTLOAD;
+  return DAG.getExtLoad(Ext, DL, Op.getValueType(), Node->getChain(),
+                        Node->getBasePtr(), Node->getMemoryVT(),
+                        Node->getMemOperand());
 }
 
 // The five pointers of the va_list that LowerVASTART() describes.

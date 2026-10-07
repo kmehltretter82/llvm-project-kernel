@@ -47,6 +47,11 @@ public:
     return MVT::i32;
   }
 
+  /// What libgcc has no function for becomes a loop around a compare and
+  /// swap.
+  AtomicExpansionKind
+  shouldExpandAtomicRMWInIR(const AtomicRMWInst *RMW) const override;
+
   /// The registers for the first words of a structure that is passed by
   /// value.
   void HandleByVal(CCState *State, unsigned &Size,
@@ -71,6 +76,7 @@ private:
   SDValue LowerVASTART(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerVACOPY(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerShift(SDValue Op, SelectionDAG &DAG) const;
+  SDValue LowerAtomicLoadStore(SDValue Op, SelectionDAG &DAG) const;
   CCAssignFn *getArgConvention() const;
   SDValue LowerFRAMEADDR(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerRETURNADDR(SDValue Op, SelectionDAG &DAG) const;
