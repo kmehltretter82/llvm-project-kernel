@@ -8,9 +8,8 @@ define i32 @shl1(i32 %a) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    mov r4,r0
-; CHECK-NEXT:    add r0,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    add r0,r0
   %r = shl i32 %a, 1
   ret i32 %r
 }
@@ -20,9 +19,8 @@ define i32 @shl2(i32 %a) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    mov r4,r0
-; CHECK-NEXT:    shll2 r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    shll2 r0
   %r = shl i32 %a, 2
   ret i32 %r
 }
@@ -32,9 +30,8 @@ define i32 @shl8(i32 %a) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    mov r4,r0
-; CHECK-NEXT:    shll8 r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    shll8 r0
   %r = shl i32 %a, 8
   ret i32 %r
 }
@@ -44,9 +41,8 @@ define i32 @shl16(i32 %a) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    mov r4,r0
-; CHECK-NEXT:    shll16 r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    shll16 r0
   %r = shl i32 %a, 16
   ret i32 %r
 }
@@ -56,9 +52,8 @@ define i32 @lshr1(i32 %a) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    mov r4,r0
-; CHECK-NEXT:    shlr r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    shlr r0
   %r = lshr i32 %a, 1
   ret i32 %r
 }
@@ -68,9 +63,8 @@ define i32 @lshr2(i32 %a) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    mov r4,r0
-; CHECK-NEXT:    shlr2 r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    shlr2 r0
   %r = lshr i32 %a, 2
   ret i32 %r
 }
@@ -80,9 +74,8 @@ define i32 @ashr1(i32 %a) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    mov r4,r0
-; CHECK-NEXT:    shar r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    shar r0
   %r = ashr i32 %a, 1
   ret i32 %r
 }
@@ -96,9 +89,8 @@ define i32 @shl5(i32 %a) {
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    mov r4,r0
 ; CHECK-NEXT:    mov #5,r1
-; CHECK-NEXT:    shld r1,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    shld r1,r0
   %r = shl i32 %a, 5
   ret i32 %r
 }
@@ -109,9 +101,8 @@ define i32 @lshr5(i32 %a) {
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    mov r4,r0
 ; CHECK-NEXT:    mov #-5,r1
-; CHECK-NEXT:    shld r1,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    shld r1,r0
   %r = lshr i32 %a, 5
   ret i32 %r
 }
@@ -122,9 +113,8 @@ define i32 @ashr5(i32 %a) {
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    mov r4,r0
 ; CHECK-NEXT:    mov #-5,r1
-; CHECK-NEXT:    shad r1,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    shad r1,r0
   %r = ashr i32 %a, 5
   ret i32 %r
 }
@@ -134,9 +124,8 @@ define i32 @shl_var(i32 %a, i32 %n) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    mov r4,r0
-; CHECK-NEXT:    shld r5,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    shld r5,r0
   %r = shl i32 %a, %n
   ret i32 %r
 }
@@ -147,9 +136,8 @@ define i32 @lshr_var(i32 %a, i32 %n) {
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    mov r4,r0
 ; CHECK-NEXT:    neg r5,r1
-; CHECK-NEXT:    shld r1,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    shld r1,r0
   %r = lshr i32 %a, %n
   ret i32 %r
 }
@@ -160,9 +148,8 @@ define i32 @ashr_var(i32 %a, i32 %n) {
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    mov r4,r0
 ; CHECK-NEXT:    neg r5,r1
-; CHECK-NEXT:    shad r1,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    shad r1,r0
   %r = ashr i32 %a, %n
   ret i32 %r
 }
@@ -174,9 +161,8 @@ define i32 @rot16(i32 %a) {
 ; CHECK-NEXT:    mov r4,r0
 ; CHECK-NEXT:    shlr16 r0
 ; CHECK-NEXT:    shll16 r4
-; CHECK-NEXT:    or r4,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    or r4,r0
   %r = call i32 @llvm.fshl.i32(i32 %a, i32 %a, i32 16)
   ret i32 %r
 }

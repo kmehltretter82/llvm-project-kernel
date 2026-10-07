@@ -8,9 +8,8 @@ define i32 @eq(i32 %a, i32 %b) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    cmp/eq r5,r4
-; CHECK-NEXT:    movt r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    movt r0
   %c = icmp eq i32 %a, %b
   %r = zext i1 %c to i32
   ret i32 %r
@@ -22,9 +21,8 @@ define i32 @ne(i32 %a, i32 %b) {
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    cmp/eq r5,r4
 ; CHECK-NEXT:    mov #-1,r0
-; CHECK-NEXT:    negc r0,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    negc r0,r0
   %c = icmp ne i32 %a, %b
   %r = zext i1 %c to i32
   ret i32 %r
@@ -35,9 +33,8 @@ define i32 @slt(i32 %a, i32 %b) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    cmp/gt r4,r5
-; CHECK-NEXT:    movt r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    movt r0
   %c = icmp slt i32 %a, %b
   %r = zext i1 %c to i32
   ret i32 %r
@@ -48,9 +45,8 @@ define i32 @sge(i32 %a, i32 %b) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    cmp/ge r5,r4
-; CHECK-NEXT:    movt r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    movt r0
   %c = icmp sge i32 %a, %b
   %r = zext i1 %c to i32
   ret i32 %r
@@ -61,9 +57,8 @@ define i32 @sgt(i32 %a, i32 %b) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    cmp/gt r5,r4
-; CHECK-NEXT:    movt r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    movt r0
   %c = icmp sgt i32 %a, %b
   %r = zext i1 %c to i32
   ret i32 %r
@@ -74,9 +69,8 @@ define i32 @ult(i32 %a, i32 %b) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    cmp/hi r4,r5
-; CHECK-NEXT:    movt r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    movt r0
   %c = icmp ult i32 %a, %b
   %r = zext i1 %c to i32
   ret i32 %r
@@ -87,9 +81,8 @@ define i32 @ugt(i32 %a, i32 %b) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    cmp/hi r5,r4
-; CHECK-NEXT:    movt r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    movt r0
   %c = icmp ugt i32 %a, %b
   %r = zext i1 %c to i32
   ret i32 %r
@@ -102,9 +95,8 @@ define i32 @eq0(i32 %a) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    tst r4,r4
-; CHECK-NEXT:    movt r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    movt r0
   %c = icmp eq i32 %a, 0
   %r = zext i1 %c to i32
   ret i32 %r
@@ -115,9 +107,8 @@ define i32 @gt0(i32 %a) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    cmp/pl r4
-; CHECK-NEXT:    movt r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    movt r0
   %c = icmp sgt i32 %a, 0
   %r = zext i1 %c to i32
   ret i32 %r
@@ -129,9 +120,8 @@ define i32 @ge0(i32 %a) {
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    not r4,r0
 ; CHECK-NEXT:    mov #-31,r1
-; CHECK-NEXT:    shld r1,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    shld r1,r0
   %c = icmp sge i32 %a, 0
   %r = zext i1 %c to i32
   ret i32 %r
@@ -142,9 +132,8 @@ define i32 @test_bits(i32 %a, i32 %b) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    tst r5,r4
-; CHECK-NEXT:    movt r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    movt r0
   %m = and i32 %a, %b
   %c = icmp eq i32 %m, 0
   %r = zext i1 %c to i32
@@ -219,9 +208,8 @@ define i32 @eq64(i64 %a, i64 %b) {
 ; CHECK-NEXT:    xor r6,r4
 ; CHECK-NEXT:    or r5,r4
 ; CHECK-NEXT:    tst r4,r4
-; CHECK-NEXT:    movt r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    movt r0
   %c = icmp eq i64 %a, %b
   %r = zext i1 %c to i32
   ret i32 %r

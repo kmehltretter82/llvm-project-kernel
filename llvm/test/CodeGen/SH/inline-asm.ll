@@ -61,9 +61,8 @@ define i32 @memory_stack() {
 ; CHECK-NEXT:    !APP
 ; CHECK-NEXT:    mov.l @r1,r0
 ; CHECK-NEXT:    !NO_APP
-; CHECK-NEXT:    add #4,r15
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    add #4,r15
   %slot = alloca i32
   store i32 7, ptr %slot
   %r = call i32 asm "mov.l $1,$0", "=r,*m"(ptr elementtype(i32) %slot)
@@ -98,10 +97,9 @@ define i32 @clobbers(i32 %a, i32 %b) {
 ; CHECK-NEXT:    !APP
 ; CHECK-NEXT:    mul.l r0,r5
 ; CHECK-NEXT:    !NO_APP
-; CHECK-NEXT:    add r5,r0
 ; CHECK-NEXT:    lds.l @r15+,pr
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    add r5,r0
   call void asm "mul.l $0,$1", "r,r,~{macl},~{mach},~{pr},~{r1}"(i32 %a, i32 %b)
   %s = add i32 %a, %b
   ret i32 %s
@@ -112,9 +110,8 @@ define i32 @stack_pointer() {
 ; CHECK-LABEL: stack_pointer:
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
-; CHECK-NEXT:    mov r15,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov r15,r0
   %r = call i32 @llvm.read_register.i32(metadata !0)
   ret i32 %r
 }

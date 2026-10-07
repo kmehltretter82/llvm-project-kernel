@@ -8,9 +8,8 @@ define i32 @mul(i32 %a, i32 %b) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    mul.l r5,r4
-; CHECK-NEXT:    sts macl,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    sts macl,r0
   %r = mul i32 %a, %b
   ret i32 %r
 }
@@ -22,9 +21,8 @@ define i64 @umul_wide(i32 %a, i32 %b) {
 ; CHECK-NEXT:    mul.l r5,r4
 ; CHECK-NEXT:    sts macl,r0
 ; CHECK-NEXT:    dmulu.l r5,r4
-; CHECK-NEXT:    sts mach,r1
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    sts mach,r1
   %x = zext i32 %a to i64
   %y = zext i32 %b to i64
   %r = mul i64 %x, %y
@@ -38,9 +36,8 @@ define i64 @smul_wide(i32 %a, i32 %b) {
 ; CHECK-NEXT:    mul.l r5,r4
 ; CHECK-NEXT:    sts macl,r0
 ; CHECK-NEXT:    dmuls.l r5,r4
-; CHECK-NEXT:    sts mach,r1
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    sts mach,r1
   %x = sext i32 %a to i64
   %y = sext i32 %b to i64
   %r = mul i64 %x, %y
@@ -106,19 +103,17 @@ define i32 @srem(i32 %a, i32 %b) {
 ; CHECK-NEXT:    .cfi_def_cfa_offset 12
 ; CHECK-NEXT:    .cfi_offset pr, -12
 ; CHECK-NEXT:    mov r5,r8
-; CHECK-NEXT:    mov r4,r9
 ; CHECK-NEXT:    mov.l .Ltmp2,r1
 ; CHECK-NEXT:    jsr @r1
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov r4,r9
 ; CHECK-NEXT:    mul.l r8,r0
 ; CHECK-NEXT:    sts macl,r1
 ; CHECK-NEXT:    sub r1,r9
 ; CHECK-NEXT:    mov r9,r0
 ; CHECK-NEXT:    lds.l @r15+,pr
 ; CHECK-NEXT:    mov.l @r15+,r9
-; CHECK-NEXT:    mov.l @r15+,r8
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov.l @r15+,r8
 ; CHECK-NEXT:    .p2align 2
 ; CHECK-NEXT:  ! %bb.1:
 ; CHECK-NEXT:  .Ltmp2:
@@ -141,19 +136,17 @@ define i32 @urem(i32 %a, i32 %b) {
 ; CHECK-NEXT:    .cfi_def_cfa_offset 12
 ; CHECK-NEXT:    .cfi_offset pr, -12
 ; CHECK-NEXT:    mov r5,r8
-; CHECK-NEXT:    mov r4,r9
 ; CHECK-NEXT:    mov.l .Ltmp3,r1
 ; CHECK-NEXT:    jsr @r1
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov r4,r9
 ; CHECK-NEXT:    mul.l r8,r0
 ; CHECK-NEXT:    sts macl,r1
 ; CHECK-NEXT:    sub r1,r9
 ; CHECK-NEXT:    mov r9,r0
 ; CHECK-NEXT:    lds.l @r15+,pr
 ; CHECK-NEXT:    mov.l @r15+,r9
-; CHECK-NEXT:    mov.l @r15+,r8
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov.l @r15+,r8
 ; CHECK-NEXT:    .p2align 2
 ; CHECK-NEXT:  ! %bb.1:
 ; CHECK-NEXT:  .Ltmp3:

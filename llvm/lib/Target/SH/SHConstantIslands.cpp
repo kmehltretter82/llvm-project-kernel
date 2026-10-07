@@ -32,7 +32,12 @@
 //
 // The delay slots are filled after this pass, so a branch with a slot
 // counts as four bytes here.  Filling a slot with an instruction from in
-// front of the branch makes the code shorter, which no distance minds.
+// front of the branch makes the code two bytes shorter.  Not every distance
+// gets shorter with it: the padding in front of literals can give the two
+// bytes back, and a load counts from its own address rounded down to a
+// multiple of four.  A load can be four bytes further from its literal
+// than planned and a branch two bytes further from its target, however
+// many slots are filled, and the limits below leave that room.
 //
 //===----------------------------------------------------------------------===//
 
@@ -71,13 +76,15 @@ public:
 
 private:
   /// The displacement of a load is at most 1020 bytes from the address of
-  /// the load, rounded down to a multiple of four, plus four.  The margin
-  /// is for the sizes that are estimates: inline assembly, and with it the
-  /// padding in front of the literals behind it.
-  static constexpr int Reach = 1000;
-  /// What a bt or bf and a bra reach, with the same margin.
-  static constexpr int CondReach = 246;
-  static constexpr int BraReach = 4078;
+  /// the load, rounded down to a multiple of four, plus four.  Twenty bytes
+  /// of margin are for the sizes that are estimates: inline assembly, and
+  /// with it the padding in front of the literals behind it.  Four more
+  /// are for the delay slots that are filled later.
+  static constexpr int Reach = 996;
+  /// What a bt or bf (254 bytes) and a bra (4094) reach, with eight and
+  /// sixteen bytes for the estimates and two for the delay slots.
+  static constexpr int CondReach = 244;
+  static constexpr int BraReach = 4076;
 
   struct Literal {
     MachineOperand Value;
@@ -119,6 +126,9 @@ private:
 } // namespace
 
 char SHConstantIslands::ID = 0;
+
+INITIALIZE_PASS(SHConstantIslands, DEBUG_TYPE,
+                "SuperH literal placement and branch relaxation", false, false)
 
 FunctionPass *llvm::createSHConstantIslandsPass() {
   return new SHConstantIslands();

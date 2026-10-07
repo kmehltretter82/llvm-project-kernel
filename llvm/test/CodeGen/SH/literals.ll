@@ -11,9 +11,8 @@ define i32 @small() {
 ; CHECK-LABEL: small:
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
-; CHECK-NEXT:    mov #127,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov #127,r0
   ret i32 127
 }
 
@@ -21,9 +20,8 @@ define i32 @negative() {
 ; CHECK-LABEL: negative:
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
-; CHECK-NEXT:    mov #-128,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov #-128,r0
   ret i32 -128
 }
 
@@ -63,9 +61,8 @@ define i32 @twice(i32 %a) {
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    mov.l .Ltmp2,r0
 ; CHECK-NEXT:    add r0,r4
-; CHECK-NEXT:    xor r4,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    xor r4,r0
 ; CHECK-NEXT:    .p2align 2
 ; CHECK-NEXT:  ! %bb.1:
 ; CHECK-NEXT:  .Ltmp2:
@@ -94,9 +91,8 @@ define ptr @address_offset() {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    mov.l .Ltmp4,r0
-; CHECK-NEXT:    add #100,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    add #100,r0
 ; CHECK-NEXT:    .p2align 2
 ; CHECK-NEXT:  ! %bb.1:
 ; CHECK-NEXT:  .Ltmp4:
@@ -127,9 +123,8 @@ define void @behind_branch(i32 %a) {
 ; CHECK-NEXT:    jsr @r8
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    lds.l @r15+,pr
-; CHECK-NEXT:    mov.l @r15+,r8
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov.l @r15+,r8
 ; CHECK-NEXT:    .p2align 2
 ; CHECK-NEXT:  ! %bb.3:
 ; CHECK-NEXT:  .Ltmp5:
@@ -167,29 +162,23 @@ define i32 @jump_table(i32 %a) {
 ; CHECK-NEXT:  .Ltmp8:
 ; CHECK-NEXT:    .ualong .LJTI8_0
 ; CHECK-NEXT:  .LBB8_2: ! %b0
+; CHECK-NEXT:    rts
 ; CHECK-NEXT:    mov #10,r0
-; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
 ; CHECK-NEXT:  .LBB8_6: ! %b4
+; CHECK-NEXT:    rts
 ; CHECK-NEXT:    mov #54,r0
-; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
 ; CHECK-NEXT:  .LBB8_4: ! %b2
+; CHECK-NEXT:    rts
 ; CHECK-NEXT:    mov #32,r0
-; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
 ; CHECK-NEXT:  .LBB8_5: ! %b3
+; CHECK-NEXT:    rts
 ; CHECK-NEXT:    mov #43,r0
-; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
 ; CHECK-NEXT:  .LBB8_3: ! %b1
+; CHECK-NEXT:    rts
 ; CHECK-NEXT:    mov #21,r0
-; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
 ; CHECK-NEXT:  .LBB8_7: ! %d
-; CHECK-NEXT:    mov #0,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov #0,r0
   switch i32 %a, label %d [
     i32 0, label %b0
     i32 1, label %b1

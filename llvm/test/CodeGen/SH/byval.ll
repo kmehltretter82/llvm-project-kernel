@@ -42,9 +42,8 @@ define void @pass(ptr %p) {
 ; CHECK-NEXT:    mov.l @(4,r4),r6
 ; CHECK-NEXT:    mov.l @r4,r5
 ; CHECK-NEXT:    mov.l .Ltmp0,r1
-; CHECK-NEXT:    mov #1,r4
 ; CHECK-NEXT:    jsr @r1
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov #1,r4
 ; CHECK-NEXT:    add #72,r15
 ; CHECK-NEXT:    lds.l @r15+,pr
 ; CHECK-NEXT:    rts
@@ -164,9 +163,8 @@ define void @pass_bytes(ptr %p) {
 ; CHECK-NEXT:    extu.w r0,r7
 ; CHECK-NEXT:    or r2,r7
 ; CHECK-NEXT:    mov.l .Ltmp1,r2
-; CHECK-NEXT:    mov r1,r4
 ; CHECK-NEXT:    jsr @r2
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov r1,r4
 ; CHECK-NEXT:    add #84,r15
 ; CHECK-NEXT:    lds.l @r15+,pr
 ; CHECK-NEXT:    rts
@@ -195,9 +193,8 @@ define i32 @get(i32 %a, ptr byval(%big) align 4 %s, i32 %b) {
 ; CHECK-NEXT:    add r15,r0
 ; CHECK-NEXT:    mov.l @r0,r0
 ; CHECK-NEXT:    add r1,r0
-; CHECK-NEXT:    add #12,r15
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    add #12,r15
   %p0 = getelementptr %big, ptr %s, i32 0, i32 0, i32 0
   %p5 = getelementptr %big, ptr %s, i32 0, i32 0, i32 5
   %v0 = load i32, ptr %p0

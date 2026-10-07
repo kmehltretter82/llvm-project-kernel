@@ -14,10 +14,9 @@ define void @local() {
 ; CHECK-NEXT:    .cfi_offset pr, -4
 ; CHECK-NEXT:    add #-16,r15
 ; CHECK-NEXT:    .cfi_def_cfa_offset 20
-; CHECK-NEXT:    mov r15,r4
 ; CHECK-NEXT:    mov.l .Ltmp0,r1
 ; CHECK-NEXT:    jsr @r1
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov r15,r4
 ; CHECK-NEXT:    add #16,r15
 ; CHECK-NEXT:    lds.l @r15+,pr
 ; CHECK-NEXT:    rts
@@ -47,16 +46,14 @@ define void @frame_pointer() "frame-pointer"="all" {
 ; CHECK-NEXT:    .cfi_def_cfa_offset 24
 ; CHECK-NEXT:    mov r15,r14
 ; CHECK-NEXT:    .cfi_def_cfa_register r14
-; CHECK-NEXT:    mov r14,r4
 ; CHECK-NEXT:    mov.l .Ltmp1,r1
 ; CHECK-NEXT:    jsr @r1
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov r14,r4
 ; CHECK-NEXT:    mov r14,r15
 ; CHECK-NEXT:    add #16,r15
 ; CHECK-NEXT:    lds.l @r15+,pr
-; CHECK-NEXT:    mov.l @r15+,r14
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov.l @r15+,r14
 ; CHECK-NEXT:    .p2align 2
 ; CHECK-NEXT:  ! %bb.1:
 ; CHECK-NEXT:  .Ltmp1:
@@ -81,10 +78,9 @@ define i32 @large(i32 %v) {
 ; CHECK-NEXT:    mov.l .Ltmp3,r1
 ; CHECK-NEXT:    add r15,r1
 ; CHECK-NEXT:    mov.l r4,@r1
-; CHECK-NEXT:    mov r15,r4
 ; CHECK-NEXT:    mov.l .Ltmp4,r1
 ; CHECK-NEXT:    jsr @r1
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov r15,r4
 ; CHECK-NEXT:    mov.l .Ltmp3,r0
 ; CHECK-NEXT:    add r15,r0
 ; CHECK-NEXT:    mov.l @r0,r0
@@ -129,9 +125,8 @@ define i32 @dynamic(i32 %n) {
 ; CHECK-NEXT:    sub r4,r1
 ; CHECK-NEXT:    mov r1,r15
 ; CHECK-NEXT:    mov.l .Ltmp6,r2
-; CHECK-NEXT:    mov r1,r4
 ; CHECK-NEXT:    jsr @r2
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov r1,r4
 ; CHECK-NEXT:    add #-8,r15
 ; CHECK-NEXT:    mov #6,r1
 ; CHECK-NEXT:    mov.l r1,@(4,r15)
@@ -141,15 +136,13 @@ define i32 @dynamic(i32 %n) {
 ; CHECK-NEXT:    mov #1,r4
 ; CHECK-NEXT:    mov #2,r5
 ; CHECK-NEXT:    mov #3,r6
-; CHECK-NEXT:    mov #4,r7
 ; CHECK-NEXT:    jsr @r1
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov #4,r7
 ; CHECK-NEXT:    add #8,r15
 ; CHECK-NEXT:    mov r14,r15
 ; CHECK-NEXT:    lds.l @r15+,pr
-; CHECK-NEXT:    mov.l @r15+,r14
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov.l @r15+,r14
 ; CHECK-NEXT:    .p2align 2
 ; CHECK-NEXT:  ! %bb.1:
 ; CHECK-NEXT:  .Ltmp6:
@@ -179,15 +172,13 @@ define void @realign() {
 ; CHECK-NEXT:    add #-24,r15
 ; CHECK-NEXT:    mov #-32,r1
 ; CHECK-NEXT:    and r1,r15
-; CHECK-NEXT:    mov r15,r4
 ; CHECK-NEXT:    mov.l .Ltmp8,r1
 ; CHECK-NEXT:    jsr @r1
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov r15,r4
 ; CHECK-NEXT:    mov r14,r15
 ; CHECK-NEXT:    lds.l @r15+,pr
-; CHECK-NEXT:    mov.l @r15+,r14
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov.l @r15+,r14
 ; CHECK-NEXT:    .p2align 2
 ; CHECK-NEXT:  ! %bb.1:
 ; CHECK-NEXT:  .Ltmp8:
@@ -227,21 +218,18 @@ define void @realign_dynamic(i32 %n) {
 ; CHECK-NEXT:    mov r15,r8
 ; CHECK-NEXT:    sub r4,r8
 ; CHECK-NEXT:    mov r8,r15
-; CHECK-NEXT:    mov r13,r4
 ; CHECK-NEXT:    mov.l .Ltmp9,r9
 ; CHECK-NEXT:    jsr @r9
-; CHECK-NEXT:    nop
-; CHECK-NEXT:    mov r8,r4
+; CHECK-NEXT:    mov r13,r4
 ; CHECK-NEXT:    jsr @r9
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov r8,r4
 ; CHECK-NEXT:    mov r14,r15
 ; CHECK-NEXT:    lds.l @r15+,pr
 ; CHECK-NEXT:    mov.l @r15+,r14
 ; CHECK-NEXT:    mov.l @r15+,r13
 ; CHECK-NEXT:    mov.l @r15+,r9
-; CHECK-NEXT:    mov.l @r15+,r8
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov.l @r15+,r8
 ; CHECK-NEXT:    .p2align 2
 ; CHECK-NEXT:  ! %bb.1:
 ; CHECK-NEXT:  .Ltmp9:
@@ -264,9 +252,8 @@ define ptr @frame_address() {
 ; CHECK-NEXT:    .cfi_def_cfa_register r14
 ; CHECK-NEXT:    mov r14,r0
 ; CHECK-NEXT:    mov r14,r15
-; CHECK-NEXT:    mov.l @r15+,r14
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov.l @r15+,r14
   %r = call ptr @llvm.frameaddress(i32 0)
   ret ptr %r
 }
@@ -275,9 +262,8 @@ define ptr @return_address() {
 ; CHECK-LABEL: return_address:
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
-; CHECK-NEXT:    sts pr,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    sts pr,r0
   %r = call ptr @llvm.returnaddress(i32 0)
   ret ptr %r
 }

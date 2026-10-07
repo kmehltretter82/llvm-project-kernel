@@ -9,9 +9,8 @@ define i32 @oeq(double %a, double %b) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    fcmp/eq dr6,dr4
-; CHECK-NEXT:    movt r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    movt r0
   %c = fcmp oeq double %a, %b
   %r = zext i1 %c to i32
   ret i32 %r
@@ -23,9 +22,8 @@ define i32 @une(double %a, double %b) {
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    fcmp/eq dr6,dr4
 ; CHECK-NEXT:    mov #-1,r0
-; CHECK-NEXT:    negc r0,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    negc r0,r0
   %c = fcmp une double %a, %b
   %r = zext i1 %c to i32
   ret i32 %r
@@ -36,9 +34,8 @@ define i32 @ogt(double %a, double %b) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    fcmp/gt dr6,dr4
-; CHECK-NEXT:    movt r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    movt r0
   %c = fcmp ogt double %a, %b
   %r = zext i1 %c to i32
   ret i32 %r
@@ -49,9 +46,8 @@ define i32 @olt(double %a, double %b) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    fcmp/gt dr4,dr6
-; CHECK-NEXT:    movt r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    movt r0
   %c = fcmp olt double %a, %b
   %r = zext i1 %c to i32
   ret i32 %r
@@ -63,9 +59,8 @@ define i32 @ule(double %a, double %b) {
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    fcmp/gt dr6,dr4
 ; CHECK-NEXT:    mov #-1,r0
-; CHECK-NEXT:    negc r0,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    negc r0,r0
   %c = fcmp ule double %a, %b
   %r = zext i1 %c to i32
   ret i32 %r
@@ -77,9 +72,8 @@ define i32 @uge(double %a, double %b) {
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    fcmp/gt dr4,dr6
 ; CHECK-NEXT:    mov #-1,r0
-; CHECK-NEXT:    negc r0,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    negc r0,r0
   %c = fcmp uge double %a, %b
   %r = zext i1 %c to i32
   ret i32 %r
@@ -98,9 +92,8 @@ define i32 @oge(double %a, double %b) {
 ; CHECK-NEXT:    fcmp/eq dr4,dr4
 ; CHECK-NEXT:    movt r0
 ; CHECK-NEXT:    and r2,r0
-; CHECK-NEXT:    and r1,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    and r1,r0
   %c = fcmp oge double %a, %b
   %r = zext i1 %c to i32
   ret i32 %r
@@ -116,9 +109,8 @@ define i32 @uno(double %a, double %b) {
 ; CHECK-NEXT:    fcmp/eq dr4,dr4
 ; CHECK-NEXT:    mov #-1,r0
 ; CHECK-NEXT:    negc r0,r0
-; CHECK-NEXT:    or r1,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    or r1,r0
   %c = fcmp uno double %a, %b
   %r = zext i1 %c to i32
   ret i32 %r

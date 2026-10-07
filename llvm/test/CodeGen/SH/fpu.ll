@@ -13,18 +13,16 @@ define double @dadd(double %a, double %b) {
 ; SH4-NEXT:  ! %bb.0:
 ; SH4-NEXT:    fmov fr4,fr0
 ; SH4-NEXT:    fmov fr5,fr1
-; SH4-NEXT:    fadd dr6,dr0
 ; SH4-NEXT:    rts
-; SH4-NEXT:    nop
+; SH4-NEXT:    fadd dr6,dr0
 ;
 ; SH4A-LABEL: dadd:
 ; SH4A:         .cfi_startproc
 ; SH4A-NEXT:  ! %bb.0:
 ; SH4A-NEXT:    fmov fr4,fr0
 ; SH4A-NEXT:    fmov fr5,fr1
-; SH4A-NEXT:    fadd dr6,dr0
 ; SH4A-NEXT:    rts
-; SH4A-NEXT:    nop
+; SH4A-NEXT:    fadd dr6,dr0
 ;
 ; SINGLE-LABEL: dadd:
 ; SINGLE:         .cfi_startproc
@@ -41,9 +39,8 @@ define double @dadd(double %a, double %b) {
 ; SINGLE-NEXT:    shll16 r1
 ; SINGLE-NEXT:    sts fpscr,r2
 ; SINGLE-NEXT:    xor r1,r2
-; SINGLE-NEXT:    lds r2,fpscr
 ; SINGLE-NEXT:    rts
-; SINGLE-NEXT:    nop
+; SINGLE-NEXT:    lds r2,fpscr
   %r = fadd double %a, %b
   ret double %r
 }
@@ -63,9 +60,8 @@ define float @fadd(float %a, float %b) {
 ; SH4-NEXT:    shll16 r1
 ; SH4-NEXT:    sts fpscr,r2
 ; SH4-NEXT:    xor r1,r2
-; SH4-NEXT:    lds r2,fpscr
 ; SH4-NEXT:    rts
-; SH4-NEXT:    nop
+; SH4-NEXT:    lds r2,fpscr
 ;
 ; SH4A-LABEL: fadd:
 ; SH4A:         .cfi_startproc
@@ -73,17 +69,15 @@ define float @fadd(float %a, float %b) {
 ; SH4A-NEXT:    fmov fr5,fr0
 ; SH4A-NEXT:    fpchg
 ; SH4A-NEXT:    fadd fr4,fr0
-; SH4A-NEXT:    fpchg
 ; SH4A-NEXT:    rts
-; SH4A-NEXT:    nop
+; SH4A-NEXT:    fpchg
 ;
 ; SINGLE-LABEL: fadd:
 ; SINGLE:         .cfi_startproc
 ; SINGLE-NEXT:  ! %bb.0:
 ; SINGLE-NEXT:    fmov fr5,fr0
-; SINGLE-NEXT:    fadd fr4,fr0
 ; SINGLE-NEXT:    rts
-; SINGLE-NEXT:    nop
+; SINGLE-NEXT:    fadd fr4,fr0
   %r = fadd float %a, %b
   ret float %r
 }
@@ -105,9 +99,8 @@ define float @fmul_add(float %a, float %b, float %c) {
 ; SH4-NEXT:    shll16 r1
 ; SH4-NEXT:    sts fpscr,r2
 ; SH4-NEXT:    xor r1,r2
-; SH4-NEXT:    lds r2,fpscr
 ; SH4-NEXT:    rts
-; SH4-NEXT:    nop
+; SH4-NEXT:    lds r2,fpscr
 ;
 ; SH4A-LABEL: fmul_add:
 ; SH4A:         .cfi_startproc
@@ -116,18 +109,16 @@ define float @fmul_add(float %a, float %b, float %c) {
 ; SH4A-NEXT:    fpchg
 ; SH4A-NEXT:    fmul fr4,fr0
 ; SH4A-NEXT:    fadd fr7,fr0
-; SH4A-NEXT:    fpchg
 ; SH4A-NEXT:    rts
-; SH4A-NEXT:    nop
+; SH4A-NEXT:    fpchg
 ;
 ; SINGLE-LABEL: fmul_add:
 ; SINGLE:         .cfi_startproc
 ; SINGLE-NEXT:  ! %bb.0:
 ; SINGLE-NEXT:    fmov fr5,fr0
 ; SINGLE-NEXT:    fmul fr4,fr0
-; SINGLE-NEXT:    fadd fr7,fr0
 ; SINGLE-NEXT:    rts
-; SINGLE-NEXT:    nop
+; SINGLE-NEXT:    fadd fr7,fr0
   %m = fmul float %a, %b
   %r = fadd float %m, %c
   ret float %r
@@ -139,18 +130,16 @@ define double @dsub(double %a, double %b) {
 ; SH4-NEXT:  ! %bb.0:
 ; SH4-NEXT:    fmov fr4,fr0
 ; SH4-NEXT:    fmov fr5,fr1
-; SH4-NEXT:    fsub dr6,dr0
 ; SH4-NEXT:    rts
-; SH4-NEXT:    nop
+; SH4-NEXT:    fsub dr6,dr0
 ;
 ; SH4A-LABEL: dsub:
 ; SH4A:         .cfi_startproc
 ; SH4A-NEXT:  ! %bb.0:
 ; SH4A-NEXT:    fmov fr4,fr0
 ; SH4A-NEXT:    fmov fr5,fr1
-; SH4A-NEXT:    fsub dr6,dr0
 ; SH4A-NEXT:    rts
-; SH4A-NEXT:    nop
+; SH4A-NEXT:    fsub dr6,dr0
 ;
 ; SINGLE-LABEL: dsub:
 ; SINGLE:         .cfi_startproc
@@ -167,9 +156,8 @@ define double @dsub(double %a, double %b) {
 ; SINGLE-NEXT:    shll16 r1
 ; SINGLE-NEXT:    sts fpscr,r2
 ; SINGLE-NEXT:    xor r1,r2
-; SINGLE-NEXT:    lds r2,fpscr
 ; SINGLE-NEXT:    rts
-; SINGLE-NEXT:    nop
+; SINGLE-NEXT:    lds r2,fpscr
   %r = fsub double %a, %b
   ret double %r
 }
@@ -180,18 +168,16 @@ define double @ddiv(double %a, double %b) {
 ; SH4-NEXT:  ! %bb.0:
 ; SH4-NEXT:    fmov fr4,fr0
 ; SH4-NEXT:    fmov fr5,fr1
-; SH4-NEXT:    fdiv dr6,dr0
 ; SH4-NEXT:    rts
-; SH4-NEXT:    nop
+; SH4-NEXT:    fdiv dr6,dr0
 ;
 ; SH4A-LABEL: ddiv:
 ; SH4A:         .cfi_startproc
 ; SH4A-NEXT:  ! %bb.0:
 ; SH4A-NEXT:    fmov fr4,fr0
 ; SH4A-NEXT:    fmov fr5,fr1
-; SH4A-NEXT:    fdiv dr6,dr0
 ; SH4A-NEXT:    rts
-; SH4A-NEXT:    nop
+; SH4A-NEXT:    fdiv dr6,dr0
 ;
 ; SINGLE-LABEL: ddiv:
 ; SINGLE:         .cfi_startproc
@@ -208,9 +194,8 @@ define double @ddiv(double %a, double %b) {
 ; SINGLE-NEXT:    shll16 r1
 ; SINGLE-NEXT:    sts fpscr,r2
 ; SINGLE-NEXT:    xor r1,r2
-; SINGLE-NEXT:    lds r2,fpscr
 ; SINGLE-NEXT:    rts
-; SINGLE-NEXT:    nop
+; SINGLE-NEXT:    lds r2,fpscr
   %r = fdiv double %a, %b
   ret double %r
 }
@@ -222,27 +207,24 @@ define double @dneg(double %a) {
 ; SH4-NEXT:  ! %bb.0:
 ; SH4-NEXT:    fmov fr4,fr0
 ; SH4-NEXT:    fmov fr5,fr1
-; SH4-NEXT:    fneg dr0
 ; SH4-NEXT:    rts
-; SH4-NEXT:    nop
+; SH4-NEXT:    fneg dr0
 ;
 ; SH4A-LABEL: dneg:
 ; SH4A:         .cfi_startproc
 ; SH4A-NEXT:  ! %bb.0:
 ; SH4A-NEXT:    fmov fr4,fr0
 ; SH4A-NEXT:    fmov fr5,fr1
-; SH4A-NEXT:    fneg dr0
 ; SH4A-NEXT:    rts
-; SH4A-NEXT:    nop
+; SH4A-NEXT:    fneg dr0
 ;
 ; SINGLE-LABEL: dneg:
 ; SINGLE:         .cfi_startproc
 ; SINGLE-NEXT:  ! %bb.0:
 ; SINGLE-NEXT:    fmov fr4,fr0
 ; SINGLE-NEXT:    fmov fr5,fr1
-; SINGLE-NEXT:    fneg dr0
 ; SINGLE-NEXT:    rts
-; SINGLE-NEXT:    nop
+; SINGLE-NEXT:    fneg dr0
   %r = fneg double %a
   ret double %r
 }
@@ -252,25 +234,22 @@ define float @fabs(float %a) {
 ; SH4:         .cfi_startproc
 ; SH4-NEXT:  ! %bb.0:
 ; SH4-NEXT:    fmov fr5,fr0
-; SH4-NEXT:    fabs fr0
 ; SH4-NEXT:    rts
-; SH4-NEXT:    nop
+; SH4-NEXT:    fabs fr0
 ;
 ; SH4A-LABEL: fabs:
 ; SH4A:         .cfi_startproc
 ; SH4A-NEXT:  ! %bb.0:
 ; SH4A-NEXT:    fmov fr5,fr0
-; SH4A-NEXT:    fabs fr0
 ; SH4A-NEXT:    rts
-; SH4A-NEXT:    nop
+; SH4A-NEXT:    fabs fr0
 ;
 ; SINGLE-LABEL: fabs:
 ; SINGLE:         .cfi_startproc
 ; SINGLE-NEXT:  ! %bb.0:
 ; SINGLE-NEXT:    fmov fr5,fr0
-; SINGLE-NEXT:    fabs fr0
 ; SINGLE-NEXT:    rts
-; SINGLE-NEXT:    nop
+; SINGLE-NEXT:    fabs fr0
   %r = call float @llvm.fabs.f32(float %a)
   ret float %r
 }
@@ -281,18 +260,16 @@ define double @dsqrt(double %a) {
 ; SH4-NEXT:  ! %bb.0:
 ; SH4-NEXT:    fmov fr4,fr0
 ; SH4-NEXT:    fmov fr5,fr1
-; SH4-NEXT:    fsqrt dr0
 ; SH4-NEXT:    rts
-; SH4-NEXT:    nop
+; SH4-NEXT:    fsqrt dr0
 ;
 ; SH4A-LABEL: dsqrt:
 ; SH4A:         .cfi_startproc
 ; SH4A-NEXT:  ! %bb.0:
 ; SH4A-NEXT:    fmov fr4,fr0
 ; SH4A-NEXT:    fmov fr5,fr1
-; SH4A-NEXT:    fsqrt dr0
 ; SH4A-NEXT:    rts
-; SH4A-NEXT:    nop
+; SH4A-NEXT:    fsqrt dr0
 ;
 ; SINGLE-LABEL: dsqrt:
 ; SINGLE:         .cfi_startproc
@@ -309,9 +286,8 @@ define double @dsqrt(double %a) {
 ; SINGLE-NEXT:    shll16 r1
 ; SINGLE-NEXT:    sts fpscr,r2
 ; SINGLE-NEXT:    xor r1,r2
-; SINGLE-NEXT:    lds r2,fpscr
 ; SINGLE-NEXT:    rts
-; SINGLE-NEXT:    nop
+; SINGLE-NEXT:    lds r2,fpscr
   %r = call double @llvm.sqrt.f64(double %a)
   ret double %r
 }
@@ -322,17 +298,15 @@ define double @extend(float %a) {
 ; SH4:         .cfi_startproc
 ; SH4-NEXT:  ! %bb.0:
 ; SH4-NEXT:    flds fr5,fpul
-; SH4-NEXT:    fcnvsd fpul,dr0
 ; SH4-NEXT:    rts
-; SH4-NEXT:    nop
+; SH4-NEXT:    fcnvsd fpul,dr0
 ;
 ; SH4A-LABEL: extend:
 ; SH4A:         .cfi_startproc
 ; SH4A-NEXT:  ! %bb.0:
 ; SH4A-NEXT:    flds fr5,fpul
-; SH4A-NEXT:    fcnvsd fpul,dr0
 ; SH4A-NEXT:    rts
-; SH4A-NEXT:    nop
+; SH4A-NEXT:    fcnvsd fpul,dr0
 ;
 ; SINGLE-LABEL: extend:
 ; SINGLE:         .cfi_startproc
@@ -348,9 +322,8 @@ define double @extend(float %a) {
 ; SINGLE-NEXT:    shll16 r1
 ; SINGLE-NEXT:    sts fpscr,r2
 ; SINGLE-NEXT:    xor r1,r2
-; SINGLE-NEXT:    lds r2,fpscr
 ; SINGLE-NEXT:    rts
-; SINGLE-NEXT:    nop
+; SINGLE-NEXT:    lds r2,fpscr
   %r = fpext float %a to double
   ret double %r
 }
@@ -360,17 +333,15 @@ define float @round(double %a) {
 ; SH4:         .cfi_startproc
 ; SH4-NEXT:  ! %bb.0:
 ; SH4-NEXT:    fcnvds dr4,fpul
-; SH4-NEXT:    fsts fpul,fr0
 ; SH4-NEXT:    rts
-; SH4-NEXT:    nop
+; SH4-NEXT:    fsts fpul,fr0
 ;
 ; SH4A-LABEL: round:
 ; SH4A:         .cfi_startproc
 ; SH4A-NEXT:  ! %bb.0:
 ; SH4A-NEXT:    fcnvds dr4,fpul
-; SH4A-NEXT:    fsts fpul,fr0
 ; SH4A-NEXT:    rts
-; SH4A-NEXT:    nop
+; SH4A-NEXT:    fsts fpul,fr0
 ;
 ; SINGLE-LABEL: round:
 ; SINGLE:         .cfi_startproc
@@ -386,9 +357,8 @@ define float @round(double %a) {
 ; SINGLE-NEXT:    shll16 r1
 ; SINGLE-NEXT:    sts fpscr,r2
 ; SINGLE-NEXT:    xor r1,r2
-; SINGLE-NEXT:    lds r2,fpscr
 ; SINGLE-NEXT:    rts
-; SINGLE-NEXT:    nop
+; SINGLE-NEXT:    lds r2,fpscr
   %r = fptrunc double %a to float
   ret float %r
 }
@@ -398,17 +368,15 @@ define i32 @toint(double %a) {
 ; SH4:         .cfi_startproc
 ; SH4-NEXT:  ! %bb.0:
 ; SH4-NEXT:    ftrc dr4,fpul
-; SH4-NEXT:    sts fpul,r0
 ; SH4-NEXT:    rts
-; SH4-NEXT:    nop
+; SH4-NEXT:    sts fpul,r0
 ;
 ; SH4A-LABEL: toint:
 ; SH4A:         .cfi_startproc
 ; SH4A-NEXT:  ! %bb.0:
 ; SH4A-NEXT:    ftrc dr4,fpul
-; SH4A-NEXT:    sts fpul,r0
 ; SH4A-NEXT:    rts
-; SH4A-NEXT:    nop
+; SH4A-NEXT:    sts fpul,r0
 ;
 ; SINGLE-LABEL: toint:
 ; SINGLE:         .cfi_startproc
@@ -424,9 +392,8 @@ define i32 @toint(double %a) {
 ; SINGLE-NEXT:    shll16 r1
 ; SINGLE-NEXT:    sts fpscr,r2
 ; SINGLE-NEXT:    xor r1,r2
-; SINGLE-NEXT:    lds r2,fpscr
 ; SINGLE-NEXT:    rts
-; SINGLE-NEXT:    nop
+; SINGLE-NEXT:    lds r2,fpscr
   %r = fptosi double %a to i32
   ret i32 %r
 }
@@ -446,9 +413,8 @@ define i32 @ftoint(float %a) {
 ; SH4-NEXT:    shll16 r1
 ; SH4-NEXT:    sts fpscr,r2
 ; SH4-NEXT:    xor r1,r2
-; SH4-NEXT:    lds r2,fpscr
 ; SH4-NEXT:    rts
-; SH4-NEXT:    nop
+; SH4-NEXT:    lds r2,fpscr
 ;
 ; SH4A-LABEL: ftoint:
 ; SH4A:         .cfi_startproc
@@ -456,17 +422,15 @@ define i32 @ftoint(float %a) {
 ; SH4A-NEXT:    fpchg
 ; SH4A-NEXT:    ftrc fr5,fpul
 ; SH4A-NEXT:    sts fpul,r0
-; SH4A-NEXT:    fpchg
 ; SH4A-NEXT:    rts
-; SH4A-NEXT:    nop
+; SH4A-NEXT:    fpchg
 ;
 ; SINGLE-LABEL: ftoint:
 ; SINGLE:         .cfi_startproc
 ; SINGLE-NEXT:  ! %bb.0:
 ; SINGLE-NEXT:    ftrc fr5,fpul
-; SINGLE-NEXT:    sts fpul,r0
 ; SINGLE-NEXT:    rts
-; SINGLE-NEXT:    nop
+; SINGLE-NEXT:    sts fpul,r0
   %r = fptosi float %a to i32
   ret i32 %r
 }
@@ -476,17 +440,15 @@ define double @fromint(i32 %a) {
 ; SH4:         .cfi_startproc
 ; SH4-NEXT:  ! %bb.0:
 ; SH4-NEXT:    lds r4,fpul
-; SH4-NEXT:    float fpul,dr0
 ; SH4-NEXT:    rts
-; SH4-NEXT:    nop
+; SH4-NEXT:    float fpul,dr0
 ;
 ; SH4A-LABEL: fromint:
 ; SH4A:         .cfi_startproc
 ; SH4A-NEXT:  ! %bb.0:
 ; SH4A-NEXT:    lds r4,fpul
-; SH4A-NEXT:    float fpul,dr0
 ; SH4A-NEXT:    rts
-; SH4A-NEXT:    nop
+; SH4A-NEXT:    float fpul,dr0
 ;
 ; SINGLE-LABEL: fromint:
 ; SINGLE:         .cfi_startproc
@@ -502,9 +464,8 @@ define double @fromint(i32 %a) {
 ; SINGLE-NEXT:    shll16 r1
 ; SINGLE-NEXT:    sts fpscr,r2
 ; SINGLE-NEXT:    xor r1,r2
-; SINGLE-NEXT:    lds r2,fpscr
 ; SINGLE-NEXT:    rts
-; SINGLE-NEXT:    nop
+; SINGLE-NEXT:    lds r2,fpscr
   %r = sitofp i32 %a to double
   ret double %r
 }
@@ -514,25 +475,22 @@ define float @bits(i32 %a) {
 ; SH4:         .cfi_startproc
 ; SH4-NEXT:  ! %bb.0:
 ; SH4-NEXT:    lds r4,fpul
-; SH4-NEXT:    fsts fpul,fr0
 ; SH4-NEXT:    rts
-; SH4-NEXT:    nop
+; SH4-NEXT:    fsts fpul,fr0
 ;
 ; SH4A-LABEL: bits:
 ; SH4A:         .cfi_startproc
 ; SH4A-NEXT:  ! %bb.0:
 ; SH4A-NEXT:    lds r4,fpul
-; SH4A-NEXT:    fsts fpul,fr0
 ; SH4A-NEXT:    rts
-; SH4A-NEXT:    nop
+; SH4A-NEXT:    fsts fpul,fr0
 ;
 ; SINGLE-LABEL: bits:
 ; SINGLE:         .cfi_startproc
 ; SINGLE-NEXT:  ! %bb.0:
 ; SINGLE-NEXT:    lds r4,fpul
-; SINGLE-NEXT:    fsts fpul,fr0
 ; SINGLE-NEXT:    rts
-; SINGLE-NEXT:    nop
+; SINGLE-NEXT:    fsts fpul,fr0
   %r = bitcast i32 %a to float
   ret float %r
 }
@@ -542,25 +500,22 @@ define i32 @tobits(float %a) {
 ; SH4:         .cfi_startproc
 ; SH4-NEXT:  ! %bb.0:
 ; SH4-NEXT:    flds fr5,fpul
-; SH4-NEXT:    sts fpul,r0
 ; SH4-NEXT:    rts
-; SH4-NEXT:    nop
+; SH4-NEXT:    sts fpul,r0
 ;
 ; SH4A-LABEL: tobits:
 ; SH4A:         .cfi_startproc
 ; SH4A-NEXT:  ! %bb.0:
 ; SH4A-NEXT:    flds fr5,fpul
-; SH4A-NEXT:    sts fpul,r0
 ; SH4A-NEXT:    rts
-; SH4A-NEXT:    nop
+; SH4A-NEXT:    sts fpul,r0
 ;
 ; SINGLE-LABEL: tobits:
 ; SINGLE:         .cfi_startproc
 ; SINGLE-NEXT:  ! %bb.0:
 ; SINGLE-NEXT:    flds fr5,fpul
-; SINGLE-NEXT:    sts fpul,r0
 ; SINGLE-NEXT:    rts
-; SINGLE-NEXT:    nop
+; SINGLE-NEXT:    sts fpul,r0
   %r = bitcast float %a to i32
   ret i32 %r
 }
@@ -573,9 +528,8 @@ define double @constant() {
 ; SH4-NEXT:    mov.l .Ltmp0,r1
 ; SH4-NEXT:    fmov.s @r1+,fr1
 ; SH4-NEXT:    fmov.s @r1,fr0
-; SH4-NEXT:    add #-4,r1
 ; SH4-NEXT:    rts
-; SH4-NEXT:    nop
+; SH4-NEXT:    add #-4,r1
 ; SH4-NEXT:    .p2align 2
 ; SH4-NEXT:  ! %bb.1:
 ; SH4-NEXT:  .Ltmp0:
@@ -587,9 +541,8 @@ define double @constant() {
 ; SH4A-NEXT:    mov.l .Ltmp0,r1
 ; SH4A-NEXT:    fmov.s @r1+,fr1
 ; SH4A-NEXT:    fmov.s @r1,fr0
-; SH4A-NEXT:    add #-4,r1
 ; SH4A-NEXT:    rts
-; SH4A-NEXT:    nop
+; SH4A-NEXT:    add #-4,r1
 ; SH4A-NEXT:    .p2align 2
 ; SH4A-NEXT:  ! %bb.1:
 ; SH4A-NEXT:  .Ltmp0:
@@ -601,9 +554,8 @@ define double @constant() {
 ; SINGLE-NEXT:    mov.l .Ltmp0,r1
 ; SINGLE-NEXT:    fmov.s @r1+,fr1
 ; SINGLE-NEXT:    fmov.s @r1,fr0
-; SINGLE-NEXT:    add #-4,r1
 ; SINGLE-NEXT:    rts
-; SINGLE-NEXT:    nop
+; SINGLE-NEXT:    add #-4,r1
 ; SINGLE-NEXT:    .p2align 2
 ; SINGLE-NEXT:  ! %bb.1:
 ; SINGLE-NEXT:  .Ltmp0:
@@ -618,27 +570,24 @@ define double @load(ptr %p) {
 ; SH4-NEXT:  ! %bb.0:
 ; SH4-NEXT:    fmov.s @r4+,fr1
 ; SH4-NEXT:    fmov.s @r4,fr0
-; SH4-NEXT:    add #-4,r4
 ; SH4-NEXT:    rts
-; SH4-NEXT:    nop
+; SH4-NEXT:    add #-4,r4
 ;
 ; SH4A-LABEL: load:
 ; SH4A:         .cfi_startproc
 ; SH4A-NEXT:  ! %bb.0:
 ; SH4A-NEXT:    fmov.s @r4+,fr1
 ; SH4A-NEXT:    fmov.s @r4,fr0
-; SH4A-NEXT:    add #-4,r4
 ; SH4A-NEXT:    rts
-; SH4A-NEXT:    nop
+; SH4A-NEXT:    add #-4,r4
 ;
 ; SINGLE-LABEL: load:
 ; SINGLE:         .cfi_startproc
 ; SINGLE-NEXT:  ! %bb.0:
 ; SINGLE-NEXT:    fmov.s @r4+,fr1
 ; SINGLE-NEXT:    fmov.s @r4,fr0
-; SINGLE-NEXT:    add #-4,r4
 ; SINGLE-NEXT:    rts
-; SINGLE-NEXT:    nop
+; SINGLE-NEXT:    add #-4,r4
   %r = load double, ptr %p
   ret double %r
 }
@@ -649,27 +598,24 @@ define void @store(ptr %p, double %v) {
 ; SH4-NEXT:  ! %bb.0:
 ; SH4-NEXT:    add #8,r4
 ; SH4-NEXT:    fmov.s fr4,@-r4
-; SH4-NEXT:    fmov.s fr5,@-r4
 ; SH4-NEXT:    rts
-; SH4-NEXT:    nop
+; SH4-NEXT:    fmov.s fr5,@-r4
 ;
 ; SH4A-LABEL: store:
 ; SH4A:         .cfi_startproc
 ; SH4A-NEXT:  ! %bb.0:
 ; SH4A-NEXT:    add #8,r4
 ; SH4A-NEXT:    fmov.s fr4,@-r4
-; SH4A-NEXT:    fmov.s fr5,@-r4
 ; SH4A-NEXT:    rts
-; SH4A-NEXT:    nop
+; SH4A-NEXT:    fmov.s fr5,@-r4
 ;
 ; SINGLE-LABEL: store:
 ; SINGLE:         .cfi_startproc
 ; SINGLE-NEXT:  ! %bb.0:
 ; SINGLE-NEXT:    add #8,r4
 ; SINGLE-NEXT:    fmov.s fr4,@-r4
-; SINGLE-NEXT:    fmov.s fr5,@-r4
 ; SINGLE-NEXT:    rts
-; SINGLE-NEXT:    nop
+; SINGLE-NEXT:    fmov.s fr5,@-r4
   store double %v, ptr %p
   ret void
 }
@@ -679,25 +625,22 @@ define float @fload(ptr %p) {
 ; SH4:         .cfi_startproc
 ; SH4-NEXT:  ! %bb.0:
 ; SH4-NEXT:    add #12,r4
-; SH4-NEXT:    fmov.s @r4,fr0
 ; SH4-NEXT:    rts
-; SH4-NEXT:    nop
+; SH4-NEXT:    fmov.s @r4,fr0
 ;
 ; SH4A-LABEL: fload:
 ; SH4A:         .cfi_startproc
 ; SH4A-NEXT:  ! %bb.0:
 ; SH4A-NEXT:    add #12,r4
-; SH4A-NEXT:    fmov.s @r4,fr0
 ; SH4A-NEXT:    rts
-; SH4A-NEXT:    nop
+; SH4A-NEXT:    fmov.s @r4,fr0
 ;
 ; SINGLE-LABEL: fload:
 ; SINGLE:         .cfi_startproc
 ; SINGLE-NEXT:  ! %bb.0:
 ; SINGLE-NEXT:    add #12,r4
-; SINGLE-NEXT:    fmov.s @r4,fr0
 ; SINGLE-NEXT:    rts
-; SINGLE-NEXT:    nop
+; SINGLE-NEXT:    fmov.s @r4,fr0
   %q = getelementptr float, ptr %p, i32 3
   %r = load float, ptr %q
   ret float %r
@@ -719,10 +662,9 @@ define float @across_call(float %a) {
 ; SH4-NEXT:    .cfi_offset fr12, -8
 ; SH4-NEXT:    fmov fr5,fr12
 ; SH4-NEXT:    flds fr12,fpul
-; SH4-NEXT:    fcnvsd fpul,dr4
 ; SH4-NEXT:    mov.l .Ltmp1,r1
 ; SH4-NEXT:    jsr @r1
-; SH4-NEXT:    nop
+; SH4-NEXT:    fcnvsd fpul,dr4
 ; SH4-NEXT:    fcnvds dr0,fpul
 ; SH4-NEXT:    fsts fpul,fr0
 ; SH4-NEXT:    mov #8,r1
@@ -735,11 +677,10 @@ define float @across_call(float %a) {
 ; SH4-NEXT:    shll16 r1
 ; SH4-NEXT:    sts fpscr,r2
 ; SH4-NEXT:    xor r1,r2
-; SH4-NEXT:    lds r2,fpscr
 ; SH4-NEXT:    fmov.s @r15+,fr12
 ; SH4-NEXT:    lds.l @r15+,pr
 ; SH4-NEXT:    rts
-; SH4-NEXT:    nop
+; SH4-NEXT:    lds r2,fpscr
 ; SH4-NEXT:    .p2align 2
 ; SH4-NEXT:  ! %bb.1:
 ; SH4-NEXT:  .Ltmp1:
@@ -756,19 +697,17 @@ define float @across_call(float %a) {
 ; SH4A-NEXT:    .cfi_offset fr12, -8
 ; SH4A-NEXT:    fmov fr5,fr12
 ; SH4A-NEXT:    flds fr12,fpul
-; SH4A-NEXT:    fcnvsd fpul,dr4
 ; SH4A-NEXT:    mov.l .Ltmp1,r1
 ; SH4A-NEXT:    jsr @r1
-; SH4A-NEXT:    nop
+; SH4A-NEXT:    fcnvsd fpul,dr4
 ; SH4A-NEXT:    fcnvds dr0,fpul
 ; SH4A-NEXT:    fsts fpul,fr0
 ; SH4A-NEXT:    fpchg
 ; SH4A-NEXT:    fmul fr12,fr0
-; SH4A-NEXT:    fpchg
 ; SH4A-NEXT:    fmov.s @r15+,fr12
 ; SH4A-NEXT:    lds.l @r15+,pr
 ; SH4A-NEXT:    rts
-; SH4A-NEXT:    nop
+; SH4A-NEXT:    fpchg
 ; SH4A-NEXT:    .p2align 2
 ; SH4A-NEXT:  ! %bb.1:
 ; SH4A-NEXT:  .Ltmp1:
@@ -796,9 +735,8 @@ define float @across_call(float %a) {
 ; SINGLE-NEXT:    shll16 r2
 ; SINGLE-NEXT:    sts fpscr,r3
 ; SINGLE-NEXT:    xor r2,r3
-; SINGLE-NEXT:    lds r3,fpscr
 ; SINGLE-NEXT:    jsr @r1
-; SINGLE-NEXT:    nop
+; SINGLE-NEXT:    lds r3,fpscr
 ; SINGLE-NEXT:    mov #8,r1
 ; SINGLE-NEXT:    shll16 r1
 ; SINGLE-NEXT:    sts fpscr,r2

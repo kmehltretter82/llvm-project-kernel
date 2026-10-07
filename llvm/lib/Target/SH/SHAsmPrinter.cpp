@@ -157,13 +157,21 @@ void SHAsmPrinter::emitFarJump(const MachineInstr *MI) {
 }
 
 // An instruction with a delay slot is one bundle with the instruction in
-// the slot.
+// the slot.  A nop is behind the branch.  An instruction that the filler
+// moved into the slot is in front of it, where it is in the order of
+// execution, and is written behind it.
 void SHAsmPrinter::emitInstruction(const MachineInstr *MI) {
-  MachineBasicBlock::const_instr_iterator I = MI->getIterator();
-  MachineBasicBlock::const_instr_iterator E = MI->getParent()->instr_end();
-  do
-    emitOne(&*I);
-  while (++I != E && I->isInsideBundle());
+  if (!MI->isBundledWithSucc()) {
+    emitOne(MI);
+    return;
+  }
+  MachineBasicBlock::const_instr_iterator First = MI->getIterator();
+  MachineBasicBlock::const_instr_iterator Second = std::next(First);
+  assert(!Second->isBundledWithSucc() && "a branch and its slot are two");
+  if (Second->hasDelaySlot(MachineInstr::IgnoreBundle))
+    std::swap(First, Second);
+  emitOne(&*First);
+  emitOne(&*Second);
 }
 
 void SHAsmPrinter::emitOne(const MachineInstr *MI) {

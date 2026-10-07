@@ -11,9 +11,8 @@ define i32 @shl24(i32 %a) {
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    mov r4,r0
 ; CHECK-NEXT:    shll16 r0
-; CHECK-NEXT:    shll8 r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    shll8 r0
   %r = shl i32 %a, 24
   ret i32 %r
 }
@@ -25,9 +24,8 @@ define i32 @shl5(i32 %a) {
 ; CHECK-NEXT:    mov r4,r0
 ; CHECK-NEXT:    shll2 r0
 ; CHECK-NEXT:    shll2 r0
-; CHECK-NEXT:    add r0,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    add r0,r0
   %r = shl i32 %a, 5
   ret i32 %r
 }
@@ -39,9 +37,8 @@ define i32 @lshr11(i32 %a) {
 ; CHECK-NEXT:    mov r4,r0
 ; CHECK-NEXT:    shlr8 r0
 ; CHECK-NEXT:    shlr2 r0
-; CHECK-NEXT:    shlr r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    shlr r0
   %r = lshr i32 %a, 11
   ret i32 %r
 }
@@ -54,9 +51,8 @@ define i32 @ashr3(i32 %a) {
 ; CHECK-NEXT:    mov r4,r0
 ; CHECK-NEXT:    shar r0
 ; CHECK-NEXT:    shar r0
-; CHECK-NEXT:    shar r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    shar r0
   %r = ashr i32 %a, 3
   ret i32 %r
 }
@@ -69,9 +65,8 @@ define i32 @ashr20(i32 %a) {
 ; CHECK-NEXT:    .cfi_def_cfa_offset 4
 ; CHECK-NEXT:    .cfi_offset pr, -4
 ; CHECK-NEXT:    mov.l .Ltmp0,r1
-; CHECK-NEXT:    mov #20,r5
 ; CHECK-NEXT:    jsr @r1
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov #20,r5
 ; CHECK-NEXT:    lds.l @r15+,pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop

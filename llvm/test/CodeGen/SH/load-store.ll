@@ -7,9 +7,8 @@ define i32 @load32(ptr %p) {
 ; CHECK-LABEL: load32:
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
-; CHECK-NEXT:    mov.l @r4,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov.l @r4,r0
   %r = load i32, ptr %p
   ret i32 %r
 }
@@ -18,9 +17,8 @@ define i32 @load32_disp(ptr %p) {
 ; CHECK-LABEL: load32_disp:
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
-; CHECK-NEXT:    mov.l @(60,r4),r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov.l @(60,r4),r0
   %q = getelementptr i32, ptr %p, i32 15
   %r = load i32, ptr %q
   ret i32 %r
@@ -31,9 +29,8 @@ define i32 @load32_far(ptr %p) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    add #64,r4
-; CHECK-NEXT:    mov.l @r4,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov.l @r4,r0
   %q = getelementptr i32, ptr %p, i32 16
   %r = load i32, ptr %q
   ret i32 %r
@@ -43,9 +40,8 @@ define i32 @load_s8(ptr %p) {
 ; CHECK-LABEL: load_s8:
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
-; CHECK-NEXT:    mov.b @r4,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov.b @r4,r0
   %v = load i8, ptr %p
   %r = sext i8 %v to i32
   ret i32 %r
@@ -56,9 +52,8 @@ define i32 @load_u8(ptr %p) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    mov.b @r4,r1
-; CHECK-NEXT:    extu.b r1,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    extu.b r1,r0
   %v = load i8, ptr %p
   %r = zext i8 %v to i32
   ret i32 %r
@@ -68,9 +63,8 @@ define i32 @load_s16(ptr %p) {
 ; CHECK-LABEL: load_s16:
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
-; CHECK-NEXT:    mov.w @r4,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov.w @r4,r0
   %v = load i16, ptr %p
   %r = sext i16 %v to i32
   ret i32 %r
@@ -81,9 +75,8 @@ define i32 @load_u16(ptr %p) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    mov.w @r4,r1
-; CHECK-NEXT:    extu.w r1,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    extu.w r1,r0
   %v = load i16, ptr %p
   %r = zext i16 %v to i32
   ret i32 %r
@@ -93,9 +86,8 @@ define void @store32(ptr %p, i32 %v) {
 ; CHECK-LABEL: store32:
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
-; CHECK-NEXT:    mov.l r5,@(12,r4)
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov.l r5,@(12,r4)
   %q = getelementptr i32, ptr %p, i32 3
   store i32 %v, ptr %q
   ret void
@@ -105,9 +97,8 @@ define void @store8(ptr %p, i32 %v) {
 ; CHECK-LABEL: store8:
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
-; CHECK-NEXT:    mov.b r5,@r4
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov.b r5,@r4
   %b = trunc i32 %v to i8
   store i8 %b, ptr %p
   ret void
@@ -118,9 +109,8 @@ define void @store16(ptr %p, i32 %v) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    add #2,r4
-; CHECK-NEXT:    mov.w r5,@r4
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov.w r5,@r4
   %b = trunc i32 %v to i16
   %q = getelementptr i16, ptr %p, i32 1
   store i16 %b, ptr %q
@@ -132,9 +122,8 @@ define i64 @load64(ptr %p) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    mov.l @r4,r0
-; CHECK-NEXT:    mov.l @(4,r4),r1
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov.l @(4,r4),r1
   %r = load i64, ptr %p
   ret i64 %r
 }
@@ -148,9 +137,8 @@ define i32 @load_global() {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    mov.l .Ltmp0,r1
-; CHECK-NEXT:    mov.l @r1,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov.l @r1,r0
 ; CHECK-NEXT:    .p2align 2
 ; CHECK-NEXT:  ! %bb.1:
 ; CHECK-NEXT:  .Ltmp0:
@@ -164,9 +152,8 @@ define void @store_global_elem(i32 %v) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    mov.l .Ltmp1,r1
-; CHECK-NEXT:    mov.l r4,@(28,r1)
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov.l r4,@(28,r1)
 ; CHECK-NEXT:    .p2align 2
 ; CHECK-NEXT:  ! %bb.1:
 ; CHECK-NEXT:  .Ltmp1:

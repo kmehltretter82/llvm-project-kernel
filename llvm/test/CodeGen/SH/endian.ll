@@ -10,17 +10,15 @@ define i64 @ret64() {
 ; LE:         .cfi_startproc
 ; LE-NEXT:  ! %bb.0:
 ; LE-NEXT:    mov #2,r0
-; LE-NEXT:    mov #1,r1
 ; LE-NEXT:    rts
-; LE-NEXT:    nop
+; LE-NEXT:    mov #1,r1
 ;
 ; BE-LABEL: ret64:
 ; BE:         .cfi_startproc
 ; BE-NEXT:  ! %bb.0:
 ; BE-NEXT:    mov #1,r0
-; BE-NEXT:    mov #2,r1
 ; BE-NEXT:    rts
-; BE-NEXT:    nop
+; BE-NEXT:    mov #2,r1
   ret i64 4294967298
 }
 
@@ -28,16 +26,14 @@ define i32 @high(i64 %a) {
 ; LE-LABEL: high:
 ; LE:         .cfi_startproc
 ; LE-NEXT:  ! %bb.0:
-; LE-NEXT:    mov r5,r0
 ; LE-NEXT:    rts
-; LE-NEXT:    nop
+; LE-NEXT:    mov r5,r0
 ;
 ; BE-LABEL: high:
 ; BE:         .cfi_startproc
 ; BE-NEXT:  ! %bb.0:
-; BE-NEXT:    mov r4,r0
 ; BE-NEXT:    rts
-; BE-NEXT:    nop
+; BE-NEXT:    mov r4,r0
   %s = lshr i64 %a, 32
   %r = trunc i64 %s to i32
   ret i32 %r
@@ -47,16 +43,14 @@ define i32 @load_low(ptr %p) {
 ; LE-LABEL: load_low:
 ; LE:         .cfi_startproc
 ; LE-NEXT:  ! %bb.0:
-; LE-NEXT:    mov.l @r4,r0
 ; LE-NEXT:    rts
-; LE-NEXT:    nop
+; LE-NEXT:    mov.l @r4,r0
 ;
 ; BE-LABEL: load_low:
 ; BE:         .cfi_startproc
 ; BE-NEXT:  ! %bb.0:
-; BE-NEXT:    mov.l @(4,r4),r0
 ; BE-NEXT:    rts
-; BE-NEXT:    nop
+; BE-NEXT:    mov.l @(4,r4),r0
   %v = load i64, ptr %p
   %r = trunc i64 %v to i32
   ret i32 %r

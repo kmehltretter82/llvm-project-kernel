@@ -68,6 +68,9 @@ private:
 
 char SHFPModeSwitch::ID = 0;
 
+INITIALIZE_PASS(SHFPModeSwitch, DEBUG_TYPE, "SuperH floating point precision",
+                false, false)
+
 FunctionPass *llvm::createSHFPModeSwitchPass() { return new SHFPModeSwitch(); }
 
 /// The precision that an instruction has to find.

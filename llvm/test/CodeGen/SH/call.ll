@@ -22,9 +22,8 @@ define i32 @four(i32 %a) {
 ; CHECK-NEXT:    mov.l .Ltmp0,r1
 ; CHECK-NEXT:    mov #1,r4
 ; CHECK-NEXT:    mov #2,r5
-; CHECK-NEXT:    mov #3,r6
 ; CHECK-NEXT:    jsr @r1
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov #3,r6
 ; CHECK-NEXT:    lds.l @r15+,pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop
@@ -52,9 +51,8 @@ define i32 @six(i32 %a, i32 %b) {
 ; CHECK-NEXT:    mov.l r1,@r15
 ; CHECK-NEXT:    mov.l .Ltmp1,r1
 ; CHECK-NEXT:    mov #3,r6
-; CHECK-NEXT:    mov #4,r7
 ; CHECK-NEXT:    jsr @r1
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov #4,r7
 ; CHECK-NEXT:    add #8,r15
 ; CHECK-NEXT:    lds.l @r15+,pr
 ; CHECK-NEXT:    rts
@@ -82,9 +80,8 @@ define i64 @split(i64 %x) {
 ; CHECK-NEXT:    mov.l r6,@r15
 ; CHECK-NEXT:    mov.l .Ltmp2,r1
 ; CHECK-NEXT:    mov #1,r4
-; CHECK-NEXT:    mov r5,r7
 ; CHECK-NEXT:    jsr @r1
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov r5,r7
 ; CHECK-NEXT:    add #4,r15
 ; CHECK-NEXT:    lds.l @r15+,pr
 ; CHECK-NEXT:    rts
@@ -103,9 +100,8 @@ define i32 @args_on_stack(i32 %a, i32 %b, i32 %c, i32 %d, i32 %e, i32 %f) {
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    mov.l @(4,r15),r1
 ; CHECK-NEXT:    mov.l @r15,r0
-; CHECK-NEXT:    add r1,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    add r1,r0
   %s = add i32 %e, %f
   ret i32 %s
 }
@@ -120,9 +116,8 @@ define void @small(i32 %a) {
 ; CHECK-NEXT:    exts.b r4,r1
 ; CHECK-NEXT:    extu.w r4,r5
 ; CHECK-NEXT:    mov.l .Ltmp3,r2
-; CHECK-NEXT:    mov r1,r4
 ; CHECK-NEXT:    jsr @r2
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov r1,r4
 ; CHECK-NEXT:    lds.l @r15+,pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop
@@ -152,15 +147,13 @@ define void @sret_caller() {
 ; CHECK-NEXT:    add #-16,r15
 ; CHECK-NEXT:    mov #-8,r1
 ; CHECK-NEXT:    and r1,r15
-; CHECK-NEXT:    mov r15,r2
 ; CHECK-NEXT:    mov.l .Ltmp4,r1
 ; CHECK-NEXT:    jsr @r1
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov r15,r2
 ; CHECK-NEXT:    mov r14,r15
 ; CHECK-NEXT:    lds.l @r15+,pr
-; CHECK-NEXT:    mov.l @r15+,r14
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov.l @r15+,r14
 ; CHECK-NEXT:    .p2align 2
 ; CHECK-NEXT:  ! %bb.1:
 ; CHECK-NEXT:  .Ltmp4:
@@ -175,9 +168,8 @@ define void @sret_callee(ptr sret({ i32, i32, i32 }) %out, i32 %v) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    mov r2,r0
-; CHECK-NEXT:    mov.l r4,@r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov.l r4,@r0
   store i32 %v, ptr %out
   ret void
 }
@@ -190,9 +182,8 @@ define { i32, i32, i32, i32 } @ret4(i32 %a) {
 ; CHECK-NEXT:    mov r4,r0
 ; CHECK-NEXT:    mov #2,r1
 ; CHECK-NEXT:    mov #3,r2
-; CHECK-NEXT:    mov #4,r3
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov #4,r3
   %r0 = insertvalue { i32, i32, i32, i32 } poison, i32 %a, 0
   %r1 = insertvalue { i32, i32, i32, i32 } %r0, i32 2, 1
   %r2 = insertvalue { i32, i32, i32, i32 } %r1, i32 3, 2
@@ -210,10 +201,9 @@ define i32 @use_ret4() {
 ; CHECK-NEXT:    mov.l .Ltmp5,r1
 ; CHECK-NEXT:    jsr @r1
 ; CHECK-NEXT:    nop
-; CHECK-NEXT:    mov r3,r0
 ; CHECK-NEXT:    lds.l @r15+,pr
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov r3,r0
 ; CHECK-NEXT:    .p2align 2
 ; CHECK-NEXT:  ! %bb.1:
 ; CHECK-NEXT:  .Ltmp5:
@@ -231,9 +221,8 @@ define i32 @indirect(ptr %f, i32 %a) {
 ; CHECK-NEXT:    .cfi_def_cfa_offset 4
 ; CHECK-NEXT:    .cfi_offset pr, -4
 ; CHECK-NEXT:    mov r4,r1
-; CHECK-NEXT:    mov r5,r4
 ; CHECK-NEXT:    jsr @r1
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov r5,r4
 ; CHECK-NEXT:    lds.l @r15+,pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop

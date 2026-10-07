@@ -143,6 +143,15 @@ class SHPseudo<dag outs, dag ins, list<dag> pattern>
   let isCodeGenOnly = 1;
 }
 
+// An instruction without a pattern.  All that it does is in its operands,
+// in Uses and Defs and in mayLoad and mayStore.  That has to be said:
+// without a pattern to look at, tablegen assumes that an instruction has
+// effects that nobody knows, and then nothing may move or remove it.
+class SHPlain<dag outs, dag ins, string asmstr>
+    : SHInst<outs, ins, asmstr, []> {
+  let hasSideEffects = 0;
+}
+
 // "op Rm,Rn": Rn = Rn op Rm.
 class SHBinOp<string mnemonic, SDPatternOperator node>
     : SHInst<(outs GPR:$dst), (ins GPR:$src1, GPR:$src2),
@@ -168,7 +177,7 @@ class SHShift<string mnemonic, SDPatternOperator node, int amount>
 //===----------------------------------------------------------------------===//
 
 let isMoveReg = 1 in
-def MOVrr : SHInst<(outs GPR:$dst), (ins GPR:$src), "mov\t$src,$dst", []>;
+def MOVrr : SHPlain<(outs GPR:$dst), (ins GPR:$src), "mov\t$src,$dst">;
 
 let isReMaterializable = 1, isAsCheapAsAMove = 1, isMoveImm = 1 in
 def MOVI : SHInst<(outs GPR:$dst), (ins simm8:$imm), "mov\t#$imm,$dst",
@@ -181,8 +190,9 @@ let isReMaterializable = 1 in
 def MOVLpcrel : SHPseudo<(outs GPR:$dst), (ins i32imm:$src), []>;
 
 // What the pseudo becomes: "mov.l .L1,Rn" with the label of the literal.
-def MOVLpc : SHInst<(outs GPR:$dst), (ins labelop:$label),
-                    "mov.l\t$label,$dst", []>;
+let mayLoad = 1 in
+def MOVLpc : SHPlain<(outs GPR:$dst), (ins labelop:$label),
+                    "mov.l\t$label,$dst">;
 
 def : Pat<(SHloadaddr tglobaladdr:$a), (MOVLpcrel tglobaladdr:$a)>;
 def : Pat<(SHloadaddr texternalsym:$a), (MOVLpcrel texternalsym:$a)>;
@@ -223,31 +233,33 @@ def : Pat<(extloadi1 addrbw:$addr), (MOVBld addrbw:$addr)>;
 
 // Push and pop, for the registers that a function saves.
 let Uses = [R15], Defs = [R15] in {
-def PUSH : SHInst<(outs), (ins GPR:$src), "mov.l\t$src,@-r15", []>;
-def POP : SHInst<(outs GPR:$dst), (ins), "mov.l\t@r15+,$dst", []>;
-let Uses = [R15, PR] in
-def PUSHPR : SHInst<(outs), (ins), "sts.l\tpr,@-r15", []>;
-let Defs = [R15, PR] in
-def POPPR : SHInst<(outs), (ins), "lds.l\t@r15+,pr", []>;
+let mayStore = 1 in
+def PUSH : SHPlain<(outs), (ins GPR:$src), "mov.l\t$src,@-r15">;
+let mayLoad = 1 in
+def POP : SHPlain<(outs GPR:$dst), (ins), "mov.l\t@r15+,$dst">;
+let Uses = [R15, PR], mayStore = 1 in
+def PUSHPR : SHPlain<(outs), (ins), "sts.l\tpr,@-r15">;
+let Defs = [R15, PR], mayLoad = 1 in
+def POPPR : SHPlain<(outs), (ins), "lds.l\t@r15+,pr">;
 }
 
 // The system registers.
 let Uses = [PR] in
-def STSPR : SHInst<(outs GPR:$dst), (ins), "sts\tpr,$dst", []>;
+def STSPR : SHPlain<(outs GPR:$dst), (ins), "sts\tpr,$dst">;
 let Defs = [PR] in
-def LDSPR : SHInst<(outs), (ins GPR:$src), "lds\t$src,pr", []>;
+def LDSPR : SHPlain<(outs), (ins GPR:$src), "lds\t$src,pr">;
 let Uses = [MACL] in
-def STSMACL : SHInst<(outs GPR:$dst), (ins), "sts\tmacl,$dst", []>;
+def STSMACL : SHPlain<(outs GPR:$dst), (ins), "sts\tmacl,$dst">;
 let Uses = [MACH] in
-def STSMACH : SHInst<(outs GPR:$dst), (ins), "sts\tmach,$dst", []>;
+def STSMACH : SHPlain<(outs GPR:$dst), (ins), "sts\tmach,$dst">;
 let Defs = [MACL] in
-def LDSMACL : SHInst<(outs), (ins GPR:$src), "lds\t$src,macl", []>;
+def LDSMACL : SHPlain<(outs), (ins GPR:$src), "lds\t$src,macl">;
 let Defs = [MACH] in
-def LDSMACH : SHInst<(outs), (ins GPR:$src), "lds\t$src,mach", []>;
+def LDSMACH : SHPlain<(outs), (ins GPR:$src), "lds\t$src,mach">;
 let Uses = [GBR] in
-def STCGBR : SHInst<(outs GPR:$dst), (ins), "stc\tgbr,$dst", []>;
+def STCGBR : SHPlain<(outs GPR:$dst), (ins), "stc\tgbr,$dst">;
 let Defs = [GBR] in
-def LDCGBR : SHInst<(outs), (ins GPR:$src), "ldc\t$src,gbr", []>;
+def LDCGBR : SHPlain<(outs), (ins GPR:$src), "ldc\t$src,gbr">;
 
 //===----------------------------------------------------------------------===//
 // Arithmetic and logic
@@ -274,30 +286,30 @@ def EXTSB : SHUnOp<"exts.b", (sext_inreg GPR:$src, i8)>;
 def EXTSW : SHUnOp<"exts.w", (sext_inreg GPR:$src, i16)>;
 // The two halves change places, or the two low bytes do.
 def SWAPW : SHUnOp<"swap.w", (rotl GPR:$src, (i32 16))>;
-def SWAPB : SHInst<(outs GPR:$dst), (ins GPR:$src), "swap.b\t$src,$dst", []>;
+def SWAPB : SHPlain<(outs GPR:$dst), (ins GPR:$src), "swap.b\t$src,$dst">;
 
 def : Pat<(bswap GPR:$src), (SWAPB (SWAPW (SWAPB GPR:$src)))>;
 
 // With the carry in T.
 let Constraints = "$src1 = $dst", Uses = [T], Defs = [T] in {
-def ADDC : SHInst<(outs GPR:$dst), (ins GPR:$src1, GPR:$src2),
-                  "addc\t$src2,$dst", []>;
-def SUBC : SHInst<(outs GPR:$dst), (ins GPR:$src1, GPR:$src2),
-                  "subc\t$src2,$dst", []>;
+def ADDC : SHPlain<(outs GPR:$dst), (ins GPR:$src1, GPR:$src2),
+                  "addc\t$src2,$dst">;
+def SUBC : SHPlain<(outs GPR:$dst), (ins GPR:$src1, GPR:$src2),
+                  "subc\t$src2,$dst">;
 }
 let Uses = [T], Defs = [T] in
-def NEGC : SHInst<(outs GPR:$dst), (ins GPR:$src), "negc\t$src,$dst", []>;
+def NEGC : SHPlain<(outs GPR:$dst), (ins GPR:$src), "negc\t$src,$dst">;
 let Defs = [T] in {
-def CLRT : SHInst<(outs), (ins), "clrt", []>;
-def SETT : SHInst<(outs), (ins), "sett", []>;
+def CLRT : SHPlain<(outs), (ins), "clrt">;
+def SETT : SHPlain<(outs), (ins), "sett">;
 }
 
 // A product goes to MACL, or to MACH and MACL if it has 64 bits.
 let Defs = [MACL] in
-def MULL : SHInst<(outs), (ins GPR:$rn, GPR:$rm), "mul.l\t$rm,$rn", []>;
+def MULL : SHPlain<(outs), (ins GPR:$rn, GPR:$rm), "mul.l\t$rm,$rn">;
 let Defs = [MACH, MACL] in {
-def DMULU : SHInst<(outs), (ins GPR:$rn, GPR:$rm), "dmulu.l\t$rm,$rn", []>;
-def DMULS : SHInst<(outs), (ins GPR:$rn, GPR:$rm), "dmuls.l\t$rm,$rn", []>;
+def DMULU : SHPlain<(outs), (ins GPR:$rn, GPR:$rm), "dmulu.l\t$rm,$rn">;
+def DMULS : SHPlain<(outs), (ins GPR:$rn, GPR:$rm), "dmuls.l\t$rm,$rn">;
 }
 
 // A multiplication with the result in a register: the instruction above
@@ -332,7 +344,7 @@ def SHLR16 : SHShift<"shlr16", srl, 16>;
 let Defs = [T] in {
 def SHLR : SHShift<"shlr", srl, 1>;
 def SHAR : SHShift<"shar", sra, 1>;
-def SHLL : SHInst<(outs GPR:$dst), (ins GPR:$src), "shll\t$dst", []> {
+def SHLL : SHPlain<(outs GPR:$dst), (ins GPR:$src), "shll\t$dst"> {
   let Constraints = "$src = $dst";
 }
 }
@@ -345,8 +357,8 @@ let Constraints = "$src1 = $dst", Predicates = [HasDynShift] in {
 def SHLD : SHInst<(outs GPR:$dst), (ins GPR:$src1, GPR:$src2),
                   "shld\t$src2,$dst",
                   [(set GPR:$dst, (shl GPR:$src1, GPR:$src2))]>;
-def SHAD : SHInst<(outs GPR:$dst), (ins GPR:$src1, GPR:$src2),
-                  "shad\t$src2,$dst", []>;
+def SHAD : SHPlain<(outs GPR:$dst), (ins GPR:$src1, GPR:$src2),
+                  "shad\t$src2,$dst">;
 }
 
 let Predicates = [HasDynShift] in {
@@ -479,7 +491,7 @@ def HasFPU : Predicate<"Subtarget->hasFPU()">;
 def HasFPUDouble : Predicate<"Subtarget->hasFPUDouble()">;
 
 let isMoveReg = 1 in
-def FMOV : SHInst<(outs FPR:$dst), (ins FPR:$src), "fmov\t$src,$dst", []>;
+def FMOV : SHPlain<(outs FPR:$dst), (ins FPR:$src), "fmov\t$src,$dst">;
 
 let canFoldAsLoad = 1 in
 def FMOVSld : SHInst<(outs FPR:$dst), (ins GPR:$base), "fmov.s\t@$base,$dst",
@@ -488,14 +500,18 @@ def FMOVSst : SHInst<(outs), (ins FPR:$src, GPR:$base), "fmov.s\t$src,@$base",
                      [(store FPR:$src, GPR:$base)]>;
 // With the address moving on, for the halves of a double.
 let Constraints = "$base = $wb" in {
-def FMOVSldinc : SHInst<(outs FPR:$dst, GPR:$wb), (ins GPR:$base),
-                        "fmov.s\t@$base+,$dst", []>;
-def FMOVSstdec : SHInst<(outs GPR:$wb), (ins FPR:$src, GPR:$base),
-                        "fmov.s\t$src,@-$base", []>;
+let mayLoad = 1 in
+def FMOVSldinc : SHPlain<(outs FPR:$dst, GPR:$wb), (ins GPR:$base),
+                        "fmov.s\t@$base+,$dst">;
+let mayStore = 1 in
+def FMOVSstdec : SHPlain<(outs GPR:$wb), (ins FPR:$src, GPR:$base),
+                        "fmov.s\t$src,@-$base">;
 }
 let Uses = [R15], Defs = [R15] in {
-def FPUSH : SHInst<(outs), (ins FPR:$src), "fmov.s\t$src,@-r15", []>;
-def FPOP : SHInst<(outs FPR:$dst), (ins), "fmov.s\t@r15+,$dst", []>;
+let mayStore = 1 in
+def FPUSH : SHPlain<(outs), (ins FPR:$src), "fmov.s\t$src,@-r15">;
+let mayLoad = 1 in
+def FPOP : SHPlain<(outs FPR:$dst), (ins), "fmov.s\t@r15+,$dst">;
 }
 
 // A double through a register: two loads or stores that move the register
@@ -592,29 +608,35 @@ def FCNVDS : SHPseudo<(outs FPR:$dst), (ins DFPR:$src),
 }
 }
 
-// What those are made of.
+// What those are made of.  The conversions depend on the precision like
+// the arithmetic does, and say so: an instruction that reads FPSCR is not
+// moved over a change of it.
 let Defs = [FPUL] in {
-def LDSFPUL : SHInst<(outs), (ins GPR:$src), "lds\t$src,fpul", []>;
-def FLDS : SHInst<(outs), (ins FPR:$src), "flds\t$src,fpul", []>;
-def FTRCfpulS : SHInst<(outs), (ins FPR:$src), "ftrc\t$src,fpul", []>;
-def FTRCfpulD : SHInst<(outs), (ins DFPR:$src), "ftrc\t$src,fpul", []>;
-def FCNVDSfpul : SHInst<(outs), (ins DFPR:$src), "fcnvds\t$src,fpul", []>;
+def LDSFPUL : SHPlain<(outs), (ins GPR:$src), "lds\t$src,fpul">;
+def FLDS : SHPlain<(outs), (ins FPR:$src), "flds\t$src,fpul">;
+let Uses = [FPSCR] in {
+def FTRCfpulS : SHPlain<(outs), (ins FPR:$src), "ftrc\t$src,fpul">;
+def FTRCfpulD : SHPlain<(outs), (ins DFPR:$src), "ftrc\t$src,fpul">;
+def FCNVDSfpul : SHPlain<(outs), (ins DFPR:$src), "fcnvds\t$src,fpul">;
+}
 }
 let Uses = [FPUL] in {
-def STSFPUL : SHInst<(outs GPR:$dst), (ins), "sts\tfpul,$dst", []>;
-def FSTS : SHInst<(outs FPR:$dst), (ins), "fsts\tfpul,$dst", []>;
-def FLOATfpulS : SHInst<(outs FPR:$dst), (ins), "float\tfpul,$dst", []>;
-def FLOATfpulD : SHInst<(outs DFPR:$dst), (ins), "float\tfpul,$dst", []>;
-def FCNVSDfpul : SHInst<(outs DFPR:$dst), (ins), "fcnvsd\tfpul,$dst", []>;
+def STSFPUL : SHPlain<(outs GPR:$dst), (ins), "sts\tfpul,$dst">;
+def FSTS : SHPlain<(outs FPR:$dst), (ins), "fsts\tfpul,$dst">;
+let Uses = [FPUL, FPSCR] in {
+def FLOATfpulS : SHPlain<(outs FPR:$dst), (ins), "float\tfpul,$dst">;
+def FLOATfpulD : SHPlain<(outs DFPR:$dst), (ins), "float\tfpul,$dst">;
+def FCNVSDfpul : SHPlain<(outs DFPR:$dst), (ins), "fcnvsd\tfpul,$dst">;
+}
 }
 
 // The precision: FPSCR through a general register, or fpchg on an SH-4A.
 let Uses = [FPSCR] in
-def STSFPSCR : SHInst<(outs GPR:$dst), (ins), "sts\tfpscr,$dst", []>;
+def STSFPSCR : SHPlain<(outs GPR:$dst), (ins), "sts\tfpscr,$dst">;
 let Defs = [FPSCR] in
-def LDSFPSCR : SHInst<(outs), (ins GPR:$src), "lds\t$src,fpscr", []>;
+def LDSFPSCR : SHPlain<(outs), (ins GPR:$src), "lds\t$src,fpscr">;
 let Uses = [FPSCR], Defs = [FPSCR] in
-def FPCHG : SHInst<(outs), (ins), "fpchg", []>;
+def FPCHG : SHPlain<(outs), (ins), "fpchg">;
 
 let usesCustomInserter = 1, Uses = [T] in {
 def SELECTF : SHPseudo<(outs FPR:$dst), (ins FPR:$t, FPR:$f),

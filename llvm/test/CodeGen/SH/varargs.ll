@@ -25,9 +25,8 @@ define i32 @first(i32 %n, ...) {
 ; CHECK-NEXT:    mov.l r1,@r15
 ; CHECK-NEXT:    mov.l r0,@(4,r15)
 ; CHECK-NEXT:    add #4,r15
-; CHECK-NEXT:    add #12,r15
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    add #12,r15
   %ap = alloca ptr
   call void @llvm.va_start(ptr %ap)
   %p = load ptr, ptr %ap
@@ -47,9 +46,8 @@ define i32 @fifth(i32 %a, i32 %b, i32 %c, i32 %d, ...) {
 ; CHECK-NEXT:    add #4,r1
 ; CHECK-NEXT:    mov.l r1,@r15
 ; CHECK-NEXT:    mov.l @(4,r15),r0
-; CHECK-NEXT:    add #4,r15
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    add #4,r15
   %ap = alloca ptr
   call void @llvm.va_start(ptr %ap)
   %p = load ptr, ptr %ap

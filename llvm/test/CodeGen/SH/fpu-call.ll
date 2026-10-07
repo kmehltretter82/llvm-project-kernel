@@ -22,9 +22,8 @@ define void @floats(float %a, float %b, float %c) {
 ; LE-NEXT:    add #8,r2
 ; LE-NEXT:    fmov.s fr7,@r2
 ; LE-NEXT:    add #4,r1
-; LE-NEXT:    fmov.s fr4,@r1
 ; LE-NEXT:    rts
-; LE-NEXT:    nop
+; LE-NEXT:    fmov.s fr4,@r1
 ; LE-NEXT:    .p2align 2
 ; LE-NEXT:  ! %bb.1:
 ; LE-NEXT:  .Ltmp0:
@@ -39,9 +38,8 @@ define void @floats(float %a, float %b, float %c) {
 ; BE-NEXT:    add #8,r2
 ; BE-NEXT:    fmov.s fr6,@r2
 ; BE-NEXT:    add #4,r1
-; BE-NEXT:    fmov.s fr5,@r1
 ; BE-NEXT:    rts
-; BE-NEXT:    nop
+; BE-NEXT:    fmov.s fr5,@r1
 ; BE-NEXT:    .p2align 2
 ; BE-NEXT:  ! %bb.1:
 ; BE-NEXT:  .Ltmp0:
@@ -56,9 +54,8 @@ define void @floats(float %a, float %b, float %c) {
 ; SH3E-NEXT:    add #8,r2
 ; SH3E-NEXT:    fmov.s fr6,@r2
 ; SH3E-NEXT:    add #4,r1
-; SH3E-NEXT:    fmov.s fr5,@r1
 ; SH3E-NEXT:    rts
-; SH3E-NEXT:    nop
+; SH3E-NEXT:    fmov.s fr5,@r1
 ; SH3E-NEXT:    .p2align 2
 ; SH3E-NEXT:  ! %bb.1:
 ; SH3E-NEXT:  .Ltmp0:
@@ -82,9 +79,8 @@ define void @mixed(float %a, double %b, float %c) {
 ; LE-NEXT:    mov.l .Ltmp2,r1
 ; LE-NEXT:    fmov.s fr5,@r1
 ; LE-NEXT:    add #4,r1
-; LE-NEXT:    fmov.s fr9,@r1
 ; LE-NEXT:    rts
-; LE-NEXT:    nop
+; LE-NEXT:    fmov.s fr9,@r1
 ; LE-NEXT:    .p2align 2
 ; LE-NEXT:  ! %bb.1:
 ; LE-NEXT:  .Ltmp1:
@@ -102,9 +98,8 @@ define void @mixed(float %a, double %b, float %c) {
 ; BE-NEXT:    mov.l .Ltmp2,r1
 ; BE-NEXT:    fmov.s fr4,@r1
 ; BE-NEXT:    add #4,r1
-; BE-NEXT:    fmov.s fr8,@r1
 ; BE-NEXT:    rts
-; BE-NEXT:    nop
+; BE-NEXT:    fmov.s fr8,@r1
 ; BE-NEXT:    .p2align 2
 ; BE-NEXT:  ! %bb.1:
 ; BE-NEXT:  .Ltmp1:
@@ -121,9 +116,8 @@ define void @mixed(float %a, double %b, float %c) {
 ; SH3E-NEXT:    mov.l .Ltmp2,r1
 ; SH3E-NEXT:    fmov.s fr4,@r1
 ; SH3E-NEXT:    add #4,r1
-; SH3E-NEXT:    fmov.s fr5,@r1
 ; SH3E-NEXT:    rts
-; SH3E-NEXT:    nop
+; SH3E-NEXT:    fmov.s fr5,@r1
 ; SH3E-NEXT:    .p2align 2
 ; SH3E-NEXT:  ! %bb.1:
 ; SH3E-NEXT:  .Ltmp1:
@@ -150,9 +144,8 @@ define void @both(i32 %a, float %b, i32 %c, double %d, i32 %e) {
 ; LE-NEXT:    add #8,r2
 ; LE-NEXT:    fmov.s fr6,@-r2
 ; LE-NEXT:    fmov.s fr7,@-r2
-; LE-NEXT:    mov.l r6,@(8,r1)
 ; LE-NEXT:    rts
-; LE-NEXT:    nop
+; LE-NEXT:    mov.l r6,@(8,r1)
 ; LE-NEXT:    .p2align 2
 ; LE-NEXT:  ! %bb.1:
 ; LE-NEXT:  .Ltmp3:
@@ -174,9 +167,8 @@ define void @both(i32 %a, float %b, i32 %c, double %d, i32 %e) {
 ; BE-NEXT:    add #8,r2
 ; BE-NEXT:    fmov.s fr7,@-r2
 ; BE-NEXT:    fmov.s fr6,@-r2
-; BE-NEXT:    mov.l r6,@(8,r1)
 ; BE-NEXT:    rts
-; BE-NEXT:    nop
+; BE-NEXT:    mov.l r6,@(8,r1)
 ; BE-NEXT:    .p2align 2
 ; BE-NEXT:  ! %bb.1:
 ; BE-NEXT:  .Ltmp3:
@@ -198,9 +190,8 @@ define void @both(i32 %a, float %b, i32 %c, double %d, i32 %e) {
 ; SH3E-NEXT:    mov.l r4,@r1
 ; SH3E-NEXT:    mov.l r5,@(4,r1)
 ; SH3E-NEXT:    mov.l @r15,r2
-; SH3E-NEXT:    mov.l r2,@(8,r1)
 ; SH3E-NEXT:    rts
-; SH3E-NEXT:    nop
+; SH3E-NEXT:    mov.l r2,@(8,r1)
 ; SH3E-NEXT:    .p2align 2
 ; SH3E-NEXT:  ! %bb.1:
 ; SH3E-NEXT:  .Ltmp3:
@@ -226,9 +217,8 @@ define void @fits(i32 %a, i32 %b, i32 %c, i64 %d, i32 %e) {
 ; LE-NEXT:    mov.l .Ltmp6,r1
 ; LE-NEXT:    mov.l r7,@(4,r1)
 ; LE-NEXT:    mov.l @r15,r2
-; LE-NEXT:    mov.l r2,@r1
 ; LE-NEXT:    rts
-; LE-NEXT:    nop
+; LE-NEXT:    mov.l r2,@r1
 ; LE-NEXT:    .p2align 2
 ; LE-NEXT:  ! %bb.1:
 ; LE-NEXT:  .Ltmp6:
@@ -240,9 +230,8 @@ define void @fits(i32 %a, i32 %b, i32 %c, i64 %d, i32 %e) {
 ; BE-NEXT:    mov.l .Ltmp6,r1
 ; BE-NEXT:    mov.l r7,@(4,r1)
 ; BE-NEXT:    mov.l @(4,r15),r2
-; BE-NEXT:    mov.l r2,@r1
 ; BE-NEXT:    rts
-; BE-NEXT:    nop
+; BE-NEXT:    mov.l r2,@r1
 ; BE-NEXT:    .p2align 2
 ; BE-NEXT:  ! %bb.1:
 ; BE-NEXT:  .Ltmp6:
@@ -255,9 +244,8 @@ define void @fits(i32 %a, i32 %b, i32 %c, i64 %d, i32 %e) {
 ; SH3E-NEXT:    mov.l @(8,r15),r2
 ; SH3E-NEXT:    mov.l r2,@(4,r1)
 ; SH3E-NEXT:    mov.l @r15,r2
-; SH3E-NEXT:    mov.l r2,@r1
 ; SH3E-NEXT:    rts
-; SH3E-NEXT:    nop
+; SH3E-NEXT:    mov.l r2,@r1
 ; SH3E-NEXT:    .p2align 2
 ; SH3E-NEXT:  ! %bb.1:
 ; SH3E-NEXT:  .Ltmp6:
@@ -277,9 +265,8 @@ define void @complex([2 x float] %z) {
 ; LE-NEXT:    mov.l .Ltmp7,r1
 ; LE-NEXT:    fmov.s fr4,@r1
 ; LE-NEXT:    add #4,r1
-; LE-NEXT:    fmov.s fr5,@r1
 ; LE-NEXT:    rts
-; LE-NEXT:    nop
+; LE-NEXT:    fmov.s fr5,@r1
 ; LE-NEXT:    .p2align 2
 ; LE-NEXT:  ! %bb.1:
 ; LE-NEXT:  .Ltmp7:
@@ -291,9 +278,8 @@ define void @complex([2 x float] %z) {
 ; BE-NEXT:    mov.l .Ltmp7,r1
 ; BE-NEXT:    fmov.s fr4,@r1
 ; BE-NEXT:    add #4,r1
-; BE-NEXT:    fmov.s fr5,@r1
 ; BE-NEXT:    rts
-; BE-NEXT:    nop
+; BE-NEXT:    fmov.s fr5,@r1
 ; BE-NEXT:    .p2align 2
 ; BE-NEXT:  ! %bb.1:
 ; BE-NEXT:  .Ltmp7:
@@ -305,9 +291,8 @@ define void @complex([2 x float] %z) {
 ; SH3E-NEXT:    mov.l .Ltmp7,r1
 ; SH3E-NEXT:    fmov.s fr4,@r1
 ; SH3E-NEXT:    add #4,r1
-; SH3E-NEXT:    fmov.s fr5,@r1
 ; SH3E-NEXT:    rts
-; SH3E-NEXT:    nop
+; SH3E-NEXT:    fmov.s fr5,@r1
 ; SH3E-NEXT:    .p2align 2
 ; SH3E-NEXT:  ! %bb.1:
 ; SH3E-NEXT:  .Ltmp7:
@@ -326,9 +311,8 @@ define void @complex_odd(float %x, [2 x float] %z) {
 ; LE-NEXT:    mov.l .Ltmp8,r1
 ; LE-NEXT:    fmov.s fr4,@r1
 ; LE-NEXT:    add #4,r1
-; LE-NEXT:    fmov.s fr7,@r1
 ; LE-NEXT:    rts
-; LE-NEXT:    nop
+; LE-NEXT:    fmov.s fr7,@r1
 ; LE-NEXT:    .p2align 2
 ; LE-NEXT:  ! %bb.1:
 ; LE-NEXT:  .Ltmp8:
@@ -340,9 +324,8 @@ define void @complex_odd(float %x, [2 x float] %z) {
 ; BE-NEXT:    mov.l .Ltmp8,r1
 ; BE-NEXT:    fmov.s fr5,@r1
 ; BE-NEXT:    add #4,r1
-; BE-NEXT:    fmov.s fr6,@r1
 ; BE-NEXT:    rts
-; BE-NEXT:    nop
+; BE-NEXT:    fmov.s fr6,@r1
 ; BE-NEXT:    .p2align 2
 ; BE-NEXT:  ! %bb.1:
 ; BE-NEXT:  .Ltmp8:
@@ -354,9 +337,8 @@ define void @complex_odd(float %x, [2 x float] %z) {
 ; SH3E-NEXT:    mov.l .Ltmp8,r1
 ; SH3E-NEXT:    fmov.s fr5,@r1
 ; SH3E-NEXT:    add #4,r1
-; SH3E-NEXT:    fmov.s fr6,@r1
 ; SH3E-NEXT:    rts
-; SH3E-NEXT:    nop
+; SH3E-NEXT:    fmov.s fr6,@r1
 ; SH3E-NEXT:    .p2align 2
 ; SH3E-NEXT:  ! %bb.1:
 ; SH3E-NEXT:  .Ltmp8:
@@ -373,9 +355,8 @@ define float @ret_float() {
 ; LE:         .cfi_startproc
 ; LE-NEXT:  ! %bb.0:
 ; LE-NEXT:    mov.l .Ltmp9,r1
-; LE-NEXT:    fmov.s @r1,fr0
 ; LE-NEXT:    rts
-; LE-NEXT:    nop
+; LE-NEXT:    fmov.s @r1,fr0
 ; LE-NEXT:    .p2align 2
 ; LE-NEXT:  ! %bb.1:
 ; LE-NEXT:  .Ltmp9:
@@ -385,9 +366,8 @@ define float @ret_float() {
 ; BE:         .cfi_startproc
 ; BE-NEXT:  ! %bb.0:
 ; BE-NEXT:    mov.l .Ltmp9,r1
-; BE-NEXT:    fmov.s @r1,fr0
 ; BE-NEXT:    rts
-; BE-NEXT:    nop
+; BE-NEXT:    fmov.s @r1,fr0
 ; BE-NEXT:    .p2align 2
 ; BE-NEXT:  ! %bb.1:
 ; BE-NEXT:  .Ltmp9:
@@ -397,9 +377,8 @@ define float @ret_float() {
 ; SH3E:         .cfi_startproc
 ; SH3E-NEXT:  ! %bb.0:
 ; SH3E-NEXT:    mov.l .Ltmp9,r1
-; SH3E-NEXT:    fmov.s @r1,fr0
 ; SH3E-NEXT:    rts
-; SH3E-NEXT:    nop
+; SH3E-NEXT:    fmov.s @r1,fr0
 ; SH3E-NEXT:    .p2align 2
 ; SH3E-NEXT:  ! %bb.1:
 ; SH3E-NEXT:  .Ltmp9:
@@ -415,9 +394,8 @@ define double @ret_double() {
 ; LE-NEXT:    mov.l .Ltmp10,r1
 ; LE-NEXT:    fmov.s @r1+,fr1
 ; LE-NEXT:    fmov.s @r1,fr0
-; LE-NEXT:    add #-4,r1
 ; LE-NEXT:    rts
-; LE-NEXT:    nop
+; LE-NEXT:    add #-4,r1
 ; LE-NEXT:    .p2align 2
 ; LE-NEXT:  ! %bb.1:
 ; LE-NEXT:  .Ltmp10:
@@ -429,9 +407,8 @@ define double @ret_double() {
 ; BE-NEXT:    mov.l .Ltmp10,r1
 ; BE-NEXT:    fmov.s @r1+,fr0
 ; BE-NEXT:    fmov.s @r1,fr1
-; BE-NEXT:    add #-4,r1
 ; BE-NEXT:    rts
-; BE-NEXT:    nop
+; BE-NEXT:    add #-4,r1
 ; BE-NEXT:    .p2align 2
 ; BE-NEXT:  ! %bb.1:
 ; BE-NEXT:  .Ltmp10:
@@ -442,9 +419,8 @@ define double @ret_double() {
 ; SH3E-NEXT:  ! %bb.0:
 ; SH3E-NEXT:    mov.l .Ltmp10,r1
 ; SH3E-NEXT:    mov.l @r1,r0
-; SH3E-NEXT:    mov.l @(4,r1),r1
 ; SH3E-NEXT:    rts
-; SH3E-NEXT:    nop
+; SH3E-NEXT:    mov.l @(4,r1),r1
 ; SH3E-NEXT:    .p2align 2
 ; SH3E-NEXT:  ! %bb.1:
 ; SH3E-NEXT:  .Ltmp10:
@@ -501,9 +477,8 @@ define void @variadic(ptr %list, i32 %n, double %d, ...) {
 ; LE-NEXT:    add #4,r1
 ; LE-NEXT:    mov.l r1,@(16,r4)
 ; LE-NEXT:    mov r14,r15
-; LE-NEXT:    mov.l @r15+,r14
 ; LE-NEXT:    rts
-; LE-NEXT:    nop
+; LE-NEXT:    mov.l @r15+,r14
 ;
 ; BE-LABEL: variadic:
 ; BE:         .cfi_startproc
@@ -547,9 +522,8 @@ define void @variadic(ptr %list, i32 %n, double %d, ...) {
 ; BE-NEXT:    add #4,r1
 ; BE-NEXT:    mov.l r1,@(16,r4)
 ; BE-NEXT:    mov r14,r15
-; BE-NEXT:    mov.l @r15+,r14
 ; BE-NEXT:    rts
-; BE-NEXT:    nop
+; BE-NEXT:    mov.l @r15+,r14
 ;
 ; SH3E-LABEL: variadic:
 ; SH3E:         .cfi_startproc
@@ -588,9 +562,8 @@ define void @variadic(ptr %list, i32 %n, double %d, ...) {
 ; SH3E-NEXT:    mov r15,r1
 ; SH3E-NEXT:    add #32,r1
 ; SH3E-NEXT:    mov.l r1,@(16,r4)
-; SH3E-NEXT:    add #32,r15
 ; SH3E-NEXT:    rts
-; SH3E-NEXT:    nop
+; SH3E-NEXT:    add #32,r15
   call void @llvm.va_start(ptr %list)
   ret void
 }
@@ -608,9 +581,8 @@ define void @copy(ptr %to, ptr %from) {
 ; LE-NEXT:    mov.l @(4,r5),r1
 ; LE-NEXT:    mov.l r1,@(4,r4)
 ; LE-NEXT:    mov.l @r5,r1
-; LE-NEXT:    mov.l r1,@r4
 ; LE-NEXT:    rts
-; LE-NEXT:    nop
+; LE-NEXT:    mov.l r1,@r4
 ;
 ; BE-LABEL: copy:
 ; BE:         .cfi_startproc
@@ -624,9 +596,8 @@ define void @copy(ptr %to, ptr %from) {
 ; BE-NEXT:    mov.l @(4,r5),r1
 ; BE-NEXT:    mov.l r1,@(4,r4)
 ; BE-NEXT:    mov.l @r5,r1
-; BE-NEXT:    mov.l r1,@r4
 ; BE-NEXT:    rts
-; BE-NEXT:    nop
+; BE-NEXT:    mov.l r1,@r4
 ;
 ; SH3E-LABEL: copy:
 ; SH3E:         .cfi_startproc
@@ -640,9 +611,8 @@ define void @copy(ptr %to, ptr %from) {
 ; SH3E-NEXT:    mov.l @(4,r5),r1
 ; SH3E-NEXT:    mov.l r1,@(4,r4)
 ; SH3E-NEXT:    mov.l @r5,r1
-; SH3E-NEXT:    mov.l r1,@r4
 ; SH3E-NEXT:    rts
-; SH3E-NEXT:    nop
+; SH3E-NEXT:    mov.l r1,@r4
   call void @llvm.va_copy(ptr %to, ptr %from)
   ret void
 }

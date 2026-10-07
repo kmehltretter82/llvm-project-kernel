@@ -25,6 +25,9 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeSHTarget() {
   RegisterTargetMachine<SHTargetMachine> Y(getTheSHebTarget());
   PassRegistry &PR = *PassRegistry::getPassRegistry();
   initializeSHAsmPrinterPass(PR);
+  initializeSHConstantIslandsPass(PR);
+  initializeSHDelaySlotFillerPass(PR);
+  initializeSHFPModeSwitchPass(PR);
 }
 
 static Reloc::Model getEffectiveRelocModel(std::optional<Reloc::Model> RM) {

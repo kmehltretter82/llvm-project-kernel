@@ -8,9 +8,8 @@ define i32 @add(i32 %a, i32 %b) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    mov r4,r0
-; CHECK-NEXT:    add r5,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    add r5,r0
   %r = add i32 %a, %b
   ret i32 %r
 }
@@ -20,9 +19,8 @@ define i32 @sub(i32 %a, i32 %b) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    mov r4,r0
-; CHECK-NEXT:    sub r5,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    sub r5,r0
   %r = sub i32 %a, %b
   ret i32 %r
 }
@@ -32,9 +30,8 @@ define i32 @and(i32 %a, i32 %b) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    mov r4,r0
-; CHECK-NEXT:    and r5,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    and r5,r0
   %r = and i32 %a, %b
   ret i32 %r
 }
@@ -44,9 +41,8 @@ define i32 @or(i32 %a, i32 %b) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    mov r4,r0
-; CHECK-NEXT:    or r5,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    or r5,r0
   %r = or i32 %a, %b
   ret i32 %r
 }
@@ -56,9 +52,8 @@ define i32 @xor(i32 %a, i32 %b) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    mov r4,r0
-; CHECK-NEXT:    xor r5,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    xor r5,r0
   %r = xor i32 %a, %b
   ret i32 %r
 }
@@ -67,9 +62,8 @@ define i32 @neg(i32 %a) {
 ; CHECK-LABEL: neg:
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
-; CHECK-NEXT:    neg r4,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    neg r4,r0
   %r = sub i32 0, %a
   ret i32 %r
 }
@@ -78,9 +72,8 @@ define i32 @not(i32 %a) {
 ; CHECK-LABEL: not:
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
-; CHECK-NEXT:    not r4,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    not r4,r0
   %r = xor i32 %a, -1
   ret i32 %r
 }
@@ -91,9 +84,8 @@ define i32 @add_imm(i32 %a) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    mov r4,r0
-; CHECK-NEXT:    add #100,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    add #100,r0
   %r = add i32 %a, 100
   ret i32 %r
 }
@@ -103,9 +95,8 @@ define i32 @add_imm_neg(i32 %a) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    mov r4,r0
-; CHECK-NEXT:    add #-128,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    add #-128,r0
   %r = add i32 %a, -128
   ret i32 %r
 }
@@ -116,9 +107,8 @@ define i32 @add_big(i32 %a) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    mov.l .Ltmp0,r0
-; CHECK-NEXT:    add r4,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    add r4,r0
 ; CHECK-NEXT:    .p2align 2
 ; CHECK-NEXT:  ! %bb.1:
 ; CHECK-NEXT:  .Ltmp0:
@@ -131,9 +121,8 @@ define i32 @zext8(i32 %a) {
 ; CHECK-LABEL: zext8:
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
-; CHECK-NEXT:    extu.b r4,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    extu.b r4,r0
   %r = and i32 %a, 255
   ret i32 %r
 }
@@ -142,9 +131,8 @@ define i32 @zext16(i32 %a) {
 ; CHECK-LABEL: zext16:
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
-; CHECK-NEXT:    extu.w r4,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    extu.w r4,r0
   %r = and i32 %a, 65535
   ret i32 %r
 }
@@ -154,9 +142,8 @@ define i32 @sext8(i8 signext %a) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    add #1,r4
-; CHECK-NEXT:    exts.b r4,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    exts.b r4,r0
   %b = add i8 %a, 1
   %r = sext i8 %b to i32
   ret i32 %r
@@ -167,9 +154,8 @@ define i32 @sext16(i16 signext %a) {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    add #1,r4
-; CHECK-NEXT:    exts.w r4,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    exts.w r4,r0
   %b = add i16 %a, 1
   %r = sext i16 %b to i32
   ret i32 %r
@@ -181,9 +167,8 @@ define i32 @bswap(i32 %a) {
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    swap.b r4,r1
 ; CHECK-NEXT:    swap.w r1,r1
-; CHECK-NEXT:    swap.b r1,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    swap.b r1,r0
   %r = call i32 @llvm.bswap.i32(i32 %a)
   ret i32 %r
 }

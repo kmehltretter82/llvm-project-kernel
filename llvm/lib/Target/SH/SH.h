@@ -24,6 +24,9 @@ FunctionPass *createSHFPModeSwitchPass();
 FunctionPass *createSHConstantIslandsPass();
 
 void initializeSHAsmPrinterPass(PassRegistry &);
+void initializeSHConstantIslandsPass(PassRegistry &);
+void initializeSHDelaySlotFillerPass(PassRegistry &);
+void initializeSHFPModeSwitchPass(PassRegistry &);
 
 } // namespace llvm
 
