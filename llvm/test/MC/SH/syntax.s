@@ -11,6 +11,10 @@
 	Cmp/Eq	# 5, r0
 # CHECK: cmp/eq #5,r0 ! encoding: [0x05,0x88]
 
+# "sp" is r15.
+	mov.l	r1,@-sp
+# CHECK: mov.l r1,@-r15 ! encoding: [0x16,0x2f]
+
 # A number is one of 32 bits, and an immediate of eight bits is any that
 # fits with or without a sign.
 	mov	#0xfffffff0,r1

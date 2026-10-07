@@ -22,8 +22,8 @@
 // the one that has this shape.  The parser does not know an addressing mode:
 // "@", "(", ")", "+", "-" and "#" are tokens, and a comma is nothing.
 //
-// A name is a register if there is one of that name.  T is not one: it is a
-// bit, which no instruction names.
+// A name is a register if there is one of that name, and "sp" is r15.  T is
+// not one: it is a bit, which no instruction names.
 //
 //===----------------------------------------------------------------------===//
 
@@ -173,6 +173,9 @@ private:
 static MCRegister MatchRegisterName(StringRef Name);
 
 MCRegister SHAsmParser::matchRegister(StringRef Name) {
+  // The one other name that GNU as has for a register.
+  if (Name.equals_insensitive("sp"))
+    return SH::R15;
   MCRegister Reg = MatchRegisterName(Name.lower());
   return Reg == SH::T ? MCRegister() : Reg;
 }
