@@ -123,6 +123,18 @@ unsigned SHInstrInfo::getInstSizeInBytes(const MachineInstr &MI) const {
     return getInlineAsmLength(MI.getOperand(0).getSymbolName(),
                               MF->getTarget().getMCAsmInfo());
   }
+  // The call of mcount at the start of a function, see
+  // SHAsmPrinter::emitProfileCall(): a push for each of r2 and r3 that
+  // carries something, five instructions, or nine in position independent
+  // code, the padding, one or two literals, the instruction that the call
+  // returns to and the pops.
+  case TargetOpcode::FENTRY_CALL: {
+    const MachineBasicBlock &Entry = MI.getMF()->front();
+    bool IsPIC = MI.getMF()->getTarget().isPositionIndependent();
+    unsigned Saved = Entry.isLiveIn(SH::R2) + Entry.isLiveIn(SH::R3);
+    unsigned Size = alignTo(2 * Saved + (IsPIC ? 18 : 10), 4);
+    return Size + (IsPIC ? 8 : 4) + 2 + 2 * Saved;
+  }
   default:
     if (MI.isMetaInstruction())
       return 0;

@@ -61,6 +61,7 @@ private:
   /// The jump over a distance from a literal: r0 is pushed, loaded, added
   /// to the program counter by braf, and popped in the delay slot of that.
   void emitFarJump(const MachineInstr *MI);
+  void emitProfileCall();
   void emitOne(const MachineInstr *MI);
 };
 
@@ -160,6 +161,76 @@ void SHAsmPrinter::emitFarJump(const MachineInstr *MI) {
   emit(SH::POP, {R0});
 }
 
+// The call of mcount in front of everything else in a function, which is
+// what -pg asks for.  It is GCC's, because mcount is written for it: the
+// return address of the function is on top of the stack, pr is the address
+// to come back to, and all other registers are as the function got them.
+//
+//   mov.l 1f,r1; sts.l pr,@-r15; mova 2f,r0; jmp @r1; lds r0,pr
+//   .align 2
+//   1: .long mcount
+//   2: lds.l @r15+,pr
+//
+// Position independent code takes the address from the global offset
+// table, which it finds first:
+//
+//   mov.l 3f,r1; mova 3f,r0; add r1,r0; mov.l 1f,r1; mov.l @(r0,r1),r1
+//   (as above)
+//   1: .long mcount@GOT
+//   3: .long _GLOBAL_OFFSET_TABLE_
+//
+// mcount keeps the registers that carry arguments.  It does not keep r2 and
+// r3, which a function is given the address of its result in and its static
+// chain: where they are, they are put on the stack first, under pr, and
+// taken back last.
+//
+// SHInstrInfo::getInstSizeInBytes() has the sizes.  They count on the
+// function being aligned to four bytes.
+void SHAsmPrinter::emitProfileCall() {
+  MCOperand R0 = MCOperand::createReg(SH::R0);
+  MCOperand R1 = MCOperand::createReg(SH::R1);
+  MCSymbol *Function = OutContext.createTempSymbol();
+  MCSymbol *Table = OutContext.createTempSymbol();
+  MCSymbol *Back = OutContext.createTempSymbol();
+  bool IsPIC = isPositionIndependent();
+  SmallVector<MCRegister, 2> Saved;
+  for (MCRegister Reg : {SH::R2, SH::R3})
+    if (MF->front().isLiveIn(Reg))
+      Saved.push_back(Reg);
+  for (MCRegister Reg : Saved)
+    emit(SH::PUSH, {MCOperand::createReg(Reg)});
+  if (IsPIC) {
+    emit(SH::MOVLpc, {R1, label(Table)});
+    emit(SH::MOVA, {label(Table)});
+    emit(SH::ADDrr, {R0, R0, R1});
+    emit(SH::MOVLpc, {R1, label(Function)});
+    emit(SH::MOVLldr0, {R1, R1});
+  } else {
+    emit(SH::MOVLpc, {R1, label(Function)});
+  }
+  emit(SH::PUSHPR);
+  emit(SH::MOVA, {label(Back)});
+  emit(SH::JMP, {R1});
+  emit(SH::LDSPR, {R0});
+  OutStreamer->emitCodeAlignment(Align(4), getSubtargetInfo());
+  OutStreamer->emitLabel(Function);
+  OutStreamer->emitValue(
+      MCSymbolRefExpr::create(GetExternalSymbolSymbol("mcount"),
+                              IsPIC ? SH::S_GOT : SH::S_None, OutContext),
+      4);
+  if (IsPIC) {
+    OutStreamer->emitLabel(Table);
+    OutStreamer->emitValue(
+        MCSymbolRefExpr::create(
+            GetExternalSymbolSymbol("_GLOBAL_OFFSET_TABLE_"), OutContext),
+        4);
+  }
+  OutStreamer->emitLabel(Back);
+  emit(SH::POPPR);
+  for (MCRegister Reg : reverse(Saved))
+    emit(SH::POP, {MCOperand::createReg(Reg)});
+}
+
 // An instruction with a delay slot is one bundle with the instruction in
 // the slot.  A nop is behind the branch.  An instruction that the filler
 // moved into the slot is in front of it, where it is in the order of
@@ -204,6 +275,41 @@ void SHAsmPrinter::emitOne(const MachineInstr *MI) {
                            4);
     return;
   }
+
+  // The literal of a call over a distance.  bsrf and braf add to the
+  // address that is four bytes behind them, which is two behind the label
+  // of the call.  An entry of the procedure linkage table is named by its
+  // distance from where the literal is.
+  case SH::CPENTRYcall: {
+    MCSymbol *Label = MI->getOperand(0).getMCSymbol();
+    OutStreamer->emitLabel(Label);
+    const MachineOperand &Function = MI->getOperand(1);
+    const MCExpr *From = MCBinaryExpr::createAdd(
+        MCSymbolRefExpr::create(MI->getOperand(2).getMCSymbol(), OutContext),
+        MCConstantExpr::create(2, OutContext), OutContext);
+    if (Function.getTargetFlags() == SH::S_PLT)
+      From = MCBinaryExpr::createSub(
+          From, MCSymbolRefExpr::create(Label, OutContext), OutContext);
+    OutStreamer->emitValue(
+        MCBinaryExpr::createSub(lowerSymbol(Function), From, OutContext), 4);
+    return;
+  }
+
+  // The call and the tail call over a distance, with the label that the
+  // literal counts from, and the tail call through a register.
+  case SH::CALLrel:
+  case SH::TAILrel:
+    emit(MI->getOpcode() == SH::CALLrel ? SH::BSRF : SH::BRAF,
+         {MCOperand::createReg(MI->getOperand(0).getReg())});
+    OutStreamer->emitLabel(MI->getOperand(1).getMCSymbol());
+    return;
+  case SH::TAILJMP:
+    emit(SH::JMP, {MCOperand::createReg(MI->getOperand(0).getReg())});
+    return;
+
+  case TargetOpcode::FENTRY_CALL:
+    emitProfileCall();
+    return;
 
   // The address of the global offset table: the address of a literal and
   // what the literal says.

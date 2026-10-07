@@ -196,7 +196,10 @@ void SHFrameLowering::emitEpilogue(MachineFunction &MF,
 
   // The return is behind the pops, the locals go in front of them.  r7 is
   // free here: r0 to r3 may hold the result, a complex number of two 64-bit
-  // integers fills all four.
+  // integers fills all four.  In front of a tail call r4 to r7 may hold
+  // arguments, and r2 is free: it would have the address of a result in
+  // memory, and with one of those there is no tail call.
+  Register Scratch = MBBI != MBB.end() && MBBI->isCall() ? SH::R2 : SH::R7;
   MachineBasicBlock::iterator Return = MBBI;
   MachineBasicBlock::iterator FirstPop = MBBI;
   while (FirstPop != MBB.begin() && isPop(*std::prev(FirstPop)))
@@ -208,9 +211,9 @@ void SHFrameLowering::emitEpilogue(MachineFunction &MF,
   // r14 was the stack pointer behind the pushes if the stack was realigned,
   // and at the end of the frame otherwise.
   if (!realignsStack(MF))
-    adjustStack(MBB, FirstPop, DL, LocalSize, SH::R7,
+    adjustStack(MBB, FirstPop, DL, LocalSize, Scratch,
                 MachineInstr::FrameDestroy);
-  adjustStack(MBB, Return, DL, SaveSize, SH::R7, MachineInstr::FrameDestroy);
+  adjustStack(MBB, Return, DL, SaveSize, Scratch, MachineInstr::FrameDestroy);
 }
 
 MachineBasicBlock::iterator SHFrameLowering::eliminateCallFramePseudoInstr(

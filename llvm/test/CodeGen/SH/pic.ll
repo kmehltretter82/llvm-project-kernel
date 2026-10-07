@@ -133,26 +133,28 @@ define i32 @call_ext(i32 %x) {
 ; CHECK-LABEL: call_ext:
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
-; CHECK-NEXT:    sts.l pr,@-r15
+; CHECK-NEXT:    mov.l r12,@-r15
 ; CHECK-NEXT:    .cfi_def_cfa_offset 4
-; CHECK-NEXT:    .cfi_offset pr, -4
-; CHECK-NEXT:    mova .Ltmp10,r0
-; CHECK-NEXT:    mov.l .Ltmp10,r1
-; CHECK-NEXT:    add r0,r1
-; CHECK-NEXT:    mov.l .Ltmp11,r2
-; CHECK-NEXT:    add r1,r2
-; CHECK-NEXT:    mov.l @r2,r2
-; CHECK-NEXT:    jsr @r2
+; CHECK-NEXT:    .cfi_offset r12, -4
+; CHECK-NEXT:    sts.l pr,@-r15
+; CHECK-NEXT:    .cfi_def_cfa_offset 8
+; CHECK-NEXT:    .cfi_offset pr, -8
+; CHECK-NEXT:    mova .Ltmp11,r0
+; CHECK-NEXT:    mov.l .Ltmp11,r12
+; CHECK-NEXT:    add r0,r12
+; CHECK-NEXT:    mov.l .Ltmp12,r1
+; CHECK-NEXT:    bsrf r1
+; CHECK-NEXT:  .Ltmp10:
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    lds.l @r15+,pr
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:    mov.l @r15+,r12
 ; CHECK-NEXT:    .p2align 2
 ; CHECK-NEXT:  ! %bb.1:
-; CHECK-NEXT:  .Ltmp10:
-; CHECK-NEXT:    .ualong _GLOBAL_OFFSET_TABLE_
 ; CHECK-NEXT:  .Ltmp11:
-; CHECK-NEXT:    .ualong callee@GOT
+; CHECK-NEXT:    .ualong _GLOBAL_OFFSET_TABLE_
+; CHECK-NEXT:  .Ltmp12:
+; CHECK-NEXT:    .ualong callee@PLT-(.Ltmp10+2-.Ltmp12)
   %r = call i32 @callee(i32 %x)
   ret i32 %r
 }
@@ -164,22 +166,17 @@ define i32 @call_loc(i32 %x) {
 ; CHECK-NEXT:    sts.l pr,@-r15
 ; CHECK-NEXT:    .cfi_def_cfa_offset 4
 ; CHECK-NEXT:    .cfi_offset pr, -4
-; CHECK-NEXT:    mova .Ltmp12,r0
-; CHECK-NEXT:    mov.l .Ltmp12,r1
-; CHECK-NEXT:    add r0,r1
-; CHECK-NEXT:    mov.l .Ltmp13,r2
-; CHECK-NEXT:    add r1,r2
-; CHECK-NEXT:    jsr @r2
+; CHECK-NEXT:    mov.l .Ltmp14,r1
+; CHECK-NEXT:    bsrf r1
+; CHECK-NEXT:  .Ltmp13:
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    lds.l @r15+,pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    .p2align 2
 ; CHECK-NEXT:  ! %bb.1:
-; CHECK-NEXT:  .Ltmp12:
-; CHECK-NEXT:    .ualong _GLOBAL_OFFSET_TABLE_
-; CHECK-NEXT:  .Ltmp13:
-; CHECK-NEXT:    .ualong helper@GOTOFF
+; CHECK-NEXT:  .Ltmp14:
+; CHECK-NEXT:    .ualong helper-(.Ltmp13+2)
   %r = call i32 @helper(i32 %x)
   ret i32 %r
 }
@@ -189,71 +186,84 @@ define i32 @switch(i32 %x) {
 ; CHECK-LABEL: switch:
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0: ! %entry
-; CHECK-NEXT:    sts.l pr,@-r15
+; CHECK-NEXT:    mov.l r12,@-r15
 ; CHECK-NEXT:    .cfi_def_cfa_offset 4
-; CHECK-NEXT:    .cfi_offset pr, -4
-; CHECK-NEXT:    mova .Ltmp14,r0
-; CHECK-NEXT:    mov.l .Ltmp14,r1
-; CHECK-NEXT:    add r0,r1
-; CHECK-NEXT:    mov #4,r2
-; CHECK-NEXT:    cmp/hi r2,r4
-; CHECK-NEXT:    bt .LBB7_8
+; CHECK-NEXT:    .cfi_offset r12, -4
+; CHECK-NEXT:    sts.l pr,@-r15
+; CHECK-NEXT:    .cfi_def_cfa_offset 8
+; CHECK-NEXT:    .cfi_offset pr, -8
+; CHECK-NEXT:    mova .Ltmp20,r0
+; CHECK-NEXT:    mov.l .Ltmp20,r12
+; CHECK-NEXT:    add r0,r12
+; CHECK-NEXT:    mov #4,r1
+; CHECK-NEXT:    cmp/hi r1,r4
+; CHECK-NEXT:    bt .LBB7_7
 ; CHECK-NEXT:  ! %bb.1: ! %entry
-; CHECK-NEXT:    mov.l .Ltmp15,r2
-; CHECK-NEXT:    add r1,r2
+; CHECK-NEXT:    mov.l .Ltmp21,r1
+; CHECK-NEXT:    add r12,r1
 ; CHECK-NEXT:    shll2 r4
-; CHECK-NEXT:    add r2,r4
-; CHECK-NEXT:    mov.l @r4,r3
-; CHECK-NEXT:    add r2,r3
-; CHECK-NEXT:    jmp @r3
+; CHECK-NEXT:    add r1,r4
+; CHECK-NEXT:    mov.l @r4,r2
+; CHECK-NEXT:    add r1,r2
+; CHECK-NEXT:    jmp @r2
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:  .LBB7_2: ! %a
-; CHECK-NEXT:    mov.l .Ltmp16,r2
-; CHECK-NEXT:    add r2,r1
-; CHECK-NEXT:    mov.l @r1,r2
-; CHECK-NEXT:    bra .LBB7_3
+; CHECK-NEXT:    mov.l .Ltmp22,r1
+; CHECK-NEXT:    bsrf r1
+; CHECK-NEXT:  .Ltmp19:
 ; CHECK-NEXT:    mov #10,r4
-; CHECK-NEXT:  .LBB7_7: ! %e
-; CHECK-NEXT:    mov.l .Ltmp16,r2
-; CHECK-NEXT:    add r2,r1
-; CHECK-NEXT:    mov.l @r1,r2
-; CHECK-NEXT:    bra .LBB7_3
+; CHECK-NEXT:    bra .LBB7_8
+; CHECK-NEXT:    nop
+; CHECK-NEXT:  .LBB7_6: ! %e
+; CHECK-NEXT:    mov.l .Ltmp23,r1
+; CHECK-NEXT:    bsrf r1
+; CHECK-NEXT:  .Ltmp15:
 ; CHECK-NEXT:    mov #54,r4
-; CHECK-NEXT:  .LBB7_5: ! %c
-; CHECK-NEXT:    mov.l .Ltmp16,r2
-; CHECK-NEXT:    add r2,r1
-; CHECK-NEXT:    mov.l @r1,r2
-; CHECK-NEXT:    bra .LBB7_3
+; CHECK-NEXT:    bra .LBB7_8
+; CHECK-NEXT:    nop
+; CHECK-NEXT:  .LBB7_4: ! %c
+; CHECK-NEXT:    mov.l .Ltmp24,r1
+; CHECK-NEXT:    bsrf r1
+; CHECK-NEXT:  .Ltmp17:
 ; CHECK-NEXT:    mov #32,r4
-; CHECK-NEXT:  .LBB7_6: ! %d
-; CHECK-NEXT:    mov.l .Ltmp16,r2
-; CHECK-NEXT:    add r2,r1
-; CHECK-NEXT:    mov.l @r1,r2
-; CHECK-NEXT:    bra .LBB7_3
+; CHECK-NEXT:    bra .LBB7_8
+; CHECK-NEXT:    nop
+; CHECK-NEXT:  .LBB7_5: ! %d
+; CHECK-NEXT:    mov.l .Ltmp25,r1
+; CHECK-NEXT:    bsrf r1
+; CHECK-NEXT:  .Ltmp16:
 ; CHECK-NEXT:    mov #43,r4
-; CHECK-NEXT:  .LBB7_4: ! %b
-; CHECK-NEXT:    mov.l .Ltmp16,r2
-; CHECK-NEXT:    add r2,r1
-; CHECK-NEXT:    mov.l @r1,r2
+; CHECK-NEXT:    bra .LBB7_8
+; CHECK-NEXT:    nop
+; CHECK-NEXT:  .LBB7_3: ! %b
+; CHECK-NEXT:    mov.l .Ltmp26,r1
+; CHECK-NEXT:    bsrf r1
+; CHECK-NEXT:  .Ltmp18:
 ; CHECK-NEXT:    mov #21,r4
-; CHECK-NEXT:  .LBB7_3: ! %a
-; CHECK-NEXT:    jsr @r2
+; CHECK-NEXT:    bra .LBB7_8
 ; CHECK-NEXT:    nop
-; CHECK-NEXT:    lds.l @r15+,pr
-; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
+; CHECK-NEXT:  .LBB7_7: ! %other
+; CHECK-NEXT:    mov #0,r0
 ; CHECK-NEXT:  .LBB7_8: ! %other
 ; CHECK-NEXT:    lds.l @r15+,pr
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    mov #0,r0
+; CHECK-NEXT:    mov.l @r15+,r12
 ; CHECK-NEXT:    .p2align 2
 ; CHECK-NEXT:  ! %bb.9:
-; CHECK-NEXT:  .Ltmp14:
+; CHECK-NEXT:  .Ltmp20:
 ; CHECK-NEXT:    .ualong _GLOBAL_OFFSET_TABLE_
-; CHECK-NEXT:  .Ltmp15:
+; CHECK-NEXT:  .Ltmp21:
 ; CHECK-NEXT:    .ualong .LJTI7_0@GOTOFF
-; CHECK-NEXT:  .Ltmp16:
-; CHECK-NEXT:    .ualong callee@GOT
+; CHECK-NEXT:  .Ltmp22:
+; CHECK-NEXT:    .ualong callee@PLT-(.Ltmp19+2-.Ltmp22)
+; CHECK-NEXT:  .Ltmp23:
+; CHECK-NEXT:    .ualong callee@PLT-(.Ltmp15+2-.Ltmp23)
+; CHECK-NEXT:  .Ltmp24:
+; CHECK-NEXT:    .ualong callee@PLT-(.Ltmp17+2-.Ltmp24)
+; CHECK-NEXT:  .Ltmp25:
+; CHECK-NEXT:    .ualong callee@PLT-(.Ltmp16+2-.Ltmp25)
+; CHECK-NEXT:  .Ltmp26:
+; CHECK-NEXT:    .ualong callee@PLT-(.Ltmp18+2-.Ltmp26)
 entry:
   switch i32 %x, label %other [
     i32 0, label %a

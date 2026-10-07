@@ -36,6 +36,11 @@ def GPR : RegisterClass<"SH", [i32], 32,
 // The sequences for thread-local storage that the linker knows use it.
 def R12Reg : RegisterClass<"SH", [i32], 32, (add R12)>;
 
+// Where the target of a tail call can be: in a register that the epilogue
+// does not restore and that carries no argument.  r2 is not among them, the
+// epilogue computes in it there.
+def TCGPR : RegisterClass<"SH", [i32], 32, (add R1, R0, R3)>;
+
 def SysReg : RegisterClass<"SH", [i32], 32, (add PR, MACH, MACL, GBR)> {
   let isAllocatable = 0;
 }

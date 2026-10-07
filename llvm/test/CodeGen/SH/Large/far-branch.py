@@ -31,7 +31,7 @@
 # CHECK-NEXT:    .ualong [[END:\.LBB0_[0-9]+]]-([[FROM2]]+4)
 # CHECK:       [[THEN]]:
 # CHECK:       [[END]]:
-# CHECK:         jsr @r8
+# CHECK:         {{jsr @r8|bsrf r1}}
 
 N = 2100
 

@@ -124,9 +124,12 @@ bool SHDelaySlotFiller::canFill(const MachineInstr &Branch,
     return true;
   // The target is read in front of the slot.
   case SH::JMP:
+  case SH::TAILJMP:
+  case SH::TAILrel:
     return !Touches(Branch.getOperand(0).getReg(), /*OnlyDefs=*/true);
   // And pr is written in front of it.
   case SH::JSR:
+  case SH::CALLrel:
     return !Touches(Branch.getOperand(0).getReg(), /*OnlyDefs=*/true) &&
            !Touches(SH::PR, /*OnlyDefs=*/false);
   // pr is read in front of the slot.

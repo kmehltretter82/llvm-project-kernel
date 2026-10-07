@@ -79,66 +79,62 @@ define i32 @catcher(i32 %x) personality ptr @__gxx_personality_v0 {
 ; PIC-NEXT:    mov.l r8,@-r15
 ; PIC-NEXT:    .cfi_def_cfa_offset 4
 ; PIC-NEXT:    .cfi_offset r8, -4
-; PIC-NEXT:    mov.l r9,@-r15
+; PIC-NEXT:    mov.l r12,@-r15
 ; PIC-NEXT:    .cfi_def_cfa_offset 8
-; PIC-NEXT:    .cfi_offset r9, -8
+; PIC-NEXT:    .cfi_offset r12, -8
 ; PIC-NEXT:    sts.l pr,@-r15
 ; PIC-NEXT:    .cfi_def_cfa_offset 12
 ; PIC-NEXT:    .cfi_offset pr, -12
-; PIC-NEXT:    mova .Ltmp3,r0
-; PIC-NEXT:    mov.l .Ltmp3,r9
-; PIC-NEXT:    add r0,r9
-; PIC-NEXT:    mov.l .Ltmp4,r1
-; PIC-NEXT:    add r9,r1
-; PIC-NEXT:    mov.l @r1,r2
+; PIC-NEXT:    mova .Ltmp7,r0
+; PIC-NEXT:    mov.l .Ltmp7,r12
+; PIC-NEXT:    add r0,r12
 ; PIC-NEXT:  .Ltmp0: ! EH_LABEL
-; PIC-NEXT:    jsr @r2
+; PIC-NEXT:    mov.l .Ltmp8,r1
+; PIC-NEXT:    bsrf r1
+; PIC-NEXT:  .Ltmp1:
 ; PIC-NEXT:    nop
-; PIC-NEXT:  .Ltmp1: ! EH_LABEL
+; PIC-NEXT:  .Ltmp2: ! EH_LABEL
 ; PIC-NEXT:  ! %bb.1: ! %done
 ; PIC-NEXT:    mov #0,r0
 ; PIC-NEXT:  .LBB0_2: ! %done
 ; PIC-NEXT:    lds.l @r15+,pr
-; PIC-NEXT:    mov.l @r15+,r9
+; PIC-NEXT:    mov.l @r15+,r12
 ; PIC-NEXT:    rts
 ; PIC-NEXT:    mov.l @r15+,r8
 ; PIC-NEXT:  .LBB0_3: ! %lpad
-; PIC-NEXT:  .Ltmp2: ! EH_LABEL
+; PIC-NEXT:  .Ltmp3: ! EH_LABEL
 ; PIC-NEXT:    mov r5,r0
 ; PIC-NEXT:    cmp/eq #1,r0
 ; PIC-NEXT:    bf .LBB0_5
 ; PIC-NEXT:  ! %bb.4: ! %catch
-; PIC-NEXT:    mov.l .Ltmp5,r1
-; PIC-NEXT:    add r9,r1
-; PIC-NEXT:    mov.l @r1,r2
-; PIC-NEXT:    jsr @r2
+; PIC-NEXT:    mov.l .Ltmp9,r1
+; PIC-NEXT:    bsrf r1
+; PIC-NEXT:  .Ltmp5:
 ; PIC-NEXT:    nop
 ; PIC-NEXT:    mov.l @r0,r8
-; PIC-NEXT:    mov.l .Ltmp6,r1
-; PIC-NEXT:    add r9,r1
-; PIC-NEXT:    mov.l @r1,r2
-; PIC-NEXT:    jsr @r2
+; PIC-NEXT:    mov.l .Ltmp10,r1
+; PIC-NEXT:    bsrf r1
+; PIC-NEXT:  .Ltmp6:
 ; PIC-NEXT:    nop
 ; PIC-NEXT:    bra .LBB0_2
 ; PIC-NEXT:    mov r8,r0
 ; PIC-NEXT:  .LBB0_5: ! %resume
-; PIC-NEXT:    mov.l .Ltmp7,r1
-; PIC-NEXT:    add r1,r9
-; PIC-NEXT:    mov.l @r9,r2
-; PIC-NEXT:    jsr @r2
+; PIC-NEXT:    mov.l .Ltmp11,r1
+; PIC-NEXT:    bsrf r1
+; PIC-NEXT:  .Ltmp4:
 ; PIC-NEXT:    nop
 ; PIC-NEXT:    .p2align 2
 ; PIC-NEXT:  ! %bb.6:
-; PIC-NEXT:  .Ltmp3:
-; PIC-NEXT:    .ualong _GLOBAL_OFFSET_TABLE_
-; PIC-NEXT:  .Ltmp4:
-; PIC-NEXT:    .ualong may_throw@GOT
-; PIC-NEXT:  .Ltmp5:
-; PIC-NEXT:    .ualong __cxa_begin_catch@GOT
-; PIC-NEXT:  .Ltmp6:
-; PIC-NEXT:    .ualong __cxa_end_catch@GOT
 ; PIC-NEXT:  .Ltmp7:
-; PIC-NEXT:    .ualong _Unwind_Resume@GOT
+; PIC-NEXT:    .ualong _GLOBAL_OFFSET_TABLE_
+; PIC-NEXT:  .Ltmp8:
+; PIC-NEXT:    .ualong may_throw@PLT-(.Ltmp1+2-.Ltmp8)
+; PIC-NEXT:  .Ltmp9:
+; PIC-NEXT:    .ualong __cxa_begin_catch@PLT-(.Ltmp5+2-.Ltmp9)
+; PIC-NEXT:  .Ltmp10:
+; PIC-NEXT:    .ualong __cxa_end_catch@PLT-(.Ltmp6+2-.Ltmp10)
+; PIC-NEXT:  .Ltmp11:
+; PIC-NEXT:    .ualong _Unwind_Resume@PLT-(.Ltmp4+2-.Ltmp11)
 entry:
   invoke void @may_throw(i32 %x)
           to label %done unwind label %lpad
@@ -172,8 +168,8 @@ done:
 ; PIC-NEXT:    .byte 255 ! @LPStart Encoding = omit
 ; PIC-NEXT:    .byte 155 ! @TType Encoding = indirect pcrel sdata4
 ; PIC:         .uleb128 .Ltmp0-.Lfunc_begin0 ! >> Call Site 1 <<
-; PIC-NEXT:    .uleb128 .Ltmp1-.Ltmp0 ! Call between .Ltmp0 and .Ltmp1
-; PIC-NEXT:    .uleb128 .Ltmp2-.Lfunc_begin0 ! jumps to .Ltmp2
+; PIC-NEXT:    .uleb128 .Ltmp2-.Ltmp0 ! Call between .Ltmp0 and .Ltmp2
+; PIC-NEXT:    .uleb128 .Ltmp3-.Lfunc_begin0 ! jumps to .Ltmp3
 ; PIC:       .Ltmp{{[0-9]+}}: ! TypeInfo 1
 ; PIC-NEXT:    .ualong .L_ZTIi.DW.stub-.Ltmp{{[0-9]+}}
 ; PIC:       DW.ref.__gxx_personality_v0:

@@ -24,6 +24,8 @@
 def CC_SH : CallingConv<[
   // The address of the place for a result that is returned in memory.
   CCIfSRet<CCAssignToReg<[R2]>>,
+  // The static chain of a nested function.
+  CCIfNest<CCAssignToReg<[R3]>>,
   CCIfByVal<CCPassByVal<4, 4>>,
   CCIfType<[i1, i8, i16], CCPromoteToType<i32>>,
   CCIfType<[i32], CCAssignToReg<[R4, R5, R6, R7]>>,
@@ -32,6 +34,8 @@ def CC_SH : CallingConv<[
 
 def CC_SH_FPU : CallingConv<[
   CCIfSRet<CCAssignToReg<[R2]>>,
+  // The static chain of a nested function.
+  CCIfNest<CCAssignToReg<[R3]>>,
   CCIfByVal<CCPassByVal<4, 4>>,
   CCIfType<[i1, i8, i16], CCPromoteToType<i32>>,
   CCCustom<"CC_SH_FPU_Custom">

@@ -50,6 +50,23 @@ def SHcall : SDNode<"SHISD::CALL", SDT_SHCall,
                     [SDNPHasChain, SDNPOptInGlue, SDNPOutGlue, SDNPVariadic]>;
 def SHret : SDNode<"SHISD::RET", SDTNone,
                    [SDNPHasChain, SDNPOptInGlue, SDNPVariadic]>;
+// A call that does not come back: the function that is called returns to
+// the caller of this one.
+def SHtailcall : SDNode<"SHISD::TAILCALL", SDT_SHCall,
+                        [SDNPHasChain, SDNPOptInGlue, SDNPVariadic]>;
+// The distance from a call to the function, and the call and the tail call
+// over that distance.  The second operand of each is the label behind the
+// instruction that calls, which the distance is counted from.
+def SDT_SHCallDist
+    : SDTypeProfile<1, 2, [SDTCisVT<0, i32>, SDTCisPtrTy<1>, SDTCisPtrTy<2>]>;
+def SDT_SHCallRel
+    : SDTypeProfile<0, -1, [SDTCisVT<0, i32>, SDTCisPtrTy<1>]>;
+def SHcalldist : SDNode<"SHISD::CALLDIST", SDT_SHCallDist>;
+def SHcallrel : SDNode<"SHISD::CALLREL", SDT_SHCallRel,
+                       [SDNPHasChain, SDNPOptInGlue, SDNPOutGlue,
+                        SDNPVariadic]>;
+def SHtailcallrel : SDNode<"SHISD::TAILCALLREL", SDT_SHCallRel,
+                           [SDNPHasChain, SDNPOptInGlue, SDNPVariadic]>;
 def SHcallseq_start : SDNode<"ISD::CALLSEQ_START", SDT_SHCallSeqStart,
                              [SDNPHasChain, SDNPOutGlue]>;
 def SHcallseq_end : SDNode<"ISD::CALLSEQ_END", SDT_SHCallSeqEnd,
@@ -554,9 +571,50 @@ let isBarrier = 1, isIndirectBranch = 1, hasDelaySlot = 1 in
 def BRAF : SHPlain<(outs), (ins GPR:$distance), "braf\t$distance">;
 }
 
-let isCall = 1, hasDelaySlot = 1, Defs = [PR, T, MACH, MACL] in
+let isCall = 1, hasDelaySlot = 1, Defs = [PR, T, MACH, MACL] in {
 def JSR : SHInst<(outs), (ins GPR:$target, variable_ops), "jsr\t@$target",
                  [(SHcall GPR:$target)]>;
+// A call over the distance in a register, which counts from four bytes
+// behind the instruction.
+def BSRF : SHPlain<(outs), (ins GPR:$distance), "bsrf\t$distance">;
+}
+
+// Position independent code calls over a distance from a literal:
+//
+//   mov.l .L1,r1; ...; bsrf r1; .L2: (the delay slot)
+//   .L1: .long function@PLT-(.L2+2-.L1)
+//
+// That is GCC's call.  It goes through the procedure linkage table, which
+// finds the function when it is first called and wants the address of the
+// global offset table in r12 for that.  A function of this module is called
+// in the same way without the table, the literal is "function-(.L2+2)".
+// MOVLcall is the load until the literal is placed, CALLrel the bsrf with
+// its label.  The label is theirs alone, so neither can be made twice.
+let isNotDuplicable = 1 in {
+let hasSideEffects = 0 in
+def MOVLcall : SHPseudo<(outs GPR:$dst),
+                        (ins i32imm:$function, labelop:$anchor), []>;
+let isCall = 1, hasDelaySlot = 1, Defs = [PR, T, MACH, MACL] in
+def CALLrel : SHPseudo<(outs),
+                       (ins GPR:$distance, labelop:$anchor, variable_ops),
+                       [(SHcallrel GPR:$distance, mcsym:$anchor)]>;
+}
+def : Pat<(SHcalldist tglobaladdr:$f, mcsym:$anchor),
+          (MOVLcall tglobaladdr:$f, mcsym:$anchor)>;
+def : Pat<(SHcalldist texternalsym:$f, mcsym:$anchor),
+          (MOVLcall texternalsym:$f, mcsym:$anchor)>;
+
+// A tail call: "jmp @Rn" behind the epilogue, or "braf Rn" over a distance
+// as above.  The register is one that the epilogue leaves alone.
+let isCall = 1, isTerminator = 1, isReturn = 1, isBarrier = 1,
+    hasDelaySlot = 1 in {
+def TAILJMP : SHPseudo<(outs), (ins TCGPR:$target, variable_ops),
+                       [(SHtailcall TCGPR:$target)]>;
+let isNotDuplicable = 1 in
+def TAILrel : SHPseudo<(outs),
+                       (ins TCGPR:$distance, labelop:$anchor, variable_ops),
+                       [(SHtailcallrel TCGPR:$distance, mcsym:$anchor)]>;
+}
 
 let isReturn = 1, isTerminator = 1, isBarrier = 1, hasDelaySlot = 1 in
 def RTS : SHInst<(outs), (ins variable_ops), "rts", [(SHret)]>;
@@ -810,4 +868,9 @@ def CPENTRY : SHPseudo<(outs), (ins labelop:$label, i32imm:$value), []>;
 def CPENTRYrel : SHPseudo<(outs),
                           (ins labelop:$label, brtarget:$target,
                                labelop:$anchor), []>;
+// The literal of a call over a distance: the function and the label behind
+// the bsrf or braf.
+def CPENTRYcall : SHPseudo<(outs),
+                           (ins labelop:$label, i32imm:$function,
+                                labelop:$anchor), []>;
 }

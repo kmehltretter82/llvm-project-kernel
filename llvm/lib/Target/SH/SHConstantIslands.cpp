@@ -93,8 +93,9 @@ private:
     /// The instructions that load it.  A MOVLpcrel is replaced by the real
     /// load, any other gets the label as its second operand.
     SmallVector<MachineInstr *, 2> Users;
-    /// The literal of a far branch: not where its target is but how far it
-    /// is from the branch, so no other instruction can share it.
+    /// The literal of a far branch or of a call over a distance: not where
+    /// its target is but how far it is from the instruction, so no other
+    /// instruction can share it.
     bool Distance = false;
   };
 
@@ -160,6 +161,7 @@ bool SHConstantIslands::loadsLiteral(const MachineInstr &MI, int &Offset) {
   switch (MI.getOpcode()) {
   // The first of the three instructions has the longest way.
   case SH::MOVLpcrel:
+  case SH::MOVLcall:
   case SH::LOADGOT:
     Offset = 0;
     return true;
@@ -242,7 +244,20 @@ MachineBasicBlock *SHConstantIslands::flush(MachineBasicBlock &MBB,
     Addr += 4;
   Addr += Addr & 2;
   for (Literal &L : Pool) {
-    if (Materialize && L.Distance) {
+    if (Materialize && L.Distance &&
+        L.Users.front()->getOpcode() == SH::MOVLcall) {
+      // The label that the distance counts from is the one of the call.
+      MachineInstr *User = L.Users.front();
+      MCSymbol *Label = Ctx.createTempSymbol();
+      BuildMI(Island, DL, TII->get(SH::CPENTRYcall))
+          .addSym(Label)
+          .add(L.Value)
+          .add(User->getOperand(2));
+      BuildMI(*User->getParent(), User, User->getDebugLoc(),
+              TII->get(SH::MOVLpc), User->getOperand(0).getReg())
+          .addSym(Label);
+      User->eraseFromParent();
+    } else if (Materialize && L.Distance) {
       MCSymbol *Label = Ctx.createTempSymbol();
       MCSymbol *Anchor = Ctx.createTempSymbol();
       BuildMI(Island, DL, TII->get(SH::CPENTRYrel))
@@ -324,6 +339,8 @@ void SHConstantIslands::place(bool Materialize) {
         if (MI.isBranch())
           addLiteral(MachineOperand::CreateMBB(MI.getOperand(0).getMBB()),
                      Addr + Offset, &MI, /*Distance=*/true);
+        else if (MI.getOpcode() == SH::MOVLcall)
+          addLiteral(MI.getOperand(1), Addr, &MI, /*Distance=*/true);
         else
           addLiteral(MI.getOperand(1), Addr, &MI);
       }

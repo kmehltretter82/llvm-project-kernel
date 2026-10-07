@@ -26,6 +26,8 @@
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/SelectionDAGNodes.h"
 #include "llvm/IR/DiagnosticInfo.h"
+#include "llvm/IR/Module.h"
+#include "llvm/MC/MCContext.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Target/TargetMachine.h"
 
@@ -1131,6 +1133,40 @@ SDValue SHTargetLowering::LowerFormalArguments(
   return Chain;
 }
 
+bool SHTargetLowering::mayBeEmittedAsTailCall(const CallInst *CI) const {
+  return CI->isTailCall();
+}
+
+/// Whether a call in tail position can be a jump.  It can if the function
+/// that is called needs nothing that is in this function's frame and
+/// returns as this function would:
+///
+/// - no argument on the stack, and none that is a structure by value, which
+///   may be a copy in this frame;
+/// - no result in memory on either side: this function returns the address
+///   of such a result in r0, and the address that the other one is given
+///   would be in r2, where the epilogue computes;
+/// - no static chain, which is in r3, where the address of the function may
+///   be;
+/// - this function has no variable arguments, whose registers it has put on
+///   the stack.
+bool SHTargetLowering::isEligibleForTailCall(
+    const TargetLowering::CallLoweringInfo &CLI, const MachineFunction &MF,
+    unsigned StackSize) const {
+  const Function &Caller = MF.getFunction();
+  auto IsC = [](CallingConv::ID CC) {
+    return CC == CallingConv::C || CC == CallingConv::Fast;
+  };
+  if (!IsC(CLI.CallConv) || !IsC(Caller.getCallingConv()))
+    return false;
+  if (StackSize != 0 || Caller.isVarArg() || Caller.hasStructRetAttr())
+    return false;
+  for (const ISD::OutputArg &Out : CLI.Outs)
+    if (Out.Flags.isByVal() || Out.Flags.isSRet() || Out.Flags.isNest())
+      return false;
+  return true;
+}
+
 SDValue SHTargetLowering::LowerCall(TargetLowering::CallLoweringInfo &CLI,
                                     SmallVectorImpl<SDValue> &InVals) const {
   SelectionDAG &DAG = CLI.DAG;
@@ -1143,15 +1179,21 @@ SDValue SHTargetLowering::LowerCall(TargetLowering::CallLoweringInfo &CLI,
   MachineFunction &MF = DAG.getMachineFunction();
   EVT PtrVT = getPointerTy(DAG.getDataLayout());
 
-  // No tail calls yet.
-  CLI.IsTailCall = false;
-
   SmallVector<CCValAssign, 16> ArgLocs;
   CCState CCInfo(CLI.CallConv, CLI.IsVarArg, MF, ArgLocs, *DAG.getContext());
   CCInfo.AnalyzeCallOperands(Outs, getArgConvention());
   unsigned NumBytes = CCInfo.getStackSize();
 
-  Chain = DAG.getCALLSEQ_START(Chain, NumBytes, 0, DL);
+  bool IsTailCall = CLI.IsTailCall && isEligibleForTailCall(CLI, MF, NumBytes);
+  if (!IsTailCall && CLI.CB && CLI.CB->isMustTailCall())
+    report_fatal_error("failed to perform tail call elimination on a call "
+                       "site marked musttail");
+  CLI.IsTailCall = IsTailCall;
+
+  // A tail call has no arguments on the stack, so the stack pointer does
+  // not move for it.
+  if (!IsTailCall)
+    Chain = DAG.getCALLSEQ_START(Chain, NumBytes, 0, DL);
 
   SmallVector<std::pair<unsigned, SDValue>, 4> RegsToPass;
   SmallVector<SDValue, 8> MemOps;
@@ -1218,20 +1260,49 @@ SDValue SHTargetLowering::LowerCall(TargetLowering::CallLoweringInfo &CLI,
   if (!MemOps.empty())
     Chain = DAG.getNode(ISD::TokenFactor, DL, MVT::Other, MemOps);
 
+  // The address of the function comes from a literal: bsr reaches only
+  // four kilobytes.  Position independent code loads the distance to the
+  // function instead and calls with bsrf (see CALLrel in SHInstrInfo.td):
+  // to the function itself if it is in this module, and to its entry in the
+  // procedure linkage table otherwise, which needs the address of the global
+  // offset table in r12.  r12 is restored in front of a tail call, so that
+  // one takes the address from the global offset table.  So does a call of
+  // a function that is not to be bound lazily (-fno-plt).
+  SDValue Anchor;
+  const auto *GA = dyn_cast<GlobalAddressSDNode>(Callee);
+  const auto *ES = dyn_cast<ExternalSymbolSDNode>(Callee);
+  if (GA || ES) {
+    const GlobalValue *GV = GA ? GA->getGlobal() : nullptr;
+    bool IsLocal = GV && getTargetMachine().shouldAssumeDSOLocal(GV);
+    const auto *F = dyn_cast_or_null<Function>(GV);
+    bool Lazy = !IsLocal && !IsTailCall &&
+                !(F && F->hasFnAttribute(Attribute::NonLazyBind)) &&
+                !(ES && MF.getFunction().getParent()->getRtLibUseGOT());
+    if (isPositionIndependent() && (IsLocal || Lazy)) {
+      Anchor = DAG.getMCSymbol(MF.getContext().createTempSymbol(), PtrVT);
+      unsigned Flags = IsLocal ? SH::S_None : SH::S_PLT;
+      SDValue Function =
+          GA ? DAG.getTargetGlobalAddress(GV, DL, PtrVT, 0, Flags)
+             : DAG.getTargetExternalSymbol(ES->getSymbol(), PtrVT, Flags);
+      Callee = DAG.getNode(SHISD::CALLDIST, DL, PtrVT, Function, Anchor);
+      if (!IsLocal)
+        RegsToPass.push_back({SH::R12, getGlobalBase(DAG, DL)});
+    } else {
+      Callee = LowerAddress(Callee, DAG);
+    }
+  }
+
   SDValue Glue;
   for (auto &[Reg, Value] : RegsToPass) {
     Chain = DAG.getCopyToReg(Chain, DL, Reg, Value, Glue);
     Glue = Chain.getValue(1);
   }
 
-  // The address of the function comes from a literal: bsr reaches only
-  // four kilobytes.
-  if (isa<GlobalAddressSDNode>(Callee) || isa<ExternalSymbolSDNode>(Callee))
-    Callee = LowerAddress(Callee, DAG);
-
   SmallVector<SDValue, 8> Ops;
   Ops.push_back(Chain);
   Ops.push_back(Callee);
+  if (Anchor.getNode())
+    Ops.push_back(Anchor);
   for (auto &[Reg, Value] : RegsToPass)
     Ops.push_back(DAG.getRegister(Reg, Value.getValueType()));
   const TargetRegisterInfo *TRI = Subtarget.getRegisterInfo();
@@ -1241,8 +1312,15 @@ SDValue SHTargetLowering::LowerCall(TargetLowering::CallLoweringInfo &CLI,
   if (Glue.getNode())
     Ops.push_back(Glue);
 
+  if (IsTailCall) {
+    MF.getFrameInfo().setHasTailCall();
+    return DAG.getNode(Anchor.getNode() ? SHISD::TAILCALLREL : SHISD::TAILCALL,
+                       DL, MVT::Other, Ops);
+  }
+
   SDVTList NodeTys = DAG.getVTList(MVT::Other, MVT::Glue);
-  Chain = DAG.getNode(SHISD::CALL, DL, NodeTys, Ops);
+  Chain = DAG.getNode(Anchor.getNode() ? SHISD::CALLREL : SHISD::CALL, DL,
+                      NodeTys, Ops);
   Glue = Chain.getValue(1);
 
   Chain = DAG.getCALLSEQ_END(Chain, NumBytes, 0, Glue, DL);

@@ -109,6 +109,10 @@ private:
                                const SmallVectorImpl<ISD::InputArg> &Ins,
                                const SDLoc &DL, SelectionDAG &DAG,
                                SmallVectorImpl<SDValue> &InVals) const override;
+  bool mayBeEmittedAsTailCall(const CallInst *CI) const override;
+  bool isEligibleForTailCall(const TargetLowering::CallLoweringInfo &CLI,
+                             const MachineFunction &MF,
+                             unsigned StackSize) const;
   SDValue LowerCall(TargetLowering::CallLoweringInfo &CLI,
                     SmallVectorImpl<SDValue> &InVals) const override;
   bool CanLowerReturn(CallingConv::ID CallConv, MachineFunction &MF,
