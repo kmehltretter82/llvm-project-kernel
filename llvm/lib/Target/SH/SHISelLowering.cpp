@@ -1315,8 +1315,15 @@ SHTargetLowering::getConstraintType(StringRef Constraint) const {
   if (Constraint.size() == 1) {
     switch (Constraint[0]) {
     case 'r':
-    case 'z':
+    case 'a':
+    case 'u':
+    case 'f':
+    case 'e':
+    case 'd':
       return C_RegisterClass;
+    case 'z':
+    case 'w':
+      return C_Register;
     default:
       break;
     }
@@ -1330,11 +1337,34 @@ SHTargetLowering::getRegForInlineAsmConstraint(const TargetRegisterInfo *TRI,
                                                MVT VT) const {
   if (Constraint.size() == 1) {
     switch (Constraint[0]) {
+    // The letters of GCC.  "a" is any register and "u" any but r15, which
+    // is never given to anything here.
     case 'r':
+    case 'a':
+    case 'u':
       return {0U, &SH::GPRRegClass};
-    // r0, which a number of instructions ask for.
+    // r0, which a number of instructions ask for.  It is the register and
+    // not a class with one member: such a class would spread to the value
+    // that is copied into the operand (see CMPEQI in SHInstrInfo.td).
     case 'z':
-      return {0U, &SH::R0RegRegClass};
+      return {SH::R0, &SH::GPRRegClass};
+    // A register of the floating point unit, for a float or for a double.
+    case 'f':
+    case 'e':
+      if (Subtarget.hasFPU() && VT == MVT::f32)
+        return {0U, &SH::FPRRegClass};
+      if (Subtarget.hasFPUDouble() && VT == MVT::f64)
+        return {0U, &SH::DFPRRegClass};
+      break;
+    case 'd':
+      if (Subtarget.hasFPUDouble() && VT == MVT::f64)
+        return {0U, &SH::DFPRRegClass};
+      break;
+    // fr0.
+    case 'w':
+      if (Subtarget.hasFPU() && VT == MVT::f32)
+        return {SH::FR0, &SH::FPRRegClass};
+      break;
     default:
       break;
     }
