@@ -3174,10 +3174,6 @@ bool Generic_GCC::IsIntegratedAssemblerDefault() const {
   case llvm::Triple::nvptx:
   case llvm::Triple::nvptx64:
   case llvm::Triple::xcore:
-  // The SuperH code generator writes assembly for GNU as.
-  case llvm::Triple::sh:
-  case llvm::Triple::sheb:
-    return false;
   default:
     return true;
   }

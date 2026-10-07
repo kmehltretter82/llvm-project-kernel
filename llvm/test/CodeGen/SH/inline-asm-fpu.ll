@@ -15,7 +15,9 @@ define i32 @r0(i32 %a, i32 %b) {
 ; CHECK-NEXT:    add r5,r0
 ; CHECK-NEXT:    !APP
 ; CHECK-NEXT:    tst #15,r0
+; CHECK-EMPTY:
 ; CHECK-NEXT:    movt r1
+; CHECK-EMPTY:
 ; CHECK-NEXT:    !NO_APP
 ; CHECK-NEXT:    add r0,r1
 ; CHECK-NEXT:    rts
@@ -33,6 +35,7 @@ define float @single(float %a, float %b) {
 ; CHECK-NEXT:    fmov fr5,fr0
 ; CHECK-NEXT:    !APP
 ; CHECK-NEXT:    fmov fr4,fr0
+; CHECK-EMPTY:
 ; CHECK-NEXT:    !NO_APP
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop
@@ -48,6 +51,7 @@ define double @double(double %a) {
 ; CHECK-NEXT:    fmov fr5,fr1
 ; CHECK-NEXT:    !APP
 ; CHECK-NEXT:    fneg dr0
+; CHECK-EMPTY:
 ; CHECK-NEXT:    !NO_APP
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop
@@ -62,6 +66,7 @@ define float @first(float %a) {
 ; CHECK-NEXT:    fmov fr5,fr0
 ; CHECK-NEXT:    !APP
 ; CHECK-NEXT:    fmov fr0,fr0
+; CHECK-EMPTY:
 ; CHECK-NEXT:    !NO_APP
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop

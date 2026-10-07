@@ -50,8 +50,5 @@ SHMCAsmInfo::SHMCAsmInfo(const Triple &TT, const MCTargetOptions &Options)
   SupportsDebugInformation = true;
   ExceptionsType = ExceptionHandling::DwarfCFI;
 
-  // There is no assembler in the library: the text goes to GNU as.
-  UseIntegratedAssembler = false;
-
   initializeAtSpecifiers(AtSpecifiers);
 }

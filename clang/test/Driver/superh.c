@@ -27,11 +27,12 @@
 // SH2EB: "-triple" "sh2eb-unknown-linux-musl"
 // SH2EB-SAME: "-target-cpu" "sh2"
 
-// The byte order changes the triple and keeps the processor.
+// The byte order changes the triple and keeps the processor, and GNU as
+// is told.
 //
-// RUN: %clang -### --target=sh4-linux-gnu -mb -c %s 2>&1 | FileCheck --check-prefix=BIG %s
-// RUN: %clang -### --target=sh4eb-linux-gnu -ml -c %s 2>&1 | FileCheck --check-prefix=LITTLE %s
-// RUN: %clang -### --target=sh4-linux-gnu -ml -c %s 2>&1 | FileCheck --check-prefix=LITTLE %s
+// RUN: %clang -### --target=sh4-linux-gnu -mb -fno-integrated-as -c %s 2>&1 | FileCheck --check-prefix=BIG %s
+// RUN: %clang -### --target=sh4eb-linux-gnu -ml -fno-integrated-as -c %s 2>&1 | FileCheck --check-prefix=LITTLE %s
+// RUN: %clang -### --target=sh4-linux-gnu -ml -fno-integrated-as -c %s 2>&1 | FileCheck --check-prefix=LITTLE %s
 //
 // BIG: "-triple" "sh4eb-unknown-linux-gnu"
 // BIG-SAME: "-target-cpu" "sh4"
@@ -40,24 +41,28 @@
 // LITTLE-SAME: "-target-cpu" "sh4"
 // LITTLE: "-little"
 
-// There is no integrated assembler: GNU as gets the byte order, and the
-// instruction set if an option names the processor.  No position
-// independent executable unless it is asked for.
+// The assembler is the one of the backend.  With -fno-integrated-as it is
+// GNU as, which gets the byte order, and the instruction set if an option
+// names the processor.  No position independent executable unless it is
+// asked for.
 //
-// RUN: %clang -### --target=sh4-linux-gnu -m4-nofpu -c %s 2>&1 | FileCheck --check-prefix=AS-NOFPU %s
-// RUN: %clang -### --target=sh4-linux-gnu -m2 -c %s 2>&1 | FileCheck --check-prefix=AS-SH2 %s
 // RUN: %clang -### --target=sh4-linux-gnu -c %s 2>&1 | FileCheck --check-prefix=AS-DEFAULT %s
+// RUN: %clang -### --target=sh4-linux-gnu -fno-integrated-as -m4-nofpu -c %s 2>&1 | FileCheck --check-prefix=AS-NOFPU %s
+// RUN: %clang -### --target=sh4-linux-gnu -fno-integrated-as -m2 -c %s 2>&1 | FileCheck --check-prefix=AS-SH2 %s
+// RUN: %clang -### --target=sh4-linux-gnu -fno-integrated-as -c %s 2>&1 | FileCheck --check-prefix=AS-GNU %s
 // RUN: %clang -### --target=sh4-linux-gnu %s 2>&1 | FileCheck --check-prefix=LINK %s
 // RUN: %clang -### --target=sh4eb-linux-gnu %s 2>&1 | FileCheck --check-prefix=LINK-EB %s
 // RUN: %clang -### --target=sh4-linux-gnu -mb %s 2>&1 | FileCheck --check-prefix=LINK-MB %s
 // RUN: %clang -### --target=sh4eb-linux-gnu -ml %s 2>&1 | FileCheck --check-prefix=LINK-ML %s
 //
+// AS-DEFAULT-NOT: "-no-integrated-as"
+// AS-DEFAULT: "-mrelocation-model" "static"
+// AS-DEFAULT-NOT: as{{(.exe)?}}" "-little"
 // AS-NOFPU: "-no-integrated-as"
 // AS-NOFPU: as{{(.exe)?}}" "-little" "--isa=sh4a-nofpu"
 // AS-SH2: as{{(.exe)?}}" "-little" "--isa=sh2"
-// AS-DEFAULT: "-mrelocation-model" "static"
-// AS-DEFAULT-NOT: "--isa
-// AS-DEFAULT-NOT: "-faddrsig"
+// AS-GNU: as{{(.exe)?}}" "-little"
+// AS-GNU-NOT: "--isa
 // LINK: "-EL" "-m" "shlelf_linux"
 // LINK-NOT: "-pie"
 // LINK: "-dynamic-linker" "/lib/ld-linux.so.2"

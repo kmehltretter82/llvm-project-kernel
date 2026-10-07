@@ -12,7 +12,9 @@ define i32 @reg(i32 %a) {
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    !APP
 ; CHECK-NEXT:    mov r4,r0
+; CHECK-EMPTY:
 ; CHECK-NEXT:    add #5,r0
+; CHECK-EMPTY:
 ; CHECK-NEXT:    !NO_APP
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop
@@ -26,7 +28,8 @@ define void @plain_constant() {
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    !APP
-; CHECK-NEXT:    1: .short 49918
+; CHECK-NEXT:  .Ltmp0:
+; CHECK-NEXT:    .uaword 49918
 ; CHECK-NEXT:    !NO_APP
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop
@@ -41,6 +44,7 @@ define i32 @memory(ptr %p) {
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    !APP
 ; CHECK-NEXT:    mov.l @r4,r0
+; CHECK-EMPTY:
 ; CHECK-NEXT:    !NO_APP
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop
@@ -60,6 +64,7 @@ define i32 @memory_stack() {
 ; CHECK-NEXT:    mov r15,r1
 ; CHECK-NEXT:    !APP
 ; CHECK-NEXT:    mov.l @r1,r0
+; CHECK-EMPTY:
 ; CHECK-NEXT:    !NO_APP
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    add #4,r15
@@ -77,7 +82,9 @@ define i64 @wide(ptr %p) {
 ; CHECK-NEXT:  ! %bb.0:
 ; CHECK-NEXT:    !APP
 ; CHECK-NEXT:    mov.l @r4,r0
+; CHECK-EMPTY:
 ; CHECK-NEXT:    mov.l @(4,r4),r1
+; CHECK-EMPTY:
 ; CHECK-NEXT:    !NO_APP
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop
@@ -96,6 +103,7 @@ define i32 @clobbers(i32 %a, i32 %b) {
 ; CHECK-NEXT:    mov r4,r0
 ; CHECK-NEXT:    !APP
 ; CHECK-NEXT:    mul.l r0,r5
+; CHECK-EMPTY:
 ; CHECK-NEXT:    !NO_APP
 ; CHECK-NEXT:    lds.l @r15+,pr
 ; CHECK-NEXT:    rts
