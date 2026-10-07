@@ -49,6 +49,8 @@
 // RUN: %clang -### --target=sh4-linux-gnu -c %s 2>&1 | FileCheck --check-prefix=AS-DEFAULT %s
 // RUN: %clang -### --target=sh4-linux-gnu %s 2>&1 | FileCheck --check-prefix=LINK %s
 // RUN: %clang -### --target=sh4eb-linux-gnu %s 2>&1 | FileCheck --check-prefix=LINK-EB %s
+// RUN: %clang -### --target=sh4-linux-gnu -mb %s 2>&1 | FileCheck --check-prefix=LINK-MB %s
+// RUN: %clang -### --target=sh4eb-linux-gnu -ml %s 2>&1 | FileCheck --check-prefix=LINK-ML %s
 //
 // AS-NOFPU: "-no-integrated-as"
 // AS-NOFPU: as{{(.exe)?}}" "-little" "--isa=sh4a-nofpu"
@@ -56,10 +58,15 @@
 // AS-DEFAULT: "-mrelocation-model" "static"
 // AS-DEFAULT-NOT: "--isa
 // AS-DEFAULT-NOT: "-faddrsig"
-// LINK: "-m" "shlelf_linux"
+// LINK: "-EL" "-m" "shlelf_linux"
 // LINK-NOT: "-pie"
 // LINK: "-dynamic-linker" "/lib/ld-linux.so.2"
-// LINK-EB: "-m" "shelf_linux"
+// LINK-EB: "-EB" "-m" "shelf_linux"
+//
+// A linker for SuperH has the emulation of the byte order that it was built
+// for and writes both orders with it, so -mb and -ml leave the name alone.
+// LINK-MB: "-EB" "-m" "shlelf_linux"
+// LINK-ML: "-EL" "-m" "shelf_linux"
 
 // Position independent code where it is asked for.
 //

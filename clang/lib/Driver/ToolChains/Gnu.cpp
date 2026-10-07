@@ -331,7 +331,20 @@ void tools::gnutools::Linker::ConstructJob(Compilation &C, const JobAction &JA,
 
   CmdArgs.push_back("--eh-frame-hdr");
 
-  if (const char *LDMOption = getLDMOption(ToolChain.getTriple(), Args)) {
+  // GNU ld for SuperH is built with the emulation of one byte order and
+  // writes either order with it. -mb and -ml change the byte order of the
+  // output but not the linker that is found, which is the one of the triple
+  // that was asked for: name its emulation, and pass the byte order.
+  llvm::Triple LDTriple = ToolChain.getTriple();
+  if (Arch == llvm::Triple::sh || Arch == llvm::Triple::sheb) {
+    llvm::Triple Asked(D.getTargetTriple());
+    if (Asked.getArch() == llvm::Triple::sh ||
+        Asked.getArch() == llvm::Triple::sheb)
+      LDTriple.setArch(Asked.getArch());
+    CmdArgs.push_back(Arch == llvm::Triple::sheb ? "-EB" : "-EL");
+  }
+
+  if (const char *LDMOption = getLDMOption(LDTriple, Args)) {
     CmdArgs.push_back("-m");
     CmdArgs.push_back(LDMOption);
   } else {
