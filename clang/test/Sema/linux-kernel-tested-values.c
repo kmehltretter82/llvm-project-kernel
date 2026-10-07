@@ -477,3 +477,78 @@ out:
   finish();
   return t ?: ERR_PTR(err);
 }
+
+// A variable that only goes into calls by its address is followed like any
+// other.  The call gives it a new value, and a test behind the call says
+// which.
+
+int get_thing(struct dev *d, struct thing **out);
+int read_count(struct dev *d, int *count);
+
+int filled_in(struct dev *d) {
+  struct thing *t = NULL;
+
+  get_thing(d, &t);
+  if (!t) // deref-note {{'t' is tested here and the path goes on with it being NULL}}
+    _printk("no thing\n");
+  return t->id; // deref-warning {{'t' is dereferenced here on a path where the earlier test found it to be NULL}}
+}
+
+int filled_in_again(struct dev *d) {
+  struct thing *t = NULL;
+
+  get_thing(d, &t);
+  if (!t)
+    get_thing(d->parent, &t);
+  return t->id;
+}
+
+int counted(struct dev *d, struct thing *t) {
+  int n;
+
+  if (read_count(d, &n))
+    return -EINVAL;
+  if (!t)
+    n = 0;
+  if (n > 0)
+    return t->id;
+  return 0;
+}
+
+// A variable whose address goes somewhere else can change at any store.
+
+int counted_elsewhere(struct dev *d, struct thing *t) {
+  int n;
+  int *where = &n;
+
+  if (read_count(d, where))
+    return -EINVAL;
+  if (!t) // deref-note {{'t' is tested here and the path goes on with it being NULL}}
+    n = 0;
+  unrelated();
+  if (n > 0)
+    return t->id; // deref-warning {{'t' is dereferenced here on a path where the earlier test found it to be NULL}}
+  return 0;
+}
+
+// "if (avail < len)" says something about len on a path that knows avail.
+
+int limited(const int *ranges, int len, int avail) {
+  if (!ranges)
+    avail = 0;
+  if (avail < len)
+    len = avail;
+  if (len > 1)
+    return ranges[3];
+  return 0;
+}
+
+int not_limited(const int *ranges, int len, int avail) {
+  if (!ranges) // deref-note {{'ranges' is tested here and the path goes on with it being NULL}}
+    avail = 8;
+  if (avail < len)
+    len = avail;
+  if (len > 1)
+    return ranges[3]; // deref-warning {{'ranges' is dereferenced here on a path where the earlier test found it to be NULL}}
+  return 0;
+}

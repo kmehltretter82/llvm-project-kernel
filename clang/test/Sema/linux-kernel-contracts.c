@@ -296,6 +296,30 @@ int use_alloc(void) {
   return 0;
 }
 
+// The result of a function that nothing is known about is handed on after a
+// test for NULL.  An error pointer passes that test: the function returns
+// NULL as far as its body says, and its caller may know more.
+struct item *pick_elsewhere(struct ctx *c);
+
+static struct item *pick_item(struct ctx *c, struct item *have) {
+  struct item *other;
+
+  if (!have)
+    return NULL;
+  other = pick_elsewhere(c);
+  if (!other)
+    return have;
+  return other;
+}
+
+int use_pick(struct ctx *c, struct item *have) {
+  struct item *i = pick_item(c, have);
+
+  if (IS_ERR(i))
+    return -ENOMEM;
+  return i ? 1 : 0;
+}
+
 // A stub says nothing about the function it stands in for.
 static struct item *stub_item(struct ctx *c) { return ERR_PTR(-ENODEV); }
 

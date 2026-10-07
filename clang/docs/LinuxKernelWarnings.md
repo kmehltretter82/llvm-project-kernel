@@ -191,6 +191,15 @@ members it or its callees store to. Otherwise it is every member of an
 object that the call is given. The search stops at a fixed budget and
 reports nothing then.
 
+A local variable whose address is taken is followed as long as the address
+goes nowhere but into calls, `err = read_reg(dev, &val);`. Such a call
+gives it a value that the search does not know, and nothing else can. A
+variable whose address is kept, `int *p = &val;`, can change wherever the
+function stores through a pointer and is not followed. A comparison of two
+variables says something about the one whose value the path does not know
+if it knows the other: behind `if (!p) n = 0;` the outcome of `if (n < len)
+len = n;` leaves `len` at zero or below.
+
 - `-Wlinux-kernel-deref-after-check` diagnoses a pointer that is read or
   written through on a path that left a NULL test through the outcome "is
   NULL":
@@ -280,7 +289,10 @@ Three more are dataflow checks over the control flow graph:
   It is not given when the source has an assignment to the variable or a
   preprocessor conditional between the two tests, because the assignment
   may be in code that this configuration does not compile, and not for
-  `else if` chains and repeated tests within one condition.
+  `else if` chains and repeated tests within one condition. A test that
+  is joined with a constant of the configuration decides nothing either:
+  behind `if (v && IS_ENABLED(CONFIG_A))` the compiler has no way to the
+  `else` with `v` set, and another configuration has.
 - `-Wlinux-kernel-use-after-free` diagnoses a dereference, or a second
   free, of a variable or member chain that every path has handed to
   `kfree()` or one of its relatives since it was last assigned. A loop that
@@ -347,7 +359,9 @@ The rest look at single expressions and calls:
 - `-Wlinux-kernel-unchecked-allocation` diagnoses `p->member` where `p` was
   given the result of `kmalloc()` or one of its relatives directly and the
   function tests `p` nowhere. An allocation with `__GFP_NOFAIL` is left
-  alone.
+  alone. A test of what holds the same result counts: a copy, the other
+  target of `p = dev->priv = kzalloc(...)`, and a member that is assigned
+  inside the condition, `if (!(dev->priv = kzalloc(...)))`.
 - `-Wlinux-kernel-indent` diagnoses a statement that starts in another
   column than the statement before it in the same block. The second one was
   often meant to be under the `if` above it.
@@ -684,6 +698,13 @@ returns it is valid. A function that returns nothing but `ERR_PTR()` or
 nothing but `NULL` is a stub for another configuration and gets no contract,
 and neither does a function that mixes both conventions. The diagnostic
 carries a note that points at the function whose contract was inferred.
+
+One case is in between. `sk = lookup(); if (!sk) return NULL; return sk;`
+returns NULL on failure as far as the body says, but if nothing is known
+about `lookup()`, the NULL test is all there is, and an error pointer passes
+it. A caller that tests the result of such a function with `IS_ERR()` may
+know more than the body shows and is not told to test for NULL. The other
+uses of the convention stay.
 
 For a function that is defined in another translation unit, two passes over
 the kernel are needed. The first collects facts, the second uses their

@@ -342,6 +342,36 @@ int checked_member(struct owner *o) {
   return 0;
 }
 
+// The member is assigned and tested in one condition.
+int checked_in_condition(struct owner *o) {
+  if (!(o->thing = kzalloc(sizeof(struct thing), GFP_KERNEL)))
+    return -ENOMEM;
+  o->thing->id = 1;
+  return 0;
+}
+
+static struct thing *the_thing;
+
+// Two variables get the result in one statement, and the test is on the
+// other one.
+int checked_other_target(void) {
+  struct thing *t;
+
+  t = the_thing = kzalloc(sizeof(*t), GFP_KERNEL);
+  if (the_thing == NULL)
+    return -ENOMEM;
+  t->id = 1;
+  return 0;
+}
+
+int unchecked_two_targets(void) {
+  struct thing *t;
+
+  t = the_thing = kzalloc(sizeof(*t), GFP_KERNEL);
+  t->id = 1; // alloc-warning {{'t' holds the result of 'kzalloc', which is NULL when the allocation fails, and is dereferenced here without a test}}
+  return 0;
+}
+
 // Another test of the index comes before the access.
 
 struct elems {

@@ -147,3 +147,31 @@ int macro_test(int x) {
   CHECK(x);
   return 1;
 }
+
+// A test that is joined with a configuration constant decides nothing for
+// the code behind it: in another configuration the constant is 0.
+
+#define CONFIG_STRICT_A 1
+#define CONFIG_STRICT_B 1
+
+int config_constant(int module) {
+  if (module && CONFIG_STRICT_A)
+    work();
+  else if (!module && CONFIG_STRICT_B)
+    step_one();
+  else
+    return 0;
+  return 1;
+}
+
+// A constant beside the two tests changes nothing.
+
+int config_constant_beside(int module) {
+  if (!module) // expected-note {{previous test is here}}
+    return 0;
+  if (CONFIG_STRICT_A)
+    work();
+  if (module) // expected-warning {{'module' is always nonzero here: every path has tested it and it has not changed since}}
+    step_one();
+  return 1;
+}

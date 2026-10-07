@@ -260,6 +260,10 @@ struct LinuxKernelAPIOrigin {
   /// The variable was given the value of another variable or of a member,
   /// which the function may have tested under that name.
   bool Copied = false;
+  /// The function was found to return NULL on failure, but it also returns
+  /// the result of a function that nothing is known about, tested for NULL
+  /// only.  If that one returns error pointers, so does this one.
+  bool Open = false;
 
   explicit operator bool() const { return Kind != LinuxKernelAPIKind::None; }
 
@@ -1332,7 +1336,15 @@ public:
   /// the unit without going through this class.
   void ensureContracts() { loadContracts(); }
 
-  LinuxKernelReturnConvention convention(const FunctionDecl *FD) {
+  /// \p Open is set if the function returns NULL on failure as far as its
+  /// body says, but hands on what a function of unknown convention returned
+  /// after a test for NULL only: "sk = lookup(); if (!sk) return NULL;
+  /// return sk;".  The test is what the author knows about lookup(), and it
+  /// lets an error pointer through.
+  LinuxKernelReturnConvention convention(const FunctionDecl *FD,
+                                         bool *Open = nullptr) {
+    if (Open)
+      *Open = false;
     if (!FD->getReturnType()->isPointerType())
       return LinuxKernelReturnConvention::Unknown;
     const FunctionDecl *Def = getBodyDecl(FD);
@@ -1340,6 +1352,7 @@ public:
       return fileContract(FD);
 
     Sources R = resolve(Sources(sources(Def)), 0);
+    bool Forwarded = false;
     for (auto [F, Tests] : R.External) {
       switch (fileContract(F)) {
       case LinuxKernelReturnConvention::ErrorPointer:
@@ -1350,9 +1363,14 @@ public:
         break;
       case LinuxKernelReturnConvention::Unknown:
         (Tests ? R.Valid : R.Opaque) = true;
+        if (Tests &&
+            !(Tests & (Sources::ErrorTested | Sources::ErrorChecked)))
+          Forwarded = true;
         break;
       }
     }
+    if (Open)
+      *Open = Forwarded;
     bool Err = R.ErrDirect || R.ErrCallee;
     bool Null = R.NullDirect || R.NullCallee;
     // An error pointer function never returns NULL, so nothing it returns
@@ -2118,12 +2136,16 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
       LinuxKernelAPIKind Kind = classifyLinuxKernelCallee(Callee);
       if (Kind != LinuxKernelAPIKind::None)
         return {Kind, Callee};
-      switch (Inference.convention(Callee)) {
+      bool Open = false;
+      switch (Inference.convention(Callee, &Open)) {
       case LinuxKernelReturnConvention::ErrorPointer:
         return {LinuxKernelAPIKind::ErrorPointer, Callee, /*Inferred=*/true};
-      case LinuxKernelReturnConvention::NullOnFailure:
-        return {LinuxKernelAPIKind::NullablePointer, Callee,
-                /*Inferred=*/true};
+      case LinuxKernelReturnConvention::NullOnFailure: {
+        LinuxKernelAPIOrigin Origin = {LinuxKernelAPIKind::NullablePointer,
+                                       Callee, /*Inferred=*/true};
+        Origin.Open = Open;
+        return Origin;
+      }
       case LinuxKernelReturnConvention::Unknown:
         break;
       }
@@ -2627,6 +2649,10 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
           break;
         if (const VarDecl *VD = getDirectLinuxVariable(BO->getLHS()))
           Out.insert(VD);
+        // "if (!(priv->shadow = kzalloc(...)))": the member is tested.
+        else if (Members)
+          if (const FieldDecl *Field = Member(stripElement(BO->getLHS())))
+            Members->Tested.insert(Field);
         E = BO->getRHS();
       }
       if (const VarDecl *VD = getDirectLinuxVariable(E))
@@ -2669,11 +2695,23 @@ class LinuxKernelWarningsVisitor : public DynamicRecursiveASTVisitor {
           AddCopy(VD, VD->getInit());
     } else if (const auto *BO = dyn_cast<BinaryOperator>(St)) {
       if (BO->getOpcode() == BO_Assign) {
-        if (const VarDecl *To = getDirectLinuxVariable(BO->getLHS()))
-          AddCopy(To, BO->getRHS());
-        else
+        if (const VarDecl *To = getDirectLinuxVariable(BO->getLHS())) {
+          // "priv = the_priv = kzalloc(...);": each is a copy of the
+          // other, and a test of one is a test of both.
+          const Expr *From = BO->getRHS();
+          for (;;) {
+            const auto *Inner =
+                dyn_cast<BinaryOperator>(From->IgnoreParenCasts());
+            if (!Inner || Inner->getOpcode() != BO_Assign)
+              break;
+            AddCopy(To, Inner->getLHS());
+            From = Inner->getRHS();
+          }
+          AddCopy(To, From);
+        } else {
           AddPlaceCopy(getDirectLinuxVariable(BO->getRHS()->IgnoreParenCasts()),
                        BO->getLHS());
+        }
       }
     }
     if (const auto *CE = dyn_cast<CallExpr>(St)) {
@@ -4699,7 +4737,7 @@ public:
       return true;
 
     LinuxKernelAPIOrigin Origin = getOrigin(Call->getArg(0));
-    if (!isNullReturningKind(Origin.Kind))
+    if (!isNullReturningKind(Origin.Kind) || Origin.Open)
       return true;
 
     unsigned Diagnostic = CheckerName == "IS_ERR"
@@ -6615,7 +6653,14 @@ private:
 
   std::vector<Location> Locations;
   std::vector<Condition> Conditions;
+  /// The variables that have their address taken, and those of them whose
+  /// address goes somewhere else than into a call.  The latter can change
+  /// wherever the function stores through a pointer, and have no location.
+  /// The others change in the calls that are given the address.  That a
+  /// callee keeps the address of a local variable of its caller, and writes
+  /// to it in a later call, is taken not to happen.
   llvm::SmallPtrSet<const VarDecl *, 16> AddressTaken;
+  llvm::SmallPtrSet<const VarDecl *, 16> Escaped;
   /// For each block, the local variables that it or a block behind it
   /// mentions, by their number in VarIndex.
   llvm::DenseMap<const VarDecl *, unsigned> VarIndex;
@@ -6719,17 +6764,42 @@ private:
            (T->isIntegralOrEnumerationType() || T->isPointerType());
   }
 
+  /// The variable that the argument \p Arg is the address of: "&v" and
+  /// "(u8 *)&v".
+  static const VarDecl *getAddressedVariable(const Expr *Arg) {
+    const auto *UO =
+        dyn_cast_or_null<UnaryOperator>(Arg ? Arg->IgnoreParenCasts() : nullptr);
+    if (!UO || UO->getOpcode() != UO_AddrOf)
+      return nullptr;
+    return getDirectLinuxVariable(UO->getSubExpr());
+  }
+
   void collectAddressTaken(const Stmt *St) {
     if (!St)
       return;
     if (const auto *UO = dyn_cast<UnaryOperator>(St)) {
       if (UO->getOpcode() == UO_AddrOf)
-        if (const VarDecl *VD = getDirectLinuxVariable(UO->getSubExpr()))
+        if (const VarDecl *VD = getDirectLinuxVariable(UO->getSubExpr())) {
           AddressTaken.insert(VD);
+          Escaped.insert(VD);
+        }
     } else if (const auto *AS = dyn_cast<GCCAsmStmt>(St)) {
       for (unsigned I = 0, E = AS->getNumOutputs(); I != E; ++I)
-        if (const VarDecl *VD = getDirectLinuxVariable(AS->getOutputExpr(I)))
+        if (const VarDecl *VD = getDirectLinuxVariable(AS->getOutputExpr(I))) {
           AddressTaken.insert(VD);
+          Escaped.insert(VD);
+        }
+    } else if (const auto *CE = dyn_cast<CallExpr>(St)) {
+      // "err = read_reg(dev, &val);": the address goes into the call, which
+      // writes to the variable while it runs.  See call().
+      collectAddressTaken(CE->getCallee());
+      for (const Expr *Arg : CE->arguments()) {
+        if (const VarDecl *VD = getAddressedVariable(Arg))
+          AddressTaken.insert(VD);
+        else
+          collectAddressTaken(Arg);
+      }
+      return;
     }
     for (const Stmt *Child : St->children())
       collectAddressTaken(Child);
@@ -7104,7 +7174,7 @@ private:
       });
     }
     int Loc = find(Root, Path);
-    if (Loc >= 0 && (Path.empty() ? !AddressTaken.count(Root) : true)) {
+    if (Loc >= 0 && (Path.empty() ? !Escaped.count(Root) : true)) {
       set(St, Loc, keeps(Loc) ? V : Value());
       link(Loc, RHS, St);
     }
@@ -7161,6 +7231,13 @@ private:
                isErrorPointerHelper(FD) || isLinuxReadOnlyCallee(FD)))
       return;
     forgetMemoryConditions(St);
+    // The call writes to a variable that it is given the address of.
+    for (const Expr *Arg : CE->arguments())
+      if (const VarDecl *VD = getAddressedVariable(Arg)) {
+        invalidate(VD, {}, St);
+        if (int Loc = find(VD, {}); Loc >= 0)
+          set(St, Loc, Value());
+      }
     const FunctionDecl *Def = nullptr;
     const sema::LinuxKernelUnit::Impl::Writes *W = nullptr;
     if (FD && FD->hasBody(Def))
@@ -7396,7 +7473,7 @@ public:
     llvm::SmallVector<const FieldDecl *, 3> Path;
     if (!E || !isTrackedType(E->getType()) || !decompose(E, Root, Path))
       return -1;
-    if (Path.empty() && AddressTaken.count(Root))
+    if (Path.empty() && Escaped.count(Root))
       return -1;
     if (int Loc = find(Root, Path); Loc >= 0)
       return Loc;
@@ -7431,7 +7508,7 @@ public:
   /// The location of the variable \p VD, or -1.
   int locate(const VarDecl *VD) {
     if (!VD->hasLocalStorage() || !isTrackedType(VD->getType()) ||
-        AddressTaken.count(VD))
+        Escaped.count(VD))
       return -1;
     if (int Loc = find(VD, {}); Loc >= 0)
       return Loc;
@@ -7996,6 +8073,23 @@ public:
           }
         }
         Value K = Loc >= 0 ? value(Other, St) : Value();
+        // "if (have < want)" where the path knows have, not want: the test
+        // says something about want.
+        if (Loc >= 0 && !K.HasConst) {
+          int OtherLoc = locate(stripWidening(Other), /*Create=*/false);
+          Value Known = OtherLoc >= 0 ? value(Side, St) : Value();
+          if (Known.HasConst) {
+            Loc = OtherLoc;
+            K = Known;
+            switch (Op) {
+            case BO_LT: Op = BO_GT; break;
+            case BO_GT: Op = BO_LT; break;
+            case BO_LE: Op = BO_GE; break;
+            case BO_GE: Op = BO_LE; break;
+            default: break;
+            }
+          }
+        }
         if (Loc >= 0 && K.HasConst) {
           std::optional<bool> Narrowed = assumeCompared(Loc, Op, K.Const,
                                                         Outcome, St);
@@ -11884,8 +11978,12 @@ public:
 
     std::vector<Facts> In(Cfg.getNumBlockIDs());
     llvm::BitVector Reached(Cfg.getNumBlockIDs());
+    // The blocks that this configuration can run.  The others are reached
+    // through a branch on a constant only and are not reported from.
+    llvm::BitVector Live(Cfg.getNumBlockIDs());
     In[Cfg.getEntry().getBlockID()].assign(Vars.size(), Fact());
     Reached.set(Cfg.getEntry().getBlockID());
+    Live.set(Cfg.getEntry().getBlockID());
     LinuxForwardOrder Order(Cfg);
     bool Changed = true;
     unsigned Rounds = 0;
@@ -11910,6 +12008,12 @@ public:
         for (const CFGBlock::AdjacentBlock &Succ : B->succs()) {
           unsigned This = SuccIndex++;
           const CFGBlock *Next = Succ.getReachableBlock();
+          // "if (v && IS_ENABLED(CONFIG_X)) ... else if (!v)": the edge that
+          // a constant takes away is there in another configuration.  What
+          // holds behind the branch has to hold on that edge as well.
+          bool Pruned = !Next;
+          if (Pruned)
+            Next = Succ.getPossiblyUnreachableBlock();
           if (!Next)
             continue;
           Facts Edge = Out;
@@ -11926,6 +12030,10 @@ public:
             }
           }
           unsigned ID = Next->getBlockID();
+          if (!Pruned && !Live.test(ID)) {
+            Live.set(ID);
+            Changed = true;
+          }
           if (!Reached.test(ID)) {
             Reached.set(ID);
             In[ID] = Edge;
@@ -11953,7 +12061,7 @@ public:
     }
 
     for (const CFGBlock *B : Cfg) {
-      if (!Reached.test(B->getBlockID()) || !isConditionalBranch(B))
+      if (!Live.test(B->getBlockID()) || !isConditionalBranch(B))
         continue;
       const Expr *Cond = LinuxPathSearch::getBranchCondition(B);
       uint8_t OnTrue = Value::Any, OnFalse = Value::Any;
