@@ -92,6 +92,12 @@ public:
     return false;
   }
 
+  /// Whether the addend of a relocation of this type is in the place that is
+  /// relocated although the relocations have a field for it.  The entry has
+  /// an addend of zero then.  SuperH is like that: its relocations are RELA
+  /// and the linker reads the addend of most of them from the section.
+  virtual bool hasInPlaceAddend(unsigned Type) const { return false; }
+
   virtual void sortRelocs(std::vector<ELFRelocationEntry> &Relocs);
 
   /// \name Accessors

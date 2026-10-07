@@ -1386,8 +1386,11 @@ void ELFObjectWriter::recordRelocation(const MCFragment &F,
   if (SymA)
     SymA->setUsedInReloc();
 
-  FixedValue = usesRela(TO, Section) ? 0 : Addend;
-  Relocations[&Section].emplace_back(FixupOffset, SymA, Type, Addend);
+  bool InPlace =
+      !usesRela(TO, Section) || TargetObjectWriter->hasInPlaceAddend(Type);
+  FixedValue = InPlace ? Addend : 0;
+  Relocations[&Section].emplace_back(
+      FixupOffset, SymA, Type, InPlace && usesRela(TO, Section) ? 0 : Addend);
 }
 
 bool ELFObjectWriter::usesRela(const MCTargetOptions &TO,
