@@ -225,6 +225,8 @@ def m_hexagon_Features_HVX_Group : OptionGroup<"<hexagon features group>">,
                                    Group<m_Group>, DocName<"Hexagon HVX">;
 def m_m68k_Features_Group: OptionGroup<"<m68k features group>">,
                            Group<m_Group>, DocName<"M68k">;
+def m_superh_cpu_Group : OptionGroup<"<superh cpu group>">,
+                         Group<m_Group>, DocName<"SuperH">;
 def m_mips_Features_Group : OptionGroup<"<mips features group>">,
                             Group<m_Group>, DocName<"MIPS">;
 def m_ppc_Features_Group : OptionGroup<"<ppc features group>">,
@@ -7376,6 +7378,50 @@ foreach i = 0 ... 7 in
 foreach i = 0 ... 5 in
   def ffixed_i#i : Flag<["-"], "ffixed-i"#i>, Group<m_sparc_Features_Group>,
     HelpText<"Reserve the I"#i#" register (SPARC only)">;
+} // let Flags = [TargetSpecific]
+
+// SuperH: the processor, with the names that GCC has for it, and the byte
+// order.  The last processor option wins.
+let Flags = [TargetSpecific] in {
+def m2 : Flag<["-"], "m2">, Group<m_superh_cpu_Group>,
+  HelpText<"Generate code for the SH-2 (SuperH only)">;
+def mj2 : Flag<["-"], "mj2">, Group<m_superh_cpu_Group>,
+  HelpText<"Generate code for the J-Core J2 (SuperH only)">;
+def m2e : Flag<["-"], "m2e">, Group<m_superh_cpu_Group>,
+  HelpText<"Generate code for the SH-2E (SuperH only)">;
+def m2a : Flag<["-"], "m2a">, Group<m_superh_cpu_Group>,
+  HelpText<"Generate code for the SH-2A (SuperH only)">;
+def m2a_nofpu : Flag<["-"], "m2a-nofpu">, Group<m_superh_cpu_Group>,
+  HelpText<"Generate code for the SH-2A without its floating point unit "
+           "(SuperH only)">;
+def m2a_single : Flag<["-"], "m2a-single">, Group<m_superh_cpu_Group>;
+def m2a_single_only : Flag<["-"], "m2a-single-only">,
+  Group<m_superh_cpu_Group>;
+def m3 : Flag<["-"], "m3">, Group<m_superh_cpu_Group>,
+  HelpText<"Generate code for the SH-3 (SuperH only)">;
+def m3e : Flag<["-"], "m3e">, Group<m_superh_cpu_Group>,
+  HelpText<"Generate code for the SH-3E (SuperH only)">;
+def m4 : Flag<["-"], "m4">, Group<m_superh_cpu_Group>,
+  HelpText<"Generate code for the SH-4 (SuperH only)">;
+def m4_nofpu : Flag<["-"], "m4-nofpu">, Group<m_superh_cpu_Group>,
+  HelpText<"Generate code for the SH-4 without its floating point unit "
+           "(SuperH only)">;
+def m4_single : Flag<["-"], "m4-single">, Group<m_superh_cpu_Group>,
+  HelpText<"Generate code for the SH-4 with the floating point unit in "
+           "single precision mode at a call (SuperH only)">;
+def m4_single_only : Flag<["-"], "m4-single-only">, Group<m_superh_cpu_Group>,
+  HelpText<"Generate code for the SH-4 with float in the floating point "
+           "unit and double in software (SuperH only)">;
+def m4a : Flag<["-"], "m4a">, Group<m_superh_cpu_Group>,
+  HelpText<"Generate code for the SH-4A (SuperH only)">;
+def m4a_nofpu : Flag<["-"], "m4a-nofpu">, Group<m_superh_cpu_Group>;
+def m4a_single : Flag<["-"], "m4a-single">, Group<m_superh_cpu_Group>;
+def m4a_single_only : Flag<["-"], "m4a-single-only">,
+  Group<m_superh_cpu_Group>;
+def m4al : Flag<["-"], "m4al">, Group<m_superh_cpu_Group>,
+  HelpText<"Generate code for the SH4AL-DSP (SuperH only)">;
+def ml : Flag<["-"], "ml">, Alias<mlittle_endian>;
+def mb : Flag<["-"], "mb">, Alias<mbig_endian>;
 } // let Flags = [TargetSpecific]
 
 // M68k features flags

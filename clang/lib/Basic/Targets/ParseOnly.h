@@ -7,8 +7,8 @@
 //===----------------------------------------------------------------------===//
 //
 // This file declares a TargetInfo for architectures that the Linux kernel
-// supports and LLVM has no backend for: Alpha, PA-RISC, SuperH, MicroBlaze,
-// Nios II and OpenRISC.  It describes their C data model well enough for the
+// supports and LLVM has no backend for: Alpha, PA-RISC, MicroBlaze, Nios II
+// and OpenRISC.  It describes their C data model well enough for the
 // frontend to parse and check code written for them.  No code can be
 // generated: these targets are for -fsyntax-only.
 //
@@ -32,7 +32,6 @@ public:
     Alpha,
     PARISC,
     PARISC64,
-    SuperH,
     MicroBlaze,
     Nios2,
     OpenRISC,

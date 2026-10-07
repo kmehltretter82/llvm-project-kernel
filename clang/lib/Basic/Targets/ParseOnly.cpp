@@ -54,10 +54,7 @@ ParseOnlyTargetInfo::getTargetBuiltins() const {
 
 std::optional<ParseOnlyTargetInfo::ArchKind>
 ParseOnlyTargetInfo::getArchKind(const llvm::Triple &Triple) {
-  // LLVM knows SuperH by now.  clang still describes it here.
-  if (Triple.getArch() != llvm::Triple::UnknownArch &&
-      Triple.getArch() != llvm::Triple::sh &&
-      Triple.getArch() != llvm::Triple::sheb)
+  if (Triple.getArch() != llvm::Triple::UnknownArch)
     return std::nullopt;
   StringRef Name = Triple.getArchName();
   if (Name.starts_with("alpha"))
@@ -72,13 +69,6 @@ ParseOnlyTargetInfo::getArchKind(const llvm::Triple &Triple) {
     return Nios2;
   if (Name.starts_with("or1k") || Name == "openrisc")
     return OpenRISC;
-  // sh, sh2, sh3, sh4, sh4a and their big-endian forms such as sh4eb.
-  if (Name.consume_front("sh")) {
-    Name.consume_back("eb");
-    Name.consume_back("el");
-    if (Name.empty() || (llvm::isDigit(Name[0]) && Name.size() <= 2))
-      return SuperH;
-  }
   return std::nullopt;
 }
 
@@ -139,14 +129,6 @@ ParseOnlyTargetInfo::ParseOnlyTargetInfo(const llvm::Triple &Triple,
     MaxAtomicPromoteWidth = MaxAtomicInlineWidth = 32;
     resetDataLayout("E-m:e-p:32:32-i64:64-n32-S64");
     break;
-  case SuperH:
-    BigEndian = Name.ends_with("eb");
-    WCharType = SignedLong;
-    Align64To32();
-    MaxAtomicPromoteWidth = MaxAtomicInlineWidth = 32;
-    resetDataLayout(BigEndian ? "E-m:e-p:32:32-i64:32-f64:32-n32-S32"
-                              : "e-m:e-p:32:32-i64:32-f64:32-n32-S32");
-    break;
   case MicroBlaze:
     BigEndian = !Name.ends_with("el");
     Align64To32();
@@ -190,8 +172,6 @@ bool ParseOnlyTargetInfo::hasFeature(StringRef Feature) const {
   case PARISC:
   case PARISC64:
     return Feature == "hppa";
-  case SuperH:
-    return Feature == "sh";
   case MicroBlaze:
     return Feature == "microblaze";
   case Nios2:
@@ -244,10 +224,6 @@ void ParseOnlyTargetInfo::getTargetDefines(const LangOptions &Opts,
     Builder.defineMacro("__hppa");
     Builder.defineMacro("__hppa64__");
     Builder.defineMacro("_PA_RISC2_0");
-    break;
-  case SuperH:
-    Builder.defineMacro("__sh__");
-    Builder.defineMacro("__SH4__");
     break;
   case MicroBlaze:
     Builder.defineMacro("__microblaze__");

@@ -14,6 +14,7 @@
 #include "Arch/PPC.h"
 #include "Arch/RISCV.h"
 #include "Arch/Sparc.h"
+#include "Arch/SuperH.h"
 #include "Arch/SystemZ.h"
 #include "clang/Config/config.h" // for GCC_INSTALL_PREFIX
 #include "clang/Driver/CommonArgs.h"
@@ -704,6 +705,21 @@ void tools::gnutools::Assembler::ConstructJob(Compilation &C,
     CmdArgs.push_back(Args.MakeArgString(MArchName));
     if (!Args.hasFlag(options::OPT_mrelax, options::OPT_mno_relax, true))
       Args.addOptOutFlag(CmdArgs, options::OPT_mrelax, options::OPT_mno_relax);
+    break;
+  }
+  case llvm::Triple::sh:
+  case llvm::Triple::sheb: {
+    // What GCC passes: the byte order, and the instruction set if an
+    // option named the processor.
+    CmdArgs.push_back(getToolChain().getArch() == llvm::Triple::sheb
+                          ? "-big"
+                          : "-little");
+    if (Args.hasArg(options::OPT_m_superh_cpu_Group, options::OPT_mcpu_EQ)) {
+      std::string ISA = superh::getSuperHAsmISA(
+          getCPUName(D, Args, getToolChain().getTriple()));
+      if (!ISA.empty())
+        CmdArgs.push_back(Args.MakeArgString(ISA));
+    }
     break;
   }
   case llvm::Triple::sparc:
@@ -2408,6 +2424,15 @@ void Generic_GCC::GCCInstallationDetector::AddDefaultGCCPrefixes(
   static const char *const M68kTriples[] = {"m68k-unknown-linux-gnu",
                                             "m68k-suse-linux"};
 
+  static const char *const SuperHLibDirs[] = {"/lib"};
+  static const char *const SuperHTriples[] = {
+      "sh4-linux-gnu", "sh4-unknown-linux-gnu", "sh4-linux",
+      "sh3-linux-gnu", "sh2-linux",             "sh-linux-gnu",
+      "sh-linux"};
+  static const char *const SuperHEBTriples[] = {
+      "sh4eb-linux-gnu", "sh4eb-unknown-linux-gnu", "sh2eb-linux-muslfdpic",
+      "sh2eb-linux-musl", "sheb-linux-gnu",         "sheb-linux"};
+
   static const char *const MIPSLibDirs[] = {"/libo32", "/lib"};
   static const char *const MIPSTriples[] = {
       "mips-linux-gnu", "mips-mti-linux", "mips-mti-linux-gnu",
@@ -2690,6 +2715,14 @@ void Generic_GCC::GCCInstallationDetector::AddDefaultGCCPrefixes(
   case llvm::Triple::m68k:
     LibDirs.append(begin(M68kLibDirs), end(M68kLibDirs));
     TripleAliases.append(begin(M68kTriples), end(M68kTriples));
+    break;
+  case llvm::Triple::sh:
+    LibDirs.append(begin(SuperHLibDirs), end(SuperHLibDirs));
+    TripleAliases.append(begin(SuperHTriples), end(SuperHTriples));
+    break;
+  case llvm::Triple::sheb:
+    LibDirs.append(begin(SuperHLibDirs), end(SuperHLibDirs));
+    TripleAliases.append(begin(SuperHEBTriples), end(SuperHEBTriples));
     break;
   case llvm::Triple::mips:
     LibDirs.append(begin(MIPSLibDirs), end(MIPSLibDirs));
@@ -3128,6 +3161,9 @@ bool Generic_GCC::IsIntegratedAssemblerDefault() const {
   case llvm::Triple::nvptx:
   case llvm::Triple::nvptx64:
   case llvm::Triple::xcore:
+  // The SuperH code generator writes assembly for GNU as.
+  case llvm::Triple::sh:
+  case llvm::Triple::sheb:
     return false;
   default:
     return true;

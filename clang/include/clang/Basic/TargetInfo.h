@@ -382,7 +382,17 @@ public:
     //    int* __va_reg;
     //    int __va_ndx;
     //} va_list;
-    XtensaABIBuiltinVaList
+    XtensaABIBuiltinVaList,
+
+    // What GCC has for a SuperH with a floating point unit:
+    // typedef struct __va_list_tag {
+    //    void *__va_next_o;
+    //    void *__va_next_o_limit;
+    //    void *__va_next_fp;
+    //    void *__va_next_fp_limit;
+    //    void *__va_next_stack;
+    //} va_list;
+    SuperHBuiltinVaList
   };
 
 protected:

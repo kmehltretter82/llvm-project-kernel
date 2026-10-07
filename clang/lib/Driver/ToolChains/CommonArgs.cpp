@@ -12,6 +12,7 @@
 #include "Arch/CSKY.h"
 #include "Arch/LoongArch.h"
 #include "Arch/M68k.h"
+#include "Arch/SuperH.h"
 #include "Arch/Mips.h"
 #include "Arch/PPC.h"
 #include "Arch/RISCV.h"
@@ -119,6 +120,8 @@ static bool useFramePointerForTargetByDefault(const llvm::opt::ArgList &Args,
   case llvm::Triple::mips64el:
   case llvm::Triple::mips:
   case llvm::Triple::mipsel:
+  case llvm::Triple::sh:
+  case llvm::Triple::sheb:
     return !clang::driver::tools::areOptimizationsEnabled(Args);
   default:
     break;
@@ -606,6 +609,10 @@ const char *tools::getLDMOption(const llvm::Triple &T, const ArgList &Args) {
   }
   case llvm::Triple::m68k:
     return "m68kelf";
+  case llvm::Triple::sh:
+    return T.isOSLinux() ? "shlelf_linux" : "shlelf";
+  case llvm::Triple::sheb:
+    return T.isOSLinux() ? "shelf_linux" : "shelf";
   case llvm::Triple::ppc:
     if (T.isOSLinux())
       return "elf32ppclinux";
@@ -799,6 +806,10 @@ std::string tools::getCPUName(const Driver &D, const ArgList &Args,
 
   case llvm::Triple::m68k:
     return m68k::getM68kTargetCPU(Args);
+
+  case llvm::Triple::sh:
+  case llvm::Triple::sheb:
+    return superh::getSuperHTargetCPU(Args, T);
 
   case llvm::Triple::mips:
   case llvm::Triple::mipsel:

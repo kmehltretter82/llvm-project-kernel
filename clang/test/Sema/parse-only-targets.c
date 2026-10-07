@@ -4,15 +4,13 @@
 // RUN: %clang_cc1 -triple alpha-unknown-linux-gnu -target-cpu ev67 -fsyntax-only -verify %s
 // RUN: %clang_cc1 -triple hppa-unknown-linux-gnu -fsyntax-only -verify %s
 // RUN: %clang_cc1 -triple hppa64-unknown-linux-gnu -fsyntax-only -verify %s
-// RUN: %clang_cc1 -triple sh4-unknown-linux-gnu -fsyntax-only -verify %s
-// RUN: %clang_cc1 -triple sh4eb-unknown-linux-gnu -fsyntax-only -verify %s
 // RUN: %clang_cc1 -triple microblaze-unknown-linux-gnu -fsyntax-only -verify %s
 // RUN: %clang_cc1 -triple microblazeel-unknown-linux-gnu -fsyntax-only -verify %s
 // RUN: %clang_cc1 -triple nios2-unknown-linux-gnu -fsyntax-only -verify %s
 // RUN: %clang_cc1 -triple or1k-unknown-linux-gnu -fsyntax-only -verify %s
 // RUN: not %clang_cc1 -triple shave-unknown-linux-gnu -fsyntax-only %s 2>&1 | FileCheck --check-prefix=UNKNOWN %s
 // RUN: not %clang_cc1 -triple vax-unknown-linux-gnu -fsyntax-only %s 2>&1 | FileCheck --check-prefix=UNKNOWN %s
-// RUN: not %clang_cc1 -triple sh4-unknown-linux-gnu -emit-obj -o /dev/null %s 2>&1 | FileCheck --check-prefix=NOCODE %s
+// RUN: not %clang_cc1 -triple or1k-unknown-linux-gnu -emit-obj -o /dev/null %s 2>&1 | FileCheck --check-prefix=NOCODE %s
 
 // UNKNOWN: error: unknown target triple
 // NOCODE: error: unable to create target
@@ -48,8 +46,7 @@ _Static_assert(__builtin_types_compatible_p(__SIZE_TYPE__, unsigned int), "");
 #if !defined(__BIG_ENDIAN__)
 #error "PA-RISC is big-endian"
 #endif
-#elif defined(__sh__) || defined(__microblaze__) || defined(__nios2__) || \
-    defined(__or1k__)
+#elif defined(__microblaze__) || defined(__nios2__) || defined(__or1k__)
 _Static_assert(sizeof(long) == 4 && sizeof(void *) == 4, "ILP32");
 _Static_assert(sizeof(struct pair) == 12, "64-bit members are aligned to 4");
 _Static_assert(__builtin_types_compatible_p(__SIZE_TYPE__, unsigned int), "");

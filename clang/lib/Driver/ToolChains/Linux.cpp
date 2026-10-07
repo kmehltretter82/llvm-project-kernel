@@ -12,6 +12,7 @@
 #include "Arch/Mips.h"
 #include "Arch/PPC.h"
 #include "Arch/RISCV.h"
+#include "Arch/SuperH.h"
 #include "clang/Config/config.h"
 #include "clang/Driver/CommonArgs.h"
 #include "clang/Driver/Distro.h"
@@ -23,6 +24,7 @@
 #include "llvm/Support/Path.h"
 #include "llvm/Support/ScopedPrinter.h"
 #include "llvm/Support/VirtualFileSystem.h"
+#include "llvm/TargetParser/SHTargetParser.h"
 
 using namespace clang::driver;
 using namespace clang::driver::toolchains;
@@ -130,6 +132,12 @@ std::string Linux::getMultiarchTriple(const Driver &D,
 
   case llvm::Triple::m68k:
     return "m68k-linux-gnu";
+
+  // Debian has one SuperH port.
+  case llvm::Triple::sh:
+    return "sh4-linux-gnu";
+  case llvm::Triple::sheb:
+    return "sh4eb-linux-gnu";
 
   case llvm::Triple::mips:
     return IsMipsR6 ? "mipsisa32r6-linux-gnu" : "mips-linux-gnu";
@@ -601,6 +609,19 @@ std::string Linux::getDynamicLinker(const ArgList &Args) const {
     case llvm::Triple::x86_64:
       ArchName = Triple.isX32() ? "x32" : Triple.getArchName().str();
       break;
+    // "sh" or "sheb", "-nofpu" where the processor has no floating point
+    // unit that the compiler uses, and "-fdpic".
+    case llvm::Triple::sh:
+    case llvm::Triple::sheb: {
+      ArchName = Arch == llvm::Triple::sheb ? "sheb" : "sh";
+      const llvm::SH::CPUInfo *CPU = llvm::SH::parseCPU(
+          tools::superh::getSuperHTargetCPU(Args, Triple));
+      if (CPU && !CPU->hasFPU())
+        ArchName += "-nofpu";
+      if (Triple.getEnvironmentName().contains("fdpic"))
+        ArchName += "-fdpic";
+      break;
+    }
     default:
       ArchName = Triple.getArchName().str();
     }
@@ -670,6 +691,11 @@ std::string Linux::getDynamicLinker(const ArgList &Args) const {
   case llvm::Triple::m68k:
     LibDir = "lib";
     Loader = "ld.so.1";
+    break;
+  case llvm::Triple::sh:
+  case llvm::Triple::sheb:
+    LibDir = "lib";
+    Loader = "ld-linux.so.2";
     break;
   case llvm::Triple::mips:
   case llvm::Triple::mipsel:
@@ -946,6 +972,10 @@ void Linux::addSYCLIncludeArgs(const ArgList &DriverArgs,
 }
 
 bool Linux::isPIEDefault(const llvm::opt::ArgList &Args) const {
+  // The GCC of the distributions makes no position independent executables
+  // for SuperH unless it is asked to.
+  if (getArch() == llvm::Triple::sh || getArch() == llvm::Triple::sheb)
+    return false;
   return CLANG_DEFAULT_PIE_ON_LINUX || getTriple().isAndroid() ||
          getTriple().isMusl() || getSanitizerArgs(Args).requiresPIE();
 }

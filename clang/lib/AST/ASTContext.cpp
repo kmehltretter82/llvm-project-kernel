@@ -10449,6 +10449,32 @@ CreateXtensaABIBuiltinVaListDecl(const ASTContext *Context) {
   return VaListTagTypedefDecl;
 }
 
+static TypedefDecl *CreateSuperHBuiltinVaListDecl(const ASTContext *Context) {
+  // typedef struct __va_list_tag {
+  RecordDecl *VaListTagDecl = Context->buildImplicitRecord("__va_list_tag");
+  VaListTagDecl->startDefinition();
+
+  // The next integer register that was saved and the end of them, the same
+  // for the floating point registers, and the next argument on the stack.
+  static const char *const FieldNames[] = {
+      "__va_next_o", "__va_next_o_limit", "__va_next_fp", "__va_next_fp_limit",
+      "__va_next_stack"};
+  for (const char *Name : FieldNames) {
+    FieldDecl *Field = FieldDecl::Create(
+        *Context, VaListTagDecl, SourceLocation(), SourceLocation(),
+        &Context->Idents.get(Name), Context->VoidPtrTy, /*TInfo=*/nullptr,
+        /*BitWidth=*/nullptr, /*Mutable=*/false, ICIS_NoInit);
+    Field->setAccess(AS_public);
+    VaListTagDecl->addDecl(Field);
+  }
+  VaListTagDecl->completeDefinition();
+  Context->VaListTagDecl = VaListTagDecl;
+  CanQualType VaListTagType = Context->getCanonicalTagType(VaListTagDecl);
+
+  // } __builtin_va_list;
+  return Context->buildImplicitTypedef(VaListTagType, "__builtin_va_list");
+}
+
 static TypedefDecl *CreateVaListDecl(const ASTContext *Context,
                                      TargetInfo::BuiltinVaListKind Kind) {
   switch (Kind) {
@@ -10470,6 +10496,8 @@ static TypedefDecl *CreateVaListDecl(const ASTContext *Context,
     return CreateHexagonBuiltinVaListDecl(Context);
   case TargetInfo::XtensaABIBuiltinVaList:
     return CreateXtensaABIBuiltinVaListDecl(Context);
+  case TargetInfo::SuperHBuiltinVaList:
+    return CreateSuperHBuiltinVaListDecl(Context);
   }
 
   llvm_unreachable("Unhandled __builtin_va_list type kind");

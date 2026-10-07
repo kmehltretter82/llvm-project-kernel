@@ -31,6 +31,7 @@
 #include "Targets/OSTargets.h"
 #include "Targets/PPC.h"
 #include "Targets/ParseOnly.h"
+#include "Targets/SuperH.h"
 #include "Targets/RISCV.h"
 #include "Targets/SPIR.h"
 #include "Targets/Sparc.h"
@@ -838,6 +839,12 @@ std::unique_ptr<TargetInfo> AllocateTarget(const llvm::Triple &Triple,
 
   case llvm::Triple::xtensa:
     return std::make_unique<XtensaTargetInfo>(Triple, Opts);
+
+  case llvm::Triple::sh:
+  case llvm::Triple::sheb:
+    if (os == llvm::Triple::Linux)
+      return std::make_unique<LinuxTargetInfo<SuperHTargetInfo>>(Triple, Opts);
+    return std::make_unique<SuperHTargetInfo>(Triple, Opts);
   }
 }
 } // namespace targets
