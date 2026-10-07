@@ -461,6 +461,12 @@ public:
   int getDwarfEHStackPointer(CodeGen::CodeGenModule &M) const override {
     return 15;
   }
+
+  // struct _Unwind_Exception of libgcc: 64 bits and three words, aligned to
+  // the largest alignment of the target, which is four bytes.  The object
+  // that was thrown is right behind it, and a handler that catches a
+  // pointer by reference looks for it there.
+  unsigned getSizeOfUnwindException() const override { return 20; }
 };
 } // end anonymous namespace
 

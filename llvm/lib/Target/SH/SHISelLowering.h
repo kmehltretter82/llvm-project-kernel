@@ -9,6 +9,7 @@
 #ifndef LLVM_LIB_TARGET_SH_SHISELLOWERING_H
 #define LLVM_LIB_TARGET_SH_SHISELLOWERING_H
 
+#include "MCTargetDesc/SHMCTargetDesc.h"
 #include "llvm/CodeGen/CallingConvLower.h"
 #include "llvm/CodeGen/SelectionDAG.h"
 #include "llvm/CodeGen/TargetLowering.h"
@@ -50,6 +51,19 @@ public:
     if (VT.isVector())
       return VT.changeVectorElementTypeToInteger();
     return MVT::i32;
+  }
+
+  /// A landing pad finds the exception in r4 and what it is in r5, where
+  /// the unwinder of libgcc puts them.
+  Register
+  getExceptionPointerRegister(ExceptionHandling,
+                              const Constant *PersonalityFn) const override {
+    return SH::R4;
+  }
+  Register
+  getExceptionSelectorRegister(ExceptionHandling,
+                               const Constant *PersonalityFn) const override {
+    return SH::R5;
   }
 
   /// What libgcc has no function for becomes a loop around a compare and
