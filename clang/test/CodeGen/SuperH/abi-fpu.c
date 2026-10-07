@@ -1,5 +1,5 @@
 // RUN: %clang_cc1 -triple sh4-unknown-linux-gnu -emit-llvm -o - %s | FileCheck --check-prefixes=CHECK,DOUBLE %s
-// RUN: %clang_cc1 -triple sh4-unknown-linux-gnu -target-cpu sh4-single-only -emit-llvm -o - %s | FileCheck --check-prefixes=CHECK,SINGLE %s
+// RUN: %clang_cc1 -triple sh4-unknown-linux-gnu -target-cpu sh3e -emit-llvm -o - %s | FileCheck --check-prefixes=CHECK,SINGLE %s
 
 // The convention of GCC with a floating point unit: float is passed as
 // such, and double if the unit computes it.  Everything else is words, of

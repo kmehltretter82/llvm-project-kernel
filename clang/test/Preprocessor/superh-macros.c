@@ -16,7 +16,6 @@
 // COMMON-DAG: #define __INT64_TYPE__ long long int
 // COMMON-DAG: #define __INTPTR_TYPE__ int
 // COMMON-DAG: #define __PTRDIFF_TYPE__ int
-// COMMON-DAG: #define __SIZEOF_DOUBLE__ 8
 // COMMON-DAG: #define __SIZEOF_LONG_DOUBLE__ 8
 // COMMON-DAG: #define __SIZEOF_LONG_LONG__ 8
 // COMMON-DAG: #define __SIZEOF_LONG__ 4
@@ -56,3 +55,21 @@
 // SH3-DAG: #define __sh3__ 1
 // SH2-DAG: #define __SH2__ 1
 // SH2-DAG: #define __sh2__ 1
+
+// double is 64 bits, but for the processors that are told to use their unit
+// for float and for nothing else: there it is float.
+//
+// RUN: %clang_cc1 -E -dM -triple sh4-unknown-linux-gnu < /dev/null | FileCheck --match-full-lines --check-prefix=DOUBLE64 %s
+// RUN: %clang_cc1 -E -dM -triple sh4-unknown-linux-gnu -target-cpu sh4-single < /dev/null | FileCheck --match-full-lines --check-prefix=DOUBLE64 %s
+// RUN: %clang_cc1 -E -dM -triple sh4-unknown-linux-gnu -target-cpu sh3e < /dev/null | FileCheck --match-full-lines --check-prefix=DOUBLE64 %s
+// RUN: %clang_cc1 -E -dM -triple sh4-unknown-linux-gnu -target-cpu sh4-nofpu < /dev/null | FileCheck --match-full-lines --check-prefix=DOUBLE64 %s
+// RUN: %clang_cc1 -E -dM -triple sh4-unknown-linux-gnu -target-cpu sh4-single-only < /dev/null | FileCheck --match-full-lines --check-prefix=DOUBLE32 %s
+// RUN: %clang_cc1 -E -dM -triple sh4eb-unknown-linux-gnu -target-cpu sh4a-single-only < /dev/null | FileCheck --match-full-lines --check-prefix=DOUBLE32 %s
+//
+// DOUBLE64-DAG: #define __SIZEOF_DOUBLE__ 8
+// DOUBLE64-DAG: #define __DBL_MANT_DIG__ 53
+// DOUBLE64-DAG: #define __SIZEOF_LONG_DOUBLE__ 8
+// DOUBLE32-DAG: #define __SIZEOF_DOUBLE__ 4
+// DOUBLE32-DAG: #define __DBL_MANT_DIG__ 24
+// DOUBLE32-DAG: #define __SIZEOF_LONG_DOUBLE__ 8
+// DOUBLE32-DAG: #define __LDBL_MANT_DIG__ 53

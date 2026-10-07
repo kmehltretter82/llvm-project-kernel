@@ -53,6 +53,10 @@ bool SuperHTargetInfo::setCPU(StringRef Name) {
   if (!Info)
     return false;
   CPU = Info;
+  // -m4-single-only and its relatives: double is float, long double stays.
+  DoubleWidth = CPU->doubleIsFloat() ? 32 : 64;
+  DoubleFormat = CPU->doubleIsFloat() ? &llvm::APFloat::IEEEsingle()
+                                      : &llvm::APFloat::IEEEdouble();
   return true;
 }
 

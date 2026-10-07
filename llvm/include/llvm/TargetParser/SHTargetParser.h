@@ -67,6 +67,13 @@ struct CPUInfo {
   bool hasFPU() const { return FPU != FK_None; }
   /// double is computed, passed and returned in floating point registers.
   bool hasDoubleFPU() const { return FPU == FK_Single || FPU == FK_Double; }
+  /// C's double is a float: the processors whose names end in
+  /// "-single-only", GCC's TARGET_FPU_SINGLE_ONLY.  An SH-2E or SH-3E has a
+  /// unit for float alone as well, but keeps a double of 64 bits and
+  /// computes it without the unit.
+  bool doubleIsFloat() const {
+    return FPU == FK_SingleOnly && Arch != AK_SH2E && Arch != AK_SH3E;
+  }
   /// shad and shld: a shift by the number in a register.
   bool hasDynamicShift() const { return Arch != AK_SH2 && Arch != AK_SH2E; }
   /// An SH-4 that uses its unit for double, GCC's TARGET_SH4.  On a
