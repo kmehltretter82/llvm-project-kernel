@@ -61,6 +61,15 @@ public:
   bool SelectAddrL(SDValue Addr, SDValue &Base, SDValue &Disp);
   /// The address of a byte or a word: a stack slot or a register.
   bool SelectAddrBW(SDValue Addr, SDValue &Base, SDValue &Disp);
+  /// A register with a displacement of 1 to 15 bytes, or of 2 to 30 for a
+  /// word: what a byte or a word can be moved to and from r0 with.
+  bool selectAddrDisp(SDValue Addr, SDValue &Base, SDValue &Disp, int Scale);
+  bool SelectAddrBDisp(SDValue Addr, SDValue &Base, SDValue &Disp) {
+    return selectAddrDisp(Addr, Base, Disp, 1);
+  }
+  bool SelectAddrWDisp(SDValue Addr, SDValue &Base, SDValue &Disp) {
+    return selectAddrDisp(Addr, Base, Disp, 2);
+  }
 
 #include "SHGenDAGISel.inc"
 };
@@ -127,6 +136,21 @@ bool SHDAGToDAGISel::SelectAddrBW(SDValue Addr, SDValue &Base, SDValue &Disp) {
     return true;
   Base = Addr;
   Disp = CurDAG->getTargetConstant(0, SDLoc(Addr), MVT::i32);
+  return true;
+}
+
+bool SHDAGToDAGISel::selectAddrDisp(SDValue Addr, SDValue &Base, SDValue &Disp,
+                                    int Scale) {
+  if (Addr.getOpcode() != ISD::ADD)
+    return false;
+  const auto *C = dyn_cast<ConstantSDNode>(Addr.getOperand(1));
+  if (!C || isa<FrameIndexSDNode>(Addr.getOperand(0)))
+    return false;
+  int64_t Value = C->getSExtValue();
+  if (Value <= 0 || Value > 15 * Scale || Value % Scale)
+    return false;
+  Base = Addr.getOperand(0);
+  Disp = CurDAG->getTargetConstant(Value, SDLoc(Addr), MVT::i32);
   return true;
 }
 

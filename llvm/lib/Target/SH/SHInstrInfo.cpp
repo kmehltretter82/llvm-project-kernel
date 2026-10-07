@@ -268,6 +268,21 @@ bool SHInstrInfo::expandPostRAPseudo(MachineInstr &MI) const {
             get(MI.getOpcode() == SH::MUL32 ? SH::STSMACL : SH::STSMACH), Dst);
     break;
   }
+  case SH::ADDC0:
+  case SH::SUBC0: {
+    // No carry comes in.
+    BuildMI(MBB, MI, DL, get(SH::CLRT));
+    BuildMI(MBB, MI, DL, get(MI.getOpcode() == SH::ADDC0 ? SH::ADDC : SH::SUBC),
+            MI.getOperand(0).getReg())
+        .add(MI.getOperand(1))
+        .add(MI.getOperand(2));
+    break;
+  }
+  case SH::NEGC0:
+    BuildMI(MBB, MI, DL, get(SH::CLRT));
+    BuildMI(MBB, MI, DL, get(SH::NEGC), MI.getOperand(0).getReg())
+        .add(MI.getOperand(1));
+    break;
   case SH::MOVI2: {
     Register Dst = MI.getOperand(0).getReg();
     int64_t First;

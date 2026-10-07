@@ -107,6 +107,8 @@ def SHtlsie : SDNode<"SHISD::TLSIE", SDT_SHTLSIE>;
 def HasDynShift : Predicate<"Subtarget->hasDynShift()">;
 
 def simm8 : Operand<i32>, ImmLeaf<i32, [{ return isInt<8>(Imm); }]>;
+// The eight bits of the logical instructions, which are not extended.
+def uimm8 : Operand<i32>, ImmLeaf<i32, [{ return isUInt<8>(Imm); }]>;
 
 def brtarget : Operand<OtherVT>;
 
@@ -123,6 +125,8 @@ def memop : Operand<i32> {
 
 def addrl : ComplexPattern<i32, 2, "SelectAddrL", [frameindex]>;
 def addrbw : ComplexPattern<i32, 2, "SelectAddrBW", [frameindex]>;
+def addrbdisp : ComplexPattern<i32, 2, "SelectAddrBDisp", [add]>;
+def addrwdisp : ComplexPattern<i32, 2, "SelectAddrWDisp", [add]>;
 def addrfi : ComplexPattern<i32, 2, "SelectAddrFI", [frameindex, add]>;
 
 // The amount of a shift to the right, which shad and shld take as a
@@ -267,6 +271,27 @@ def MOVWst : SHInst<(outs), (ins GPR:$src, memop:$addr), "mov.w\t$src,$addr",
 def MOVBst : SHInst<(outs), (ins GPR:$src, memop:$addr), "mov.b\t$src,$addr",
                     [(truncstorei8 GPR:$src, addrbw:$addr)]>;
 
+// A byte or a word at a displacement from a register, which only r0 can be
+// loaded with and stored from.  That is one instruction where the address
+// would need two more, and a copy if the value is not wanted in r0.
+let AddedComplexity = 5 in {
+let Defs = [R0] in {
+def MOVBldr0 : SHInst<(outs), (ins memop:$addr), "mov.b\t$addr,r0",
+                      [(set R0, (sextloadi8 addrbdisp:$addr))]>;
+def MOVWldr0 : SHInst<(outs), (ins memop:$addr), "mov.w\t$addr,r0",
+                      [(set R0, (sextloadi16 addrwdisp:$addr))]>;
+}
+let Uses = [R0] in {
+def MOVBstr0 : SHInst<(outs), (ins memop:$addr), "mov.b\tr0,$addr",
+                      [(truncstorei8 R0, addrbdisp:$addr)]>;
+def MOVWstr0 : SHInst<(outs), (ins memop:$addr), "mov.w\tr0,$addr",
+                      [(truncstorei16 R0, addrwdisp:$addr)]>;
+}
+def : Pat<(extloadi16 addrwdisp:$addr), (MOVWldr0 addrwdisp:$addr)>;
+def : Pat<(extloadi8 addrbdisp:$addr), (MOVBldr0 addrbdisp:$addr)>;
+def : Pat<(extloadi1 addrbdisp:$addr), (MOVBldr0 addrbdisp:$addr)>;
+}
+
 def : Pat<(extloadi16 addrbw:$addr), (MOVWld addrbw:$addr)>;
 def : Pat<(extloadi8 addrbw:$addr), (MOVBld addrbw:$addr)>;
 def : Pat<(extloadi1 addrbw:$addr), (MOVBld addrbw:$addr)>;
@@ -336,15 +361,31 @@ def SWAPB : SHPlain<(outs GPR:$dst), (ins GPR:$src), "swap.b\t$src,$dst">;
 
 def : Pat<(bswap GPR:$src), (SWAPB (SWAPW (SWAPB GPR:$src)))>;
 
-// With the carry in T.
+// With the carry in T: the upper half of a sum or a difference of 64 bits
+// adds the carry of the lower half, which adds none.  The lower half is
+// "clrt" and the same instruction.  The two are glued, and nothing that is
+// inserted between them later changes T (see the head of this file).
 let Constraints = "$src1 = $dst", Uses = [T], Defs = [T] in {
-def ADDC : SHPlain<(outs GPR:$dst), (ins GPR:$src1, GPR:$src2),
-                  "addc\t$src2,$dst">;
-def SUBC : SHPlain<(outs GPR:$dst), (ins GPR:$src1, GPR:$src2),
-                  "subc\t$src2,$dst">;
+def ADDC : SHInst<(outs GPR:$dst), (ins GPR:$src1, GPR:$src2),
+                  "addc\t$src2,$dst",
+                  [(set GPR:$dst, (adde GPR:$src1, GPR:$src2))]>;
+def SUBC : SHInst<(outs GPR:$dst), (ins GPR:$src1, GPR:$src2),
+                  "subc\t$src2,$dst",
+                  [(set GPR:$dst, (sube GPR:$src1, GPR:$src2))]>;
 }
+let Constraints = "$src1 = $dst", Defs = [T], Size = 4 in {
+def ADDC0 : SHPseudo<(outs GPR:$dst), (ins GPR:$src1, GPR:$src2),
+                     [(set GPR:$dst, (addc GPR:$src1, GPR:$src2))]>;
+def SUBC0 : SHPseudo<(outs GPR:$dst), (ins GPR:$src1, GPR:$src2),
+                     [(set GPR:$dst, (subc GPR:$src1, GPR:$src2))]>;
+}
+// 0 - Rm - T: the halves of a 64-bit number with the other sign.
 let Uses = [T], Defs = [T] in
-def NEGC : SHPlain<(outs GPR:$dst), (ins GPR:$src), "negc\t$src,$dst">;
+def NEGC : SHInst<(outs GPR:$dst), (ins GPR:$src), "negc\t$src,$dst",
+                  [(set GPR:$dst, (sube (i32 0), GPR:$src))]>;
+let Defs = [T], Size = 4 in
+def NEGC0 : SHPseudo<(outs GPR:$dst), (ins GPR:$src),
+                     [(set GPR:$dst, (subc (i32 0), GPR:$src))]>;
 let Defs = [T] in {
 def CLRT : SHPlain<(outs), (ins), "clrt">;
 def SETT : SHPlain<(outs), (ins), "sett">;
@@ -439,6 +480,17 @@ def CMPPL : SHInst<(outs), (ins GPR:$rn), "cmp/pl\t$rn",
                    [(SHcmppl GPR:$rn)]>;
 def CMPPZ : SHInst<(outs), (ins GPR:$rn), "cmp/pz\t$rn",
                    [(SHcmppz GPR:$rn)]>;
+// With an immediate, which only r0 can be compared with.  The value is
+// copied to r0 if it is somewhere else, and that is no more than the "mov
+// #imm" that the other form needs.  r0 is named, not asked for as a class of
+// one register: a value that was given such a class through a copy would
+// have to stay in r0 all its life.
+let Uses = [R0] in {
+def CMPEQI : SHInst<(outs), (ins simm8:$imm), "cmp/eq\t#$imm,r0",
+                    [(SHcmpeq R0, simm8:$imm)]>;
+def TSTI : SHInst<(outs), (ins uimm8:$imm), "tst\t#$imm,r0",
+                  [(SHtst R0, uimm8:$imm)]>;
+}
 }
 
 let Uses = [T] in

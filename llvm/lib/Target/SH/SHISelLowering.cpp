@@ -85,6 +85,11 @@ SHTargetLowering::SHTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::ConstantPool, MVT::i32, Custom);
   setOperationAction(ISD::GlobalTLSAddress, MVT::i32, Custom);
 
+  // A sum or a difference of 64 bits is two instructions with the carry in
+  // T between them.
+  setOperationAction({ISD::ADDC, ISD::ADDE, ISD::SUBC, ISD::SUBE}, MVT::i32,
+                     Legal);
+
   // There is no instruction that divides.  The division is a library call,
   // and the remainder is computed from the quotient: libgcc has no function
   // for it on SuperH.

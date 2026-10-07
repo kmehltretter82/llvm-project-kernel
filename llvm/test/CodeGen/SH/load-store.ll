@@ -108,9 +108,9 @@ define void @store16(ptr %p, i32 %v) {
 ; CHECK-LABEL: store16:
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
-; CHECK-NEXT:    add #2,r4
+; CHECK-NEXT:    mov r5,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    mov.w r5,@r4
+; CHECK-NEXT:    mov.w r0,@(2,r4)
   %b = trunc i32 %v to i16
   %q = getelementptr i16, ptr %p, i32 1
   store i16 %b, ptr %q

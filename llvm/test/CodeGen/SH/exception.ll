@@ -42,8 +42,8 @@ define i32 @catcher(i32 %x) personality ptr @__gxx_personality_v0 {
 ; CHECK-NEXT:    mov.l @r15+,r8
 ; CHECK-NEXT:  .LBB0_3: ! %lpad
 ; CHECK-NEXT:  .Ltmp2: ! EH_LABEL
-; CHECK-NEXT:    mov #1,r1
-; CHECK-NEXT:    cmp/eq r1,r5
+; CHECK-NEXT:    mov r5,r0
+; CHECK-NEXT:    cmp/eq #1,r0
 ; CHECK-NEXT:    bf .LBB0_5
 ; CHECK-NEXT:  ! %bb.4: ! %catch
 ; CHECK-NEXT:    mov.l .Ltmp4,r1
@@ -104,8 +104,8 @@ define i32 @catcher(i32 %x) personality ptr @__gxx_personality_v0 {
 ; PIC-NEXT:    mov.l @r15+,r8
 ; PIC-NEXT:  .LBB0_3: ! %lpad
 ; PIC-NEXT:  .Ltmp2: ! EH_LABEL
-; PIC-NEXT:    mov #1,r1
-; PIC-NEXT:    cmp/eq r1,r5
+; PIC-NEXT:    mov r5,r0
+; PIC-NEXT:    cmp/eq #1,r0
 ; PIC-NEXT:    bf .LBB0_5
 ; PIC-NEXT:  ! %bb.4: ! %catch
 ; PIC-NEXT:    mov.l .Ltmp5,r1
