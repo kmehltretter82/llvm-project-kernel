@@ -7280,12 +7280,17 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
     Args.AddLastArg(CmdArgs, options::OPT_pg);
 
     llvm::Triple::ArchType Arch = TC.getArch();
+    bool IsSuperH = Arch == llvm::Triple::sh || Arch == llvm::Triple::sheb;
     if (Arg *A = Args.getLastArg(options::OPT_mfentry)) {
-      if (Arch == llvm::Triple::systemz || TC.getTriple().isX86())
+      if (Arch == llvm::Triple::systemz || TC.getTriple().isX86() || IsSuperH)
         A->render(Args, CmdArgs);
       else
         D.Diag(diag::err_drv_unsupported_opt_for_target)
             << A->getAsString(Args) << TripleStr;
+    } else if (IsSuperH && Args.hasArg(options::OPT_pg)) {
+      // mcount of SuperH is called in front of the prologue, with the return
+      // address on the stack: that is the call that -mfentry stands for.
+      CmdArgs.push_back("-mfentry");
     }
     if (Arg *A = Args.getLastArg(options::OPT_mnop_mcount)) {
       if (Arch == llvm::Triple::systemz)
@@ -8658,7 +8663,8 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
 
   if (Arg *A = Args.getLastArg(options::OPT_pg))
     if (FPKeepKind == CodeGenOptions::FramePointerKind::None &&
-        !Args.hasArg(options::OPT_mfentry))
+        !Args.hasArg(options::OPT_mfentry) &&
+        TC.getArch() != llvm::Triple::sh && TC.getArch() != llvm::Triple::sheb)
       D.Diag(diag::err_drv_argument_not_allowed_with) << "-fomit-frame-pointer"
                                                       << A->getAsString(Args);
 

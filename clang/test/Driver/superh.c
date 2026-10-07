@@ -89,3 +89,14 @@
 // MUSL-EB: "-dynamic-linker" "/lib/ld-musl-sheb-nofpu.so.1"
 
 int x;
+
+// -pg: mcount is called in front of the prologue, with the return address
+// of the function on the stack.  That is the call that -mfentry stands for,
+// and it does not need a frame pointer.
+//
+// RUN: %clang -### --target=sh4-linux-gnu -pg -c %s 2>&1 | FileCheck --check-prefix=PG %s
+// RUN: %clang -### --target=sh4-linux-gnu -pg -fomit-frame-pointer -c %s 2>&1 | FileCheck --check-prefix=PG %s
+//
+// PG-NOT: error:
+// PG: "-pg" "-mfentry"
+
