@@ -100,7 +100,18 @@ def SHInstPrinter : AsmWriter {
   string AsmWriterClassName = "InstPrinter";
 }
 
+// The syntax of GNU as.  A mnemonic can have a dot in it ("mov.l").  The
+// characters of an address are tokens of their own: "@(4,r1)", "@r1+",
+// "@-r15", and so is the "#" of an immediate.
+def SHAsmParser : AsmParser;
+
+def SHAsmParserVariant : AsmParserVariant {
+  let TokenizingCharacters = "@()+-#";
+}
+
 def SH : Target {
   let InstructionSet = SHInstrInfo;
   let AssemblyWriters = [SHInstPrinter];
+  let AssemblyParsers = [SHAsmParser];
+  let AssemblyParserVariants = [SHAsmParserVariant];
 }

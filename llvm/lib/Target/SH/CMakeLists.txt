@@ -2,10 +2,13 @@ add_llvm_component_group(SH)
 
 set(LLVM_TARGET_DEFINITIONS SH.td)
 
+tablegen(LLVM SHGenAsmMatcher.inc -gen-asm-matcher)
 tablegen(LLVM SHGenAsmWriter.inc -gen-asm-writer)
 tablegen(LLVM SHGenCallingConv.inc -gen-callingconv)
 tablegen(LLVM SHGenDAGISel.inc -gen-dag-isel)
+tablegen(LLVM SHGenDisassemblerTables.inc -gen-disassembler)
 tablegen(LLVM SHGenInstrInfo.inc -gen-instr-info)
+tablegen(LLVM SHGenMCCodeEmitter.inc -gen-emitter)
 tablegen(LLVM SHGenRegisterInfo.inc -gen-register-info)
 tablegen(LLVM SHGenSDNodeInfo.inc -gen-sd-node-info)
 tablegen(LLVM SHGenSubtargetInfo.inc -gen-subtarget)
@@ -44,5 +47,7 @@ add_llvm_target(SHCodeGen
   SH
   )
 
+add_subdirectory(AsmParser)
+add_subdirectory(Disassembler)
 add_subdirectory(MCTargetDesc)
 add_subdirectory(TargetInfo)

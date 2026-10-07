@@ -26,6 +26,22 @@ def MACL : SHReg<21, "macl">, DwarfRegNum<[21]>;
 // carry of the instructions that have one.
 def T : SHReg<22, "t">;
 
+// What the code generator never names and the assembler has to know: the
+// registers of the system, the second set of r0 to r7, and the program
+// counter, which is written in "@(disp,pc)".
+def SR : SHReg<0, "sr">;
+def VBR : SHReg<0, "vbr">;
+def SSR : SHReg<0, "ssr">;
+def SPC : SHReg<0, "spc">;
+def SGR : SHReg<0, "sgr">;
+def DBR : SHReg<0, "dbr">;
+def PC : SHReg<0, "pc">;
+foreach I = 0...7 in
+  def R#I#_BANK : SHReg<I, "r"#I#"_bank">;
+def BankReg : RegisterClass<"SH", [i32], 32, (sequence "R%u_BANK", 0, 7)> {
+  let isAllocatable = 0;
+}
+
 // r1 to r3 are free at any time, r0 is asked for by name too often to be the
 // first choice, r4 to r7 carry arguments.  r8 to r14 are saved by the callee.
 def GPR : RegisterClass<"SH", [i32], 32,

@@ -90,6 +90,9 @@ public:
       MachineInstr::MIFlag Flags = MachineInstr::NoFlags) const override;
 
   unsigned getInstSizeInBytes(const MachineInstr &MI) const override;
+  /// The size of an instruction by itself, where the function above gives
+  /// the size of all of a bundle for the first instruction of it.
+  unsigned getSizeOfOne(const MachineInstr &MI) const;
 
   bool analyzeBranch(MachineBasicBlock &MBB, MachineBasicBlock *&TBB,
                      MachineBasicBlock *&FBB,

@@ -116,6 +116,20 @@ void SHInstrInfo::loadRegFromStackSlot(MachineBasicBlock &MBB,
 }
 
 unsigned SHInstrInfo::getInstSizeInBytes(const MachineInstr &MI) const {
+  // A branch and the instruction in its delay slot are one bundle, which is
+  // written as one.
+  if (MI.isBundledWithSucc() && !MI.isBundledWithPred()) {
+    unsigned Size = 0;
+    MachineBasicBlock::const_instr_iterator I = MI.getIterator();
+    do {
+      Size += getSizeOfOne(*I);
+    } while ((I++)->isBundledWithSucc());
+    return Size;
+  }
+  return getSizeOfOne(MI);
+}
+
+unsigned SHInstrInfo::getSizeOfOne(const MachineInstr &MI) const {
   switch (MI.getOpcode()) {
   case TargetOpcode::INLINEASM:
   case TargetOpcode::INLINEASM_BR: {

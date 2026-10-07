@@ -44,6 +44,24 @@ void SHInstPrinter::printOperand(const MCInst *MI, unsigned OpNo,
   }
 }
 
+// A place in the code is an expression where the compiler or the assembler
+// made the instruction.  Where the disassembler did, it is a number: how
+// far the place is from the instruction.  That is printed as an address
+// where the address of the instruction is known and wanted, and as a
+// distance from "." otherwise, which the assembler reads back.
+void SHInstPrinter::printBranchTarget(const MCInst *MI, uint64_t Address,
+                                      unsigned OpNo, raw_ostream &O) {
+  const MCOperand &Op = MI->getOperand(OpNo);
+  if (!Op.isImm())
+    return printOperand(MI, OpNo, O);
+  if (PrintBranchImmAsAddress)
+    O << formatHex(Address + Op.getImm());
+  else if (Op.getImm() < 0)
+    O << ".-" << -Op.getImm();
+  else
+    O << ".+" << Op.getImm();
+}
+
 // "@(8,r15)", and "@r1" where there is no displacement.
 void SHInstPrinter::printMemOperand(const MCInst *MI, unsigned OpNo,
                                     raw_ostream &O) {

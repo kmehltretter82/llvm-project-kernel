@@ -11,8 +11,25 @@
 
 #include "llvm/Support/DataTypes.h"
 
+#include <cstdint>
+#include <memory>
+
 namespace llvm {
+class MCAsmBackend;
+class MCCodeEmitter;
+class MCContext;
+class MCInstrInfo;
+class MCObjectTargetWriter;
+class MCRegisterInfo;
+class MCSubtargetInfo;
+class MCTargetOptions;
 class Target;
+
+MCCodeEmitter *createSHMCCodeEmitter(const MCInstrInfo &MCII, MCContext &Ctx);
+MCAsmBackend *createSHAsmBackend(const Target &T, const MCSubtargetInfo &STI,
+                                 const MCRegisterInfo &MRI,
+                                 const MCTargetOptions &Options);
+std::unique_ptr<MCObjectTargetWriter> createSHELFObjectWriter(uint8_t OSABI);
 } // namespace llvm
 
 // The names of the registers.

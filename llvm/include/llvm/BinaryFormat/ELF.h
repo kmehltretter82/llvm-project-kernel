@@ -759,6 +759,31 @@ enum : unsigned {
   EF_SPARCV9_RMO = 0x2,
 };
 
+// SuperH specific e_flags: the processor that the code is for, as binutils
+// numbers them.
+enum : unsigned {
+  EF_SH_MACH_MASK = 0x1f,
+  EF_SH_UNKNOWN = 0,
+  EF_SH1 = 1,
+  EF_SH2 = 2,
+  EF_SH3 = 3,
+  EF_SH_DSP = 4,
+  EF_SH3_DSP = 5,
+  EF_SH4AL_DSP = 6,
+  EF_SH3E = 8,
+  EF_SH4 = 9,
+  EF_SH2E = 11,
+  EF_SH4A = 12,
+  EF_SH2A = 13,
+  EF_SH4_NOFPU = 16,
+  EF_SH4A_NOFPU = 17,
+  EF_SH4_NOMMU_NOFPU = 18,
+  EF_SH2A_NOFPU = 19,
+  EF_SH3_NOMMU = 20,
+  EF_SH_PIC = 0x100,
+  EF_SH_FDPIC = 0x8000,
+};
+
 // ELF Relocation type for Sparc.
 enum {
 #include "ELFRelocs/Sparc.def"

@@ -52,6 +52,7 @@ private:
   /// operand that names none.
   const MCExpr *lowerSymbol(const MachineOperand &MO) const;
   bool lowerOperand(const MachineOperand &MO, MCOperand &Out) const;
+  bool lowerAddress(const MachineInstr *MI, MCInst &Out) const;
   void lower(const MachineInstr *MI, MCInst &Out) const;
 
   void emit(unsigned Opcode, std::initializer_list<MCOperand> Operands = {});
@@ -134,7 +135,70 @@ bool SHAsmPrinter::lowerOperand(const MachineOperand &MO,
   }
 }
 
+// The instructions of the code generator have an address as a register and
+// a displacement.  The processor has one instruction for "@Rm" and another
+// for "@(disp,Rm)", and only a long word has both.
+bool SHAsmPrinter::lowerAddress(const MachineInstr *MI, MCInst &Out) const {
+  unsigned Indirect, Displaced = 0;
+  // Where the address begins: behind the register that is loaded or
+  // stored, if the instruction names it.
+  unsigned Addr = 1;
+  switch (MI->getOpcode()) {
+  case SH::MOVLld:
+    Indirect = SH::MOVLind;
+    Displaced = SH::MOVLdisp;
+    break;
+  case SH::MOVWld:
+    Indirect = SH::MOVWind;
+    break;
+  case SH::MOVBld:
+    Indirect = SH::MOVBind;
+    break;
+  case SH::MOVLst:
+    Indirect = SH::MOVLsti;
+    Displaced = SH::MOVLstd;
+    break;
+  case SH::MOVWst:
+    Indirect = SH::MOVWsti;
+    break;
+  case SH::MOVBst:
+    Indirect = SH::MOVBsti;
+    break;
+  // With r0, which is not an operand: these have a displacement always.
+  case SH::MOVBldr0:
+    Indirect = Displaced = SH::MOVBlddisp;
+    Addr = 0;
+    break;
+  case SH::MOVWldr0:
+    Indirect = Displaced = SH::MOVWlddisp;
+    Addr = 0;
+    break;
+  case SH::MOVBstr0:
+    Indirect = Displaced = SH::MOVBstdisp;
+    Addr = 0;
+    break;
+  case SH::MOVWstr0:
+    Indirect = Displaced = SH::MOVWstdisp;
+    Addr = 0;
+    break;
+  default:
+    return false;
+  }
+  int64_t Disp = MI->getOperand(Addr + 1).getImm();
+  bool HasDisp = Disp || Indirect == Displaced;
+  assert((!HasDisp || Displaced) && "a displacement that no instruction has");
+  Out.setOpcode(HasDisp ? Displaced : Indirect);
+  if (Addr)
+    Out.addOperand(MCOperand::createReg(MI->getOperand(0).getReg()));
+  Out.addOperand(MCOperand::createReg(MI->getOperand(Addr).getReg()));
+  if (HasDisp)
+    Out.addOperand(MCOperand::createImm(Disp));
+  return true;
+}
+
 void SHAsmPrinter::lower(const MachineInstr *MI, MCInst &Out) const {
+  if (lowerAddress(MI, Out))
+    return;
   Out.setOpcode(MI->getOpcode());
   for (const MachineOperand &MO : MI->operands()) {
     MCOperand Op;

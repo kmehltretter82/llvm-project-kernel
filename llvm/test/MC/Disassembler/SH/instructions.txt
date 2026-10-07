@@ -1,0 +1,417 @@
+# RUN: llvm-mc --disassemble -triple=sh4-unknown-linux-gnu < %s | FileCheck %s
+
+# The bytes that GNU as makes of each instruction, and what the
+# disassembler prints for them (sh-dev/mc/gen-lit.py wrote this file).
+# An operation of the floating point unit is printed as the one on
+# float: whether it is one on double is not in the bits.
+
+0x63 0x69
+# CHECK: mov{{[[:space:]]+}}r6,r9
+0xa3 0xe9
+# CHECK: mov{{[[:space:]]+}}#-93,r9
+0x60 0x29
+# CHECK: mov.b{{[[:space:]]+}}r6,@r9
+0x61 0x29
+# CHECK: mov.w{{[[:space:]]+}}r6,@r9
+0x62 0x29
+# CHECK: mov.l{{[[:space:]]+}}r6,@r9
+0x60 0x69
+# CHECK: mov.b{{[[:space:]]+}}@r6,r9
+0x61 0x69
+# CHECK: mov.w{{[[:space:]]+}}@r6,r9
+0x62 0x69
+# CHECK: mov.l{{[[:space:]]+}}@r6,r9
+0x64 0x29
+# CHECK: mov.b{{[[:space:]]+}}r6,@-r9
+0x65 0x29
+# CHECK: mov.w{{[[:space:]]+}}r6,@-r9
+0x66 0x29
+# CHECK: mov.l{{[[:space:]]+}}r6,@-r9
+0x64 0x69
+# CHECK: mov.b{{[[:space:]]+}}@r6+,r9
+0x65 0x69
+# CHECK: mov.w{{[[:space:]]+}}@r6+,r9
+0x66 0x69
+# CHECK: mov.l{{[[:space:]]+}}@r6+,r9
+0x9d 0x80
+# CHECK: mov.b{{[[:space:]]+}}r0,@(13,r9)
+0x9d 0x81
+# CHECK: mov.w{{[[:space:]]+}}r0,@(26,r9)
+0x6d 0x19
+# CHECK: mov.l{{[[:space:]]+}}r6,@(52,r9)
+0x6d 0x84
+# CHECK: mov.b{{[[:space:]]+}}@(13,r6),r0
+0x6d 0x85
+# CHECK: mov.w{{[[:space:]]+}}@(26,r6),r0
+0x6d 0x59
+# CHECK: mov.l{{[[:space:]]+}}@(52,r6),r9
+0x64 0x09
+# CHECK: mov.b{{[[:space:]]+}}r6,@(r0,r9)
+0x65 0x09
+# CHECK: mov.w{{[[:space:]]+}}r6,@(r0,r9)
+0x66 0x09
+# CHECK: mov.l{{[[:space:]]+}}r6,@(r0,r9)
+0x6c 0x09
+# CHECK: mov.b{{[[:space:]]+}}@(r0,r6),r9
+0x6d 0x09
+# CHECK: mov.w{{[[:space:]]+}}@(r0,r6),r9
+0x6e 0x09
+# CHECK: mov.l{{[[:space:]]+}}@(r0,r6),r9
+0xb7 0xc0
+# CHECK: mov.b{{[[:space:]]+}}r0,@(183,gbr)
+0xb7 0xc1
+# CHECK: mov.w{{[[:space:]]+}}r0,@(366,gbr)
+0xb7 0xc2
+# CHECK: mov.l{{[[:space:]]+}}r0,@(732,gbr)
+0xb7 0xc4
+# CHECK: mov.b{{[[:space:]]+}}@(183,gbr),r0
+0xb7 0xc5
+# CHECK: mov.w{{[[:space:]]+}}@(366,gbr),r0
+0xb7 0xc6
+# CHECK: mov.l{{[[:space:]]+}}@(732,gbr),r0
+0x29 0x09
+# CHECK: movt{{[[:space:]]+}}r9
+0x68 0x69
+# CHECK: swap.b{{[[:space:]]+}}r6,r9
+0x69 0x69
+# CHECK: swap.w{{[[:space:]]+}}r6,r9
+0x6d 0x29
+# CHECK: xtrct{{[[:space:]]+}}r6,r9
+0xc3 0x09
+# CHECK: movca.l{{[[:space:]]+}}r0,@r9
+0x73 0x09
+# CHECK: movco.l{{[[:space:]]+}}r0,@r9
+0x63 0x06
+# CHECK: movli.l{{[[:space:]]+}}@r6,r0
+0xa9 0x46
+# CHECK: movua.l{{[[:space:]]+}}@r6,r0
+0xe9 0x46
+# CHECK: movua.l{{[[:space:]]+}}@r6+,r0
+0x6c 0x39
+# CHECK: add{{[[:space:]]+}}r6,r9
+0xa3 0x79
+# CHECK: add{{[[:space:]]+}}#-93,r9
+0x6e 0x39
+# CHECK: addc{{[[:space:]]+}}r6,r9
+0x6f 0x39
+# CHECK: addv{{[[:space:]]+}}r6,r9
+0xa3 0x88
+# CHECK: cmp/eq{{[[:space:]]+}}#-93,r0
+0x60 0x39
+# CHECK: cmp/eq{{[[:space:]]+}}r6,r9
+0x62 0x39
+# CHECK: cmp/hs{{[[:space:]]+}}r6,r9
+0x63 0x39
+# CHECK: cmp/ge{{[[:space:]]+}}r6,r9
+0x66 0x39
+# CHECK: cmp/hi{{[[:space:]]+}}r6,r9
+0x67 0x39
+# CHECK: cmp/gt{{[[:space:]]+}}r6,r9
+0x11 0x49
+# CHECK: cmp/pz{{[[:space:]]+}}r9
+0x15 0x49
+# CHECK: cmp/pl{{[[:space:]]+}}r9
+0x6c 0x29
+# CHECK: cmp/str{{[[:space:]]+}}r6,r9
+0x64 0x39
+# CHECK: div1{{[[:space:]]+}}r6,r9
+0x67 0x29
+# CHECK: div0s{{[[:space:]]+}}r6,r9
+0x19 0x00
+# CHECK: div0u
+0x6d 0x39
+# CHECK: dmuls.l{{[[:space:]]+}}r6,r9
+0x65 0x39
+# CHECK: dmulu.l{{[[:space:]]+}}r6,r9
+0x10 0x49
+# CHECK: dt{{[[:space:]]+}}r9
+0x6e 0x69
+# CHECK: exts.b{{[[:space:]]+}}r6,r9
+0x6f 0x69
+# CHECK: exts.w{{[[:space:]]+}}r6,r9
+0x6c 0x69
+# CHECK: extu.b{{[[:space:]]+}}r6,r9
+0x6d 0x69
+# CHECK: extu.w{{[[:space:]]+}}r6,r9
+0x6f 0x09
+# CHECK: mac.l{{[[:space:]]+}}@r6+,@r9+
+0x6f 0x49
+# CHECK: mac.w{{[[:space:]]+}}@r6+,@r9+
+0x67 0x09
+# CHECK: mul.l{{[[:space:]]+}}r6,r9
+0x6f 0x29
+# CHECK: muls.w{{[[:space:]]+}}r6,r9
+0x6e 0x29
+# CHECK: mulu.w{{[[:space:]]+}}r6,r9
+0x6b 0x69
+# CHECK: neg{{[[:space:]]+}}r6,r9
+0x6a 0x69
+# CHECK: negc{{[[:space:]]+}}r6,r9
+0x68 0x39
+# CHECK: sub{{[[:space:]]+}}r6,r9
+0x6a 0x39
+# CHECK: subc{{[[:space:]]+}}r6,r9
+0x6b 0x39
+# CHECK: subv{{[[:space:]]+}}r6,r9
+0x69 0x29
+# CHECK: and{{[[:space:]]+}}r6,r9
+0xc5 0xc9
+# CHECK: and{{[[:space:]]+}}#197,r0
+0xc5 0xcd
+# CHECK: and.b{{[[:space:]]+}}#197,@(r0,gbr)
+0x67 0x69
+# CHECK: not{{[[:space:]]+}}r6,r9
+0x6b 0x29
+# CHECK: or{{[[:space:]]+}}r6,r9
+0xc5 0xcb
+# CHECK: or{{[[:space:]]+}}#197,r0
+0xc5 0xcf
+# CHECK: or.b{{[[:space:]]+}}#197,@(r0,gbr)
+0x1b 0x49
+# CHECK: tas.b{{[[:space:]]+}}@r9
+0x68 0x29
+# CHECK: tst{{[[:space:]]+}}r6,r9
+0xc5 0xc8
+# CHECK: tst{{[[:space:]]+}}#197,r0
+0xc5 0xcc
+# CHECK: tst.b{{[[:space:]]+}}#197,@(r0,gbr)
+0x6a 0x29
+# CHECK: xor{{[[:space:]]+}}r6,r9
+0xc5 0xca
+# CHECK: xor{{[[:space:]]+}}#197,r0
+0xc5 0xce
+# CHECK: xor.b{{[[:space:]]+}}#197,@(r0,gbr)
+0x04 0x49
+# CHECK: rotl{{[[:space:]]+}}r9
+0x05 0x49
+# CHECK: rotr{{[[:space:]]+}}r9
+0x24 0x49
+# CHECK: rotcl{{[[:space:]]+}}r9
+0x25 0x49
+# CHECK: rotcr{{[[:space:]]+}}r9
+0x6c 0x49
+# CHECK: shad{{[[:space:]]+}}r6,r9
+0x20 0x49
+# CHECK: shal{{[[:space:]]+}}r9
+0x21 0x49
+# CHECK: shar{{[[:space:]]+}}r9
+0x6d 0x49
+# CHECK: shld{{[[:space:]]+}}r6,r9
+0x00 0x49
+# CHECK: shll{{[[:space:]]+}}r9
+0x01 0x49
+# CHECK: shlr{{[[:space:]]+}}r9
+0x08 0x49
+# CHECK: shll2{{[[:space:]]+}}r9
+0x09 0x49
+# CHECK: shlr2{{[[:space:]]+}}r9
+0x18 0x49
+# CHECK: shll8{{[[:space:]]+}}r9
+0x19 0x49
+# CHECK: shlr8{{[[:space:]]+}}r9
+0x28 0x49
+# CHECK: shll16{{[[:space:]]+}}r9
+0x29 0x49
+# CHECK: shlr16{{[[:space:]]+}}r9
+0x23 0x06
+# CHECK: braf{{[[:space:]]+}}r6
+0x03 0x06
+# CHECK: bsrf{{[[:space:]]+}}r6
+0x2b 0x46
+# CHECK: jmp{{[[:space:]]+}}@r6
+0x0b 0x46
+# CHECK: jsr{{[[:space:]]+}}@r6
+0x0b 0x00
+# CHECK: rts
+0x28 0x00
+# CHECK: clrmac
+0x48 0x00
+# CHECK: clrs
+0x08 0x00
+# CHECK: clrt
+0x0e 0x46
+# CHECK: ldc{{[[:space:]]+}}r6,sr
+0x1e 0x46
+# CHECK: ldc{{[[:space:]]+}}r6,gbr
+0x2e 0x46
+# CHECK: ldc{{[[:space:]]+}}r6,vbr
+0x3e 0x46
+# CHECK: ldc{{[[:space:]]+}}r6,ssr
+0x4e 0x46
+# CHECK: ldc{{[[:space:]]+}}r6,spc
+0xfa 0x46
+# CHECK: ldc{{[[:space:]]+}}r6,dbr
+0x3a 0x46
+# CHECK: ldc{{[[:space:]]+}}r6,sgr
+0xde 0x46
+# CHECK: ldc{{[[:space:]]+}}r6,r5_bank
+0x07 0x46
+# CHECK: ldc.l{{[[:space:]]+}}@r6+,sr
+0x17 0x46
+# CHECK: ldc.l{{[[:space:]]+}}@r6+,gbr
+0x27 0x46
+# CHECK: ldc.l{{[[:space:]]+}}@r6+,vbr
+0x37 0x46
+# CHECK: ldc.l{{[[:space:]]+}}@r6+,ssr
+0x47 0x46
+# CHECK: ldc.l{{[[:space:]]+}}@r6+,spc
+0xf6 0x46
+# CHECK: ldc.l{{[[:space:]]+}}@r6+,dbr
+0x36 0x46
+# CHECK: ldc.l{{[[:space:]]+}}@r6+,sgr
+0xd7 0x46
+# CHECK: ldc.l{{[[:space:]]+}}@r6+,r5_bank
+0x0a 0x46
+# CHECK: lds{{[[:space:]]+}}r6,mach
+0x1a 0x46
+# CHECK: lds{{[[:space:]]+}}r6,macl
+0x2a 0x46
+# CHECK: lds{{[[:space:]]+}}r6,pr
+0x06 0x46
+# CHECK: lds.l{{[[:space:]]+}}@r6+,mach
+0x16 0x46
+# CHECK: lds.l{{[[:space:]]+}}@r6+,macl
+0x26 0x46
+# CHECK: lds.l{{[[:space:]]+}}@r6+,pr
+0x38 0x00
+# CHECK: ldtlb
+0x09 0x00
+# CHECK: nop
+0x83 0x09
+# CHECK: pref{{[[:space:]]+}}@r9
+0xd3 0x09
+# CHECK: prefi{{[[:space:]]+}}@r9
+0x93 0x09
+# CHECK: ocbi{{[[:space:]]+}}@r9
+0xa3 0x09
+# CHECK: ocbp{{[[:space:]]+}}@r9
+0xb3 0x09
+# CHECK: ocbwb{{[[:space:]]+}}@r9
+0xe3 0x09
+# CHECK: icbi{{[[:space:]]+}}@r9
+0xab 0x00
+# CHECK: synco
+0x2b 0x00
+# CHECK: rte
+0x58 0x00
+# CHECK: sets
+0x18 0x00
+# CHECK: sett
+0x1b 0x00
+# CHECK: sleep
+0x02 0x09
+# CHECK: stc{{[[:space:]]+}}sr,r9
+0x12 0x09
+# CHECK: stc{{[[:space:]]+}}gbr,r9
+0x22 0x09
+# CHECK: stc{{[[:space:]]+}}vbr,r9
+0x32 0x09
+# CHECK: stc{{[[:space:]]+}}ssr,r9
+0x42 0x09
+# CHECK: stc{{[[:space:]]+}}spc,r9
+0x3a 0x09
+# CHECK: stc{{[[:space:]]+}}sgr,r9
+0xfa 0x09
+# CHECK: stc{{[[:space:]]+}}dbr,r9
+0xd2 0x09
+# CHECK: stc{{[[:space:]]+}}r5_bank,r9
+0x03 0x49
+# CHECK: stc.l{{[[:space:]]+}}sr,@-r9
+0x13 0x49
+# CHECK: stc.l{{[[:space:]]+}}gbr,@-r9
+0x23 0x49
+# CHECK: stc.l{{[[:space:]]+}}vbr,@-r9
+0x33 0x49
+# CHECK: stc.l{{[[:space:]]+}}ssr,@-r9
+0x43 0x49
+# CHECK: stc.l{{[[:space:]]+}}spc,@-r9
+0x32 0x49
+# CHECK: stc.l{{[[:space:]]+}}sgr,@-r9
+0xf2 0x49
+# CHECK: stc.l{{[[:space:]]+}}dbr,@-r9
+0xd3 0x49
+# CHECK: stc.l{{[[:space:]]+}}r5_bank,@-r9
+0x0a 0x09
+# CHECK: sts{{[[:space:]]+}}mach,r9
+0x1a 0x09
+# CHECK: sts{{[[:space:]]+}}macl,r9
+0x2a 0x09
+# CHECK: sts{{[[:space:]]+}}pr,r9
+0x02 0x49
+# CHECK: sts.l{{[[:space:]]+}}mach,@-r9
+0x12 0x49
+# CHECK: sts.l{{[[:space:]]+}}macl,@-r9
+0x22 0x49
+# CHECK: sts.l{{[[:space:]]+}}pr,@-r9
+0xc5 0xc3
+# CHECK: trapa{{[[:space:]]+}}#197
+0x8d 0xfb
+# CHECK: fldi0{{[[:space:]]+}}fr11
+0x9d 0xfb
+# CHECK: fldi1{{[[:space:]]+}}fr11
+0x5c 0xfb
+# CHECK: fmov{{[[:space:]]+}}fr5,fr11
+0x68 0xfb
+# CHECK: fmov.s{{[[:space:]]+}}@r6,fr11
+0x66 0xfb
+# CHECK: fmov.s{{[[:space:]]+}}@(r0,r6),fr11
+0x69 0xfb
+# CHECK: fmov.s{{[[:space:]]+}}@r6+,fr11
+0x5a 0xf9
+# CHECK: fmov.s{{[[:space:]]+}}fr5,@r9
+0x5b 0xf9
+# CHECK: fmov.s{{[[:space:]]+}}fr5,@-r9
+0x57 0xf9
+# CHECK: fmov.s{{[[:space:]]+}}fr5,@(r0,r9)
+0x1d 0xf5
+# CHECK: flds{{[[:space:]]+}}fr5,fpul
+0x0d 0xfb
+# CHECK: fsts{{[[:space:]]+}}fpul,fr11
+0x5d 0xfb
+# CHECK: fabs{{[[:space:]]+}}fr11
+0x50 0xfb
+# CHECK: fadd{{[[:space:]]+}}fr5,fr11
+0x54 0xfb
+# CHECK: fcmp/eq{{[[:space:]]+}}fr5,fr11
+0x55 0xfb
+# CHECK: fcmp/gt{{[[:space:]]+}}fr5,fr11
+0x53 0xfb
+# CHECK: fdiv{{[[:space:]]+}}fr5,fr11
+0x2d 0xfb
+# CHECK: float{{[[:space:]]+}}fpul,fr11
+0x5e 0xfb
+# CHECK: fmac{{[[:space:]]+}}fr0,fr5,fr11
+0x52 0xfb
+# CHECK: fmul{{[[:space:]]+}}fr5,fr11
+0x4d 0xfb
+# CHECK: fneg{{[[:space:]]+}}fr11
+0x6d 0xfb
+# CHECK: fsqrt{{[[:space:]]+}}fr11
+0x51 0xfb
+# CHECK: fsub{{[[:space:]]+}}fr5,fr11
+0x3d 0xf5
+# CHECK: ftrc{{[[:space:]]+}}fr5,fpul
+0x6a 0x46
+# CHECK: lds{{[[:space:]]+}}r6,fpscr
+0x5a 0x46
+# CHECK: lds{{[[:space:]]+}}r6,fpul
+0x66 0x46
+# CHECK: lds.l{{[[:space:]]+}}@r6+,fpscr
+0x56 0x46
+# CHECK: lds.l{{[[:space:]]+}}@r6+,fpul
+0x6a 0x09
+# CHECK: sts{{[[:space:]]+}}fpscr,r9
+0x5a 0x09
+# CHECK: sts{{[[:space:]]+}}fpul,r9
+0x62 0x49
+# CHECK: sts.l{{[[:space:]]+}}fpscr,@-r9
+0x52 0x49
+# CHECK: sts.l{{[[:space:]]+}}fpul,@-r9
+0xfd 0xfb
+# CHECK: frchg
+0xfd 0xf3
+# CHECK: fschg
+0xfd 0xf7
+# CHECK: fpchg
+0x7d 0xfb
+# CHECK: fsrra{{[[:space:]]+}}fr11
