@@ -207,54 +207,32 @@ define i32 @switch(i32 %x) {
 ; CHECK-NEXT:    add r2,r3
 ; CHECK-NEXT:    jmp @r3
 ; CHECK-NEXT:    nop
-; CHECK-NEXT:    .p2align 2
-; CHECK-NEXT:  ! %bb.9:
-; CHECK-NEXT:  .Ltmp14:
-; CHECK-NEXT:    .ualong _GLOBAL_OFFSET_TABLE_
-; CHECK-NEXT:  .Ltmp15:
-; CHECK-NEXT:    .ualong .LJTI7_0@GOTOFF
 ; CHECK-NEXT:  .LBB7_2: ! %a
 ; CHECK-NEXT:    mov.l .Ltmp16,r2
 ; CHECK-NEXT:    add r2,r1
 ; CHECK-NEXT:    mov.l @r1,r1
 ; CHECK-NEXT:    bra .LBB7_3
 ; CHECK-NEXT:    mov #10,r4
-; CHECK-NEXT:    .p2align 2
-; CHECK-NEXT:  ! %bb.10:
-; CHECK-NEXT:  .Ltmp16:
-; CHECK-NEXT:    .ualong callee@GOT
 ; CHECK-NEXT:  .LBB7_7: ! %e
-; CHECK-NEXT:    mov.l .Ltmp17,r2
+; CHECK-NEXT:    mov.l .Ltmp16,r2
 ; CHECK-NEXT:    add r2,r1
 ; CHECK-NEXT:    mov.l @r1,r1
 ; CHECK-NEXT:    bra .LBB7_3
 ; CHECK-NEXT:    mov #54,r4
-; CHECK-NEXT:    .p2align 2
-; CHECK-NEXT:  ! %bb.11:
-; CHECK-NEXT:  .Ltmp17:
-; CHECK-NEXT:    .ualong callee@GOT
 ; CHECK-NEXT:  .LBB7_5: ! %c
-; CHECK-NEXT:    mov.l .Ltmp18,r2
+; CHECK-NEXT:    mov.l .Ltmp16,r2
 ; CHECK-NEXT:    add r2,r1
 ; CHECK-NEXT:    mov.l @r1,r1
 ; CHECK-NEXT:    bra .LBB7_3
 ; CHECK-NEXT:    mov #32,r4
-; CHECK-NEXT:    .p2align 2
-; CHECK-NEXT:  ! %bb.12:
-; CHECK-NEXT:  .Ltmp18:
-; CHECK-NEXT:    .ualong callee@GOT
 ; CHECK-NEXT:  .LBB7_6: ! %d
-; CHECK-NEXT:    mov.l .Ltmp19,r2
+; CHECK-NEXT:    mov.l .Ltmp16,r2
 ; CHECK-NEXT:    add r2,r1
 ; CHECK-NEXT:    mov.l @r1,r1
 ; CHECK-NEXT:    bra .LBB7_3
 ; CHECK-NEXT:    mov #43,r4
-; CHECK-NEXT:    .p2align 2
-; CHECK-NEXT:  ! %bb.13:
-; CHECK-NEXT:  .Ltmp19:
-; CHECK-NEXT:    .ualong callee@GOT
 ; CHECK-NEXT:  .LBB7_4: ! %b
-; CHECK-NEXT:    mov.l .Ltmp20,r2
+; CHECK-NEXT:    mov.l .Ltmp16,r2
 ; CHECK-NEXT:    add r2,r1
 ; CHECK-NEXT:    mov.l @r1,r1
 ; CHECK-NEXT:    mov #21,r4
@@ -264,14 +242,18 @@ define i32 @switch(i32 %x) {
 ; CHECK-NEXT:    lds.l @r15+,pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop
-; CHECK-NEXT:    .p2align 2
-; CHECK-NEXT:  ! %bb.14:
-; CHECK-NEXT:  .Ltmp20:
-; CHECK-NEXT:    .ualong callee@GOT
 ; CHECK-NEXT:  .LBB7_8: ! %other
 ; CHECK-NEXT:    lds.l @r15+,pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    mov #0,r0
+; CHECK-NEXT:    .p2align 2
+; CHECK-NEXT:  ! %bb.9:
+; CHECK-NEXT:  .Ltmp14:
+; CHECK-NEXT:    .ualong _GLOBAL_OFFSET_TABLE_
+; CHECK-NEXT:  .Ltmp15:
+; CHECK-NEXT:    .ualong .LJTI7_0@GOTOFF
+; CHECK-NEXT:  .Ltmp16:
+; CHECK-NEXT:    .ualong callee@GOT
 entry:
   switch i32 %x, label %other [
     i32 0, label %a

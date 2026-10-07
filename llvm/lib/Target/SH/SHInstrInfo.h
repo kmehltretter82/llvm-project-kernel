@@ -20,6 +20,52 @@ namespace llvm {
 
 class SHSubtarget;
 
+namespace SH {
+/// A number that does not fit the eight bits of an immediate but is one
+/// instruction away from a number that does: MOVI2 makes it in a register
+/// with two instructions, where a literal is an instruction, four bytes of
+/// data and a load.  None of the second instructions changes T.
+enum class TwoInsnImm {
+  None,
+  /// 128 to 255: "mov #imm,Rn; extu.b Rn,Rn".
+  ZExt8,
+  /// 65408 to 65535: "mov #imm,Rn; extu.w Rn,Rn".
+  ZExt16,
+  /// Twice a number: "mov #imm,Rn; add Rn,Rn".
+  Shl1,
+  /// "mov #imm,Rn" and shll2, shll8 or shll16.
+  Shl2,
+  Shl8,
+  Shl16,
+};
+
+/// Which of these \p Imm is, and the immediate of the mov.
+inline TwoInsnImm classifyTwoInsnImm(int64_t Imm, int64_t &First) {
+  if (isInt<8>(Imm) || !isInt<32>(Imm))
+    return TwoInsnImm::None;
+  if (Imm >= 128 && Imm <= 255) {
+    First = Imm - 256;
+    return TwoInsnImm::ZExt8;
+  }
+  if (Imm >= 65408 && Imm <= 65535) {
+    First = Imm - 65536;
+    return TwoInsnImm::ZExt16;
+  }
+  static const std::pair<unsigned, TwoInsnImm> Shifts[] = {
+      {1, TwoInsnImm::Shl1},
+      {2, TwoInsnImm::Shl2},
+      {8, TwoInsnImm::Shl8},
+      {16, TwoInsnImm::Shl16},
+  };
+  for (auto [Amount, Kind] : Shifts)
+    if (Imm % (int64_t(1) << Amount) == 0 && isInt<8>(Imm >> Amount)) {
+      First = Imm >> Amount;
+      return Kind;
+    }
+  return TwoInsnImm::None;
+}
+} // namespace SH
+
 class SHInstrInfo : public SHGenInstrInfo {
   const SHRegisterInfo RI;
   virtual void anchor();

@@ -193,6 +193,20 @@ let isReMaterializable = 1, isAsCheapAsAMove = 1, isMoveImm = 1 in
 def MOVI : SHInst<(outs GPR:$dst), (ins simm8:$imm), "mov\t#$imm,$dst",
                   [(set GPR:$dst, simm8:$imm)]>;
 
+// A number that is one instruction away from an immediate: 240 is
+// "mov #-16,Rn; extu.b Rn,Rn" and 4096 is "mov #16,Rn; shll8 Rn" (see
+// SH::classifyTwoInsnImm).  That is two bytes less than a literal and no
+// load.  It is one instruction until the registers are allocated, so that it
+// can be made again where it is needed instead of being kept on the stack.
+def imm2insn : ImmLeaf<i32, [{
+  int64_t First;
+  return SH::classifyTwoInsnImm(Imm, First) != SH::TwoInsnImm::None;
+}]>;
+let isReMaterializable = 1, isAsCheapAsAMove = 1, isMoveImm = 1, Size = 4,
+    hasSideEffects = 0 in
+def MOVI2 : SHPseudo<(outs GPR:$dst), (ins i32imm:$imm),
+                     [(set GPR:$dst, imm2insn:$imm)]>;
+
 // A number or an address that is loaded from a literal.  The operand is the
 // number, the global, the symbol, the block address, the jump table or the
 // constant pool entry.

@@ -40,10 +40,6 @@ define i32 @catcher(i32 %x) personality ptr @__gxx_personality_v0 {
 ; CHECK-NEXT:    lds.l @r15+,pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    mov.l @r15+,r8
-; CHECK-NEXT:    .p2align 2
-; CHECK-NEXT:  ! %bb.6:
-; CHECK-NEXT:  .Ltmp3:
-; CHECK-NEXT:    .ualong may_throw
 ; CHECK-NEXT:  .LBB0_3: ! %lpad
 ; CHECK-NEXT:  .Ltmp2: ! EH_LABEL
 ; CHECK-NEXT:    mov #1,r1
@@ -59,18 +55,18 @@ define i32 @catcher(i32 %x) personality ptr @__gxx_personality_v0 {
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    bra .LBB0_2
 ; CHECK-NEXT:    mov r8,r0
-; CHECK-NEXT:    .p2align 2
-; CHECK-NEXT:  ! %bb.7:
-; CHECK-NEXT:  .Ltmp4:
-; CHECK-NEXT:    .ualong __cxa_begin_catch
-; CHECK-NEXT:  .Ltmp5:
-; CHECK-NEXT:    .ualong __cxa_end_catch
 ; CHECK-NEXT:  .LBB0_5: ! %resume
 ; CHECK-NEXT:    mov.l .Ltmp6,r1
 ; CHECK-NEXT:    jsr @r1
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    .p2align 2
-; CHECK-NEXT:  ! %bb.8:
+; CHECK-NEXT:  ! %bb.6:
+; CHECK-NEXT:  .Ltmp3:
+; CHECK-NEXT:    .ualong may_throw
+; CHECK-NEXT:  .Ltmp4:
+; CHECK-NEXT:    .ualong __cxa_begin_catch
+; CHECK-NEXT:  .Ltmp5:
+; CHECK-NEXT:    .ualong __cxa_end_catch
 ; CHECK-NEXT:  .Ltmp6:
 ; CHECK-NEXT:    .ualong _Unwind_Resume
 ;
@@ -106,12 +102,6 @@ define i32 @catcher(i32 %x) personality ptr @__gxx_personality_v0 {
 ; PIC-NEXT:    mov.l @r15+,r9
 ; PIC-NEXT:    rts
 ; PIC-NEXT:    mov.l @r15+,r8
-; PIC-NEXT:    .p2align 2
-; PIC-NEXT:  ! %bb.6:
-; PIC-NEXT:  .Ltmp3:
-; PIC-NEXT:    .ualong _GLOBAL_OFFSET_TABLE_
-; PIC-NEXT:  .Ltmp4:
-; PIC-NEXT:    .ualong may_throw@GOT
 ; PIC-NEXT:  .LBB0_3: ! %lpad
 ; PIC-NEXT:  .Ltmp2: ! EH_LABEL
 ; PIC-NEXT:    mov #1,r1
@@ -131,12 +121,6 @@ define i32 @catcher(i32 %x) personality ptr @__gxx_personality_v0 {
 ; PIC-NEXT:    nop
 ; PIC-NEXT:    bra .LBB0_2
 ; PIC-NEXT:    mov r8,r0
-; PIC-NEXT:    .p2align 2
-; PIC-NEXT:  ! %bb.7:
-; PIC-NEXT:  .Ltmp5:
-; PIC-NEXT:    .ualong __cxa_begin_catch@GOT
-; PIC-NEXT:  .Ltmp6:
-; PIC-NEXT:    .ualong __cxa_end_catch@GOT
 ; PIC-NEXT:  .LBB0_5: ! %resume
 ; PIC-NEXT:    mov.l .Ltmp7,r1
 ; PIC-NEXT:    add r1,r9
@@ -144,7 +128,15 @@ define i32 @catcher(i32 %x) personality ptr @__gxx_personality_v0 {
 ; PIC-NEXT:    jsr @r1
 ; PIC-NEXT:    nop
 ; PIC-NEXT:    .p2align 2
-; PIC-NEXT:  ! %bb.8:
+; PIC-NEXT:  ! %bb.6:
+; PIC-NEXT:  .Ltmp3:
+; PIC-NEXT:    .ualong _GLOBAL_OFFSET_TABLE_
+; PIC-NEXT:  .Ltmp4:
+; PIC-NEXT:    .ualong may_throw@GOT
+; PIC-NEXT:  .Ltmp5:
+; PIC-NEXT:    .ualong __cxa_begin_catch@GOT
+; PIC-NEXT:  .Ltmp6:
+; PIC-NEXT:    .ualong __cxa_end_catch@GOT
 ; PIC-NEXT:  .Ltmp7:
 ; PIC-NEXT:    .ualong _Unwind_Resume@GOT
 entry:

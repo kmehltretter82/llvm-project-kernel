@@ -13,7 +13,8 @@
 // literals go:
 //
 // - behind an unconditional branch or a return, where nothing runs into
-//   them, if one comes in time;
+//   them, if one comes in time: the last one that does, so that the pools
+//   are few and a literal that is loaded in several places is there once;
 // - otherwise in the middle of the code, with a jump around them.
 //
 // The second job needs the same knowledge of where everything is: a
@@ -121,6 +122,10 @@ private:
 
   void addLiteral(const MachineOperand &Value, int UseAddr, MachineInstr *User,
                   bool Distance = false);
+  /// Whether an instruction loads a literal, and how far into itself the
+  /// load is.
+  static bool loadsLiteral(const MachineInstr &MI, int &Offset);
+  bool canWait(MachineFunction::iterator Block) const;
   MachineBasicBlock *flush(MachineBasicBlock &MBB,
                            MachineBasicBlock::iterator Before, bool Inline,
                            bool Materialize);
@@ -149,6 +154,60 @@ void SHConstantIslands::addLiteral(const MachineOperand &Value, int UseAddr,
       }
   Worst = std::max(Worst, int(4 * Pool.size()) - UseAddr);
   Pool.push_back({Value, {User}, Distance});
+}
+
+bool SHConstantIslands::loadsLiteral(const MachineInstr &MI, int &Offset) {
+  switch (MI.getOpcode()) {
+  // The first of the three instructions has the longest way.
+  case SH::MOVLpcrel:
+  case SH::LOADGOT:
+    Offset = 0;
+    return true;
+  // The load is the second instruction of the sequence, and the third
+  // behind the conditional branch.
+  case SH::BRAfar:
+    Offset = 2;
+    return true;
+  case SH::BTfar:
+  case SH::BFfar:
+    Offset = 4;
+    return true;
+  default:
+    return false;
+  }
+}
+
+/// The code has come to the end of \p Block, behind an unconditional
+/// branch, with literals waiting.  They can go here.  They can also wait for
+/// the next such place if they reach from there, and that is better: one
+/// large pool has a literal once that two small ones have twice, and is
+/// padded once.  This walks ahead as place() will, with every load on the
+/// way taken as one of a new literal, and says whether it gets to such a
+/// place without having to put the literals into running code.
+bool SHConstantIslands::canWait(MachineFunction::iterator Block) const {
+  int Ahead = Addr, Far = Worst;
+  unsigned Count = Pool.size();
+  for (auto BI = std::next(Block); BI != MF->end(); ++BI) {
+    if (Islands.count(&*BI))
+      continue;
+    const MachineInstr *Last = nullptr;
+    for (const MachineInstr &MI : *BI) {
+      int Size = sizeOf(MI);
+      if (!Size)
+        continue;
+      if (Ahead + 6 + Far + 16 + Size > Reach)
+        return false;
+      int Offset;
+      if (loadsLiteral(MI, Offset))
+        Far = std::max(Far, int(4 * Count++) - (Ahead + Offset));
+      Ahead += Size;
+      Last = &MI;
+    }
+    if (Last && Last->isBarrier())
+      return true;
+  }
+  // The end of the function is such a place.
+  return true;
 }
 
 /// Put the waiting literals behind \p MBB.  \p Inline: the code runs on
@@ -259,25 +318,14 @@ void SHConstantIslands::place(bool Materialize) {
       InTerminators |= MI.isTerminator();
 
       InstAddr[&MI] = Addr;
-      switch (MI.getOpcode()) {
-      // The first of the three instructions has the longest way.
-      case SH::MOVLpcrel:
-      case SH::LOADGOT:
-        addLiteral(MI.getOperand(1), Addr, &MI);
-        break;
-      // The load is the second instruction of the sequence, and the third
-      // behind the conditional branch.
-      case SH::BRAfar:
-        addLiteral(MachineOperand::CreateMBB(MI.getOperand(0).getMBB()),
-                   Addr + 2, &MI, /*Distance=*/true);
-        break;
-      case SH::BTfar:
-      case SH::BFfar:
-        addLiteral(MachineOperand::CreateMBB(MI.getOperand(0).getMBB()),
-                   Addr + 4, &MI, /*Distance=*/true);
-        break;
-      default:
-        break;
+      int Offset;
+      if (loadsLiteral(MI, Offset)) {
+        // A far branch loads how far away its target is.
+        if (MI.isBranch())
+          addLiteral(MachineOperand::CreateMBB(MI.getOperand(0).getMBB()),
+                     Addr + Offset, &MI, /*Distance=*/true);
+        else
+          addLiteral(MI.getOperand(1), Addr, &MI);
       }
       Addr += Size;
 
@@ -285,8 +333,10 @@ void SHConstantIslands::place(bool Materialize) {
       // it is the last thing in its block that takes room.  What takes none
       // does not count: debug information must not change the code.
       if (!Pool.empty() && MI.isBarrier() &&
-          none_of(make_range(I, MBB->end()),
-                  [&](const MachineInstr &Next) { return sizeOf(Next) != 0; }))
+          none_of(
+              make_range(I, MBB->end()),
+              [&](const MachineInstr &Next) { return sizeOf(Next) != 0; }) &&
+          !canWait(BI))
         flush(*MBB, MBB->end(), /*Inline=*/false, Materialize);
     }
   }

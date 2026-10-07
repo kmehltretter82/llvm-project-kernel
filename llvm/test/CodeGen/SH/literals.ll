@@ -30,13 +30,9 @@ define i32 @shifted() {
 ; CHECK-LABEL: shifted:
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
-; CHECK-NEXT:    mov.l .Ltmp0,r0
+; CHECK-NEXT:    mov #16,r0
 ; CHECK-NEXT:    rts
-; CHECK-NEXT:    nop
-; CHECK-NEXT:    .p2align 2
-; CHECK-NEXT:  ! %bb.1:
-; CHECK-NEXT:  .Ltmp0:
-; CHECK-NEXT:    .ualong 4096
+; CHECK-NEXT:    shll8 r0
   ret i32 4096
 }
 
@@ -44,12 +40,12 @@ define i32 @big() {
 ; CHECK-LABEL: big:
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
-; CHECK-NEXT:    mov.l .Ltmp1,r0
+; CHECK-NEXT:    mov.l .Ltmp0,r0
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    .p2align 2
 ; CHECK-NEXT:  ! %bb.1:
-; CHECK-NEXT:  .Ltmp1:
+; CHECK-NEXT:  .Ltmp0:
 ; CHECK-NEXT:    .ualong 305419896
   ret i32 305419896
 }
@@ -59,13 +55,13 @@ define i32 @twice(i32 %a) {
 ; CHECK-LABEL: twice:
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
-; CHECK-NEXT:    mov.l .Ltmp2,r0
+; CHECK-NEXT:    mov.l .Ltmp1,r0
 ; CHECK-NEXT:    add r0,r4
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    xor r4,r0
 ; CHECK-NEXT:    .p2align 2
 ; CHECK-NEXT:  ! %bb.1:
-; CHECK-NEXT:  .Ltmp2:
+; CHECK-NEXT:  .Ltmp1:
 ; CHECK-NEXT:    .ualong 100000
   %x = add i32 %a, 100000
   %y = xor i32 %x, 100000
@@ -76,12 +72,12 @@ define ptr @address() {
 ; CHECK-LABEL: address:
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
-; CHECK-NEXT:    mov.l .Ltmp3,r0
+; CHECK-NEXT:    mov.l .Ltmp2,r0
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    .p2align 2
 ; CHECK-NEXT:  ! %bb.1:
-; CHECK-NEXT:  .Ltmp3:
+; CHECK-NEXT:  .Ltmp2:
 ; CHECK-NEXT:    .ualong g
   ret ptr @g
 }
@@ -90,12 +86,12 @@ define ptr @address_offset() {
 ; CHECK-LABEL: address_offset:
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
-; CHECK-NEXT:    mov.l .Ltmp4,r0
+; CHECK-NEXT:    mov.l .Ltmp3,r0
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    add #100,r0
 ; CHECK-NEXT:    .p2align 2
 ; CHECK-NEXT:  ! %bb.1:
-; CHECK-NEXT:  .Ltmp4:
+; CHECK-NEXT:  .Ltmp3:
 ; CHECK-NEXT:    .ualong g
   ret ptr getelementptr (i32, ptr @g, i32 25)
 }
@@ -112,14 +108,14 @@ define void @behind_branch(i32 %a) {
 ; CHECK-NEXT:    .cfi_def_cfa_offset 8
 ; CHECK-NEXT:    .cfi_offset pr, -8
 ; CHECK-NEXT:    tst r4,r4
-; CHECK-NEXT:    mov.l .Ltmp5,r8
+; CHECK-NEXT:    mov.l .Ltmp4,r8
 ; CHECK-NEXT:    bf .LBB7_2
 ; CHECK-NEXT:  ! %bb.1: ! %t
-; CHECK-NEXT:    mov.l .Ltmp6,r4
+; CHECK-NEXT:    mov.l .Ltmp5,r4
 ; CHECK-NEXT:    jsr @r8
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:  .LBB7_2: ! %e
-; CHECK-NEXT:    mov.l .Ltmp7,r4
+; CHECK-NEXT:    mov.l .Ltmp6,r4
 ; CHECK-NEXT:    jsr @r8
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    lds.l @r15+,pr
@@ -127,11 +123,11 @@ define void @behind_branch(i32 %a) {
 ; CHECK-NEXT:    mov.l @r15+,r8
 ; CHECK-NEXT:    .p2align 2
 ; CHECK-NEXT:  ! %bb.3:
-; CHECK-NEXT:  .Ltmp5:
+; CHECK-NEXT:  .Ltmp4:
 ; CHECK-NEXT:    .ualong ext
-; CHECK-NEXT:  .Ltmp6:
+; CHECK-NEXT:  .Ltmp5:
 ; CHECK-NEXT:    .ualong 100000
-; CHECK-NEXT:  .Ltmp7:
+; CHECK-NEXT:  .Ltmp6:
 ; CHECK-NEXT:    .ualong 200000
   %c = icmp eq i32 %a, 0
   br i1 %c, label %t, label %e
@@ -152,15 +148,11 @@ define i32 @jump_table(i32 %a) {
 ; CHECK-NEXT:    bt .LBB8_7
 ; CHECK-NEXT:  ! %bb.1:
 ; CHECK-NEXT:    shll2 r4
-; CHECK-NEXT:    mov.l .Ltmp8,r1
+; CHECK-NEXT:    mov.l .Ltmp7,r1
 ; CHECK-NEXT:    add r4,r1
 ; CHECK-NEXT:    mov.l @r1,r1
 ; CHECK-NEXT:    jmp @r1
 ; CHECK-NEXT:    nop
-; CHECK-NEXT:    .p2align 2
-; CHECK-NEXT:  ! %bb.8:
-; CHECK-NEXT:  .Ltmp8:
-; CHECK-NEXT:    .ualong .LJTI8_0
 ; CHECK-NEXT:  .LBB8_2: ! %b0
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    mov #10,r0
@@ -179,6 +171,10 @@ define i32 @jump_table(i32 %a) {
 ; CHECK-NEXT:  .LBB8_7: ! %d
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    mov #0,r0
+; CHECK-NEXT:    .p2align 2
+; CHECK-NEXT:  ! %bb.8:
+; CHECK-NEXT:  .Ltmp7:
+; CHECK-NEXT:    .ualong .LJTI8_0
   switch i32 %a, label %d [
     i32 0, label %b0
     i32 1, label %b1
@@ -204,15 +200,15 @@ define ptr @block_address() {
 ; CHECK-LABEL: block_address:
 ; CHECK:         .cfi_startproc
 ; CHECK-NEXT:  ! %bb.0:
-; CHECK-NEXT:  .Ltmp10: ! Block address taken
+; CHECK-NEXT:  .Ltmp9: ! Block address taken
 ; CHECK-NEXT:  ! %bb.1: ! %next
-; CHECK-NEXT:    mov.l .Ltmp9,r0
+; CHECK-NEXT:    mov.l .Ltmp8,r0
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    .p2align 2
 ; CHECK-NEXT:  ! %bb.2:
-; CHECK-NEXT:  .Ltmp9:
-; CHECK-NEXT:    .ualong .Ltmp10
+; CHECK-NEXT:  .Ltmp8:
+; CHECK-NEXT:    .ualong .Ltmp9
   br label %next
 next:
   ret ptr blockaddress(@block_address, %next)

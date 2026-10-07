@@ -268,6 +268,39 @@ bool SHInstrInfo::expandPostRAPseudo(MachineInstr &MI) const {
             get(MI.getOpcode() == SH::MUL32 ? SH::STSMACL : SH::STSMACH), Dst);
     break;
   }
+  case SH::MOVI2: {
+    Register Dst = MI.getOperand(0).getReg();
+    int64_t First;
+    SH::TwoInsnImm Kind =
+        SH::classifyTwoInsnImm(MI.getOperand(1).getImm(), First);
+    BuildMI(MBB, MI, DL, get(SH::MOVI), Dst).addImm(First);
+    unsigned Second = 0;
+    switch (Kind) {
+    case SH::TwoInsnImm::None:
+      llvm_unreachable("not a number for MOVI2");
+    case SH::TwoInsnImm::ZExt8:
+      Second = SH::EXTUB;
+      break;
+    case SH::TwoInsnImm::ZExt16:
+      Second = SH::EXTUW;
+      break;
+    case SH::TwoInsnImm::Shl1:
+      BuildMI(MBB, MI, DL, get(SH::ADDrr), Dst).addReg(Dst).addReg(Dst);
+      break;
+    case SH::TwoInsnImm::Shl2:
+      Second = SH::SHLL2;
+      break;
+    case SH::TwoInsnImm::Shl8:
+      Second = SH::SHLL8;
+      break;
+    case SH::TwoInsnImm::Shl16:
+      Second = SH::SHLL16;
+      break;
+    }
+    if (Second)
+      BuildMI(MBB, MI, DL, get(Second), Dst).addReg(Dst, RegState::Kill);
+    break;
+  }
   case SH::MOVRT: {
     // 0 - (-1) - T
     Register Dst = MI.getOperand(0).getReg();

@@ -174,10 +174,6 @@ define void @branch(i32 %a, i32 %b) {
 ; CHECK-NEXT:    mov.l .Ltmp0,r1
 ; CHECK-NEXT:    bra .LBB12_2
 ; CHECK-NEXT:    nop
-; CHECK-NEXT:    .p2align 2
-; CHECK-NEXT:  ! %bb.4:
-; CHECK-NEXT:  .Ltmp0:
-; CHECK-NEXT:    .ualong f
 ; CHECK-NEXT:  .LBB12_3: ! %e
 ; CHECK-NEXT:    mov.l .Ltmp1,r1
 ; CHECK-NEXT:  .LBB12_2: ! %t
@@ -187,7 +183,9 @@ define void @branch(i32 %a, i32 %b) {
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    .p2align 2
-; CHECK-NEXT:  ! %bb.5:
+; CHECK-NEXT:  ! %bb.4:
+; CHECK-NEXT:  .Ltmp0:
+; CHECK-NEXT:    .ualong f
 ; CHECK-NEXT:  .Ltmp1:
 ; CHECK-NEXT:    .ualong g
   %c = icmp ult i32 %a, %b
