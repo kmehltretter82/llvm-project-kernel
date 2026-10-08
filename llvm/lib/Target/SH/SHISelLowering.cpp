@@ -165,23 +165,28 @@ SHTargetLowering::SHTargetLowering(const TargetMachine &TM,
   if (STI.hasFPU())
     setOperationAction(ISD::VACOPY, MVT::Other, Custom);
 
-  // Atomic operations.  On Linux those on up to 32 bits are the __sync
-  // functions of libgcc: sequences that the kernel starts again if it
-  // interrupted them, which is what GCC makes inline by default.  A load
-  // and a store of a word are atomic as they are, and nothing has to be
-  // fenced on one processor.  Everything else is a call of __atomic_*.
+  // Atomic operations.  On Linux those on up to 32 bits are sequences that
+  // the kernel starts again if it interrupted them: written here as GCC
+  // writes them by default (GUSA_RMW and the others of SHInstrInfo.td), or
+  // called as the __sync functions of libgcc, which are the same sequences.
+  // A load and a store of a word are atomic as they are, and nothing has to
+  // be fenced on one processor.  Everything else is a call of __atomic_*.
   if (STI.getTargetTriple().isOSLinux()) {
     setMaxAtomicSizeInBitsSupported(32);
     setOperationAction({ISD::ATOMIC_CMP_SWAP, ISD::ATOMIC_SWAP,
                         ISD::ATOMIC_LOAD_ADD, ISD::ATOMIC_LOAD_SUB,
                         ISD::ATOMIC_LOAD_AND, ISD::ATOMIC_LOAD_OR,
                         ISD::ATOMIC_LOAD_XOR, ISD::ATOMIC_LOAD_NAND},
-                       MVT::i32, LibCall);
+                       MVT::i32, STI.useGUSA() ? Legal : LibCall);
     setOperationAction({ISD::ATOMIC_LOAD, ISD::ATOMIC_STORE}, MVT::i32, Custom);
     setOperationAction(ISD::ATOMIC_FENCE, MVT::Other, Custom);
   } else {
     setMaxAtomicSizeInBitsSupported(0);
   }
+}
+
+ISD::NodeType SHTargetLowering::getExtendForAtomicOps() const {
+  return Subtarget.useGUSA() ? ISD::SIGN_EXTEND : ISD::ANY_EXTEND;
 }
 
 TargetLowering::AtomicExpansionKind

@@ -119,3 +119,15 @@ int x;
 // KCOV-NOT: error:
 // KCOV: "-fsanitize-coverage-trace-pc"
 // KMSAN: error: unsupported option '-fsanitize=kernel-memory' for target 'sh4-unknown-linux-gnu'
+
+// How atomic operations are done on Linux.  The default of the backend is
+// what GCC calls soft-gusa.  The Linux kernel asks for "none" where it has
+// the __sync functions itself.  The other models of GCC are not known.
+// RUN: %clang -### --target=sh4-linux-gnu -matomic-model=none -c %s 2>&1 | FileCheck --check-prefix=ATOMIC-NONE %s
+// RUN: %clang -### --target=sh4-linux-gnu -matomic-model=soft-gusa -c %s 2>&1 | FileCheck --check-prefix=ATOMIC-GUSA %s
+// RUN: %clang -### --target=sh4-linux-gnu -c %s 2>&1 | FileCheck --check-prefix=ATOMIC-GUSA %s
+// RUN: not %clang -### --target=sh4-linux-gnu -matomic-model=hard-llcs -c %s 2>&1 | FileCheck --check-prefix=ATOMIC-BAD %s
+//
+// ATOMIC-NONE: "-target-feature" "+atomic-calls"
+// ATOMIC-GUSA-NOT: atomic-calls
+// ATOMIC-BAD: error: unsupported argument 'hard-llcs' to option '-matomic-model='

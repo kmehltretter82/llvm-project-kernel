@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "SuperH.h"
+#include "clang/Basic/DiagnosticDriver.h"
 #include "clang/Options/Options.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Option/Arg.h"
@@ -60,4 +61,18 @@ std::string superh::getSuperHAsmISA(StringRef CPU) {
     return Info->hasFPU() ? "--isa=sh4a" : "--isa=sh4a-nofpu";
   }
   return "";
+}
+
+void superh::getSuperHTargetFeatures(const Driver &D, const ArgList &Args,
+                                     std::vector<StringRef> &Features) {
+  // "soft-gusa" is what the backend does on Linux for an SH-3 and later
+  // without being asked.
+  if (const Arg *A = Args.getLastArg(options::OPT_matomic_model_EQ)) {
+    StringRef Model = A->getValue();
+    if (Model == "none")
+      Features.push_back("+atomic-calls");
+    else if (Model != "soft-gusa")
+      D.Diag(diag::err_drv_unsupported_option_argument)
+          << A->getSpelling() << Model;
+  }
 }

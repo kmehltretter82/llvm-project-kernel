@@ -34,6 +34,7 @@ class SHSubtarget : public SHGenSubtargetInfo {
   bool HasFPU = false;
   bool HasFPUDouble = false;
   bool HasFPUSingleMode = false;
+  bool HasAtomicCalls = false;
 
   SHInstrInfo InstrInfo;
   SHTargetLowering TLInfo;
@@ -68,6 +69,13 @@ public:
   /// alone: see llvm/TargetParser/SHTargetParser.h.
   bool isSH4FPU() const { return HasSH4 && HasFPUDouble; }
   bool leavesRegistersFree() const { return isSH4FPU() || HasSH2A; }
+  /// An atomic operation on up to 32 bits is a gUSA sequence: GCC's
+  /// -matomic-model=soft-gusa, its default for Linux on an SH-3 and later.
+  /// The kernel starts such a sequence again when it interrupted it, so it
+  /// is atomic on one processor.
+  bool useGUSA() const {
+    return TargetTriple.isOSLinux() && HasSH3 && !HasAtomicCalls;
+  }
 
   const TargetFrameLowering *getFrameLowering() const override {
     return &FrameLowering;

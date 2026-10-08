@@ -7422,6 +7422,10 @@ def m4al : Flag<["-"], "m4al">, Group<m_superh_cpu_Group>,
   HelpText<"Generate code for the SH4AL-DSP (SuperH only)">;
 def ml : Flag<["-"], "ml">, Alias<mlittle_endian>;
 def mb : Flag<["-"], "mb">, Alias<mbig_endian>;
+def matomic_model_EQ : Joined<["-"], "matomic-model=">, Group<m_Group>,
+  HelpText<"How atomic operations are done on Linux: soft-gusa, sequences "
+           "that the kernel starts again when it interrupted them (the "
+           "default), or none, calls of the __sync functions (SuperH only)">;
 } // let Flags = [TargetSpecific]
 
 // M68k features flags

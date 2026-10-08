@@ -10,9 +10,12 @@
 #ifndef LLVM_CLANG_LIB_DRIVER_TOOLCHAINS_ARCH_SUPERH_H
 #define LLVM_CLANG_LIB_DRIVER_TOOLCHAINS_ARCH_SUPERH_H
 
+#include "clang/Driver/Driver.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/Option/ArgList.h"
 #include "llvm/TargetParser/Triple.h"
 #include <string>
+#include <vector>
 
 namespace clang {
 namespace driver {
@@ -27,6 +30,11 @@ std::string getSuperHTargetCPU(const llvm::opt::ArgList &Args,
 /// The instruction set to tell the assembler, as GCC does: "--isa=sh4a".
 /// Empty for a processor that GCC passes nothing for.
 std::string getSuperHAsmISA(llvm::StringRef CPU);
+
+/// What -matomic-model= asks of the backend.  GCC has more models than the
+/// two that are known here.
+void getSuperHTargetFeatures(const Driver &D, const llvm::opt::ArgList &Args,
+                             std::vector<llvm::StringRef> &Features);
 
 } // end namespace superh
 } // end namespace tools

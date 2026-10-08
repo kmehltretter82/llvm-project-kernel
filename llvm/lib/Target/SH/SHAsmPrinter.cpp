@@ -63,6 +63,8 @@ private:
   /// The jump over a distance from a literal: r0 is pushed, loaded, added
   /// to the program counter by braf, and popped in the delay slot of that.
   void emitFarJump(const MachineInstr *MI);
+  /// An atomic operation as a gUSA sequence, see SHInstrInfo.td.
+  void emitGUSA(const MachineInstr *MI);
   void emitProfileCall();
   void emitOne(const MachineInstr *MI);
 };
@@ -300,6 +302,78 @@ void SHAsmPrinter::emitProfileCall() {
 // the slot.  A nop is behind the branch.  An instruction that the filler
 // moved into the slot is in front of it, where it is in the order of
 // execution, and is written behind it.
+void SHAsmPrinter::emitGUSA(const MachineInstr *MI) {
+  auto Reg = [](Register R) { return MCOperand::createReg(R); };
+  auto Inst = [](unsigned Opcode, std::initializer_list<MCOperand> Operands) {
+    MCInst I;
+    I.setOpcode(Opcode);
+    for (const MCOperand &Op : Operands)
+      I.addOperand(Op);
+    return I;
+  };
+  static const unsigned Loads[] = {SH::MOVBind, SH::MOVWind, 0, SH::MOVLind};
+  static const unsigned Stores[] = {SH::MOVBsti, SH::MOVWsti, 0, SH::MOVLsti};
+  unsigned NumOps = MI->getNumExplicitOperands();
+  unsigned Bytes = MI->getOperand(NumOps - 1).getImm();
+  unsigned Load = Loads[Bytes - 1], Store = Stores[Bytes - 1];
+  MCSymbol *End = OutContext.createTempSymbol();
+  MCOperand Old = Reg(MI->getOperand(0).getReg());
+
+  // What stands between the two labels.
+  SmallVector<MCInst, 5> Body;
+  switch (MI->getOpcode()) {
+  case SH::GUSA_RMW: {
+    static const unsigned Ops[] = {SH::ADDrr, SH::SUBrr, SH::ANDrr, SH::ORrr,
+                                   SH::XORrr};
+    MCOperand Tmp = Reg(MI->getOperand(1).getReg());
+    MCOperand Ptr = Reg(MI->getOperand(2).getReg());
+    MCOperand Val = Reg(MI->getOperand(3).getReg());
+    unsigned Op = MI->getOperand(4).getImm();
+    Body.push_back(Inst(Load, {Old, Ptr}));
+    if (Op < 5) {
+      Body.push_back(Inst(SH::MOVrr, {Tmp, Old}));
+      Body.push_back(Inst(Ops[Op], {Tmp, Tmp, Val}));
+    } else {
+      Body.push_back(Inst(SH::MOVrr, {Tmp, Val}));
+      Body.push_back(Inst(SH::ANDrr, {Tmp, Tmp, Old}));
+      Body.push_back(Inst(SH::NOT, {Tmp, Tmp}));
+    }
+    Body.push_back(Inst(Store, {Tmp, Ptr}));
+    break;
+  }
+  case SH::GUSA_XCHG: {
+    MCOperand Ptr = Reg(MI->getOperand(1).getReg());
+    Body.push_back(Inst(Load, {Old, Ptr}));
+    Body.push_back(Inst(Store, {Reg(MI->getOperand(2).getReg()), Ptr}));
+    break;
+  }
+  case SH::GUSA_CAS: {
+    MCOperand Ptr = Reg(MI->getOperand(1).getReg());
+    Body.push_back(Inst(Load, {Old, Ptr}));
+    Body.push_back(Inst(SH::CMPEQ, {Old, Reg(MI->getOperand(2).getReg())}));
+    Body.push_back(Inst(SH::BF, {label(End)}));
+    Body.push_back(Inst(Store, {Reg(MI->getOperand(3).getReg()), Ptr}));
+    break;
+  }
+  }
+
+  // mova wants the end at a multiple of four: the padding goes where an
+  // even number of instructions follows it up to there.
+  MCOperand R1 = Reg(SH::R1), R15 = Reg(SH::R15);
+  bool Even = Body.size() % 2 == 0;
+  emit(SH::MOVA, {label(End)});
+  if (Even)
+    OutStreamer->emitCodeAlignment(Align(4), getSubtargetInfo());
+  emit(SH::MOVrr, {R1, R15});
+  if (!Even)
+    OutStreamer->emitCodeAlignment(Align(4), getSubtargetInfo());
+  emit(SH::MOVI, {R15, MCOperand::createImm(-2 * int(Body.size()))});
+  for (const MCInst &I : Body)
+    EmitToStreamer(*OutStreamer, I);
+  OutStreamer->emitLabel(End);
+  emit(SH::MOVrr, {R15, R1});
+}
+
 void SHAsmPrinter::emitInstruction(const MachineInstr *MI) {
   if (!MI->isBundledWithSucc()) {
     emitOne(MI);
@@ -387,6 +461,12 @@ void SHAsmPrinter::emitOne(const MachineInstr *MI) {
     emit(SH::ADDrr, {Dst, Dst, R0});
     return;
   }
+
+  case SH::GUSA_RMW:
+  case SH::GUSA_XCHG:
+  case SH::GUSA_CAS:
+    emitGUSA(MI);
+    return;
 
   // Thread-local storage: the two sequences that the linker rewrites.
   case SH::TLSCALL: {

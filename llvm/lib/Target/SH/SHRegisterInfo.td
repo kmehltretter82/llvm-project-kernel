@@ -48,6 +48,10 @@ def GPR : RegisterClass<"SH", [i32], 32,
                         (add R1, R2, R3, R0, R7, R6, R5, R4, R8, R9, R10, R11,
                              R12, R13, R14, R15)>;
 
+// What an atomic sequence can compute in: r0 has the address of its end
+// while it runs, r1 the stack pointer, and r15 its length.
+def GUSAReg : RegisterClass<"SH", [i32], 32, (sub GPR, R0, R1, R15)>;
+
 // The register that GCC keeps the address of the global offset table in.
 // The sequences for thread-local storage that the linker knows use it.
 def R12Reg : RegisterClass<"SH", [i32], 32, (add R12)>;

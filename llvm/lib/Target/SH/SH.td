@@ -53,6 +53,15 @@ def FeatureFPUSingleMode
                        "A function is entered with the floating point unit in "
                        "single precision mode">;
 
+// The atomic operations on Linux.  By default they are what GCC makes of
+// them there: gUSA sequences, which the kernel starts again when it
+// interrupted one.  With this feature they are calls of the __sync functions
+// of libgcc.
+def FeatureAtomicCalls
+    : SubtargetFeature<"atomic-calls", "HasAtomicCalls", "true",
+                       "Atomic operations are calls of __sync functions, not "
+                       "gUSA sequences (-matomic-model=none)">;
+
 //===----------------------------------------------------------------------===//
 // Processors.  The names are those of llvm/TargetParser/SHTargetParser.h:
 // what GCC has as -m<name> without the "sh".

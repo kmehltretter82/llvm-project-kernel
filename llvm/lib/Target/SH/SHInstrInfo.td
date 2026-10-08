@@ -1194,6 +1194,75 @@ def TLSIE : SHPseudo<(outs GPR:$dst), (ins R12Reg:$got, i32imm:$sym),
                            (SHtlsie R12Reg:$got, tglobaltlsaddr:$sym))]>;
 
 //===----------------------------------------------------------------------===//
+// Atomic operations as gUSA sequences
+//===----------------------------------------------------------------------===//
+
+// What GCC writes with -matomic-model=soft-gusa, its default for Linux:
+//
+//      mova 1f,r0; .align 2; mov r15,r1; mov #(0f-1f),r15
+//   0: mov.l @Rptr,Rold; mov Rold,Rtmp; add Rval,Rtmp; mov.l Rtmp,@Rptr
+//   1: mov r1,r15
+//
+// Between 0 and 1 the stack pointer is a small negative number, which no
+// stack has.  The kernel takes that for the mark of such a sequence when it
+// interrupts one: r0 says where it ends and r15 how long it is, and the
+// kernel puts the program back to the instruction in front of 0.  Nothing
+// between 0 and 1 may be done twice to a wrong end, so the store is the last
+// instruction.
+//
+// mova needs its target at a multiple of four.  The padding stands where
+// the number of instructions between it and 1 is even: in front of "mov
+// r15,r1", or behind it if the sequence has an odd number of them.
+//
+// The registers of the sequence are not r0 and r1.  The old value and the
+// scratch register are written while the address and the operand are still
+// needed.  The last operand is the size of the object in bytes.  Size is the
+// longest that the sequence can get, with the padding.
+def UseGUSA : Predicate<"Subtarget->useGUSA()">;
+
+let Defs = [R0, R1], mayLoad = 1, mayStore = 1, hasSideEffects = 1 in {
+// The operations: 0 add, 1 sub, 2 and, 3 or, 4 xor, 5 nand.
+let Size = 20, Constraints = "@earlyclobber $old,@earlyclobber $tmp" in
+def GUSA_RMW : SHPseudo<(outs GUSAReg:$old, GUSAReg:$tmp),
+                        (ins GUSAReg:$ptr, GUSAReg:$val, i32imm:$op,
+                             i32imm:$bytes), []>;
+let Size = 14, Constraints = "@earlyclobber $old" in
+def GUSA_XCHG : SHPseudo<(outs GUSAReg:$old),
+                         (ins GUSAReg:$ptr, GUSAReg:$val, i32imm:$bytes), []>;
+// "cmp/eq Rold,Rexpected; bf 1f" between the load and the store.
+let Size = 18, Defs = [R0, R1, T], Constraints = "@earlyclobber $old" in
+def GUSA_CAS : SHPseudo<(outs GUSAReg:$old),
+                        (ins GUSAReg:$ptr, GUSAReg:$expected, GUSAReg:$new,
+                             i32imm:$bytes), []>;
+}
+
+multiclass GUSAPats<string type, int bytes> {
+  def : Pat<(!cast<PatFrag>("atomic_load_add_" # type) GUSAReg:$p, GUSAReg:$v),
+            (GUSA_RMW GUSAReg:$p, GUSAReg:$v, 0, bytes)>;
+  def : Pat<(!cast<PatFrag>("atomic_load_sub_" # type) GUSAReg:$p, GUSAReg:$v),
+            (GUSA_RMW GUSAReg:$p, GUSAReg:$v, 1, bytes)>;
+  def : Pat<(!cast<PatFrag>("atomic_load_and_" # type) GUSAReg:$p, GUSAReg:$v),
+            (GUSA_RMW GUSAReg:$p, GUSAReg:$v, 2, bytes)>;
+  def : Pat<(!cast<PatFrag>("atomic_load_or_" # type) GUSAReg:$p, GUSAReg:$v),
+            (GUSA_RMW GUSAReg:$p, GUSAReg:$v, 3, bytes)>;
+  def : Pat<(!cast<PatFrag>("atomic_load_xor_" # type) GUSAReg:$p, GUSAReg:$v),
+            (GUSA_RMW GUSAReg:$p, GUSAReg:$v, 4, bytes)>;
+  def : Pat<(!cast<PatFrag>("atomic_load_nand_" # type) GUSAReg:$p,
+                                                        GUSAReg:$v),
+            (GUSA_RMW GUSAReg:$p, GUSAReg:$v, 5, bytes)>;
+  def : Pat<(!cast<PatFrag>("atomic_swap_" # type) GUSAReg:$p, GUSAReg:$v),
+            (GUSA_XCHG GUSAReg:$p, GUSAReg:$v, bytes)>;
+  def : Pat<(!cast<PatFrag>("atomic_cmp_swap_" # type) GUSAReg:$p,
+                                                       GUSAReg:$e, GUSAReg:$n),
+            (GUSA_CAS GUSAReg:$p, GUSAReg:$e, GUSAReg:$n, bytes)>;
+}
+let Predicates = [UseGUSA] in {
+defm : GUSAPats<"i8", 1>;
+defm : GUSAPats<"i16", 2>;
+defm : GUSAPats<"i32", 4>;
+}
+
+//===----------------------------------------------------------------------===//
 // Literals in the code (see SHConstantIslands.cpp)
 //===----------------------------------------------------------------------===//
 

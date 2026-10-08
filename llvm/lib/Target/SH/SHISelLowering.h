@@ -71,6 +71,16 @@ public:
   AtomicExpansionKind
   shouldExpandAtomicRMWInIR(const AtomicRMWInst *RMW) const override;
 
+  /// An atomic sequence loads a byte or a word of 16 bits with mov.b or
+  /// mov.w, which extend the sign, and compares what it loaded with a
+  /// whole register.  Nothing is known about a function that is called
+  /// for the operation: the ones of libgcc extend the sign of what they
+  /// return as well, the ones that the Linux kernel has in C do not.
+  ISD::NodeType getExtendForAtomicOps() const override;
+  ISD::NodeType getExtendForAtomicCmpSwapArg() const override {
+    return getExtendForAtomicOps();
+  }
+
   /// The registers for the first words of a structure that is passed by
   /// value.
   void HandleByVal(CCState *State, unsigned &Size,
