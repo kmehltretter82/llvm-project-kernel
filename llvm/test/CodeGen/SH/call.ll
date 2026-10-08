@@ -25,6 +25,8 @@ define i32 @four(i32 %a) {
 ; CHECK-NEXT:    jsr @r1
 ; CHECK-NEXT:    mov #3,r6
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 0
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    .p2align 2
@@ -54,7 +56,10 @@ define i32 @six(i32 %a, i32 %b) {
 ; CHECK-NEXT:    jsr @r1
 ; CHECK-NEXT:    mov #4,r7
 ; CHECK-NEXT:    add #8,r15
+; CHECK-NEXT:    .cfi_def_cfa_offset 4
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 0
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    .p2align 2
@@ -83,7 +88,10 @@ define i64 @split(i64 %x) {
 ; CHECK-NEXT:    jsr @r1
 ; CHECK-NEXT:    mov r5,r7
 ; CHECK-NEXT:    add #4,r15
+; CHECK-NEXT:    .cfi_def_cfa_offset 4
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 0
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    .p2align 2
@@ -119,6 +127,8 @@ define void @small(i32 %a) {
 ; CHECK-NEXT:    jsr @r2
 ; CHECK-NEXT:    mov r1,r4
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 0
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    .p2align 2
@@ -151,7 +161,10 @@ define void @sret_caller() {
 ; CHECK-NEXT:    jsr @r1
 ; CHECK-NEXT:    mov r15,r2
 ; CHECK-NEXT:    mov r14,r15
+; CHECK-NEXT:    .cfi_def_cfa r15, 8
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 4
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    mov.l @r15+,r14
 ; CHECK-NEXT:    .p2align 2
@@ -202,6 +215,8 @@ define i32 @use_ret4() {
 ; CHECK-NEXT:    jsr @r1
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 0
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    mov r3,r0
 ; CHECK-NEXT:    .p2align 2
@@ -224,6 +239,8 @@ define i32 @indirect(ptr %f, i32 %a) {
 ; CHECK-NEXT:    jsr @r2
 ; CHECK-NEXT:    mov r5,r4
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 0
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop
   %r = call i32 %f(i32 %a)

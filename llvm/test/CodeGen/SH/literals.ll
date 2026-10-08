@@ -119,6 +119,8 @@ define void @behind_branch(i32 %a) {
 ; CHECK-NEXT:    jsr @r8
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 4
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    mov.l @r15+,r8
 ; CHECK-NEXT:    .p2align 2

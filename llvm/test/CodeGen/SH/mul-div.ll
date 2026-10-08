@@ -58,6 +58,8 @@ define i32 @sdiv(i32 %a, i32 %b) {
 ; CHECK-NEXT:    jsr @r1
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 0
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    .p2align 2
@@ -79,6 +81,8 @@ define i32 @udiv(i32 %a, i32 %b) {
 ; CHECK-NEXT:    jsr @r1
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 0
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    .p2align 2
@@ -111,7 +115,11 @@ define i32 @srem(i32 %a, i32 %b) {
 ; CHECK-NEXT:    sub r1,r9
 ; CHECK-NEXT:    mov r9,r0
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 8
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    mov.l @r15+,r9
+; CHECK-NEXT:    .cfi_def_cfa_offset 4
+; CHECK-NEXT:    .cfi_restore r9
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    mov.l @r15+,r8
 ; CHECK-NEXT:    .p2align 2
@@ -144,7 +152,11 @@ define i32 @urem(i32 %a, i32 %b) {
 ; CHECK-NEXT:    sub r1,r9
 ; CHECK-NEXT:    mov r9,r0
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 8
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    mov.l @r15+,r9
+; CHECK-NEXT:    .cfi_def_cfa_offset 4
+; CHECK-NEXT:    .cfi_restore r9
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    mov.l @r15+,r8
 ; CHECK-NEXT:    .p2align 2
@@ -166,6 +178,8 @@ define i64 @sdiv64(i64 %a, i64 %b) {
 ; CHECK-NEXT:    jsr @r1
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 0
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    .p2align 2

@@ -29,6 +29,7 @@ define i32 @catcher(i32 %x) personality ptr @__gxx_personality_v0 {
 ; CHECK-NEXT:    sts.l pr,@-r15
 ; CHECK-NEXT:    .cfi_def_cfa_offset 8
 ; CHECK-NEXT:    .cfi_offset pr, -8
+; CHECK-NEXT:    .cfi_remember_state
 ; CHECK-NEXT:  .Ltmp0: ! EH_LABEL
 ; CHECK-NEXT:    mov.l .Ltmp3,r1
 ; CHECK-NEXT:    jsr @r1
@@ -38,9 +39,12 @@ define i32 @catcher(i32 %x) personality ptr @__gxx_personality_v0 {
 ; CHECK-NEXT:    mov #0,r0
 ; CHECK-NEXT:  .LBB0_2: ! %done
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 4
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    mov.l @r15+,r8
 ; CHECK-NEXT:  .LBB0_3: ! %lpad
+; CHECK-NEXT:    .cfi_restore_state
 ; CHECK-NEXT:  .Ltmp2: ! EH_LABEL
 ; CHECK-NEXT:    mov r5,r0
 ; CHECK-NEXT:    cmp/eq #1,r0
@@ -85,6 +89,7 @@ define i32 @catcher(i32 %x) personality ptr @__gxx_personality_v0 {
 ; PIC-NEXT:    sts.l pr,@-r15
 ; PIC-NEXT:    .cfi_def_cfa_offset 12
 ; PIC-NEXT:    .cfi_offset pr, -12
+; PIC-NEXT:    .cfi_remember_state
 ; PIC-NEXT:    mova .Ltmp7,r0
 ; PIC-NEXT:    mov.l .Ltmp7,r12
 ; PIC-NEXT:    add r0,r12
@@ -98,10 +103,15 @@ define i32 @catcher(i32 %x) personality ptr @__gxx_personality_v0 {
 ; PIC-NEXT:    mov #0,r0
 ; PIC-NEXT:  .LBB0_2: ! %done
 ; PIC-NEXT:    lds.l @r15+,pr
+; PIC-NEXT:    .cfi_def_cfa_offset 8
+; PIC-NEXT:    .cfi_restore pr
 ; PIC-NEXT:    mov.l @r15+,r12
+; PIC-NEXT:    .cfi_def_cfa_offset 4
+; PIC-NEXT:    .cfi_restore r12
 ; PIC-NEXT:    rts
 ; PIC-NEXT:    mov.l @r15+,r8
 ; PIC-NEXT:  .LBB0_3: ! %lpad
+; PIC-NEXT:    .cfi_restore_state
 ; PIC-NEXT:  .Ltmp3: ! EH_LABEL
 ; PIC-NEXT:    mov r5,r0
 ; PIC-NEXT:    cmp/eq #1,r0

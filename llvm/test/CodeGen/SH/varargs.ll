@@ -25,6 +25,7 @@ define i32 @first(i32 %n, ...) {
 ; CHECK-NEXT:    mov.l r1,@r15
 ; CHECK-NEXT:    mov.l r0,@(4,r15)
 ; CHECK-NEXT:    add #4,r15
+; CHECK-NEXT:    .cfi_def_cfa_offset 12
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    add #12,r15
   %ap = alloca ptr
@@ -77,7 +78,10 @@ define void @caller(i32 %a, i64 %b) {
 ; CHECK-NEXT:    jsr @r1
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    add #4,r15
+; CHECK-NEXT:    .cfi_def_cfa_offset 4
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 0
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    .p2align 2

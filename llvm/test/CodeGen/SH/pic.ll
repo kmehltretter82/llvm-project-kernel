@@ -147,6 +147,8 @@ define i32 @call_ext(i32 %x) {
 ; CHECK-NEXT:  .Ltmp10:
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 4
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    mov.l @r15+,r12
 ; CHECK-NEXT:    .p2align 2
@@ -171,6 +173,8 @@ define i32 @call_loc(i32 %x) {
 ; CHECK-NEXT:  .Ltmp13:
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 0
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    .p2align 2
@@ -246,6 +250,8 @@ define i32 @switch(i32 %x) {
 ; CHECK-NEXT:    mov #0,r0
 ; CHECK-NEXT:  .LBB7_8: ! %other
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 4
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    mov.l @r15+,r12
 ; CHECK-NEXT:    .p2align 2

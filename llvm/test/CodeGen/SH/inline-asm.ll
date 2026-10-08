@@ -106,6 +106,8 @@ define i32 @clobbers(i32 %a, i32 %b) {
 ; CHECK-EMPTY:
 ; CHECK-NEXT:    !NO_APP
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 0
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    add r5,r0
   call void asm "mul.l $0,$1", "r,r,~{macl},~{mach},~{pr},~{r1}"(i32 %a, i32 %b)

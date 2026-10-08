@@ -56,6 +56,8 @@ define i32 @result(i32 %x) {
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    cmp/eq #-7,r0
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 0
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    movt r0
 ; CHECK-NEXT:    .p2align 2

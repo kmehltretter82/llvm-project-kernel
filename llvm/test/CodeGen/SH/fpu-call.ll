@@ -477,6 +477,7 @@ define void @variadic(ptr %list, i32 %n, double %d, ...) {
 ; LE-NEXT:    add #4,r1
 ; LE-NEXT:    mov.l r1,@(16,r4)
 ; LE-NEXT:    mov r14,r15
+; LE-NEXT:    .cfi_def_cfa r15, 4
 ; LE-NEXT:    rts
 ; LE-NEXT:    mov.l @r15+,r14
 ;
@@ -522,6 +523,7 @@ define void @variadic(ptr %list, i32 %n, double %d, ...) {
 ; BE-NEXT:    add #4,r1
 ; BE-NEXT:    mov.l r1,@(16,r4)
 ; BE-NEXT:    mov r14,r15
+; BE-NEXT:    .cfi_def_cfa r15, 4
 ; BE-NEXT:    rts
 ; BE-NEXT:    mov.l @r15+,r14
 ;

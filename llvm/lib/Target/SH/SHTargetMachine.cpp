@@ -45,6 +45,9 @@ SHTargetMachine::SHTargetMachine(const Target &T, const Triple &TT,
                                getEffectiveCodeModel(CM, CodeModel::Small), OL),
       TLOF(std::make_unique<TargetLoweringObjectFileELF>()) {
   initAsmInfo();
+  // The epilogues have unwind information.  This is what puts the state of
+  // the prologue back for a block that stands behind one.
+  setCFIFixup(true);
 }
 
 SHTargetMachine::~SHTargetMachine() = default;

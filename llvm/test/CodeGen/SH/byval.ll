@@ -45,7 +45,10 @@ define void @pass(ptr %p) {
 ; CHECK-NEXT:    jsr @r1
 ; CHECK-NEXT:    mov #1,r4
 ; CHECK-NEXT:    add #72,r15
+; CHECK-NEXT:    .cfi_def_cfa_offset 4
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 0
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    .p2align 2
@@ -141,7 +144,10 @@ define void @pass_bytes(ptr %p) {
 ; CHECK-NEXT:    jsr @r2
 ; CHECK-NEXT:    mov r1,r4
 ; CHECK-NEXT:    add #84,r15
+; CHECK-NEXT:    .cfi_def_cfa_offset 4
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 0
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    .p2align 2

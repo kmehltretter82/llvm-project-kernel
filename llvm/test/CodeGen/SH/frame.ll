@@ -18,7 +18,10 @@ define void @local() {
 ; CHECK-NEXT:    jsr @r1
 ; CHECK-NEXT:    mov r15,r4
 ; CHECK-NEXT:    add #16,r15
+; CHECK-NEXT:    .cfi_def_cfa_offset 4
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 0
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    .p2align 2
@@ -51,7 +54,10 @@ define void @frame_pointer() "frame-pointer"="all" {
 ; CHECK-NEXT:    mov r14,r4
 ; CHECK-NEXT:    mov r14,r15
 ; CHECK-NEXT:    add #16,r15
+; CHECK-NEXT:    .cfi_def_cfa r15, 8
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 4
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    mov.l @r15+,r14
 ; CHECK-NEXT:    .p2align 2
@@ -86,7 +92,10 @@ define i32 @large(i32 %v) {
 ; CHECK-NEXT:    mov.l @r0,r0
 ; CHECK-NEXT:    mov.l .Ltmp5,r7
 ; CHECK-NEXT:    add r7,r15
+; CHECK-NEXT:    .cfi_def_cfa_offset 4
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 0
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    .p2align 2
@@ -140,7 +149,10 @@ define i32 @dynamic(i32 %n) {
 ; CHECK-NEXT:    mov #4,r7
 ; CHECK-NEXT:    add #8,r15
 ; CHECK-NEXT:    mov r14,r15
+; CHECK-NEXT:    .cfi_def_cfa r15, 8
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 4
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    mov.l @r15+,r14
 ; CHECK-NEXT:    .p2align 2
@@ -176,7 +188,10 @@ define void @realign() {
 ; CHECK-NEXT:    jsr @r1
 ; CHECK-NEXT:    mov r15,r4
 ; CHECK-NEXT:    mov r14,r15
+; CHECK-NEXT:    .cfi_def_cfa r15, 8
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 4
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    mov.l @r15+,r14
 ; CHECK-NEXT:    .p2align 2
@@ -224,10 +239,19 @@ define void @realign_dynamic(i32 %n) {
 ; CHECK-NEXT:    jsr @r9
 ; CHECK-NEXT:    mov r8,r4
 ; CHECK-NEXT:    mov r14,r15
+; CHECK-NEXT:    .cfi_def_cfa r15, 20
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 16
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    mov.l @r15+,r14
+; CHECK-NEXT:    .cfi_def_cfa_offset 12
+; CHECK-NEXT:    .cfi_restore r14
 ; CHECK-NEXT:    mov.l @r15+,r13
+; CHECK-NEXT:    .cfi_def_cfa_offset 8
+; CHECK-NEXT:    .cfi_restore r13
 ; CHECK-NEXT:    mov.l @r15+,r9
+; CHECK-NEXT:    .cfi_def_cfa_offset 4
+; CHECK-NEXT:    .cfi_restore r9
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    mov.l @r15+,r8
 ; CHECK-NEXT:    .p2align 2
@@ -252,6 +276,7 @@ define ptr @frame_address() {
 ; CHECK-NEXT:    .cfi_def_cfa_register r14
 ; CHECK-NEXT:    mov r14,r0
 ; CHECK-NEXT:    mov r14,r15
+; CHECK-NEXT:    .cfi_def_cfa r15, 4
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    mov.l @r15+,r14
   %r = call ptr @llvm.frameaddress(i32 0)
@@ -295,7 +320,10 @@ define { i64, i64 } @large_frame_four_words() {
 ; CHECK-NEXT:    mov #100,r7
 ; CHECK-NEXT:    shll2 r7
 ; CHECK-NEXT:    add r7,r15
+; CHECK-NEXT:    .cfi_def_cfa_offset 4
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 0
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    mov r1,r3
 ; CHECK-NEXT:    .p2align 2

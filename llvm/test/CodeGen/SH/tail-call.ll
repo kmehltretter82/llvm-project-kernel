@@ -163,6 +163,8 @@ define i32 @tail_frame(i32 %x) {
 ; CHECK-NEXT:    mov r8,r4
 ; CHECK-NEXT:    mov.l .Ltmp2,r1
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 4
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    jmp @r1
 ; CHECK-NEXT:    mov.l @r15+,r8
 ; CHECK-NEXT:    .p2align 2
@@ -195,7 +197,11 @@ define i32 @tail_frame(i32 %x) {
 ; PIC-NEXT:    mov.l @r1,r1
 ; PIC-NEXT:    mov r8,r4
 ; PIC-NEXT:    lds.l @r15+,pr
+; PIC-NEXT:    .cfi_def_cfa_offset 8
+; PIC-NEXT:    .cfi_restore pr
 ; PIC-NEXT:    mov.l @r15+,r12
+; PIC-NEXT:    .cfi_def_cfa_offset 4
+; PIC-NEXT:    .cfi_restore r12
 ; PIC-NEXT:    jmp @r1
 ; PIC-NEXT:    mov.l @r15+,r8
 ; PIC-NEXT:    .p2align 2
@@ -250,10 +256,19 @@ define void @tail_large(i32 %a, i32 %b, i32 %c, i32 %d) {
 ; CHECK-NEXT:    mov r8,r7
 ; CHECK-NEXT:    mov.l .Ltmp6,r2
 ; CHECK-NEXT:    add r2,r15
+; CHECK-NEXT:    .cfi_def_cfa_offset 20
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 16
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    mov.l @r15+,r11
+; CHECK-NEXT:    .cfi_def_cfa_offset 12
+; CHECK-NEXT:    .cfi_restore r11
 ; CHECK-NEXT:    mov.l @r15+,r10
+; CHECK-NEXT:    .cfi_def_cfa_offset 8
+; CHECK-NEXT:    .cfi_restore r10
 ; CHECK-NEXT:    mov.l @r15+,r9
+; CHECK-NEXT:    .cfi_def_cfa_offset 4
+; CHECK-NEXT:    .cfi_restore r9
 ; CHECK-NEXT:    jmp @r1
 ; CHECK-NEXT:    mov.l @r15+,r8
 ; CHECK-NEXT:    .p2align 2
@@ -311,11 +326,22 @@ define void @tail_large(i32 %a, i32 %b, i32 %c, i32 %d) {
 ; PIC-NEXT:    mov r8,r7
 ; PIC-NEXT:    mov.l .Ltmp13,r2
 ; PIC-NEXT:    add r2,r15
+; PIC-NEXT:    .cfi_def_cfa_offset 24
 ; PIC-NEXT:    lds.l @r15+,pr
+; PIC-NEXT:    .cfi_def_cfa_offset 20
+; PIC-NEXT:    .cfi_restore pr
 ; PIC-NEXT:    mov.l @r15+,r12
+; PIC-NEXT:    .cfi_def_cfa_offset 16
+; PIC-NEXT:    .cfi_restore r12
 ; PIC-NEXT:    mov.l @r15+,r11
+; PIC-NEXT:    .cfi_def_cfa_offset 12
+; PIC-NEXT:    .cfi_restore r11
 ; PIC-NEXT:    mov.l @r15+,r10
+; PIC-NEXT:    .cfi_def_cfa_offset 8
+; PIC-NEXT:    .cfi_restore r10
 ; PIC-NEXT:    mov.l @r15+,r9
+; PIC-NEXT:    .cfi_def_cfa_offset 4
+; PIC-NEXT:    .cfi_restore r9
 ; PIC-NEXT:    jmp @r1
 ; PIC-NEXT:    mov.l @r15+,r8
 ; PIC-NEXT:    .p2align 2
@@ -353,7 +379,10 @@ define void @no_stack(i32 %a) {
 ; CHECK-NEXT:    jsr @r1
 ; CHECK-NEXT:    mov r4,r7
 ; CHECK-NEXT:    add #4,r15
+; CHECK-NEXT:    .cfi_def_cfa_offset 4
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 0
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    .p2align 2
@@ -383,7 +412,10 @@ define void @no_stack(i32 %a) {
 ; PIC-NEXT:  .Ltmp14:
 ; PIC-NEXT:    mov r4,r7
 ; PIC-NEXT:    add #4,r15
+; PIC-NEXT:    .cfi_def_cfa_offset 8
 ; PIC-NEXT:    lds.l @r15+,pr
+; PIC-NEXT:    .cfi_def_cfa_offset 4
+; PIC-NEXT:    .cfi_restore pr
 ; PIC-NEXT:    rts
 ; PIC-NEXT:    mov.l @r15+,r12
 ; PIC-NEXT:    .p2align 2
@@ -412,6 +444,8 @@ define void @no_sret(ptr sret(%struct.big) %out) {
 ; CHECK-NEXT:    mov r2,r8
 ; CHECK-NEXT:    mov r8,r0
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 4
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    mov.l @r15+,r8
 ; CHECK-NEXT:    .p2align 2
@@ -440,7 +474,11 @@ define void @no_sret(ptr sret(%struct.big) %out) {
 ; PIC-NEXT:    mov r2,r8
 ; PIC-NEXT:    mov r8,r0
 ; PIC-NEXT:    lds.l @r15+,pr
+; PIC-NEXT:    .cfi_def_cfa_offset 8
+; PIC-NEXT:    .cfi_restore pr
 ; PIC-NEXT:    mov.l @r15+,r12
+; PIC-NEXT:    .cfi_def_cfa_offset 4
+; PIC-NEXT:    .cfi_restore r12
 ; PIC-NEXT:    rts
 ; PIC-NEXT:    mov.l @r15+,r8
 ; PIC-NEXT:    .p2align 2
@@ -470,6 +508,8 @@ define i32 @no_varargs(i32 %x, ...) {
 ; CHECK-NEXT:    jsr @r1
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 12
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    add #12,r15
 ; CHECK-NEXT:    .p2align 2
@@ -499,7 +539,11 @@ define i32 @no_varargs(i32 %x, ...) {
 ; PIC-NEXT:  .Ltmp20:
 ; PIC-NEXT:    nop
 ; PIC-NEXT:    lds.l @r15+,pr
+; PIC-NEXT:    .cfi_def_cfa_offset 16
+; PIC-NEXT:    .cfi_restore pr
 ; PIC-NEXT:    mov.l @r15+,r12
+; PIC-NEXT:    .cfi_def_cfa_offset 12
+; PIC-NEXT:    .cfi_restore r12
 ; PIC-NEXT:    rts
 ; PIC-NEXT:    add #12,r15
 ; PIC-NEXT:    .p2align 2

@@ -42,6 +42,8 @@ define i32 @call(i32 %a, i32 %b) {
 ; CHECK-NEXT:    jsr @r1
 ; CHECK-NEXT:    add #1,r4
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 0
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    nop
 ; CHECK-NEXT:    .p2align 2
@@ -60,6 +62,8 @@ define i32 @call(i32 %a, i32 %b) {
 ; NOP-NEXT:    jsr @r1
 ; NOP-NEXT:    nop
 ; NOP-NEXT:    lds.l @r15+,pr
+; NOP-NEXT:    .cfi_def_cfa_offset 0
+; NOP-NEXT:    .cfi_restore pr
 ; NOP-NEXT:    rts
 ; NOP-NEXT:    nop
 ; NOP-NEXT:    .p2align 2
@@ -104,7 +108,11 @@ define i32 @join(i32 %a, i32 %b, ptr %p) {
 ; CHECK-NEXT:    jsr @r9
 ; CHECK-NEXT:    mov r8,r5
 ; CHECK-NEXT:    lds.l @r15+,pr
+; CHECK-NEXT:    .cfi_def_cfa_offset 8
+; CHECK-NEXT:    .cfi_restore pr
 ; CHECK-NEXT:    mov.l @r15+,r9
+; CHECK-NEXT:    .cfi_def_cfa_offset 4
+; CHECK-NEXT:    .cfi_restore r9
 ; CHECK-NEXT:    rts
 ; CHECK-NEXT:    mov.l @r15+,r8
 ; CHECK-NEXT:    .p2align 2
@@ -146,8 +154,14 @@ define i32 @join(i32 %a, i32 %b, ptr %p) {
 ; NOP-NEXT:    jsr @r9
 ; NOP-NEXT:    nop
 ; NOP-NEXT:    lds.l @r15+,pr
+; NOP-NEXT:    .cfi_def_cfa_offset 8
+; NOP-NEXT:    .cfi_restore pr
 ; NOP-NEXT:    mov.l @r15+,r9
+; NOP-NEXT:    .cfi_def_cfa_offset 4
+; NOP-NEXT:    .cfi_restore r9
 ; NOP-NEXT:    mov.l @r15+,r8
+; NOP-NEXT:    .cfi_def_cfa_offset 0
+; NOP-NEXT:    .cfi_restore r8
 ; NOP-NEXT:    rts
 ; NOP-NEXT:    nop
 ; NOP-NEXT:    .p2align 2

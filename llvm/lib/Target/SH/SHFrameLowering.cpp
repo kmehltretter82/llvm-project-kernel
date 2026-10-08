@@ -213,7 +213,47 @@ void SHFrameLowering::emitEpilogue(MachineFunction &MF,
   if (!realignsStack(MF))
     adjustStack(MBB, FirstPop, DL, LocalSize, Scratch,
                 MachineInstr::FrameDestroy);
+
+  // The unwind information follows the epilogue instruction by instruction,
+  // for an unwinder that is asked in the middle of it: a debugger, a
+  // profiler, or a kernel that walks the stack of what an interrupt found
+  // running.  From here on the frame of the caller is found from the stack
+  // pointer again, also where r14 said so until now: r14 is about to get
+  // the value of the caller back.
+  bool NeedsCFI = MF.needsFrameMoves();
+  int64_t Pushed = SaveSize + PushSize;
+  if (NeedsCFI && (hasFP(MF) || LocalSize)) {
+    CFIInstBuilder Builder(MBB, FirstPop, MachineInstr::FrameDestroy);
+    if (hasFP(MF))
+      Builder.buildDefCFA(SH::R15, Pushed);
+    else
+      Builder.buildDefCFAOffset(Pushed);
+  }
+  for (MachineBasicBlock::iterator I = FirstPop; I != Return;) {
+    Register Reg =
+        I->getOpcode() == SH::POPPR ? Register(SH::PR) : I->getOperand(0).getReg();
+    ++I;
+    Pushed -= 4;
+    if (NeedsCFI) {
+      CFIInstBuilder Builder(MBB, I, MachineInstr::FrameDestroy);
+      Builder.buildDefCFAOffset(Pushed);
+      Builder.buildRestore(Reg);
+    }
+  }
   adjustStack(MBB, Return, DL, SaveSize, Scratch, MachineInstr::FrameDestroy);
+  if (NeedsCFI && SaveSize)
+    CFIInstBuilder(MBB, Return, MachineInstr::FrameDestroy)
+        .buildDefCFAOffset(0);
+}
+
+// What CFIFixup writes in front of a block that runs without a frame and
+// stands behind one that has it.
+void SHFrameLowering::resetCFIToInitialState(MachineBasicBlock &MBB) const {
+  const MachineFrameInfo &MFI = MBB.getParent()->getFrameInfo();
+  CFIInstBuilder Builder(MBB, MBB.begin(), MachineInstr::NoFlags);
+  Builder.buildDefCFA(SH::R15, 0);
+  for (const CalleeSavedInfo &I : MFI.getCalleeSavedInfo())
+    Builder.buildSameValue(I.getReg());
 }
 
 MachineBasicBlock::iterator SHFrameLowering::eliminateCallFramePseudoInstr(

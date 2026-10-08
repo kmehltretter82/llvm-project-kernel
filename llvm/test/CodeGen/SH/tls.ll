@@ -73,6 +73,8 @@ define i32 @load_other() {
 ; PIC-NEXT:  .Ltmp3:
 ; PIC-NEXT:    mov.l @r0,r0
 ; PIC-NEXT:    lds.l @r15+,pr
+; PIC-NEXT:    .cfi_def_cfa_offset 4
+; PIC-NEXT:    .cfi_restore pr
 ; PIC-NEXT:    rts
 ; PIC-NEXT:    mov.l @r15+,r12
 ; PIC-NEXT:    .p2align 2
@@ -138,6 +140,8 @@ define i32 @load_mine() {
 ; PIC-NEXT:  .Ltmp7:
 ; PIC-NEXT:    mov.l @r0,r0
 ; PIC-NEXT:    lds.l @r15+,pr
+; PIC-NEXT:    .cfi_def_cfa_offset 4
+; PIC-NEXT:    .cfi_restore pr
 ; PIC-NEXT:    rts
 ; PIC-NEXT:    mov.l @r15+,r12
 ; PIC-NEXT:    .p2align 2
@@ -196,7 +200,11 @@ define void @store_hidden(i32 %v) {
 ; PIC-NEXT:    add r0,r1
 ; PIC-NEXT:    mov.l r8,@r1
 ; PIC-NEXT:    lds.l @r15+,pr
+; PIC-NEXT:    .cfi_def_cfa_offset 8
+; PIC-NEXT:    .cfi_restore pr
 ; PIC-NEXT:    mov.l @r15+,r12
+; PIC-NEXT:    .cfi_def_cfa_offset 4
+; PIC-NEXT:    .cfi_restore r12
 ; PIC-NEXT:    rts
 ; PIC-NEXT:    mov.l @r15+,r8
 ; PIC-NEXT:    .p2align 2
@@ -266,6 +274,8 @@ define ptr @element() {
 ; PIC-NEXT:  .Ltmp16:
 ; PIC-NEXT:    add #20,r0
 ; PIC-NEXT:    lds.l @r15+,pr
+; PIC-NEXT:    .cfi_def_cfa_offset 4
+; PIC-NEXT:    .cfi_restore pr
 ; PIC-NEXT:    rts
 ; PIC-NEXT:    mov.l @r15+,r12
 ; PIC-NEXT:    .p2align 2

@@ -28,6 +28,13 @@
 // volatile object needs.  The search ends at a call, a branch, inline
 // assembly, a label, and at the instructions that set up the frame.
 //
+// Of the instructions that take the frame down only the last one can go to
+// the slot.  The unwind information behind each of them says where the
+// frame of the caller is from there on, counted from the ones in front, so
+// their order has to stay.  What it says behind the last one is dropped
+// with the move: that instruction now runs with the branch, and no address
+// is left where it would hold.
+//
 // The two are one bundle, so that the branch is still the last thing in its
 // block for everyone who looks.  A nop is behind the branch in the bundle.
 // An instruction that was moved into the slot is in front of it, as it is
@@ -152,11 +159,16 @@ MachineInstr *SHDelaySlotFiller::findFiller(MachineInstr &Branch) const {
   };
 
   unsigned Budget = 8;
+  bool SeenFrameDestroy = false;
   for (MachineBasicBlock::iterator I = Branch.getIterator();
        I != MBB.begin() && Budget; --Budget) {
     --I;
     MachineInstr &MI = *I;
-    if (MI.isDebugInstr()) {
+    // The unwind information of an epilogue is not in the way.  It is
+    // there with -g and may not be without, and the code has to be the
+    // same.
+    if (MI.isDebugInstr() ||
+        (MI.isCFIInstruction() && MI.getFlag(MachineInstr::FrameDestroy))) {
       ++Budget;
       continue;
     }
@@ -175,6 +187,12 @@ MachineInstr *SHDelaySlotFiller::findFiller(MachineInstr &Branch) const {
     bool Free = canFill(Branch, MI);
     if (Free && Memory && MI.mayLoadOrStore())
       Free = false;
+    // Only the last one of an epilogue, see above.
+    if (MI.getFlag(MachineInstr::FrameDestroy)) {
+      if (SeenFrameDestroy)
+        Free = false;
+      SeenFrameDestroy = true;
+    }
     for (const MachineOperand &MO : MI.operands()) {
       if (!Free)
         break;
@@ -222,6 +240,14 @@ bool SHDelaySlotFiller::runOnMachineFunction(MachineFunction &MF) {
             for (const MachineOperand &MO : Filler->all_uses())
               if (MO.getReg())
                 Over->clearRegisterKills(MO.getReg(), TRI);
+          // What the unwind information said from behind it on.
+          if (Filler->getFlag(MachineInstr::FrameDestroy))
+            for (auto CFI = std::next(Filler->getIterator()); CFI != I;) {
+              MachineInstr &MI = *CFI++;
+              if (MI.isCFIInstruction() &&
+                  MI.getFlag(MachineInstr::FrameDestroy))
+                MI.eraseFromParent();
+            }
           // In the order of execution: the instruction, then the branch.
           MBB.splice(I, &MBB, Filler->getIterator());
           MIBundleBuilder(MBB, Filler->getIterator(), std::next(I));

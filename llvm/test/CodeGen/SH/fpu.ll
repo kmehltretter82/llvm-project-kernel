@@ -678,7 +678,11 @@ define float @across_call(float %a) {
 ; SH4-NEXT:    sts fpscr,r2
 ; SH4-NEXT:    xor r1,r2
 ; SH4-NEXT:    fmov.s @r15+,fr12
+; SH4-NEXT:    .cfi_def_cfa_offset 4
+; SH4-NEXT:    .cfi_restore fr12
 ; SH4-NEXT:    lds.l @r15+,pr
+; SH4-NEXT:    .cfi_def_cfa_offset 0
+; SH4-NEXT:    .cfi_restore pr
 ; SH4-NEXT:    rts
 ; SH4-NEXT:    lds r2,fpscr
 ; SH4-NEXT:    .p2align 2
@@ -705,7 +709,11 @@ define float @across_call(float %a) {
 ; SH4A-NEXT:    fpchg
 ; SH4A-NEXT:    fmul fr12,fr0
 ; SH4A-NEXT:    fmov.s @r15+,fr12
+; SH4A-NEXT:    .cfi_def_cfa_offset 4
+; SH4A-NEXT:    .cfi_restore fr12
 ; SH4A-NEXT:    lds.l @r15+,pr
+; SH4A-NEXT:    .cfi_def_cfa_offset 0
+; SH4A-NEXT:    .cfi_restore pr
 ; SH4A-NEXT:    rts
 ; SH4A-NEXT:    fpchg
 ; SH4A-NEXT:    .p2align 2
@@ -751,7 +759,11 @@ define float @across_call(float %a) {
 ; SINGLE-NEXT:    lds r2,fpscr
 ; SINGLE-NEXT:    fmul fr12,fr0
 ; SINGLE-NEXT:    fmov.s @r15+,fr12
+; SINGLE-NEXT:    .cfi_def_cfa_offset 4
+; SINGLE-NEXT:    .cfi_restore fr12
 ; SINGLE-NEXT:    lds.l @r15+,pr
+; SINGLE-NEXT:    .cfi_def_cfa_offset 0
+; SINGLE-NEXT:    .cfi_restore pr
 ; SINGLE-NEXT:    rts
 ; SINGLE-NEXT:    nop
 ; SINGLE-NEXT:    .p2align 2
