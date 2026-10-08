@@ -19,6 +19,7 @@
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCExpr.h"
 #include "llvm/MC/MCInst.h"
+#include "llvm/MC/MCInstBuilder.h"
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/MC/MCSymbol.h"
 #include "llvm/MC/TargetRegistry.h"
@@ -459,6 +460,18 @@ void SHAsmPrinter::emitOne(const MachineInstr *MI) {
   MCInst Inst;
   lower(MI, Inst);
   EmitToStreamer(*OutStreamer, Inst);
+
+  // What must stand behind a trap on some processors, so that they do not
+  // take a literal for instructions: see SHSubtarget::padsTraps().
+  if (MI->getOpcode() == SH::TRAP &&
+      MI->getMF()->getSubtarget<SHSubtarget>().padsTraps()) {
+    MCInst Pad = MCInstBuilder(SH::ORrr)
+                     .addReg(SH::R0)
+                     .addReg(SH::R0)
+                     .addReg(SH::R0);
+    for (unsigned I = 0; I != 5; ++I)
+      EmitToStreamer(*OutStreamer, Pad);
+  }
 }
 
 // An operand of inline assembly, as GCC prints it: a register by its name

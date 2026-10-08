@@ -149,6 +149,9 @@ unsigned SHInstrInfo::getSizeOfOne(const MachineInstr &MI) const {
     unsigned Size = alignTo(2 * Saved + (IsPIC ? 18 : 10), 4);
     return Size + (IsPIC ? 8 : 4) + 2 + 2 * Saved;
   }
+  // With the padding that SHAsmPrinter::emitOne() writes behind it.
+  case SH::TRAP:
+    return MI.getMF()->getSubtarget<SHSubtarget>().padsTraps() ? 12 : 2;
   default:
     if (MI.isMetaInstruction())
       return 0;
