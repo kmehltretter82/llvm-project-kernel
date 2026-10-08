@@ -1018,6 +1018,8 @@ Linux::getSupportedSanitizers(BoundArch BA,
   const bool IsRISCV64 = getTriple().isRISCV64();
   const bool IsSystemZ = getTriple().getArch() == llvm::Triple::systemz;
   const bool IsHexagon = getTriple().getArch() == llvm::Triple::hexagon;
+  const bool IsSuperH = getTriple().getArch() == llvm::Triple::sh ||
+                        getTriple().getArch() == llvm::Triple::sheb;
   const bool IsAndroid = getTriple().isAndroid();
   SanitizerMask Res = ToolChain::getSupportedSanitizers(BA, DeviceOffloadKind);
   Res |= SanitizerKind::Address;
@@ -1036,6 +1038,10 @@ Linux::getSupportedSanitizers(BoundArch BA,
     Res |= SanitizerKind::Leak;
   if (IsX86_64 || IsMIPS64 || IsAArch64 || IsPowerPC64 || IsSystemZ ||
       IsLoongArch64 || IsRISCV64)
+    Res |= SanitizerKind::Thread;
+  // No runtime library for SuperH: this is for the kernel, which has its own
+  // (KCSAN).
+  if (IsSuperH)
     Res |= SanitizerKind::Thread;
   if (IsX86_64 || IsAArch64 || IsSystemZ || IsHexagon)
     Res |= SanitizerKind::Type;

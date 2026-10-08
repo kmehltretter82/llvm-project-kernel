@@ -105,3 +105,17 @@ int x;
 // PG-NOT: error:
 // PG: "-pg" "-mfentry"
 
+// The kernel has runtime libraries of its own for these: KASAN, KCSAN (which
+// is -fsanitize=thread) and KCOV.
+// RUN: %clang -### --target=sh4-linux-gnu -fsanitize=kernel-address -c %s 2>&1 | FileCheck --check-prefix=KASAN %s
+// RUN: %clang -### --target=sh4-linux-gnu -fsanitize=thread -c %s 2>&1 | FileCheck --check-prefix=KCSAN %s
+// RUN: %clang -### --target=sh4-linux-gnu -fsanitize-coverage=trace-pc,trace-cmp -c %s 2>&1 | FileCheck --check-prefix=KCOV %s
+// RUN: not %clang -### --target=sh4-linux-gnu -fsanitize=kernel-memory -c %s 2>&1 | FileCheck --check-prefix=KMSAN %s
+//
+// KASAN-NOT: error:
+// KASAN: "-fsanitize=kernel-address"
+// KCSAN-NOT: error:
+// KCSAN: "-fsanitize=thread"
+// KCOV-NOT: error:
+// KCOV: "-fsanitize-coverage-trace-pc"
+// KMSAN: error: unsupported option '-fsanitize=kernel-memory' for target 'sh4-unknown-linux-gnu'
