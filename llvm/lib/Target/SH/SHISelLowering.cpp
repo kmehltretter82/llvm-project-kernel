@@ -122,7 +122,7 @@ SHTargetLowering::SHTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::DYNAMIC_STACKALLOC, MVT::i32, Expand);
   setOperationAction(ISD::STACKSAVE, MVT::Other, Expand);
   setOperationAction(ISD::STACKRESTORE, MVT::Other, Expand);
-  setOperationAction(ISD::TRAP, MVT::Other, Expand);
+  setOperationAction(ISD::TRAP, MVT::Other, Legal);
 
   // The floating point unit compares for "equal" and "greater".  Both are
   // false if an operand is not a number, so they and their opposites are

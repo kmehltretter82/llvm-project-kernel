@@ -908,6 +908,14 @@ def RTS : SHInst<(outs), (ins variable_ops), "rts", [(SHret)]>, Enc0<0x000b>;
 
 def NOP : SHInst<(outs), (ins), "nop", []>, Enc0<0x0009>;
 
+// What __builtin_trap() becomes.  0xfffd is the one code that every SuperH
+// promises to leave undefined: it raises the illegal instruction exception,
+// also while the floating point unit is switched off, where every other
+// code that begins with 0xf says that instead.  GNU as has no name for it.
+// GCC calls abort() here, which a kernel does not have.
+let isTrap = 1, hasSideEffects = 1 in
+def TRAP : SHInst<(outs), (ins), ".word\t0xfffd", [(trap)]>, Enc0<0xfffd>;
+
 // The block copy becomes a loop over words, or over bytes where the
 // alignment does not allow words.
 let usesCustomInserter = 1, Defs = [T] in

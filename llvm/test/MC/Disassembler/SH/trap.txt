@@ -1,0 +1,15 @@
+# RUN: llvm-mc -triple=sh4-unknown-linux-gnu -disassemble < %s | FileCheck %s
+# RUN: llvm-mc -triple=sh4-unknown-linux-gnu -disassemble -show-encoding < %s | FileCheck %s --check-prefix=ENC
+
+# What __builtin_trap() becomes has no name: 0xfffd, which no SuperH
+# defines.  Its neighbours are instructions of the floating point unit.
+
+0xfd 0xff
+# CHECK: .word 0xfffd
+# ENC: encoding: [0xfd,0xff]
+
+0xfd 0xfb
+# CHECK: frchg
+
+0xfd 0xf3
+# CHECK: fschg
