@@ -781,6 +781,24 @@ question. Without a contracts file they know the functions whose body is
 at hand, which includes the inline wrappers of the headers, and a short
 list of names such as `platform_irq_count()` and `sg_nents_for_len()`.
 
+A fourth kind of line, `mem`, is about the pointer members of structures
+rather than about functions: for each member that a function of the unit
+touches it says whether the unit stores a fresh allocation into it (`S`, a
+call returning a pointer to non-const that is not one of the known lookups
+such as `strchr()` or `dlsym()`, directly or through a local; members that
+are function pointers are left out), frees it (`F`, `free()`,
+`freezero()`, `kfree()` and names ending in `_free`, `_destroy`, `_release`
+or `_put`) or hands it on (`E`, copies it to another place, passes it
+through a parameter that is not a pointer to const, or returns it). A
+variadic argument counts as a read. Static functions count here, unlike in
+the other lines. `clang/utils/linux-kernel/member-leaks.py facts` lists the
+members with an `S` somewhere and neither `F` nor `E` anywhere: nothing in
+the program releases what was stored there. The case it was written for is
+OpenSSH 10.6, where `kex.c` stores the peer's version string into
+`ssh->remote_version` and no file frees it. Its answer is a list to read,
+not a diagnostic: a member that is released by freeing the whole object
+with a custom routine, or through an alias, shows up as well.
+
 ## Static analyzer
 
 Whether a call may sleep while a spinlock is held depends on the path, so

@@ -695,6 +695,172 @@ static bool isSimpleLinuxStorage(const Expr *E) {
   return false;
 }
 
+/// Facts about the pointer members of structures, for the leak report of
+/// clang/utils/linux-kernel/member-leaks.py ("mem" lines of the facts file):
+/// whether a function of this translation unit stores a fresh allocation into
+/// a member ('S'), frees it ('F'), or hands it on ('E': copies it to another
+/// place, passes it through a parameter that is not a pointer to const, or
+/// returns it).  A member that is stored to somewhere in the program but
+/// neither freed nor handed on anywhere is a leak candidate.  The case this
+/// was written for is OpenSSH 10.6, where kex.c stores the peer's version
+/// string into ssh->remote_version and no file frees it.
+class LinuxMemberFactsCollector : public DynamicRecursiveASTVisitor {
+public:
+  enum : unsigned { Stored = 1, Freed = 2, Escaped = 4 };
+
+  static void collect(const FunctionDecl *FD,
+                      llvm::StringMap<unsigned> &Flags) {
+    LinuxMemberFactsCollector C(Flags);
+    Stmt *Body = FD->getBody();
+    if (!Body)
+      return;
+    // Two passes: the locals that hold a fresh allocation first, so that a
+    // store of such a local counts wherever the two statements are.
+    C.TraverseStmt(Body);
+    C.Second = true;
+    C.TraverseStmt(Body);
+  }
+
+  static std::string memberName(const MemberExpr *ME) {
+    const auto *FD = cast<FieldDecl>(ME->getMemberDecl());
+    const RecordDecl *RD = FD->getParent();
+    std::string Rec = RD->getName().str();
+    if (Rec.empty()) {
+      if (const TypedefNameDecl *TD = RD->getTypedefNameForAnonDecl())
+        Rec = TD->getName().str();
+      else
+        Rec = "anon";
+    }
+    return Rec + "::" + FD->getName().str();
+  }
+
+  /// The member of a pointer type behind casts and parentheses.
+  static const MemberExpr *pointerMember(const Expr *E) {
+    const auto *ME = dyn_cast<MemberExpr>(E->IgnoreParenCasts());
+    if (!ME || !ME->getType()->isPointerType() ||
+        ME->getType()->isFunctionPointerType() ||
+        !isa<FieldDecl>(ME->getMemberDecl()))
+      return nullptr;
+    return ME;
+  }
+
+  /// Whether \p E is a call whose result the caller owns: a function that
+  /// returns a pointer to something that is not const, and that is not one
+  /// of the known lookups into storage that exists already.
+  static bool isFreshCall(const Expr *E) {
+    const auto *CE = dyn_cast<CallExpr>(E->IgnoreParenCasts());
+    if (!CE)
+      return false;
+    QualType T = CE->getType();
+    if (!T->isPointerType() || T->getPointeeType().isConstQualified())
+      return false;
+    const FunctionDecl *FD = CE->getDirectCallee();
+    if (!FD || !FD->getIdentifier())
+      return false;
+    static const char *const Borrowed[] = {
+        "strchr",    "strrchr",   "strstr",    "strpbrk",    "strcasestr",
+        "strtok",    "strtok_r",  "strsep",    "memchr",     "memrchr",
+        "memmem",    "getenv",    "basename",  "dirname",    "localtime",
+        "gmtime",    "getpwnam",  "getpwuid",  "getgrnam",   "getgrgid",
+        "dlsym",     "sshbuf_ptr", "sshbuf_mutable_ptr", "sshbuf_reserve",
+    };
+    for (const char *B : Borrowed)
+      if (FD->getName() == B)
+        return false;
+    return true;
+  }
+
+  static bool isFreeName(StringRef Name) {
+    return Name == "free" || Name == "freezero" || Name == "kfree" ||
+           Name == "kvfree" || Name == "vfree" || Name.ends_with("_free") ||
+           Name.ends_with("_destroy") || Name.ends_with("_release") ||
+           Name.ends_with("_put");
+  }
+
+  bool VisitVarDecl(VarDecl *VD) override {
+    if (!VD->isLocalVarDecl() || !VD->hasInit())
+      return true;
+    if (!Second) {
+      if (isFreshCall(VD->getInit()))
+        FreshLocals.insert(VD);
+    } else if (const MemberExpr *ME = pointerMember(VD->getInit())) {
+      Flags[memberName(ME)] |= Escaped;
+    }
+    return true;
+  }
+
+  bool VisitBinaryOperator(BinaryOperator *BO) override {
+    if (BO->getOpcode() != BO_Assign)
+      return true;
+    const Expr *RHS = BO->getRHS();
+    if (!Second) {
+      if (const auto *DRE =
+              dyn_cast<DeclRefExpr>(BO->getLHS()->IgnoreParenCasts()))
+        if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))
+          if (VD->isLocalVarDecl() && isFreshCall(RHS))
+            FreshLocals.insert(VD);
+      return true;
+    }
+    if (const MemberExpr *ME = pointerMember(BO->getLHS())) {
+      bool Fresh = isFreshCall(RHS);
+      if (!Fresh)
+        if (const auto *DRE = dyn_cast<DeclRefExpr>(RHS->IgnoreParenCasts()))
+          if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))
+            Fresh = FreshLocals.count(VD);
+      if (Fresh)
+        Flags[memberName(ME)] |= Stored;
+    }
+    if (const MemberExpr *ME = pointerMember(RHS))
+      Flags[memberName(ME)] |= Escaped;
+    return true;
+  }
+
+  bool VisitReturnStmt(ReturnStmt *RS) override {
+    if (Second && RS->getRetValue())
+      if (const MemberExpr *ME = pointerMember(RS->getRetValue()))
+        Flags[memberName(ME)] |= Escaped;
+    return true;
+  }
+
+  bool VisitCallExpr(CallExpr *CE) override {
+    if (!Second)
+      return true;
+    const FunctionDecl *FD = CE->getDirectCallee();
+    StringRef Name = FD && FD->getIdentifier() ? FD->getName() : StringRef();
+    const bool Free = isFreeName(Name);
+    for (unsigned I = 0, E = CE->getNumArgs(); I != E; ++I) {
+      const MemberExpr *ME = pointerMember(CE->getArg(I));
+      if (!ME)
+        continue;
+      if (Free && I == 0) {
+        Flags[memberName(ME)] |= Freed;
+        continue;
+      }
+      // Through a parameter that is not a pointer to const the callee may
+      // keep it.  A variadic argument is a format argument, a read.
+      bool MayKeep = true;
+      if (FD && I < FD->getNumParams()) {
+        QualType PT = FD->getParamDecl(I)->getType();
+        if (PT->isPointerType() && PT->getPointeeType().isConstQualified())
+          MayKeep = false;
+      } else if (FD && FD->isVariadic()) {
+        MayKeep = false;
+      }
+      if (MayKeep)
+        Flags[memberName(ME)] |= Escaped;
+    }
+    return true;
+  }
+
+private:
+  explicit LinuxMemberFactsCollector(llvm::StringMap<unsigned> &Flags)
+      : Flags(Flags) {}
+
+  llvm::StringMap<unsigned> &Flags;
+  llvm::SmallPtrSet<const VarDecl *, 16> FreshLocals;
+  bool Second = false;
+};
+
 static std::string getLinuxExprText(const Expr *E, const Sema &S) {
   StringRef Text = Lexer::getSourceText(
       CharSourceRange::getTokenRange(E->getSourceRange()),
@@ -1508,6 +1674,29 @@ public:
            << (Params.empty() ? std::string("-") : llvm::join(Params, ","))
            << '\n';
     }
+    // The pointer members of structures: stored, freed, handed on.  Static
+    // functions count here, which is why this is a separate loop.
+    {
+      llvm::StringMap<unsigned> MemberFlags;
+      for (const Decl *D : Ctx.getTranslationUnitDecl()->decls())
+        if (const auto *FD = dyn_cast<FunctionDecl>(D))
+          if (FD->doesThisDeclarationHaveABody())
+            LinuxMemberFactsCollector::collect(FD, MemberFlags);
+      std::vector<StringRef> Members;
+      for (const auto &KV : MemberFlags)
+        Members.push_back(KV.first());
+      llvm::sort(Members);
+      StringRef MainFile = SM.getFilename(
+          SM.getLocForStartOfFile(SM.getMainFileID()));
+      for (StringRef M : Members) {
+        unsigned F = MemberFlags[M];
+        OS << "mem\t" << M << '\t' << (MainFile.empty() ? "?" : MainFile)
+           << '\t' << (F & LinuxMemberFactsCollector::Stored ? "S" : "")
+           << (F & LinuxMemberFactsCollector::Freed ? "F" : "")
+           << (F & LinuxMemberFactsCollector::Escaped ? "E" : "") << '\n';
+      }
+    }
+
     if (Text.empty())
       return;
 
