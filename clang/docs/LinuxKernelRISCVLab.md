@@ -52,12 +52,15 @@ attaches LLVM `!pcsections` metadata to selected existing instructions under
 an explicit RV64/ELF/medium-code-model gate.  A companion expected-site table
 makes dropped metadata fatal in the object reader.  This is already useful for
 surviving store/atomic publication instructions with the default SelectionDAG
-backend.  An explicitly experimental `-fglobal-isel` lane preserves the four
-entry/call/publication/return anchors in the current fixture without changing
-`.text`.  SelectionDAG still drops three of those anchors and is retained as a
-required negative test.  Neither result turns an IR-relative description such
-as "after call" into a promise that the final instruction is adjacent to the
-call; the resolved machine PC is the only scheduleable boundary.
+backend.  Rules can select a direct call, function entry/exit, or a named
+optimized-IR opcode and one-based occurrence inside a function.  The latter
+lets a policy select the surviving publication `store` directly instead of
+inferring it from "after call."  An explicitly experimental `-fglobal-isel`
+lane preserves the four entry/call/publication/return anchors in the current
+fixture without changing `.text`.  SelectionDAG still drops three of those
+anchors and is retained as a required negative test.  Neither result turns an
+IR-relative selector into a promise about final instruction adjacency; the
+resolved machine PC is the only scheduleable boundary.
 
 ### Layer B: explicit callback and perturb mode
 
@@ -269,8 +272,9 @@ As of 2026-10-15 on `kernel-lab-riscv`:
   rejects a wrong-width relocation that could otherwise link to plausible
   bytes;
 - the optimizer-last C map pass emits one qualified 32-byte `!pcsections`
-  carrier without changing object or linked `.text`, and its object
-  `ADD64`/`SUB64` relocation pair resolves correctly across linker relaxation;
+  carrier on a directly selected optimized-IR `store` without changing object
+  or linked `.text`, and its object `ADD64`/`SUB64` relocation pair resolves
+  correctly across linker relaxation;
 - a four-site call/entry/return negative deliberately loses three backend
   markers and is rejected by the emitted-versus-expected coverage gate;
 - compiling that same four-site fixture through RISC-V GlobalISel preserves
@@ -285,10 +289,10 @@ As of 2026-10-15 on `kernel-lab-riscv`:
 - no Linux boot, QEMU injection, FPGA run, or correctness verdict has yet been
   claimed from this new branch.
 
-The next compiler task is to add an explicit statement/instruction selector,
-then preserve PC-section metadata through the default RISC-V backend (or emit
-the records at final Machine IR/AsmPrinter) so the lab does not depend on
-experimental GlobalISel.  Inertness checks must then expand to all executable
-sections, symbols, relaxation, and unwind data.  The next QEMU task is the RV64
-exact-site TB stop without injection, followed by the real PLIC endpoint and
-deterministic schedule.
+The next compiler task is to preserve PC-section metadata through the default
+RISC-V backend (or emit the records at final Machine IR/AsmPrinter) so the lab
+does not depend on experimental GlobalISel, and then add a stable source-level
+statement interface.  Inertness checks must expand to all executable sections,
+symbols, relaxation, and unwind data.  The next QEMU task is the RV64 exact-site
+TB stop without injection, followed by the real PLIC endpoint and deterministic
+schedule.

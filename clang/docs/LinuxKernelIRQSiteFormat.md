@@ -79,7 +79,9 @@ The first qualification fixture demonstrates a backend difference that must
 remain visible: default RISC-V SelectionDAG preserves a store anchor but drops
 entry, call, and return anchors, while experimental GlobalISel preserves all
 four.  The expected table turns the former into a hard validation failure.
-Even when a record survives, a source- or IR-relative selector does not promise
+The initial direct-instruction policy selector names an optimizer-last LLVM IR
+opcode and an optional one-based occurrence inside a function.  Even when a
+record survives, a source- or IR-relative selector does not promise
 machine-instruction adjacency after scheduling.  The linked record's resolved
 PC is authoritative for triggering; richer predecessor/successor claims need
 an independent final-machine-code checker.

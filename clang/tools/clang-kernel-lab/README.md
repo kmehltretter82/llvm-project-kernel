@@ -70,3 +70,12 @@ example, an IR instruction selected as "after call" can move away from the
 call during instruction scheduling.  Consumers schedule only the resolved PC
 and use the policy description as provenance, not as an unchecked assertion
 about neighboring instructions.
+
+Map rules currently support direct calls (`match: "call"`), function entry or
+exit (`match: "function"`), and optimizer-last LLVM IR instructions
+(`match: "instruction"`).  An instruction rule names its containing function
+in `symbol`, an LLVM IR opcode such as `store`, and optionally a one-based
+`occurrence`; its only valid position is `before`.  This is deliberately an IR
+selector, not yet a stable source-level statement annotation or a final
+machine-opcode selector.  The expectation table makes deletion or unsupported
+backend propagation fatal instead of silently accepting incomplete coverage.

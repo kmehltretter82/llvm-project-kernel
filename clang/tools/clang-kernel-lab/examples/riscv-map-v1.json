@@ -5,9 +5,11 @@
   "require_each_rule": true,
   "sites": [
     {
-      "match": "call",
-      "symbol": "publish_irq_state",
-      "position": "after",
+      "match": "instruction",
+      "symbol": "irq_map_probe",
+      "opcode": "store",
+      "occurrence": 1,
+      "position": "before",
       "kind": 39,
       "noinstr": true
     }

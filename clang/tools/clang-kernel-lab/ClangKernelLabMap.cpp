@@ -71,7 +71,7 @@ constexpr uint32_t FlagC = 1U << 3;
 constexpr uint32_t FlagNoInstr = 1U << 4;
 constexpr uint32_t FlagManualID = 1U << 5;
 
-enum class MatchKind : uint8_t { Call, Function };
+enum class MatchKind : uint8_t { Call, Function, Instruction };
 enum class SitePhase : uint8_t { Before, After, Entry, Exit };
 
 struct Rule {
@@ -80,6 +80,8 @@ struct Rule {
   uint16_t Kind = 0;
   bool NoInstr = false;
   std::optional<std::pair<uint64_t, uint64_t>> ManualID;
+  std::optional<unsigned> Occurrence;
+  std::string Opcode;
   std::string Symbol;
 };
 
@@ -128,11 +130,14 @@ static Expected<MatchKind> parseMatch(StringRef Text) {
     return MatchKind::Call;
   if (Text == "function")
     return MatchKind::Function;
-  return configError("match must be 'call' or 'function'");
+  if (Text == "instruction")
+    return MatchKind::Instruction;
+  return configError("match must be 'call', 'function', or 'instruction'");
 }
 
 static Expected<SitePhase> parsePhase(StringRef Text, MatchKind Match) {
-  if (Text == "before" && Match == MatchKind::Call)
+  if (Text == "before" &&
+      (Match == MatchKind::Call || Match == MatchKind::Instruction))
     return SitePhase::Before;
   if (Text == "after" && Match == MatchKind::Call)
     return SitePhase::After;
@@ -216,6 +221,25 @@ static Expected<Config> parseConfig(StringRef Path) {
     R.Phase = *Phase;
     R.Kind = static_cast<uint16_t>(*Kind);
     R.Symbol = Symbol->str();
+    if (*Match == MatchKind::Instruction) {
+      auto Opcode = Object->getString("opcode");
+      if (!Opcode || Opcode->empty() || Opcode->size() > 64)
+        return configError(
+            "instruction rule requires an opcode of 1 through 64 bytes");
+      R.Opcode = Opcode->str();
+      if (const json::Value *Value = Object->get("occurrence")) {
+        std::optional<int64_t> Occurrence = Value->getAsInteger();
+        if (!Occurrence || *Occurrence <= 0 ||
+            static_cast<uint64_t>(*Occurrence) >
+                std::numeric_limits<unsigned>::max())
+          return configError(
+              "instruction occurrence must be a positive integer");
+        R.Occurrence = static_cast<unsigned>(*Occurrence);
+      }
+    } else if (Object->get("opcode") || Object->get("occurrence")) {
+      return configError(
+          "opcode and occurrence apply only to instruction rules");
+    }
     if (auto NoInstr = Object->getBoolean("noinstr"))
       R.NoInstr = *NoInstr;
     if (auto Manual = Object->getString("site_id")) {
@@ -226,7 +250,8 @@ static Expected<Config> parseConfig(StringRef Path) {
     }
 
     std::string Key = (Twine(*MatchText) + "\n" + R.Symbol + "\n" +
-                       *PositionText + "\n" + Twine(R.Kind))
+                       *PositionText + "\n" + Twine(R.Kind) + "\n" +
+                       R.Opcode + "\n" + Twine(R.Occurrence.value_or(0)))
                           .str();
     if (!RuleKeys.insert(std::move(Key)).second)
       return configError("duplicate match/symbol/position/kind rule");
@@ -450,6 +475,30 @@ PreservedAnalyses KernelLabMapPass::run(Module &M, ModuleAnalysisManager &) {
           Sites.push_back(std::move(Site));
           ++RuleMatches[&R];
         }
+      }
+    }
+
+    for (const Rule &R : Configuration.Rules) {
+      if (R.Match != MatchKind::Instruction || R.Symbol != F.getName())
+        continue;
+      unsigned MatchingOccurrence = 0;
+      for (Instruction &I : instructions(F)) {
+        if (R.Opcode != I.getOpcodeName())
+          continue;
+        ++MatchingOccurrence;
+        if (R.Occurrence && MatchingOccurrence != *R.Occurrence)
+          continue;
+        PlannedSite Site;
+        Site.Anchor = &I;
+        Site.Descriptor = &R;
+        Site.FunctionName = F.getName().str();
+        Site.CalleeName = R.Opcode;
+        Site.Ordinal = Ordinals.lookup(&I);
+        findLocation(I, F, M, Site.SourceName, Site.Line, Site.Column);
+        Sites.push_back(std::move(Site));
+        ++RuleMatches[&R];
+        if (R.Occurrence)
+          break;
       }
     }
 

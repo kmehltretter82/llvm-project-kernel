@@ -13,16 +13,18 @@
     },
     {
       "match": "call",
-      "symbol": "publish_irq_state",
+      "symbol": "reschedule_check",
       "position": "before",
-      "kind": 39,
+      "kind": 37,
       "noinstr": true
     },
     {
-      "match": "call",
-      "symbol": "publish_irq_state",
-      "position": "after",
-      "kind": 37,
+      "match": "instruction",
+      "symbol": "irq_map_probe",
+      "opcode": "store",
+      "occurrence": 1,
+      "position": "before",
+      "kind": 39,
       "noinstr": true
     },
     {
