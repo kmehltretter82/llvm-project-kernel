@@ -17,6 +17,7 @@
 // RUN: %clang_analyze_cc1 -triple riscv64-unknown-linux-gnu \
 // RUN:   -D CONFIG_PREEMPT_RT=1 \
 // RUN:   -analyzer-checker=core,alpha.linux.AtomicSleep \
+// RUN:   -analyze-function=manifest_unlisted_external_then_wait \
 // RUN:   -analyzer-config alpha.linux.AtomicSleep:RTContext=true \
 // RUN:   -verify=default %s
 // REQUIRES: riscv-registered-target
@@ -30,6 +31,9 @@ void imported_rt_wait(void);
 void imported_sleep(void);
 void imported_unknown(void);
 void unlisted_external(void);
+void __local_bh_enable_ip(unsigned long ip, unsigned int count);
+void nmi_exit(void);
+void preempt_count_sub(int value);
 
 void manifest_identity_anchor(void) {}
 
@@ -74,4 +78,29 @@ void manifest_unlisted_external_then_wait(void) {
 void manifest_callback_then_wait(void (*callback)(void)) {
   callback(); // manifest-warning {{Imported entry context became unknown after unresolved call}}
   imported_rt_wait(); // manifest-warning {{Imported effect has no proved post-call context preservation}}
+}
+
+void manifest_bh_exit_balanced(rt_spinlock_t *lock) {
+  __local_bh_enable_ip(0, 2u << 8);
+  rt_spin_lock(lock);
+  rt_spin_unlock(lock);
+}
+
+void manifest_softirq_bh_exit_balanced(rt_spinlock_t *lock) {
+  __local_bh_enable_ip(0, 2u << 8);
+  __local_bh_enable_ip(0, 1u << 8);
+  rt_spin_lock(lock);
+  rt_spin_unlock(lock);
+}
+
+void manifest_nmi_exit_balanced(rt_spinlock_t *lock) {
+  nmi_exit();
+  rt_spin_lock(lock);
+  rt_spin_unlock(lock);
+}
+
+void manifest_nmi_counter_exit_balanced(rt_spinlock_t *lock) {
+  preempt_count_sub((1u << 20) | (1u << 16));
+  rt_spin_lock(lock);
+  rt_spin_unlock(lock);
 }

@@ -1028,15 +1028,20 @@ void LinuxAtomicSleepChecker::checkBeginFunction(CheckerContext &C) const {
     Sections = Factory.add(Section, Sections);
   };
   Add(SectionKind::Preempt, F->Preempt);
-  Add(SectionKind::BottomHalf, F->BH);
-  Add(SectionKind::RCU, F->RCU);
-  Add(SectionKind::Migration, F->Migration);
   if (F->EntryKind == "hardirq")
     Add(SectionKind::HardIRQ, 1);
-  else if (F->EntryKind == "nmi")
+  else if (F->EntryKind == "nmi") {
+    // Linux NMI entry increments both HARDIRQ_OFFSET and NMI_OFFSET.
+    Add(SectionKind::HardIRQ, 1);
     Add(SectionKind::NMI, 1);
-  else if (F->EntryKind == "softirq" && !F->BH)
+  } else if (F->EntryKind == "softirq")
     Add(SectionKind::BottomHalf, 1);
+  // Manifest depths are logical local_bh_disable() nesting levels.  Each
+  // level occupies two SOFTIRQ_OFFSET units; an active softirq above occupies
+  // one independent unit.
+  Add(SectionKind::BottomHalf, 2 * F->BH);
+  Add(SectionKind::RCU, F->RCU);
+  Add(SectionKind::Migration, F->Migration);
   C.addTransition(State->set<ActiveAtomicSections>(Sections)
                       ->set<ImportedEntryContext>(true));
 }
@@ -1408,6 +1413,11 @@ void LinuxAtomicSleepChecker::checkPostCall(const CallEvent &Call,
                               sectionMask(SectionKind::BottomHalf);
         Input = Input->add<ActiveAtomicSections>(BHSection);
       }
+      if (RTContext && Section.Kind == SectionKind::NMI) {
+        AtomicSection HardIRQSection = Section;
+        HardIRQSection.Kind = SectionKind::HardIRQ;
+        Input = Input->add<ActiveAtomicSections>(HardIRQSection);
+      }
       return Input->add<ActiveAtomicSections>(Section);
     };
     ProgramStateRef Entered = Enter(State);
@@ -1466,7 +1476,10 @@ void LinuxAtomicSleepChecker::checkPostCall(const CallEvent &Call,
       if (const llvm::APSInt *Count = C.getSValBuilder().getKnownValue(
               State, Call.getArgSVal(0)))
         Amount = std::max<unsigned>(1, Count->getZExtValue() & 0xff);
+    const Expr *NMIEntry = nullptr;
     if (Match >= 0) {
+      if (RTContext && CR.Kind == SectionKind::NMI)
+        NMIEntry = Open[Match].Entry;
       if (RTContext && Open[Match].Amount > Amount)
         Open[Match].Amount -= Amount;
       else
@@ -1490,6 +1503,26 @@ void LinuxAtomicSleepChecker::checkPostCall(const CallEvent &Call,
       }
       BHUnderflow = Remaining != 0;
     }
+    bool NMIUnderflow = false;
+    if (RTContext && CR.Kind == SectionKind::NMI && Match >= 0) {
+      unsigned Remaining = 1;
+      for (auto It = Open.begin(); It != Open.end() && Remaining;) {
+        // Remove the HARDIRQ_OFFSET component paired with this NMI entry,
+        // rather than consuming an unrelated nested hard-IRQ section.
+        if (It->Kind != SectionKind::HardIRQ || It->Entry != NMIEntry) {
+          ++It;
+          continue;
+        }
+        unsigned Removed = std::min(Remaining, It->Amount);
+        Remaining -= Removed;
+        It->Amount -= Removed;
+        if (!It->Amount)
+          It = Open.erase(It);
+        else
+          ++It;
+      }
+      NMIUnderflow = Remaining != 0;
+    }
     llvm::ImmutableList<AtomicSection> List = Factory.getEmptyList();
     for (const AtomicSection &Section : llvm::reverse(Open))
       List = Factory.add(Section, List);
@@ -1498,6 +1531,13 @@ void LinuxAtomicSleepChecker::checkPostCall(const CallEvent &Call,
       State = State->set<UnknownContextKinds>(State->get<UnknownContextKinds>() |
                                               sectionMask(SectionKind::BottomHalf));
       reportUnknown(Call, C, State, "BH release exceeds the known disabled depth");
+    } else if (NMIUnderflow) {
+      State = State->set<UnknownContextKinds>(
+          State->get<UnknownContextKinds>() |
+          sectionMask(SectionKind::NMI) |
+          sectionMask(SectionKind::HardIRQ));
+      reportUnknown(Call, C, State,
+                    "NMI exit has no matching hard IRQ component");
     } else if (UnknownRestore)
       reportUnknown(Call, C, State, "IRQ restore uses flags without a known saved state");
     else

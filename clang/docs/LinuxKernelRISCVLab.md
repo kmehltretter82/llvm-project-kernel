@@ -300,6 +300,9 @@ As of 2026-10-16 on `kernel-lab-riscv`:
   one perturbation point, and zero disabled-mode hooks;
 - the recovered PREEMPT_RT analyzer has RISC-V primitive-context regressions,
   a compiler-identity-to-manifest round trip, and visible empty-TU validation;
+- imported BH depths now use logical `local_bh_disable()` units, while NMI
+  entries carry their paired hard-IRQ counter component; matched manifest and
+  primitive exits are covered by focused RISC-V analyzer regressions;
 - the frozen phase-3 manifest campaign is preserved in-tree, and its separate
   RISC-V port passes all 87 reviewed predicates on clean commit
   `b5294bcb4282`, with all 24 identity mutations rejected independently from

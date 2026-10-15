@@ -72,18 +72,18 @@ did not produce a positive RT-wait diagnostic.  Manifest import semantics,
 default compatibility, clean-build integration, LLVM regression tests, and a
 real kernel translation unit have not been qualified for V4.
 
-Known follow-up items include:
+Known follow-up items at the recovery point included:
 
-* make invalid manifest rejection visible even when no function is analyzed;
-* do not silently preserve imported entry facts across unknown callbacks or
-  unlisted opaque calls;
-* qualify positive bottom-half entry units and NMI entry/exit accounting;
 * separate manifest-validation failures from post-call coverage gaps in the
   test runner;
-* resolve the foreign-static isolation case versus whole-manifest rejection;
 * run the prepared 174-record importer matrix and 89 adversarial cases; and
 * perform a clean build plus focused analyzer regression tests before making
   correctness claims.
+
+The zero-path visibility, opaque-call invalidation, positive BH/NMI accounting,
+and foreign-static isolation gaps are now covered below.  The original
+cross-target matrix and independent adversarial suite remain separate,
+unfinished qualification work.
 
 ## In-tree qualification progress
 
@@ -122,6 +122,16 @@ invalidates those facts once, marks the tracked contexts and IRQ state
 unknown, and emits a coverage-gap diagnostic at the call.  This prevents a
 later imported wait/sleep effect from reusing a stale clean entry assumption.
 The same calls without a manifest entry retain the pre-existing behavior.
+
+Manifest `context.bh` is defined as a logical `local_bh_disable()` nesting
+depth, not a raw softirq-counter value.  On RT each depth is therefore imported
+as two `SOFTIRQ_OFFSET` units.  A `softirq` entry contributes its independent
+one-unit active-softirq component before any explicit BH-disable depth.  An
+NMI entry likewise contributes both `NMI_OFFSET` and its paired
+`HARDIRQ_OFFSET`; direct `nmi_enter()`/`nmi_exit()` modeling uses the same
+pairing and will not consume an unrelated hard-IRQ nesting level.  Positive
+manifest regressions balance BH-only, softirq-plus-BH, direct NMI-exit, and
+bulk preemption-counter exit paths.
 
 The separate RISC-V port of the frozen campaign has now passed all 87 records
 (29 cases under non-RT and both RT/BH fixture profiles) on clean commit

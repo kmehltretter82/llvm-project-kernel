@@ -175,10 +175,10 @@ void hardirq_counter_bits_are_balanced(rt_spinlock_t *rt) {
 }
 
 void nmi_counter_bits_are_balanced(rt_spinlock_t *rt) {
-  preempt_count_add(1u << 20);
+  preempt_count_add((1u << 20) | (1u << 16));
   rt_spin_lock(rt); // rt-warning {{Call to RT lock 'rt_spin_lock' inside NMI context}}
   rt_spin_unlock(rt);
-  preempt_count_sub(1u << 20);
+  preempt_count_sub((1u << 20) | (1u << 16));
   rt_spin_lock(rt);
   rt_spin_unlock(rt);
 }
