@@ -137,13 +137,14 @@ The separate RISC-V port of the frozen campaign has now passed all 87 records
 (29 cases under non-RT and both RT/BH fixture profiles) on clean commit
 `b5294bcb4282`.  All 24 identity mutations were rejected as validation
 failures, independently of the 60 expected post-call coverage gaps.  The
-original 174 x86-64/Arm64 records and the archived 89 adversarial cases have
-not been rerun.  This remains bounded API-fixture qualification; opaque
-unlisted-call invalidation and real-kernel translation-unit coverage remain
-open.
+BH/NMI correction at `d1b37192986d` was followed by a second 87/87 pass with
+the same diagnostic counts and no resource failures.  The original 174
+x86-64/Arm64 records and the archived 89 adversarial cases have not been rerun.
+This remains bounded API-fixture qualification; real-kernel translation-unit
+coverage remains open.
 
-The frozen phase-3 inputs, RISC-V runner, full result JSON, and compact receipt
-are preserved under `clang/utils/kernel-lab/rt-context-campaign-v1`.  Larger
-generated evidence, binaries, kernel objects, and historical test outputs
-remain outside the LLVM repository on the HETZNER volume under
+The frozen phase-3 inputs, RISC-V runner, initial full result JSON, and compact
+receipts are preserved under `clang/utils/kernel-lab/rt-context-campaign-v1`.
+Larger generated evidence, binaries, kernel objects, and historical test
+outputs remain outside the LLVM repository on the HETZNER volume under
 `hetzner/recent-20261013/linux-work/dmadebug/rt-clang-work-20261012/`.

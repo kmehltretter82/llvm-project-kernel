@@ -306,7 +306,8 @@ As of 2026-10-16 on `kernel-lab-riscv`:
 - the frozen phase-3 manifest campaign is preserved in-tree, and its separate
   RISC-V port passes all 87 reviewed predicates on clean commit
   `b5294bcb4282`, with all 24 identity mutations rejected independently from
-  60 explicit post-call coverage gaps;
+  60 explicit post-call coverage gaps; the BH/NMI correction at
+  `d1b37192986d` retains the same 87/87 result and diagnostic counts;
 - the source-derived QEMU/Linux inventory checker covers exactly 17 families,
   finds 16 existing CPU interrupt-entry hooks, and keeps Hexagon as the one
   explicit source gap; and
