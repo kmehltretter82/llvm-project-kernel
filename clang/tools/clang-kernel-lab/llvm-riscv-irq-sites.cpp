@@ -33,14 +33,18 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <tuple>
 #include <utility>
+#include <vector>
 
 using namespace llvm;
 using namespace llvm::object;
 
 namespace {
 
-constexpr StringLiteral SiteSectionName = ".riscv.linux_irq_sites";
+constexpr StringLiteral AssemblySectionName = ".riscv.linux_irq_sites";
+constexpr StringLiteral CCarrierSectionName = ".riscv.linux_irq_c_sites";
+constexpr StringLiteral ExpectedSectionName = ".riscv.linux_irq_expected";
 constexpr StringLiteral TriggerPhase =
     "AFTER_PREVIOUS_RETIRE/BEFORE_INSN_AT_SITE";
 constexpr uint8_t SiteVersion = 1;
@@ -51,6 +55,8 @@ constexpr uint32_t FlagAssembly = 1U << 2;
 constexpr uint32_t FlagC = 1U << 3;
 constexpr uint32_t KnownFlags = (1U << 6) - 1;
 constexpr uint64_t MaxSiteSectionBytes = 16 * 1024 * 1024;
+
+enum class CarrierKind { Assembly, C };
 
 static StringRef siteKindName(uint16_t Kind) {
   switch (Kind) {
@@ -87,6 +93,14 @@ struct Site {
   uint64_t SymbolOffset = 0;
   std::string RelocationType;
   std::string RelocationSymbol;
+  CarrierKind Carrier = CarrierKind::Assembly;
+};
+
+struct ExpectedSite {
+  uint16_t Kind = 0;
+  uint32_t Flags = 0;
+  uint64_t IDLow = 0;
+  uint64_t IDHigh = 0;
 };
 
 static int fail(const Twine &Message) {
@@ -113,6 +127,21 @@ static std::string sha256(StringRef Bytes) {
   SHA256 Hasher;
   Hasher.update(Bytes);
   return toHex(Hasher.final(), /*LowerCase=*/true);
+}
+
+static Expected<uint64_t> addSigned(uint64_t Value, int64_t Addend) {
+  if (Addend >= 0) {
+    uint64_t Positive = static_cast<uint64_t>(Addend);
+    if (Value > std::numeric_limits<uint64_t>::max() - Positive)
+      return createStringError(inconvertibleErrorCode(),
+                               "relocation value overflows uint64");
+    return Value + Positive;
+  }
+  uint64_t Magnitude = static_cast<uint64_t>(-(Addend + 1)) + 1;
+  if (Value < Magnitude)
+    return createStringError(inconvertibleErrorCode(),
+                             "relocation value underflows uint64");
+  return Value - Magnitude;
 }
 
 static Expected<std::string> containingTextSection(const ObjectFile &Object,
@@ -173,7 +202,8 @@ containingFunction(const ObjectFile &Object, uint64_t Address) {
 
 static Expected<SmallVector<Site, 16>> readSites(const ObjectFile &Object,
                                                  SectionRef SiteSection,
-                                                 bool IsRelocatable) {
+                                                 bool IsRelocatable,
+                                                 CarrierKind Carrier) {
   Expected<StringRef> ContentsOrError = SiteSection.getContents();
   if (!ContentsOrError)
     return ContentsOrError.takeError();
@@ -190,14 +220,41 @@ static Expected<SmallVector<Site, 16>> readSites(const ObjectFile &Object,
   for (size_t Offset = 0; Offset < Contents.size(); Offset += SiteRecordSize) {
     const auto *Data =
         reinterpret_cast<const uint8_t *>(Contents.data() + Offset);
-    uint8_t Version = Data[0];
-    uint8_t Size = Data[1];
     Site S;
-    S.Kind = support::endian::read16le(Data + 2);
-    S.Flags = support::endian::read32le(Data + 4);
-    S.Address = support::endian::read64le(Data + 8);
-    S.IDLow = support::endian::read64le(Data + 16);
-    S.IDHigh = support::endian::read64le(Data + 24);
+    S.Carrier = Carrier;
+    uint8_t Version;
+    uint8_t Size;
+    if (Carrier == CarrierKind::Assembly) {
+      Version = Data[0];
+      Size = Data[1];
+      S.Kind = support::endian::read16le(Data + 2);
+      S.Flags = support::endian::read32le(Data + 4);
+      S.Address = support::endian::read64le(Data + 8);
+      S.IDLow = support::endian::read64le(Data + 16);
+      S.IDHigh = support::endian::read64le(Data + 24);
+    } else {
+      int64_t Relative = static_cast<int64_t>(support::endian::read64le(Data));
+      Version = Data[8];
+      Size = Data[9];
+      S.Kind = support::endian::read16le(Data + 10);
+      S.Flags = support::endian::read32le(Data + 12);
+      S.IDLow = support::endian::read64le(Data + 16);
+      S.IDHigh = support::endian::read64le(Data + 24);
+      if (!IsRelocatable) {
+        if (SiteSection.getAddress() >
+            std::numeric_limits<uint64_t>::max() - Offset)
+          return createStringError(inconvertibleErrorCode(),
+                                   "C carrier record address overflows");
+        Expected<uint64_t> Address =
+            addSigned(SiteSection.getAddress() + Offset, Relative);
+        if (!Address)
+          return Address.takeError();
+        S.Address = *Address;
+      } else if (Relative != 0) {
+        return createStringError(inconvertibleErrorCode(),
+                                 "relocatable C carrier has nonzero PC data");
+      }
+    }
 
     if (Version != SiteVersion)
       return createStringError(inconvertibleErrorCode(),
@@ -220,6 +277,12 @@ static Expected<SmallVector<Site, 16>> readSites(const ObjectFile &Object,
       return createStringError(
           inconvertibleErrorCode(),
           "site must identify exactly one source language");
+    if (Carrier == CarrierKind::Assembly && !(S.Flags & FlagAssembly))
+      return createStringError(inconvertibleErrorCode(),
+                               "assembly carrier contains a C site");
+    if (Carrier == CarrierKind::C && !(S.Flags & FlagC))
+      return createStringError(inconvertibleErrorCode(),
+                               "C carrier contains an assembly site");
     if (!S.IDLow && !S.IDHigh)
       return createStringError(inconvertibleErrorCode(),
                                "zero site identifier is invalid");
@@ -253,19 +316,61 @@ static Expected<SmallVector<Site, 16>> readSites(const ObjectFile &Object,
   return Sites;
 }
 
-static Expected<uint64_t> addSigned(uint64_t Value, int64_t Addend) {
-  if (Addend >= 0) {
-    uint64_t Positive = static_cast<uint64_t>(Addend);
-    if (Value > std::numeric_limits<uint64_t>::max() - Positive)
-      return createStringError(inconvertibleErrorCode(),
-                               "relocation value overflows uint64");
-    return Value + Positive;
-  }
-  uint64_t Magnitude = static_cast<uint64_t>(-(Addend + 1)) + 1;
-  if (Value < Magnitude)
+static Expected<SmallVector<ExpectedSite, 16>>
+readExpectedSites(SectionRef Section) {
+  constexpr size_t ExpectedRecordSize = 24;
+  Expected<StringRef> ContentsOrError = Section.getContents();
+  if (!ContentsOrError)
+    return ContentsOrError.takeError();
+  StringRef Contents = *ContentsOrError;
+  if (Contents.size() > MaxSiteSectionBytes)
     return createStringError(inconvertibleErrorCode(),
-                             "relocation value underflows uint64");
-  return Value - Magnitude;
+                             "expected-site section exceeds 16 MiB");
+  if (Contents.size() % ExpectedRecordSize)
+    return createStringError(inconvertibleErrorCode(),
+                             "expected-site section has a partial record");
+
+  SmallVector<ExpectedSite, 16> Result;
+  for (size_t Offset = 0; Offset < Contents.size();
+       Offset += ExpectedRecordSize) {
+    const auto *Data =
+        reinterpret_cast<const uint8_t *>(Contents.data() + Offset);
+    ExpectedSite E;
+    E.Kind = support::endian::read16le(Data);
+    uint16_t Reserved = support::endian::read16le(Data + 2);
+    E.Flags = support::endian::read32le(Data + 4);
+    E.IDLow = support::endian::read64le(Data + 8);
+    E.IDHigh = support::endian::read64le(Data + 16);
+    if (Reserved)
+      return createStringError(inconvertibleErrorCode(),
+                               "expected-site reserved field is nonzero");
+    if (siteKindName(E.Kind).empty())
+      return createStringError(inconvertibleErrorCode(),
+                               "expected site has an unknown kind");
+    if (E.Flags & ~KnownFlags)
+      return createStringError(inconvertibleErrorCode(),
+                               "expected site has unknown flags");
+    uint32_t Boundary = FlagAfterPreviousRetire | FlagBeforeInsnAtSite;
+    if ((E.Flags & Boundary) != Boundary || !(E.Flags & FlagC) ||
+        (E.Flags & FlagAssembly))
+      return createStringError(inconvertibleErrorCode(),
+                               "expected site is not a C boundary");
+    if (!E.IDLow && !E.IDHigh)
+      return createStringError(inconvertibleErrorCode(),
+                               "expected site has a zero identifier");
+    Result.push_back(E);
+  }
+  return Result;
+}
+
+using SiteKey = std::tuple<uint64_t, uint64_t, uint16_t, uint32_t>;
+
+static SiteKey key(uint64_t High, uint64_t Low, uint16_t Kind, uint32_t Flags) {
+  return {High, Low, Kind, Flags};
+}
+
+static StringRef carrierName(CarrierKind Carrier) {
+  return Carrier == CarrierKind::Assembly ? "assembly-record" : "pcsections";
 }
 
 static Error validateRelocations(const ObjectFile &Object,
@@ -359,6 +464,104 @@ static Error validateRelocations(const ObjectFile &Object,
   return Error::success();
 }
 
+static Error validateCRelocations(const ObjectFile &Object,
+                                  SectionRef SiteSection,
+                                  MutableArrayRef<Site> Sites) {
+  struct RelocationPair {
+    bool HasAdd = false;
+    bool HasSub = false;
+  };
+  SmallVector<RelocationPair, 16> Seen(Sites.size());
+  for (SectionRef Section : Object.sections()) {
+    Expected<section_iterator> RelocatedOrError = Section.getRelocatedSection();
+    if (!RelocatedOrError)
+      return RelocatedOrError.takeError();
+    section_iterator Relocated = *RelocatedOrError;
+    if (Relocated == Object.section_end() || *Relocated != SiteSection)
+      continue;
+
+    for (RelocationRef Relocation : Section.relocations()) {
+      uint64_t Offset = Relocation.getOffset();
+      if (Offset % SiteRecordSize)
+        return createStringError(
+            inconvertibleErrorCode(),
+            "unexpected C-carrier relocation at offset 0x%" PRIx64, Offset);
+      size_t Index = static_cast<size_t>(Offset / SiteRecordSize);
+      if (Index >= Sites.size())
+        return createStringError(inconvertibleErrorCode(),
+                                 "C-carrier relocation lies past its records");
+      bool IsAdd = Relocation.getType() == ELF::R_RISCV_ADD64;
+      bool IsSub = Relocation.getType() == ELF::R_RISCV_SUB64;
+      if (!IsAdd && !IsSub)
+        return createStringError(
+            inconvertibleErrorCode(),
+            "C carrier requires R_RISCV_ADD64/R_RISCV_SUB64, found %" PRIu64,
+            Relocation.getType());
+      if ((IsAdd && Seen[Index].HasAdd) || (IsSub && Seen[Index].HasSub))
+        return createStringError(inconvertibleErrorCode(),
+                                 "duplicate C-carrier PC relocation");
+
+      Expected<int64_t> Addend = ELFRelocationRef(Relocation).getAddend();
+      if (!Addend)
+        return Addend.takeError();
+      if (*Addend)
+        return createStringError(inconvertibleErrorCode(),
+                                 "C-carrier PC relocation has an addend");
+      symbol_iterator SymbolIterator = Relocation.getSymbol();
+      if (SymbolIterator == Object.symbol_end())
+        return createStringError(inconvertibleErrorCode(),
+                                 "C-carrier relocation has no symbol");
+      SymbolRef Symbol = *SymbolIterator;
+      Expected<uint64_t> Value = Symbol.getValue();
+      if (!Value)
+        return Value.takeError();
+      Expected<section_iterator> SymbolSectionOrError = Symbol.getSection();
+      if (!SymbolSectionOrError)
+        return SymbolSectionOrError.takeError();
+      section_iterator SymbolSection = *SymbolSectionOrError;
+      if (SymbolSection == Object.section_end())
+        return createStringError(inconvertibleErrorCode(),
+                                 "C-carrier relocation symbol is undefined");
+      Expected<StringRef> SymbolName = Symbol.getName();
+      if (!SymbolName)
+        return SymbolName.takeError();
+
+      Site &S = Sites[Index];
+      if (IsAdd) {
+        if (!SymbolSection->isText())
+          return createStringError(inconvertibleErrorCode(),
+                                   "C-carrier ADD64 does not target text");
+        uint64_t SectionAddress = SymbolSection->getAddress();
+        if (*Value < SectionAddress ||
+            *Value - SectionAddress >= SymbolSection->getSize())
+          return createStringError(inconvertibleErrorCode(),
+                                   "C-carrier ADD64 points outside text");
+        Expected<StringRef> SectionName = SymbolSection->getName();
+        if (!SectionName)
+          return SectionName.takeError();
+        S.TextSection = SectionName->str();
+        S.TextSectionOffset = *Value - SectionAddress;
+        S.RelocationSymbol = SymbolName->str();
+        Seen[Index].HasAdd = true;
+      } else {
+        if (*SymbolSection != SiteSection || *Value != Offset)
+          return createStringError(
+              inconvertibleErrorCode(),
+              "C-carrier SUB64 does not reference its own record base");
+        Seen[Index].HasSub = true;
+      }
+      S.RelocationType = "R_RISCV_ADD64+R_RISCV_SUB64";
+    }
+  }
+
+  for (const RelocationPair &Pair : Seen)
+    if (!Pair.HasAdd || !Pair.HasSub)
+      return createStringError(
+          inconvertibleErrorCode(),
+          "C-carrier PC lacks an ADD64/SUB64 relocation pair");
+  return Error::success();
+}
+
 } // namespace
 
 int main(int Argc, char **Argv) {
@@ -393,47 +596,110 @@ int main(int Argc, char **Argv) {
   if (IsRelocatable && LoadBias)
     return fail("--load-bias is invalid with --validate-relocatable");
 
-  std::optional<SectionRef> SiteSection;
+  SmallVector<std::pair<SectionRef, CarrierKind>, 4> SiteSections;
+  SmallVector<SectionRef, 2> ExpectedSections;
   for (SectionRef Section : Object->sections()) {
     Expected<StringRef> Name = Section.getName();
     if (!Name)
       return fail(toString(Name.takeError()));
-    if (*Name != SiteSectionName)
-      continue;
-    if (SiteSection)
-      return fail("linked image contains multiple IRQ site sections");
-    SiteSection = Section;
+    if (*Name == AssemblySectionName)
+      SiteSections.push_back({Section, CarrierKind::Assembly});
+    else if (*Name == CCarrierSectionName)
+      SiteSections.push_back({Section, CarrierKind::C});
+    else if (*Name == ExpectedSectionName)
+      ExpectedSections.push_back(Section);
   }
-  if (!SiteSection)
-    return fail(Twine("linked image lacks ") + SiteSectionName);
+  if (SiteSections.empty())
+    return fail(Twine("image lacks ") + AssemblySectionName + " and " +
+                CCarrierSectionName);
 
-  Expected<SmallVector<Site, 16>> SitesOrError =
-      readSites(*Object, *SiteSection, IsRelocatable);
-  if (!SitesOrError)
-    return fail(toString(SitesOrError.takeError()));
-  if (SitesOrError->empty())
+  SmallVector<Site, 32> Sites;
+  std::set<std::pair<uint64_t, uint64_t>> IDs;
+  std::set<SiteKey> ActualCSites;
+  SHA256 CombinedSectionHash;
+  json::Array JSONSections;
+  for (const auto &[Section, Carrier] : SiteSections) {
+    Expected<StringRef> Name = Section.getName();
+    if (!Name)
+      return fail(toString(Name.takeError()));
+    Expected<StringRef> Bytes = Section.getContents();
+    if (!Bytes)
+      return fail(toString(Bytes.takeError()));
+    CombinedSectionHash.update(*Name);
+    CombinedSectionHash.update(StringRef("\0", 1));
+    CombinedSectionHash.update(*Bytes);
+    JSONSections.push_back(json::Object{
+        {"name", *Name},
+        {"role", Carrier == CarrierKind::Assembly ? "site-records"
+                                                  : "pcsections-carrier"},
+        {"size", static_cast<int64_t>(Bytes->size())},
+        {"sha256", sha256(*Bytes)},
+    });
+
+    Expected<SmallVector<Site, 16>> Parsed =
+        readSites(*Object, Section, IsRelocatable, Carrier);
+    if (!Parsed)
+      return fail(toString(Parsed.takeError()));
+    if (IsRelocatable) {
+      Error Validation = Carrier == CarrierKind::Assembly
+                             ? validateRelocations(*Object, Section, *Parsed)
+                             : validateCRelocations(*Object, Section, *Parsed);
+      if (Validation)
+        return fail(toString(std::move(Validation)));
+    }
+    for (Site &S : *Parsed) {
+      if (!IDs.insert({S.IDHigh, S.IDLow}).second)
+        return fail("duplicate site identifier across carrier sections");
+      if (S.Carrier == CarrierKind::C)
+        ActualCSites.insert(key(S.IDHigh, S.IDLow, S.Kind, S.Flags));
+      Sites.push_back(std::move(S));
+    }
+  }
+  if (Sites.empty())
     return fail("IRQ site section contains no records");
-  if (IsRelocatable) {
-    if (Error Validation =
-            validateRelocations(*Object, *SiteSection, *SitesOrError))
-      return fail(toString(std::move(Validation)));
-  } else {
-    for (const Site &S : *SitesOrError)
-      if (LoadBias > std::numeric_limits<uint64_t>::max() - S.Address)
-        return fail("load bias overflows a runtime site address");
-  }
 
-  Expected<StringRef> SiteBytes = SiteSection->getContents();
-  if (!SiteBytes)
-    return fail(toString(SiteBytes.takeError()));
+  std::set<SiteKey> ExpectedCSites;
+  for (SectionRef Section : ExpectedSections) {
+    Expected<StringRef> Bytes = Section.getContents();
+    if (!Bytes)
+      return fail(toString(Bytes.takeError()));
+    CombinedSectionHash.update(ExpectedSectionName);
+    CombinedSectionHash.update(StringRef("\0", 1));
+    CombinedSectionHash.update(*Bytes);
+    JSONSections.push_back(json::Object{
+        {"name", ExpectedSectionName},
+        {"role", "expected-c-sites"},
+        {"size", static_cast<int64_t>(Bytes->size())},
+        {"sha256", sha256(*Bytes)},
+    });
+    Expected<SmallVector<ExpectedSite, 16>> Parsed = readExpectedSites(Section);
+    if (!Parsed)
+      return fail(toString(Parsed.takeError()));
+    for (const ExpectedSite &E : *Parsed)
+      if (!ExpectedCSites.insert(key(E.IDHigh, E.IDLow, E.Kind, E.Flags))
+               .second)
+        return fail("duplicate identifier in expected C-site table");
+  }
+  if (ActualCSites != ExpectedCSites)
+    return fail(Twine("C carrier/expectation mismatch: emitted ") +
+                Twine(ActualCSites.size()) + ", expected " +
+                Twine(ExpectedCSites.size()));
+
+  for (const Site &S : Sites)
+    if (!IsRelocatable &&
+        LoadBias > std::numeric_limits<uint64_t>::max() - S.Address)
+      return fail("load bias overflows a runtime site address");
+
+  std::string CombinedHash =
+      toHex(CombinedSectionHash.final(), /*LowerCase=*/true);
   BuildIDRef ID = getBuildID(Object.get());
 
   json::Array JSONSites;
-  for (const Site &S : *SitesOrError) {
+  for (const Site &S : Sites) {
     json::Object JSONSite{
         {"site_id", siteID(S.IDHigh, S.IDLow)}, {"kind", S.Kind},
         {"kind_name", siteKindName(S.Kind)},    {"flags", S.Flags},
-        {"text_section", S.TextSection},
+        {"carrier", carrierName(S.Carrier)},    {"text_section", S.TextSection},
     };
     if (IsRelocatable) {
       JSONSite["text_section_offset"] = hex64(S.TextSectionOffset);
@@ -471,7 +737,8 @@ int main(int Argc, char **Argv) {
       {"record_size", SiteRecordSize},
       {"trigger_phase", TriggerPhase},
       {"default_hit_count_scope", "per-vcpu"},
-      {"site_section_sha256", sha256(*SiteBytes)},
+      {"site_section_sha256", CombinedHash},
+      {"site_sections", std::move(JSONSections)},
       {"image", std::move(Image)},
       {"sites", std::move(JSONSites)},
   };

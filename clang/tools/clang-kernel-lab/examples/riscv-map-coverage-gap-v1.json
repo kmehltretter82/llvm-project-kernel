@@ -1,0 +1,36 @@
+{
+  "schema": 1,
+  "target_os": "linux",
+  "strict": true,
+  "require_each_rule": true,
+  "sites": [
+    {
+      "match": "function",
+      "symbol": "irq_map_probe",
+      "position": "entry",
+      "kind": 4,
+      "noinstr": true
+    },
+    {
+      "match": "call",
+      "symbol": "publish_irq_state",
+      "position": "before",
+      "kind": 39,
+      "noinstr": true
+    },
+    {
+      "match": "call",
+      "symbol": "publish_irq_state",
+      "position": "after",
+      "kind": 37,
+      "noinstr": true
+    },
+    {
+      "match": "function",
+      "symbol": "irq_map_probe",
+      "position": "exit",
+      "kind": 5,
+      "noinstr": true
+    }
+  ]
+}

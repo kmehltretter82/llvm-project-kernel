@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "target_os": "linux",
+  "strict": true,
+  "require_each_rule": true,
+  "sites": [
+    {
+      "match": "call",
+      "symbol": "publish_irq_state",
+      "position": "after",
+      "kind": 39,
+      "noinstr": true
+    }
+  ]
+}

@@ -545,11 +545,20 @@ PreservedAnalyses KernelLabPass::run(Module &M, ModuleAnalysisManager &) {
 
 static void registerCallbacks(PassBuilder &PB) {
   std::shared_ptr<const LoadedConfig> Loaded = loadConfig();
+#if LLVM_VERSION_MAJOR >= 24
+  PB.registerPipelineStartEPCallback([Loaded](ModulePassManager &Manager,
+                                              OptimizationLevel,
+                                              ThinOrFullLTOPhase) {
+    if (Loaded->Requested)
+      Manager.addPass(KernelLabPass(Loaded));
+  });
+#else
   PB.registerPipelineStartEPCallback(
       [Loaded](ModulePassManager &Manager, OptimizationLevel) {
         if (Loaded->Requested)
           Manager.addPass(KernelLabPass(Loaded));
       });
+#endif
   PB.registerPipelineParsingCallback(
       [Loaded](StringRef Name, ModulePassManager &Manager,
                ArrayRef<PassBuilder::PipelineElement>) {

@@ -47,6 +47,13 @@ The first annotations cover RISC-V vector entry/return, the first state
 publication visible to tracing, IRQ-mask transitions, preempt-count changes,
 softirq entry/exit, RCU transitions, and task-local provenance.
 
+The first C path is a separate optimizer-last `ClangKernelLabMap` pass.  It
+attaches LLVM `!pcsections` metadata to selected existing instructions under
+an explicit RV64/ELF/medium-code-model gate.  A companion expected-site table
+makes dropped metadata fatal in the object reader.  This is already useful for
+surviving store/atomic publication instructions; call, entry, and return
+propagation remain backend work and are covered by a negative fixture.
+
 ### Layer B: explicit callback and perturb mode
 
 `ClangKernelLab` is an early pass-plugin prototype for code-changing
@@ -256,6 +263,11 @@ As of 2026-10-15 on `kernel-lab-riscv`:
 - object mode validates one `R_RISCV_64` relocation per address field and
   rejects a wrong-width relocation that could otherwise link to plausible
   bytes;
+- the optimizer-last C map pass emits one qualified 32-byte `!pcsections`
+  carrier without changing object or linked `.text`, and its object
+  `ADD64`/`SUB64` relocation pair resolves correctly across linker relaxation;
+- a four-site call/entry/return negative deliberately loses three backend
+  markers and is rejected by the emitted-versus-expected coverage gate;
 - the callback/perturb plugin builds against installed LLVM 22 using `-j1`;
 - its RISC-V opt-in/disabled smoke test passes with four callbacks and one
   perturbation point;
@@ -265,8 +277,8 @@ As of 2026-10-15 on `kernel-lab-riscv`:
 - no Linux boot, QEMU injection, FPGA run, or correctness verdict has yet been
   claimed from this new branch.
 
-The next compiler task is a C/statement annotation path that survives final
-code emission without changing executable bytes, followed by executable
-section/symbol/relaxation/unwind inertness gates.  The next QEMU task is the
-RV64 exact-site TB stop without injection, followed by the real PLIC endpoint
-and deterministic schedule.
+The next compiler task is to preserve PC-section metadata on RISC-V calls,
+returns, and explicit statement sites, then expand inertness checks to all
+executable sections, symbols, relaxation, and unwind data.  The next QEMU task
+is the RV64 exact-site TB stop without injection, followed by the real PLIC
+endpoint and deterministic schedule.

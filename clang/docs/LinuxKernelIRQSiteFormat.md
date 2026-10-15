@@ -45,6 +45,36 @@ that input section while producing `vmlinux`.  A post-link tool may emit a
 sidecar and strip the records from a boot image only after resolving and
 hashing them.
 
+### Late C carrier
+
+The first text-inert C implementation uses LLVM `!pcsections` metadata after
+IR optimization.  LLVM specifies that this metadata does not affect
+optimizations or generated code outside the requested data section.  For the
+RV64 medium/large code model, `.riscv.linux_irq_c_sites` contains a separate
+32-byte carrier:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 8 | Signed PC-relative delta from this field to the site. |
+| 8 | 1 | Version. |
+| 9 | 1 | Record size. |
+| 10 | 2 | Kind. |
+| 12 | 4 | Flags. |
+| 16 | 8 | Site ID low half. |
+| 24 | 8 | Site ID high half. |
+
+Relocatable objects encode the first field with an `R_RISCV_ADD64` and
+`R_RISCV_SUB64` pair.  The linked-image tool resolves this carrier into the
+same sidecar representation as an assembly record.  Map compilation requires
+`-mcmodel=medany` so LLVM uses an eight-byte PC field; other code models are
+rejected rather than changing the record size.
+
+PC metadata can be lost when an IR instruction is deleted or a backend fails
+to propagate it.  Therefore the pass also emits one 24-byte entry in
+`.riscv.linux_irq_expected` for every requested C site: kind, reserved zero,
+flags, and the 128-bit ID.  The object/link tool requires the emitted and
+expected sets to be identical.  A warning is not treated as coverage.
+
 ## Flags
 
 | Bit | Name | Requirement |
@@ -123,8 +153,9 @@ garbage collection, ThinLTO, and split-debug qualification remain required.
 
 `clang/utils/kernel-lab/irq_site_format.py` is the bounded reference encoder
 and decoder for resolved records.  `riscv/linux_irq_sites.inc` emits the
-assembly form.  `llvm-riscv-irq-sites` validates linked RV64 images and emits
-the initial sidecar; its `--validate-relocatable` mode additionally requires
-one `R_RISCV_64` relocation from each address field to an in-range text
-boundary.  These remain experimental tools and do not establish an installed
-Linux ABI.
+assembly form.  `ClangKernelLabMap` attaches late C PC-section records selected
+by a bounded policy file.  `llvm-riscv-irq-sites` validates linked RV64 images
+and emits the initial sidecar; its `--validate-relocatable` mode additionally
+requires either one `R_RISCV_64` assembly relocation or the exact C-carrier
+`ADD64`/`SUB64` pair to an in-range text boundary.  These remain experimental
+tools and do not establish an installed Linux ABI.

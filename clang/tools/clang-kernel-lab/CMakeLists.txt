@@ -16,9 +16,23 @@ add_llvm_pass_plugin(ClangKernelLab
   PARTIAL_SOURCES_INTENDED
   )
 
+add_llvm_pass_plugin(ClangKernelLabMap
+  ClangKernelLabMap.cpp
+  PARTIAL_SOURCES_INTENDED
+  )
+
 set_target_properties(ClangKernelLab PROPERTIES
   CXX_STANDARD 17
   CXX_STANDARD_REQUIRED YES
+  )
+
+set_target_properties(ClangKernelLabMap PROPERTIES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED YES
+  )
+
+target_include_directories(ClangKernelLabMap PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../include
   )
 
 llvm_map_components_to_libnames(KERNEL_LAB_LLVM_LIBS

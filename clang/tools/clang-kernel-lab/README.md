@@ -1,8 +1,11 @@
 # Clang Kernel Lab prototype
 
-This directory contains two deliberately separate experimental tools for the
-Linux IRQ/PREEMPT_RT laboratory:
+This directory contains three deliberately separated experimental components
+for the Linux IRQ/PREEMPT_RT laboratory:
 
+- `ClangKernelLabMap` is the text-inert, optimizer-last map pass.  It emits
+  LLVM PC-section records plus an independently checked expectation table and
+  requires RV64 ELF with `-mcmodel=medany`.
 - `llvm-riscv-irq-sites` validates the text-inert 32-byte site records and
   emits a linked-image JSON sidecar.  Its `--validate-relocatable` mode checks
   that every object record has exactly one `R_RISCV_64` relocation to an
@@ -25,7 +28,7 @@ cmake -S clang/tools/clang-kernel-lab \
   -G Ninja \
   -DLLVM_DIR=/path/to/lib/cmake/llvm
 cmake --build ../build-kernel-lab \
-  --target ClangKernelLab llvm-riscv-irq-sites -- -j1
+  --target ClangKernelLabMap ClangKernelLab llvm-riscv-irq-sites -- -j1
 ```
 
 The in-tree build is opt-in with `-DCLANG_ENABLE_KERNEL_LAB=ON`.  Local
@@ -43,9 +46,18 @@ python3 clang/utils/kernel-lab/tests/test_riscv_site_map.py \
 python3 clang/tools/clang-kernel-lab/tests/test_callback_plugin.py \
   --clang /path/to/clang \
   --plugin ../build-kernel-lab/ClangKernelLab.so
+python3 clang/tools/clang-kernel-lab/tests/test_map_plugin.py \
+  --clang /path/to/clang --ld-lld /path/to/ld.lld \
+  --llvm-objcopy /path/to/llvm-objcopy \
+  --plugin ../build-kernel-lab/ClangKernelLabMap.so \
+  --site-tool ../build-kernel-lab/llvm-riscv-irq-sites
 ```
 
 On macOS the pass-plugin suffix is `.dylib`.  The site-map test checks object
 and linked `.text` identity, linked sidecar identity/load-bias fields, valid
 object relocations, linked/object mode separation, and rejection of a
 deliberately wrong-width relocation.
+
+The C-map test additionally proves disabled/enabled object and linked `.text`
+identity, validates the PC-relative relocation pair across linker relaxation,
+and proves that the tool rejects a requested site dropped by code generation.
