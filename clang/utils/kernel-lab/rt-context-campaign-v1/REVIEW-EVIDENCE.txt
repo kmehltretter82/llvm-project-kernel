@@ -1,0 +1,27 @@
+Independent phase-3 API-fixture effect/entry review, frozen before execution.
+The source external-effect-definitions.c is reviewed evidence for the three
+external declarations: an RT lock acquire/release may wait on PREEMPT_RT;
+schedule is an ordinary sleeping operation; foreign_context_action is opaque.
+These are effect capabilities, not guarantees that a call will physically sleep.
+No arbitrary helper-name whitelist may determine them. Manifest fields bind exact
+source file/hash/token-offset, function type and linkage, with profile macros,
+target triple and every real loaded file/hash verified before any seed/effect.
+
+An explicit task/softirq/threaded-IRQ fixture with IRQs enabled and no preemption
+or raw-lock prohibition permits the declared RT wait. BH/RCU/migration context
+alone does not forbid RT wait. Raw lock, preemption disabled, hard IRQs disabled,
+hard IRQ and NMI fixture entries forbid RT wait on RT. A declared RT-only wait
+has no RT waiting effect on non-RT. Ordinary sleeping operations remain invalid
+in hard IRQ or an ordinary RCU read section. Entry facts are borrowed ambient
+context; they are not locks or irqsave tokens owned by the current function.
+Only top-frame analysis may install an entry seed. Inlining the same helper must
+preserve the caller's actual context. Same-spelling internal functions in other
+TUs must not share entry/effect identities. Unknown effect yields explicit
+incomplete context; a prior known witness cannot disappear. We do not assert
+post-opaque context preservation or require a new certain witness after it.
+
+Stale source, header, config/autoconf, evidence or target identity; conflicting
+records; and duplicate JSON keys must cause explicit incomplete validation and
+must not authorize seeds/effects. The no-manifest control preserves existing
+primitive behavior. Failed/timed-out/zero-analysis executions are coverage gaps.
+The frozen oracle describes these predicates independently of compiler output.

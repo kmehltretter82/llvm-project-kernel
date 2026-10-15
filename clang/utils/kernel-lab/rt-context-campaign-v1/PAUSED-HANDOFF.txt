@@ -1,0 +1,78 @@
+Paused phase-3 test handoff
+Captured UTC: 2026-10-12T20:24:16.316924+00:00
+
+Status: prepared only. Parent instructed pause after the next buildable checkpoint;
+no importer compiler was executed here and no 174-record matrix was launched.
+No model/source edits, builds, hardware/controller actions, or additional tests
+were performed for this handoff. Frozen original oracle bytes remain unchanged.
+
+Prepared paths:
+  Runner: /home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/run.py
+  Original expected semantics: /home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/EXPECTED.json
+  Original freeze/pins: /home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/ORACLE-FREEZE.json
+  Separately reviewed post-call coverage supplement:
+    /home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/COVERAGE-SEMANTICS-SUPPLEMENT.json
+    /home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/COVERAGE-SEMANTICS-SUPPLEMENT.txt
+  Fixture bodies/evidence: fixture_cases.c, same_static_a.c, same_static_b.c,
+    fixture-context.h, external-effect-definitions.c, REVIEW-EVIDENCE.txt
+  Preparation only: /home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/prepared-v1/PLAN.json
+  Mock encoder exercise only: /home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/encoder-selfcheck/RESULT.json
+  This handoff's exact artifact hashes: /home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/PAUSED-HANDOFF.json
+
+The independent oracle was frozen at 2026-10-12T20:06:37.281340+00:00:
+29 cases across six profiles = 174 test records. Expected RT wait and ordinary
+sleep predicates were specified before new-binary execution. Coverage supplement
+was fixed at 2026-10-12T20:12:38.593951+00:00 before new-binary execution. It does
+not change operation-legality predicates. Imported effects do not imply proved
+post-call context preservation; their visible gaps keep complete_coverage=false.
+The fixtures are API fixtures and establish no kernel or runtime verdict.
+
+Encoder compatibility observed in the saved importer (read-only):
+  LinuxAtomicSleepChecker.cpp:181-204 emits exact canonical FUNCTION_FIELDS:
+    name, type, linkage, source_path, source_sha256, offset.
+  :254 facts shape matches schema/effect_model/target_triple/predefines_sha256/
+    translation_unit/files/macros/functions consumed by runner; meanings come only
+    from the independent oracle, never inferred from raw identity facts.
+  :316 onward checks compiler identity, every disk pin, and loaded source buffers.
+  :353 onward checks configuration kind, kernel .config pin and loaded autoconf.
+  :384 requires pinned evidence; subsequent matching uses exact bindings.
+  :394 rejects unbound/conflicting records transactionally.
+  :401 rejects effect overrides of already modeled primitives.
+  :955 onward applies entry seeds only to top frames.
+  :1056 onward emits an incomplete-context gap after imported noninlined effects.
+Actual compile/API correctness remains parent-owned and pending its build repair;
+this is a source/interface review, not successful execution evidence.
+
+Material compatibility constraint before any future qualification:
+  EXPECTED.json:1563-1574 frozen static_tu_b_task_seed intentionally includes the
+  foreign same-name static entry from same_static_a.c in addition to its own B
+  task entry. Current transactional importer rejects that foreign unbound record.
+  Therefore this does not currently exercise a valid B task-entry isolation
+  control; it is rejected input and must not count as supported-operation success.
+  Preserve the frozen oracle and record unsupported/failure if policy remains.
+
+Runner qualification limitation to repair separately before any future run:
+  run.py:82 presently merges manifest-validation diagnostics with post-call
+  incomplete-context diagnostics; :278-281 checks their combined presence.
+  A rejected intended-valid manifest could otherwise falsely satisfy a legal
+  case whose coverage supplement requires a gap. Require no validation failure
+  for intended-valid cases, and require validation failure for mutation cases.
+  This is runner/infrastructure hardening; do not adjust frozen predicates.
+  None of those changes were made after the stop instruction.
+
+A later authorized full run needs a pinned successful build manifest and compiler
+SHA. Existing runner executes one compiler process at a time, 120-second wall and
+3072-MiB address-space bounds. Full execution requires 18 identity captures
+(three sources x six profiles), then 174 case invocations. Resource exhaustion,
+missing positive analyzer exploration, drift, unexpected warnings, and bounds
+are failures/gaps; silence cannot establish supported coverage.
+
+Completed separate evidence available for handoff:
+  /home/karl/linux-work/dmadebug/rt-clang-work-20261012/annotation-checks/bounded-netpoll-v3/REPORT.txt
+  /home/karl/linux-work/dmadebug/rt-clang-work-20261012/annotation-checks/bounded-netpoll-v3/RESULTS.json
+  /home/karl/linux-work/dmadebug/rt-clang-work-20261012/annotation-checks/bounded-netpoll-v3/FINAL-VERIFICATION.json
+  /home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-inventory/REPORT.txt
+  /home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-inventory/DRIVER-CALLBACKS.json
+  /home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-inventory/ENTRY-CONTEXTS.json
+Annotation evidence covers two bounded opt-in netpoll compiles only; phase-3
+inventory is read-only source evidence. Neither provides a kernel verdict.

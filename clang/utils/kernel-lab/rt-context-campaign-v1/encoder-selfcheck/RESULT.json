@@ -1,0 +1,176 @@
+{
+  "actual_compiler_identities_not_claimed": true,
+  "cases_encoded": 28,
+  "frozen_original_inputs_unchanged": true,
+  "records": [
+    {
+      "case": "task_rt_wait",
+      "encoder_completed": true,
+      "functions": 2,
+      "manifest_mutation": null
+    },
+    {
+      "case": "preempt_rt_wait",
+      "encoder_completed": true,
+      "functions": 2,
+      "manifest_mutation": null
+    },
+    {
+      "case": "irq_off_rt_wait",
+      "encoder_completed": true,
+      "functions": 2,
+      "manifest_mutation": null
+    },
+    {
+      "case": "hardirq_rt_wait",
+      "encoder_completed": true,
+      "functions": 2,
+      "manifest_mutation": null
+    },
+    {
+      "case": "nmi_rt_wait",
+      "encoder_completed": true,
+      "functions": 2,
+      "manifest_mutation": null
+    },
+    {
+      "case": "raw_lock_rt_wait",
+      "encoder_completed": true,
+      "functions": 2,
+      "manifest_mutation": null
+    },
+    {
+      "case": "bh_rt_wait_valid",
+      "encoder_completed": true,
+      "functions": 2,
+      "manifest_mutation": null
+    },
+    {
+      "case": "rcu_rt_wait_valid",
+      "encoder_completed": true,
+      "functions": 2,
+      "manifest_mutation": null
+    },
+    {
+      "case": "migration_rt_wait_valid",
+      "encoder_completed": true,
+      "functions": 2,
+      "manifest_mutation": null
+    },
+    {
+      "case": "softirq_rt_wait_valid",
+      "encoder_completed": true,
+      "functions": 2,
+      "manifest_mutation": null
+    },
+    {
+      "case": "threaded_irq_rt_wait_valid",
+      "encoder_completed": true,
+      "functions": 2,
+      "manifest_mutation": null
+    },
+    {
+      "case": "task_ordinary_sleep_valid",
+      "encoder_completed": true,
+      "functions": 2,
+      "manifest_mutation": null
+    },
+    {
+      "case": "hardirq_ordinary_sleep",
+      "encoder_completed": true,
+      "functions": 2,
+      "manifest_mutation": null
+    },
+    {
+      "case": "rcu_ordinary_sleep",
+      "encoder_completed": true,
+      "functions": 2,
+      "manifest_mutation": null
+    },
+    {
+      "case": "explicit_unknown_effect",
+      "encoder_completed": true,
+      "functions": 2,
+      "manifest_mutation": null
+    },
+    {
+      "case": "unknown_preserves_prior_witness",
+      "encoder_completed": true,
+      "functions": 3,
+      "manifest_mutation": null
+    },
+    {
+      "case": "stale_translation_unit",
+      "encoder_completed": true,
+      "functions": 2,
+      "manifest_mutation": "tu_hash"
+    },
+    {
+      "case": "stale_review_evidence",
+      "encoder_completed": true,
+      "functions": 2,
+      "manifest_mutation": "evidence_hash"
+    },
+    {
+      "case": "stale_loaded_header",
+      "encoder_completed": true,
+      "functions": 2,
+      "manifest_mutation": "header_hash"
+    },
+    {
+      "case": "stale_config_file",
+      "encoder_completed": true,
+      "functions": 2,
+      "manifest_mutation": "config_hash"
+    },
+    {
+      "case": "stale_loaded_autoconf",
+      "encoder_completed": true,
+      "functions": 2,
+      "manifest_mutation": "autoconf_hash"
+    },
+    {
+      "case": "wrong_target_triple",
+      "encoder_completed": true,
+      "functions": 2,
+      "manifest_mutation": "target_triple"
+    },
+    {
+      "case": "conflicting_effects",
+      "encoder_completed": true,
+      "functions": 3,
+      "manifest_mutation": "conflicting_record"
+    },
+    {
+      "case": "duplicate_json_key",
+      "encoder_completed": true,
+      "functions": 2,
+      "manifest_mutation": "duplicate_key"
+    },
+    {
+      "case": "inlined_entry_seed_isolation",
+      "encoder_completed": true,
+      "functions": 3,
+      "manifest_mutation": null
+    },
+    {
+      "case": "top_frame_inline_entry_seed",
+      "encoder_completed": true,
+      "functions": 2,
+      "manifest_mutation": null
+    },
+    {
+      "case": "static_tu_a_irq_seed",
+      "encoder_completed": true,
+      "functions": 2,
+      "manifest_mutation": null
+    },
+    {
+      "case": "static_tu_b_task_seed",
+      "encoder_completed": true,
+      "functions": 3,
+      "manifest_mutation": null
+    }
+  ],
+  "status": "encoder-only mock metadata selfcheck; no compiler or semantic test executed"
+}

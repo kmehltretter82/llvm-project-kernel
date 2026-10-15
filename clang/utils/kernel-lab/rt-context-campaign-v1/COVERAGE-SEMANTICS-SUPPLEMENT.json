@@ -1,0 +1,184 @@
+{
+  "case_overlays": {
+    "bh_rt_wait_valid": {
+      "allowed_post_import_context_gap": true,
+      "complete_coverage": false,
+      "reason": "Every noninlined imported effect has unknown net context effects; invalid identity cannot authorize any imported meaning.",
+      "required_incomplete_context_warning": true
+    },
+    "conflicting_effects": {
+      "allowed_post_import_context_gap": true,
+      "complete_coverage": false,
+      "reason": "Every noninlined imported effect has unknown net context effects; invalid identity cannot authorize any imported meaning.",
+      "required_incomplete_context_warning": true
+    },
+    "duplicate_json_key": {
+      "allowed_post_import_context_gap": true,
+      "complete_coverage": false,
+      "reason": "Every noninlined imported effect has unknown net context effects; invalid identity cannot authorize any imported meaning.",
+      "required_incomplete_context_warning": true
+    },
+    "explicit_unknown_effect": {
+      "allowed_post_import_context_gap": true,
+      "complete_coverage": false,
+      "reason": "Every noninlined imported effect has unknown net context effects; invalid identity cannot authorize any imported meaning.",
+      "required_incomplete_context_warning": true
+    },
+    "hardirq_ordinary_sleep": {
+      "allowed_post_import_context_gap": true,
+      "complete_coverage": false,
+      "reason": "Every noninlined imported effect has unknown net context effects; invalid identity cannot authorize any imported meaning.",
+      "required_incomplete_context_warning": true
+    },
+    "hardirq_rt_wait": {
+      "allowed_post_import_context_gap": true,
+      "complete_coverage": false,
+      "reason": "Every noninlined imported effect has unknown net context effects; invalid identity cannot authorize any imported meaning.",
+      "required_incomplete_context_warning": true
+    },
+    "inlined_entry_seed_isolation": {
+      "allowed_post_import_context_gap": true,
+      "complete_coverage": false,
+      "reason": "Every noninlined imported effect has unknown net context effects; invalid identity cannot authorize any imported meaning.",
+      "required_incomplete_context_warning": true
+    },
+    "irq_off_rt_wait": {
+      "allowed_post_import_context_gap": true,
+      "complete_coverage": false,
+      "reason": "Every noninlined imported effect has unknown net context effects; invalid identity cannot authorize any imported meaning.",
+      "required_incomplete_context_warning": true
+    },
+    "migration_rt_wait_valid": {
+      "allowed_post_import_context_gap": true,
+      "complete_coverage": false,
+      "reason": "Every noninlined imported effect has unknown net context effects; invalid identity cannot authorize any imported meaning.",
+      "required_incomplete_context_warning": true
+    },
+    "nmi_rt_wait": {
+      "allowed_post_import_context_gap": true,
+      "complete_coverage": false,
+      "reason": "Every noninlined imported effect has unknown net context effects; invalid identity cannot authorize any imported meaning.",
+      "required_incomplete_context_warning": true
+    },
+    "no_manifest_unchanged": {
+      "allowed_post_import_context_gap": true,
+      "complete_coverage": true,
+      "reason": "Every noninlined imported effect has unknown net context effects; invalid identity cannot authorize any imported meaning.",
+      "required_incomplete_context_warning": false
+    },
+    "preempt_rt_wait": {
+      "allowed_post_import_context_gap": true,
+      "complete_coverage": false,
+      "reason": "Every noninlined imported effect has unknown net context effects; invalid identity cannot authorize any imported meaning.",
+      "required_incomplete_context_warning": true
+    },
+    "raw_lock_rt_wait": {
+      "allowed_post_import_context_gap": true,
+      "complete_coverage": false,
+      "reason": "Every noninlined imported effect has unknown net context effects; invalid identity cannot authorize any imported meaning.",
+      "required_incomplete_context_warning": true
+    },
+    "rcu_ordinary_sleep": {
+      "allowed_post_import_context_gap": true,
+      "complete_coverage": false,
+      "reason": "Every noninlined imported effect has unknown net context effects; invalid identity cannot authorize any imported meaning.",
+      "required_incomplete_context_warning": true
+    },
+    "rcu_rt_wait_valid": {
+      "allowed_post_import_context_gap": true,
+      "complete_coverage": false,
+      "reason": "Every noninlined imported effect has unknown net context effects; invalid identity cannot authorize any imported meaning.",
+      "required_incomplete_context_warning": true
+    },
+    "softirq_rt_wait_valid": {
+      "allowed_post_import_context_gap": true,
+      "complete_coverage": false,
+      "reason": "Every noninlined imported effect has unknown net context effects; invalid identity cannot authorize any imported meaning.",
+      "required_incomplete_context_warning": true
+    },
+    "stale_config_file": {
+      "allowed_post_import_context_gap": true,
+      "complete_coverage": false,
+      "reason": "Every noninlined imported effect has unknown net context effects; invalid identity cannot authorize any imported meaning.",
+      "required_incomplete_context_warning": true
+    },
+    "stale_loaded_autoconf": {
+      "allowed_post_import_context_gap": true,
+      "complete_coverage": false,
+      "reason": "Every noninlined imported effect has unknown net context effects; invalid identity cannot authorize any imported meaning.",
+      "required_incomplete_context_warning": true
+    },
+    "stale_loaded_header": {
+      "allowed_post_import_context_gap": true,
+      "complete_coverage": false,
+      "reason": "Every noninlined imported effect has unknown net context effects; invalid identity cannot authorize any imported meaning.",
+      "required_incomplete_context_warning": true
+    },
+    "stale_review_evidence": {
+      "allowed_post_import_context_gap": true,
+      "complete_coverage": false,
+      "reason": "Every noninlined imported effect has unknown net context effects; invalid identity cannot authorize any imported meaning.",
+      "required_incomplete_context_warning": true
+    },
+    "stale_translation_unit": {
+      "allowed_post_import_context_gap": true,
+      "complete_coverage": false,
+      "reason": "Every noninlined imported effect has unknown net context effects; invalid identity cannot authorize any imported meaning.",
+      "required_incomplete_context_warning": true
+    },
+    "static_tu_a_irq_seed": {
+      "allowed_post_import_context_gap": true,
+      "complete_coverage": false,
+      "reason": "Every noninlined imported effect has unknown net context effects; invalid identity cannot authorize any imported meaning.",
+      "required_incomplete_context_warning": true
+    },
+    "static_tu_b_task_seed": {
+      "allowed_post_import_context_gap": true,
+      "complete_coverage": false,
+      "reason": "Every noninlined imported effect has unknown net context effects; invalid identity cannot authorize any imported meaning.",
+      "required_incomplete_context_warning": true
+    },
+    "task_ordinary_sleep_valid": {
+      "allowed_post_import_context_gap": true,
+      "complete_coverage": false,
+      "reason": "Every noninlined imported effect has unknown net context effects; invalid identity cannot authorize any imported meaning.",
+      "required_incomplete_context_warning": true
+    },
+    "task_rt_wait": {
+      "allowed_post_import_context_gap": true,
+      "complete_coverage": false,
+      "reason": "Every noninlined imported effect has unknown net context effects; invalid identity cannot authorize any imported meaning.",
+      "required_incomplete_context_warning": true
+    },
+    "threaded_irq_rt_wait_valid": {
+      "allowed_post_import_context_gap": true,
+      "complete_coverage": false,
+      "reason": "Every noninlined imported effect has unknown net context effects; invalid identity cannot authorize any imported meaning.",
+      "required_incomplete_context_warning": true
+    },
+    "top_frame_inline_entry_seed": {
+      "allowed_post_import_context_gap": true,
+      "complete_coverage": false,
+      "reason": "Every noninlined imported effect has unknown net context effects; invalid identity cannot authorize any imported meaning.",
+      "required_incomplete_context_warning": true
+    },
+    "unknown_preserves_prior_witness": {
+      "allowed_post_import_context_gap": true,
+      "complete_coverage": false,
+      "reason": "Every noninlined imported effect has unknown net context effects; invalid identity cannot authorize any imported meaning.",
+      "required_incomplete_context_warning": true
+    },
+    "wrong_target_triple": {
+      "allowed_post_import_context_gap": true,
+      "complete_coverage": false,
+      "reason": "Every noninlined imported effect has unknown net context effects; invalid identity cannot authorize any imported meaning.",
+      "required_incomplete_context_warning": true
+    }
+  },
+  "created_utc": "2026-10-12T20:12:38.593951+00:00",
+  "illegal_wait_and_ordinary_sleep_predicates_unchanged": true,
+  "new_importer_binary_executed": false,
+  "original_oracle_sha256": "7954e906d0b826ef7a49d3b0a32f1a02ac5b3eb41d24de3118920587b5bb2177",
+  "reason": "Final importer scope explicitly provides may-wait capabilities without post-call context-preserving net effects. This requirement was clarified before any new importer compiler execution. The original frozen oracle already disclaims post-call preservation, but its initial gap/coverage booleans were too strict. Preserve original raw verdict separately.",
+  "schema": 1
+}

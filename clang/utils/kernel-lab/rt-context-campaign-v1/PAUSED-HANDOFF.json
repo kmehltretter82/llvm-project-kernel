@@ -1,0 +1,34 @@
+{
+  "artifact_sha256": {
+    "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/COVERAGE-SEMANTICS-SUPPLEMENT.json": "e23e5e32b341934ca1d3dcdffdb8b06f8c75c608c3cef62612f07520f774f321",
+    "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/COVERAGE-SEMANTICS-SUPPLEMENT.txt": "ae9ec34f7a7ba03c66de8b4c32ee7441e5b10a50aaf1845ee6e218947af0e4b8",
+    "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/EXPECTED.json": "7954e906d0b826ef7a49d3b0a32f1a02ac5b3eb41d24de3118920587b5bb2177",
+    "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/ORACLE-FREEZE.json": "8cc84ede5f614bdb0f0166752073f1d37a56e30a08f89f5df0a574bc7c2f8b7f",
+    "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/README.txt": "719a2311eb29733a64fb9ec9062934232e3a083098220a9e05afd6c9b3c61646",
+    "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/REVIEW-EVIDENCE.txt": "a3b8fccd1f0f0f12366e26b38b6dcacdf8b7d5fbb51090d0da226133ea9f1e66",
+    "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/external-effect-definitions.c": "5063835d4b05559529f349bd3c4167f5b0d630ebcd0a3a88988af706f68c4038",
+    "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/fixture-context.h": "6ba9b9f2b9876bf95cf9033e5e5b73855475ed7e27a8cae7d04fff6b65a8e4d0",
+    "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/fixture_cases.c": "bca4802593364ea8012120b3d7a20007b933e9f7545cca722489d840d6c849c7",
+    "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/run.py": "0f65883bacb71005871f621a9f84e930c6ff428f8d69d3c0a6378bfe97cadbc5",
+    "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/same_static_a.c": "1ff25dc910da1f27f58fb9570959a60f0d5e6b696b6232d5df5326f080c17ca4",
+    "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/same_static_b.c": "5f459b29a0f4cbb56775b5513ffffa9ab32b036a3b7dbad0b77904bd723ffa84"
+  },
+  "captured_utc": "2026-10-12T20:24:16.316924+00:00",
+  "constraints": [
+    "foreign-static-record-rejected-by-transactional-importer",
+    "runner-must-distinguish-validation-failure-from-post-call-gap"
+  ],
+  "frozen_original_pins_verified_unchanged": true,
+  "handoff_text_sha256": "18dae8b39a9ac62c366244cd8629309074d0612b3b8462e0dd0fb3c5b43e2c31",
+  "identity_capture_processes_if_later_run": 18,
+  "kernel_verdict": "not established",
+  "matrix_executed": false,
+  "new_importer_compiler_executed": false,
+  "reviewed_importer_source": {
+    "build_verified": false,
+    "observed_sha256": "0e26e377df9f0dce442b7860b328c6c42cb0383e5ab0e394c60e6896ffac9da2",
+    "path": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/llvm-project/clang/lib/StaticAnalyzer/Checkers/LinuxAtomicSleepChecker.cpp"
+  },
+  "status": "paused-prepared-only",
+  "test_records": 174
+}

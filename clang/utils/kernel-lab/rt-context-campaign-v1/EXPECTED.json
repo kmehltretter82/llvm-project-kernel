@@ -1,0 +1,1600 @@
+{
+  "cases": [
+    {
+      "context": {
+        "bh": 0,
+        "irq_mode": "enabled",
+        "kind": "task",
+        "migration": 0,
+        "preempt": 0,
+        "rcu": 0
+      },
+      "effect": "rt-lock-wait",
+      "expected": {
+        "arm64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        }
+      },
+      "function": "p3_case_task_wait",
+      "id": "task_rt_wait",
+      "manifest_mutation": null,
+      "source": "fixture_cases.c"
+    },
+    {
+      "context": {
+        "bh": 0,
+        "irq_mode": "enabled",
+        "kind": "task",
+        "migration": 0,
+        "preempt": 1,
+        "rcu": 0
+      },
+      "effect": "rt-lock-wait",
+      "expected": {
+        "arm64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        },
+        "arm64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        },
+        "x86_64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        },
+        "x86_64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        }
+      },
+      "function": "p3_case_preempt_wait",
+      "id": "preempt_rt_wait",
+      "manifest_mutation": null,
+      "source": "fixture_cases.c"
+    },
+    {
+      "context": {
+        "bh": 0,
+        "irq_mode": "disabled",
+        "kind": "task",
+        "migration": 0,
+        "preempt": 0,
+        "rcu": 0
+      },
+      "effect": "rt-lock-wait",
+      "expected": {
+        "arm64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        },
+        "arm64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        },
+        "x86_64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        },
+        "x86_64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        }
+      },
+      "function": "p3_case_irq_off_wait",
+      "id": "irq_off_rt_wait",
+      "manifest_mutation": null,
+      "source": "fixture_cases.c"
+    },
+    {
+      "context": {
+        "bh": 0,
+        "irq_mode": "disabled",
+        "kind": "hardirq",
+        "migration": 0,
+        "preempt": 0,
+        "rcu": 0
+      },
+      "effect": "rt-lock-wait",
+      "expected": {
+        "arm64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        },
+        "arm64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        },
+        "x86_64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        },
+        "x86_64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        }
+      },
+      "function": "p3_case_hardirq_wait",
+      "id": "hardirq_rt_wait",
+      "manifest_mutation": null,
+      "source": "fixture_cases.c"
+    },
+    {
+      "context": {
+        "bh": 0,
+        "irq_mode": "disabled",
+        "kind": "nmi",
+        "migration": 0,
+        "preempt": 0,
+        "rcu": 0
+      },
+      "effect": "rt-lock-wait",
+      "expected": {
+        "arm64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        },
+        "arm64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        },
+        "x86_64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        },
+        "x86_64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        }
+      },
+      "function": "p3_case_nmi_wait",
+      "id": "nmi_rt_wait",
+      "manifest_mutation": null,
+      "source": "fixture_cases.c"
+    },
+    {
+      "context": {
+        "bh": 0,
+        "irq_mode": "enabled",
+        "kind": "task",
+        "migration": 0,
+        "preempt": 0,
+        "rcu": 0
+      },
+      "effect": "rt-lock-wait",
+      "expected": {
+        "arm64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        },
+        "arm64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        },
+        "x86_64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        },
+        "x86_64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        }
+      },
+      "function": "p3_case_raw_wait",
+      "id": "raw_lock_rt_wait",
+      "manifest_mutation": null,
+      "source": "fixture_cases.c"
+    },
+    {
+      "context": {
+        "bh": 1,
+        "irq_mode": "enabled",
+        "kind": "task",
+        "migration": 0,
+        "preempt": 0,
+        "rcu": 0
+      },
+      "effect": "rt-lock-wait",
+      "expected": {
+        "arm64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        }
+      },
+      "function": "p3_case_bh_wait",
+      "id": "bh_rt_wait_valid",
+      "manifest_mutation": null,
+      "source": "fixture_cases.c"
+    },
+    {
+      "context": {
+        "bh": 0,
+        "irq_mode": "enabled",
+        "kind": "task",
+        "migration": 0,
+        "preempt": 0,
+        "rcu": 1
+      },
+      "effect": "rt-lock-wait",
+      "expected": {
+        "arm64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        }
+      },
+      "function": "p3_case_rcu_wait",
+      "id": "rcu_rt_wait_valid",
+      "manifest_mutation": null,
+      "source": "fixture_cases.c"
+    },
+    {
+      "context": {
+        "bh": 0,
+        "irq_mode": "enabled",
+        "kind": "task",
+        "migration": 1,
+        "preempt": 0,
+        "rcu": 0
+      },
+      "effect": "rt-lock-wait",
+      "expected": {
+        "arm64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        }
+      },
+      "function": "p3_case_migration_wait",
+      "id": "migration_rt_wait_valid",
+      "manifest_mutation": null,
+      "source": "fixture_cases.c"
+    },
+    {
+      "context": {
+        "bh": 1,
+        "irq_mode": "enabled",
+        "kind": "softirq",
+        "migration": 0,
+        "preempt": 0,
+        "rcu": 0
+      },
+      "effect": "rt-lock-wait",
+      "expected": {
+        "arm64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        }
+      },
+      "function": "p3_case_softirq_wait",
+      "id": "softirq_rt_wait_valid",
+      "manifest_mutation": null,
+      "source": "fixture_cases.c"
+    },
+    {
+      "context": {
+        "bh": 0,
+        "irq_mode": "enabled",
+        "kind": "threadedirq",
+        "migration": 0,
+        "preempt": 0,
+        "rcu": 0
+      },
+      "effect": "rt-lock-wait",
+      "expected": {
+        "arm64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        }
+      },
+      "function": "p3_case_threaded_irq_wait",
+      "id": "threaded_irq_rt_wait_valid",
+      "manifest_mutation": null,
+      "source": "fixture_cases.c"
+    },
+    {
+      "context": {
+        "bh": 0,
+        "irq_mode": "enabled",
+        "kind": "task",
+        "migration": 0,
+        "preempt": 0,
+        "rcu": 0
+      },
+      "effect": "ordinary-sleep",
+      "expected": {
+        "arm64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        }
+      },
+      "function": "p3_case_task_sleep",
+      "id": "task_ordinary_sleep_valid",
+      "manifest_mutation": null,
+      "source": "fixture_cases.c"
+    },
+    {
+      "context": {
+        "bh": 0,
+        "irq_mode": "disabled",
+        "kind": "hardirq",
+        "migration": 0,
+        "preempt": 0,
+        "rcu": 0
+      },
+      "effect": "ordinary-sleep",
+      "expected": {
+        "arm64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": true,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": true,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": true,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": true,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": true,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": true,
+          "rt_lock_wait_warning": false
+        }
+      },
+      "function": "p3_case_hardirq_sleep",
+      "id": "hardirq_ordinary_sleep",
+      "manifest_mutation": null,
+      "source": "fixture_cases.c"
+    },
+    {
+      "context": {
+        "bh": 0,
+        "irq_mode": "enabled",
+        "kind": "task",
+        "migration": 0,
+        "preempt": 0,
+        "rcu": 1
+      },
+      "effect": "ordinary-sleep",
+      "expected": {
+        "arm64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": true,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": true,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": true,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": true,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": true,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": true,
+          "rt_lock_wait_warning": false
+        }
+      },
+      "function": "p3_case_rcu_sleep",
+      "id": "rcu_ordinary_sleep",
+      "manifest_mutation": null,
+      "source": "fixture_cases.c"
+    },
+    {
+      "context": {
+        "bh": 0,
+        "irq_mode": "enabled",
+        "kind": "task",
+        "migration": 0,
+        "preempt": 0,
+        "rcu": 0
+      },
+      "effect": "unknown",
+      "expected": {
+        "arm64-nonrt": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-n": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-y": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-nonrt": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-n": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-y": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        }
+      },
+      "function": "p3_case_unknown_effect",
+      "id": "explicit_unknown_effect",
+      "manifest_mutation": null,
+      "source": "fixture_cases.c"
+    },
+    {
+      "context": {
+        "bh": 0,
+        "irq_mode": "enabled",
+        "kind": "task",
+        "migration": 0,
+        "preempt": 1,
+        "rcu": 0
+      },
+      "effect": "rt-lock-wait",
+      "expected": {
+        "arm64-nonrt": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-n": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        },
+        "arm64-rt-bh-y": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        },
+        "x86_64-nonrt": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-n": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        },
+        "x86_64-rt-bh-y": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        }
+      },
+      "function": "p3_case_unknown_keeps_prior_witness",
+      "id": "unknown_preserves_prior_witness",
+      "manifest_mutation": null,
+      "post_unknown_context": "unqualified; no assertion of unchanged context or clean subsequent call",
+      "required_rt_warning_call_index": 0,
+      "source": "fixture_cases.c",
+      "unknown_effect_also_required": true
+    },
+    {
+      "configuration_kind": "api-fixture",
+      "context": {
+        "bh": 0,
+        "irq_mode": "disabled",
+        "kind": "task",
+        "migration": 0,
+        "preempt": 0,
+        "rcu": 0
+      },
+      "effect": "rt-lock-wait",
+      "expected": {
+        "arm64-nonrt": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-n": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-y": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-nonrt": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-n": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-y": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        }
+      },
+      "function": "p3_case_validation",
+      "id": "stale_translation_unit",
+      "manifest_mutation": "tu_hash",
+      "source": "fixture_cases.c",
+      "validation_failure_must_precede_trusted_seed_or_effect": true
+    },
+    {
+      "configuration_kind": "api-fixture",
+      "context": {
+        "bh": 0,
+        "irq_mode": "disabled",
+        "kind": "task",
+        "migration": 0,
+        "preempt": 0,
+        "rcu": 0
+      },
+      "effect": "rt-lock-wait",
+      "expected": {
+        "arm64-nonrt": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-n": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-y": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-nonrt": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-n": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-y": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        }
+      },
+      "function": "p3_case_validation",
+      "id": "stale_review_evidence",
+      "manifest_mutation": "evidence_hash",
+      "source": "fixture_cases.c",
+      "validation_failure_must_precede_trusted_seed_or_effect": true
+    },
+    {
+      "configuration_kind": "api-fixture",
+      "context": {
+        "bh": 0,
+        "irq_mode": "disabled",
+        "kind": "task",
+        "migration": 0,
+        "preempt": 0,
+        "rcu": 0
+      },
+      "effect": "rt-lock-wait",
+      "expected": {
+        "arm64-nonrt": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-n": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-y": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-nonrt": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-n": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-y": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        }
+      },
+      "function": "p3_case_validation",
+      "id": "stale_loaded_header",
+      "manifest_mutation": "header_hash",
+      "source": "fixture_cases.c",
+      "validation_failure_must_precede_trusted_seed_or_effect": true
+    },
+    {
+      "configuration_kind": "kernel",
+      "context": {
+        "bh": 0,
+        "irq_mode": "disabled",
+        "kind": "task",
+        "migration": 0,
+        "preempt": 0,
+        "rcu": 0
+      },
+      "effect": "rt-lock-wait",
+      "expected": {
+        "arm64-nonrt": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-n": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-y": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-nonrt": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-n": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-y": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        }
+      },
+      "function": "p3_case_validation",
+      "id": "stale_config_file",
+      "manifest_mutation": "config_hash",
+      "source": "fixture_cases.c",
+      "validation_failure_must_precede_trusted_seed_or_effect": true
+    },
+    {
+      "configuration_kind": "kernel",
+      "context": {
+        "bh": 0,
+        "irq_mode": "disabled",
+        "kind": "task",
+        "migration": 0,
+        "preempt": 0,
+        "rcu": 0
+      },
+      "effect": "rt-lock-wait",
+      "expected": {
+        "arm64-nonrt": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-n": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-y": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-nonrt": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-n": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-y": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        }
+      },
+      "function": "p3_case_validation",
+      "id": "stale_loaded_autoconf",
+      "manifest_mutation": "autoconf_hash",
+      "source": "fixture_cases.c",
+      "validation_failure_must_precede_trusted_seed_or_effect": true
+    },
+    {
+      "configuration_kind": "api-fixture",
+      "context": {
+        "bh": 0,
+        "irq_mode": "disabled",
+        "kind": "task",
+        "migration": 0,
+        "preempt": 0,
+        "rcu": 0
+      },
+      "effect": "rt-lock-wait",
+      "expected": {
+        "arm64-nonrt": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-n": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-y": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-nonrt": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-n": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-y": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        }
+      },
+      "function": "p3_case_validation",
+      "id": "wrong_target_triple",
+      "manifest_mutation": "target_triple",
+      "source": "fixture_cases.c",
+      "validation_failure_must_precede_trusted_seed_or_effect": true
+    },
+    {
+      "configuration_kind": "api-fixture",
+      "context": {
+        "bh": 0,
+        "irq_mode": "disabled",
+        "kind": "task",
+        "migration": 0,
+        "preempt": 0,
+        "rcu": 0
+      },
+      "effect": "rt-lock-wait",
+      "expected": {
+        "arm64-nonrt": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-n": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-y": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-nonrt": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-n": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-y": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        }
+      },
+      "function": "p3_case_validation",
+      "id": "conflicting_effects",
+      "manifest_mutation": "conflicting_record",
+      "source": "fixture_cases.c",
+      "validation_failure_must_precede_trusted_seed_or_effect": true
+    },
+    {
+      "configuration_kind": "api-fixture",
+      "context": {
+        "bh": 0,
+        "irq_mode": "disabled",
+        "kind": "task",
+        "migration": 0,
+        "preempt": 0,
+        "rcu": 0
+      },
+      "effect": "rt-lock-wait",
+      "expected": {
+        "arm64-nonrt": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-n": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-y": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-nonrt": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-n": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-y": {
+          "complete_coverage": false,
+          "incomplete_context_warning": true,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        }
+      },
+      "function": "p3_case_validation",
+      "id": "duplicate_json_key",
+      "manifest_mutation": "duplicate_key",
+      "source": "fixture_cases.c",
+      "validation_failure_must_precede_trusted_seed_or_effect": true
+    },
+    {
+      "checks_existing_typed_primitives": true,
+      "context": null,
+      "effect": "rt-lock-wait",
+      "expected": {
+        "arm64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        },
+        "arm64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        },
+        "x86_64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        },
+        "x86_64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        }
+      },
+      "function": "p3_case_no_manifest",
+      "id": "no_manifest_unchanged",
+      "manifest_enabled": false,
+      "manifest_mutation": null,
+      "source": "fixture_cases.c"
+    },
+    {
+      "additional_entry": {
+        "context": {
+          "bh": 0,
+          "irq_mode": "disabled",
+          "kind": "task",
+          "migration": 0,
+          "preempt": 0,
+          "rcu": 0
+        },
+        "function": "p3_inline_entry"
+      },
+      "context": {
+        "bh": 0,
+        "irq_mode": "enabled",
+        "kind": "task",
+        "migration": 0,
+        "preempt": 0,
+        "rcu": 0
+      },
+      "effect": "rt-lock-wait",
+      "expected": {
+        "arm64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        }
+      },
+      "function": "p3_case_inline_isolation",
+      "id": "inlined_entry_seed_isolation",
+      "inlined_entry_must_not_override_caller": true,
+      "manifest_mutation": null,
+      "source": "fixture_cases.c"
+    },
+    {
+      "context": {
+        "bh": 0,
+        "irq_mode": "disabled",
+        "kind": "task",
+        "migration": 0,
+        "preempt": 0,
+        "rcu": 0
+      },
+      "effect": "rt-lock-wait",
+      "expected": {
+        "arm64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        },
+        "arm64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        },
+        "x86_64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        },
+        "x86_64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        }
+      },
+      "function": "p3_inline_entry",
+      "id": "top_frame_inline_entry_seed",
+      "manifest_mutation": null,
+      "source": "fixture_cases.c"
+    },
+    {
+      "context": {
+        "bh": 0,
+        "irq_mode": "disabled",
+        "kind": "task",
+        "migration": 0,
+        "preempt": 0,
+        "rcu": 0
+      },
+      "effect": "rt-lock-wait",
+      "expected": {
+        "arm64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        },
+        "arm64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        },
+        "x86_64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        },
+        "x86_64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": true
+        }
+      },
+      "function": "p3_same_entry",
+      "id": "static_tu_a_irq_seed",
+      "linkage": "internal",
+      "manifest_mutation": null,
+      "same_name_other_tu": "same_static_b.c",
+      "source": "same_static_a.c"
+    },
+    {
+      "context": {
+        "bh": 0,
+        "irq_mode": "enabled",
+        "kind": "task",
+        "migration": 0,
+        "preempt": 0,
+        "rcu": 0
+      },
+      "effect": "rt-lock-wait",
+      "expected": {
+        "arm64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "arm64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-nonrt": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-n": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        },
+        "x86_64-rt-bh-y": {
+          "complete_coverage": true,
+          "incomplete_context_warning": false,
+          "ordinary_sleep_warning": false,
+          "rt_lock_wait_warning": false
+        }
+      },
+      "foreign_other_tu_entry_context": {
+        "bh": 0,
+        "irq_mode": "disabled",
+        "kind": "task",
+        "migration": 0,
+        "preempt": 0,
+        "rcu": 0
+      },
+      "function": "p3_same_entry",
+      "id": "static_tu_b_task_seed",
+      "linkage": "internal",
+      "manifest_mutation": null,
+      "same_name_other_tu": "same_static_a.c",
+      "source": "same_static_b.c"
+    }
+  ],
+  "configuration_note": "Profiles are explicit API fixtures; generated/autoconf.h and .config are synthetic inputs for validation, not resolved Kconfig. Kernel-shaped validation tests exercise importer requirements only.",
+  "created_utc": "2026-10-12T20:06:37.281340+00:00",
+  "effect_model": "linux-rt-context-1",
+  "profiles": [
+    "x86_64-nonrt",
+    "x86_64-rt-bh-y",
+    "x86_64-rt-bh-n",
+    "arm64-nonrt",
+    "arm64-rt-bh-y",
+    "arm64-rt-bh-n"
+  ],
+  "schema": 1,
+  "status": "independent_semantic_oracle_frozen_before_new_compiler_execution",
+  "unsupported_limits": [
+    "No functionpointer target resolution is asserted",
+    "Known wait/sleep effects do not establish post-call context-preserving transfer or complete kernel coverage",
+    "Only fixture predicate completeness is asserted for successfully modeled known operations",
+    "Unknown or validation failure must be visible; silence is not a pass",
+    "No bounds/timeouts/failed analyses qualify"
+  ],
+  "warnings_match_semantics_not_current_stderr": true
+}

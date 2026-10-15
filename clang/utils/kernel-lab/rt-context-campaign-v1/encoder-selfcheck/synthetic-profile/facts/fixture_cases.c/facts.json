@@ -1,0 +1,203 @@
+{
+  "files": {
+    "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/encoder-selfcheck/synthetic-profile/inputs/fixture-context.h": "6ba9b9f2b9876bf95cf9033e5e5b73855475ed7e27a8cae7d04fff6b65a8e4d0",
+    "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/encoder-selfcheck/synthetic-profile/inputs/fixture_cases.c": "bca4802593364ea8012120b3d7a20007b933e9f7545cca722489d840d6c849c7",
+    "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/encoder-selfcheck/synthetic-profile/inputs/generated/autoconf.h": "b24156388970d49773b43f9115476d483fd669fde821a8657a2229fc3e293f71"
+  },
+  "functions": [
+    {
+      "linkage": "external",
+      "name": "p3_rt_wait_effect",
+      "offset": 197,
+      "source_path": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/encoder-selfcheck/synthetic-profile/inputs/fixture_cases.c",
+      "source_sha256": "bca4802593364ea8012120b3d7a20007b933e9f7545cca722489d840d6c849c7",
+      "type": "void (void)"
+    },
+    {
+      "linkage": "external",
+      "name": "p3_ordinary_sleep_effect",
+      "offset": 234,
+      "source_path": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/encoder-selfcheck/synthetic-profile/inputs/fixture_cases.c",
+      "source_sha256": "bca4802593364ea8012120b3d7a20007b933e9f7545cca722489d840d6c849c7",
+      "type": "void (void)"
+    },
+    {
+      "linkage": "external",
+      "name": "p3_opaque_effect",
+      "offset": 278,
+      "source_path": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/encoder-selfcheck/synthetic-profile/inputs/fixture_cases.c",
+      "source_sha256": "bca4802593364ea8012120b3d7a20007b933e9f7545cca722489d840d6c849c7",
+      "type": "void (void)"
+    },
+    {
+      "linkage": "external",
+      "name": "p3_case_task_wait",
+      "offset": 482,
+      "source_path": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/encoder-selfcheck/synthetic-profile/inputs/fixture_cases.c",
+      "source_sha256": "bca4802593364ea8012120b3d7a20007b933e9f7545cca722489d840d6c849c7",
+      "type": "void (void)"
+    },
+    {
+      "linkage": "external",
+      "name": "p3_case_preempt_wait",
+      "offset": 536,
+      "source_path": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/encoder-selfcheck/synthetic-profile/inputs/fixture_cases.c",
+      "source_sha256": "bca4802593364ea8012120b3d7a20007b933e9f7545cca722489d840d6c849c7",
+      "type": "void (void)"
+    },
+    {
+      "linkage": "external",
+      "name": "p3_case_irq_off_wait",
+      "offset": 593,
+      "source_path": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/encoder-selfcheck/synthetic-profile/inputs/fixture_cases.c",
+      "source_sha256": "bca4802593364ea8012120b3d7a20007b933e9f7545cca722489d840d6c849c7",
+      "type": "void (void)"
+    },
+    {
+      "linkage": "external",
+      "name": "p3_case_hardirq_wait",
+      "offset": 650,
+      "source_path": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/encoder-selfcheck/synthetic-profile/inputs/fixture_cases.c",
+      "source_sha256": "bca4802593364ea8012120b3d7a20007b933e9f7545cca722489d840d6c849c7",
+      "type": "void (void)"
+    },
+    {
+      "linkage": "external",
+      "name": "p3_case_nmi_wait",
+      "offset": 707,
+      "source_path": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/encoder-selfcheck/synthetic-profile/inputs/fixture_cases.c",
+      "source_sha256": "bca4802593364ea8012120b3d7a20007b933e9f7545cca722489d840d6c849c7",
+      "type": "void (void)"
+    },
+    {
+      "linkage": "external",
+      "name": "p3_case_bh_wait",
+      "offset": 760,
+      "source_path": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/encoder-selfcheck/synthetic-profile/inputs/fixture_cases.c",
+      "source_sha256": "bca4802593364ea8012120b3d7a20007b933e9f7545cca722489d840d6c849c7",
+      "type": "void (void)"
+    },
+    {
+      "linkage": "external",
+      "name": "p3_case_rcu_wait",
+      "offset": 812,
+      "source_path": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/encoder-selfcheck/synthetic-profile/inputs/fixture_cases.c",
+      "source_sha256": "bca4802593364ea8012120b3d7a20007b933e9f7545cca722489d840d6c849c7",
+      "type": "void (void)"
+    },
+    {
+      "linkage": "external",
+      "name": "p3_case_migration_wait",
+      "offset": 865,
+      "source_path": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/encoder-selfcheck/synthetic-profile/inputs/fixture_cases.c",
+      "source_sha256": "bca4802593364ea8012120b3d7a20007b933e9f7545cca722489d840d6c849c7",
+      "type": "void (void)"
+    },
+    {
+      "linkage": "external",
+      "name": "p3_case_softirq_wait",
+      "offset": 924,
+      "source_path": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/encoder-selfcheck/synthetic-profile/inputs/fixture_cases.c",
+      "source_sha256": "bca4802593364ea8012120b3d7a20007b933e9f7545cca722489d840d6c849c7",
+      "type": "void (void)"
+    },
+    {
+      "linkage": "external",
+      "name": "p3_case_threaded_irq_wait",
+      "offset": 981,
+      "source_path": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/encoder-selfcheck/synthetic-profile/inputs/fixture_cases.c",
+      "source_sha256": "bca4802593364ea8012120b3d7a20007b933e9f7545cca722489d840d6c849c7",
+      "type": "void (void)"
+    },
+    {
+      "linkage": "external",
+      "name": "p3_case_raw_wait",
+      "offset": 1043,
+      "source_path": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/encoder-selfcheck/synthetic-profile/inputs/fixture_cases.c",
+      "source_sha256": "bca4802593364ea8012120b3d7a20007b933e9f7545cca722489d840d6c849c7",
+      "type": "void (void)"
+    },
+    {
+      "linkage": "external",
+      "name": "p3_case_task_sleep",
+      "offset": 1171,
+      "source_path": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/encoder-selfcheck/synthetic-profile/inputs/fixture_cases.c",
+      "source_sha256": "bca4802593364ea8012120b3d7a20007b933e9f7545cca722489d840d6c849c7",
+      "type": "void (void)"
+    },
+    {
+      "linkage": "external",
+      "name": "p3_case_hardirq_sleep",
+      "offset": 1233,
+      "source_path": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/encoder-selfcheck/synthetic-profile/inputs/fixture_cases.c",
+      "source_sha256": "bca4802593364ea8012120b3d7a20007b933e9f7545cca722489d840d6c849c7",
+      "type": "void (void)"
+    },
+    {
+      "linkage": "external",
+      "name": "p3_case_rcu_sleep",
+      "offset": 1298,
+      "source_path": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/encoder-selfcheck/synthetic-profile/inputs/fixture_cases.c",
+      "source_sha256": "bca4802593364ea8012120b3d7a20007b933e9f7545cca722489d840d6c849c7",
+      "type": "void (void)"
+    },
+    {
+      "linkage": "external",
+      "name": "p3_case_unknown_effect",
+      "offset": 1359,
+      "source_path": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/encoder-selfcheck/synthetic-profile/inputs/fixture_cases.c",
+      "source_sha256": "bca4802593364ea8012120b3d7a20007b933e9f7545cca722489d840d6c849c7",
+      "type": "void (void)"
+    },
+    {
+      "linkage": "external",
+      "name": "p3_case_unknown_keeps_prior_witness",
+      "offset": 1417,
+      "source_path": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/encoder-selfcheck/synthetic-profile/inputs/fixture_cases.c",
+      "source_sha256": "bca4802593364ea8012120b3d7a20007b933e9f7545cca722489d840d6c849c7",
+      "type": "void (void)"
+    },
+    {
+      "linkage": "external",
+      "name": "p3_case_validation",
+      "offset": 1536,
+      "source_path": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/encoder-selfcheck/synthetic-profile/inputs/fixture_cases.c",
+      "source_sha256": "bca4802593364ea8012120b3d7a20007b933e9f7545cca722489d840d6c849c7",
+      "type": "void (void)"
+    },
+    {
+      "linkage": "external",
+      "name": "p3_case_no_manifest",
+      "offset": 1591,
+      "source_path": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/encoder-selfcheck/synthetic-profile/inputs/fixture_cases.c",
+      "source_sha256": "bca4802593364ea8012120b3d7a20007b933e9f7545cca722489d840d6c849c7",
+      "type": "void (void)"
+    },
+    {
+      "linkage": "internal",
+      "name": "p3_inline_entry",
+      "offset": 1771,
+      "source_path": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/encoder-selfcheck/synthetic-profile/inputs/fixture_cases.c",
+      "source_sha256": "bca4802593364ea8012120b3d7a20007b933e9f7545cca722489d840d6c849c7",
+      "type": "void (void)"
+    },
+    {
+      "linkage": "external",
+      "name": "p3_case_inline_isolation",
+      "offset": 1823,
+      "source_path": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/encoder-selfcheck/synthetic-profile/inputs/fixture_cases.c",
+      "source_sha256": "bca4802593364ea8012120b3d7a20007b933e9f7545cca722489d840d6c849c7",
+      "type": "void (void)"
+    }
+  ],
+  "macros": {
+    "CONFIG_PREEMPT_RT": "1",
+    "CONFIG_PREEMPT_RT_NEEDS_BH_LOCK": "absent"
+  },
+  "predefines_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "target_triple": "x86_64-unknown-linux-gnu",
+  "translation_unit": {
+    "path": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/phase3-tests/encoder-selfcheck/synthetic-profile/inputs/fixture_cases.c",
+    "sha256": "bca4802593364ea8012120b3d7a20007b933e9f7545cca722489d840d6c849c7"
+  }
+}

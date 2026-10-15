@@ -1,0 +1,11 @@
+Pre-execution coverage semantics clarification
+
+The frozen original EXPECTED.json is retained byte-for-byte. Known RT wait and
+ordinary sleep capability imports do not claim net context effects, so their
+noninlined PostCall must emit an explicit incomplete-context gap. Legal-operation
+controls must tolerate and require this visible gap, and cannot qualify entire
+path coverage. Invalid manifests and explicit unknown effects also require a
+visible gap. The no-manifest compatibility case has no imported summary and
+retains its original behavior. No illegal-wait or ordinary-sleep expectation is
+changed, and no compiler output was consulted. Save both the original raw
+verdict and this reviewed supported-operation predicate verdict.
