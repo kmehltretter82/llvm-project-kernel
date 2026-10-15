@@ -298,6 +298,12 @@ As of 2026-10-16 on `kernel-lab-riscv`:
 - the complete LLVM 24 driver passes the patched SelectionDAG four-site lane;
   its RISC-V opt-in/disabled callback smoke test passes with four callbacks,
   one perturbation point, and zero disabled-mode hooks;
+- the recovered PREEMPT_RT analyzer has RISC-V primitive-context regressions,
+  a compiler-identity-to-manifest round trip, and visible empty-TU validation;
+- the frozen phase-3 manifest campaign is preserved in-tree, and its separate
+  RISC-V port passes all 87 reviewed predicates on clean commit
+  `b5294bcb4282`, with all 24 identity mutations rejected independently from
+  60 explicit post-call coverage gaps;
 - the source-derived QEMU/Linux inventory checker covers exactly 17 families,
   finds 16 existing CPU interrupt-entry hooks, and keeps Hexagon as the one
   explicit source gap; and

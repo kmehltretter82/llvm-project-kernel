@@ -27,5 +27,9 @@ classifies manifest-validation failures independently from post-call context
 gaps: mutation cases require validation failure, and intended-valid cases
 forbid it.
 
+The clean `b5294bcb4282` campaign passed all 87 reviewed predicates.  Its full
+result and execution plan, plus a compact limitations-and-hashes receipt, are
+preserved in `qualifications/b5294bcb/`.
+
 Generated campaign runs are evidence artifacts and must use a fresh output
 directory.  They are not source inputs and should not be committed here.
