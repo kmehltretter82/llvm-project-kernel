@@ -55,12 +55,14 @@ surviving store/atomic publication instructions with the default SelectionDAG
 backend.  Rules can select a direct call, function entry/exit, or a named
 optimized-IR opcode and one-based occurrence inside a function.  The latter
 lets a policy select the surviving publication `store` directly instead of
-inferring it from "after call."  An explicitly experimental `-fglobal-isel`
-lane preserves the four entry/call/publication/return anchors in the current
-fixture without changing `.text`.  SelectionDAG still drops three of those
-anchors and is retained as a required negative test.  Neither result turns an
-IR-relative selector into a promise about final instruction adjacency; the
-resolved machine PC is the only scheduleable boundary.
+inferring it from "after call."  Stock LLVM 22 SelectionDAG drops the entry,
+call, and return records and remains the coverage-gate negative control.  The
+lab branch adds a generic actual-call-node handoff plus RISC-V call and return
+propagation; its LLVM 24 SelectionDAG preserves all four records.  Experimental
+GlobalISel provides an independent four-record control.  Both successful
+lanes keep object and linked `.text` identical.  An IR-relative selector still
+does not promise final instruction adjacency; the resolved machine PC is the
+only scheduleable boundary.
 
 ### Layer B: explicit callback and perturb mode
 
@@ -255,7 +257,7 @@ summary.  Result directories are immutable after their final SHA-256 manifest.
 
 ## Current execution ledger
 
-As of 2026-10-15 on `kernel-lab-riscv`:
+As of 2026-10-16 on `kernel-lab-riscv`:
 
 - the recovered PREEMPT_RT branch is preserved and pushed separately;
 - the version-one 32-byte resolved-record encoder/decoder exists;
@@ -276,7 +278,14 @@ As of 2026-10-15 on `kernel-lab-riscv`:
   or linked `.text`, and its object `ADD64`/`SUB64` relocation pair resolves
   correctly across linker relaxation;
 - a four-site call/entry/return negative deliberately loses three backend
-  markers and is rejected by the emitted-versus-expected coverage gate;
+  markers under stock LLVM 22 SelectionDAG and is rejected by the
+  emitted-versus-expected coverage gate;
+- the lab LLVM 24 SelectionDAG passes the actual call node back to generic
+  lowering and maps return metadata to the lowered return chain; its RISC-V
+  regression places labels immediately before `call` and `ret`;
+- the same patched SelectionDAG preserves all four expected records in a real
+  relocatable and linked RV64 ELF; final PCs resolve to `jal`, `sw`, and `ret`,
+  and object and linked `.text` match their unmapped controls byte for byte;
 - compiling that same four-site fixture through RISC-V GlobalISel preserves
   all four expected records, and both its object and linked `.text` remain
   byte-identical to GlobalISel controls;
@@ -289,10 +298,9 @@ As of 2026-10-15 on `kernel-lab-riscv`:
 - no Linux boot, QEMU injection, FPGA run, or correctness verdict has yet been
   claimed from this new branch.
 
-The next compiler task is to preserve PC-section metadata through the default
-RISC-V backend (or emit the records at final Machine IR/AsmPrinter) so the lab
-does not depend on experimental GlobalISel, and then add a stable source-level
-statement interface.  Inertness checks must expand to all executable sections,
-symbols, relaxation, and unwind data.  The next QEMU task is the RV64 exact-site
-TB stop without injection, followed by the real PLIC endpoint and deterministic
-schedule.
+The next compiler task is to build and qualify the complete patched Clang/LLVM
+driver rather than the currently separated frontend-plugin and LLVM 24 `llc`,
+then add a stable source-level statement interface.  Inertness checks must
+expand to all executable sections, symbols, relaxation, and unwind data.  The
+next QEMU task is the RV64 exact-site TB stop without injection, followed by the
+real PLIC endpoint and deterministic schedule.

@@ -51,6 +51,14 @@ python3 clang/tools/clang-kernel-lab/tests/test_map_plugin.py \
   --llvm-objcopy /path/to/llvm-objcopy \
   --plugin ../build-kernel-lab/ClangKernelLabMap.so \
   --site-tool ../build-kernel-lab/llvm-riscv-irq-sites
+python3 clang/tools/clang-kernel-lab/tests/test_selectiondag_backend.py \
+  --clang /path/to/plugin-compatible/clang \
+  --llc ../build-riscv-llvm/bin/llc \
+  --ld-lld /path/to/ld.lld \
+  --llvm-objcopy /path/to/llvm-objcopy \
+  --llvm-objdump /path/to/llvm-objdump \
+  --plugin ../build-kernel-lab/ClangKernelLabMap.so \
+  --site-tool ../build-kernel-lab/llvm-riscv-irq-sites
 ```
 
 On macOS the pass-plugin suffix is `.dylib`.  The site-map test checks object
@@ -64,6 +72,22 @@ and proves that the tool rejects a requested site dropped by code generation.
 It exercises the same four-site policy in two backend lanes: default RISC-V
 SelectionDAG is the expected coverage-failure control, while experimental
 GlobalISel must preserve all four records with byte-identical `.text`.
+
+The lab branch also patches LLVM 24 SelectionDAG.  Its target test verifies
+that PC-section labels are immediately before the RISC-V call and return:
+
+```text
+build-riscv-llvm/bin/llc -O2 -code-model=medium \
+  llvm/test/CodeGen/RISCV/pcsections-call-return.ll \
+  | FileCheck llvm/test/CodeGen/RISCV/pcsections-call-return.ll
+```
+
+`test_selectiondag_backend.py` is the wider gate.  It feeds optimizer-last IR
+from the map plugin to the patched `llc`, requires all four expected records in
+object and linked modes, compares mapped and unmapped `.text`, and checks the
+resolved final PCs against `jal`, `sw`, and `ret`.  This deliberately permits
+the frontend/plugin and backend to be built separately while the complete
+patched Clang driver is still being qualified.
 
 The map records identify final machine PCs, not source-level adjacency.  For
 example, an IR instruction selected as "after call" can move away from the

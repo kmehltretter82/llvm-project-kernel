@@ -76,9 +76,13 @@ flags, and the 128-bit ID.  The object/link tool requires the emitted and
 expected sets to be identical.  A warning is not treated as coverage.
 
 The first qualification fixture demonstrates a backend difference that must
-remain visible: default RISC-V SelectionDAG preserves a store anchor but drops
-entry, call, and return anchors, while experimental GlobalISel preserves all
-four.  The expected table turns the former into a hard validation failure.
+remain visible: stock LLVM 22 RISC-V SelectionDAG preserves a store anchor but
+drops entry, call, and return anchors, while experimental GlobalISel preserves
+all four.  The expected table turns the former into a hard validation failure.
+The lab LLVM 24 backend fixes the default SelectionDAG path by identifying the
+actual target call node and mapping return metadata to the lowered return
+chain.  Its four records are checked in relocatable and linked ELF, and their
+resolved PCs are checked against final `jal`, `sw`, and `ret` instructions.
 The initial direct-instruction policy selector names an optimizer-last LLVM IR
 opcode and an optional one-based occurrence inside a function.  Even when a
 record survives, a source- or IR-relative selector does not promise
