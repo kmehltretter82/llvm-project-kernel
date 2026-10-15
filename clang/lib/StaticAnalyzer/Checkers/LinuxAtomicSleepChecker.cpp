@@ -179,7 +179,7 @@ struct RTContextManifest {
   mutable std::vector<RTManifestFunction> Functions;
 
   static std::optional<llvm::json::Object>
-  binding(const FunctionDecl *FD, CheckerContext &C) {
+  binding(const FunctionDecl *FD, ASTContext &Ctx) {
     if (!FD || !FD->getIdentifier() || !FD->getDeclContext()->isFileContext())
       return std::nullopt;
     if (const FunctionDecl *Def = FD->getDefinition())
@@ -187,7 +187,7 @@ struct RTContextManifest {
     SourceLocation Loc = FD->getLocation();
     if (!Loc.isFileID())
       return std::nullopt;
-    const SourceManager &SM = C.getSourceManager();
+    const SourceManager &SM = Ctx.getSourceManager();
     FileID FID = SM.getFileID(Loc);
     auto File = SM.getFileEntryRefForID(FID);
     auto Bytes = SM.getBufferDataOrNone(FID);
@@ -204,11 +204,12 @@ struct RTContextManifest {
         {"offset", static_cast<int64_t>(SM.getFileOffset(Loc))}};
   }
 
-  static llvm::json::Object facts(CheckerContext &C, std::string &Error) {
-    const SourceManager &SM = C.getSourceManager();
+  static llvm::json::Object facts(ASTContext &Ctx, Preprocessor &PP,
+                                  std::string &Error) {
+    const SourceManager &SM = Ctx.getSourceManager();
     auto Main = SM.getFileEntryRefForID(SM.getMainFileID());
     auto MainBytes = SM.getBufferDataOrNone(SM.getMainFileID());
-    if (!Main || !MainBytes || C.getASTContext().getExternalSource()) {
+    if (!Main || !MainBytes || Ctx.getExternalSource()) {
       Error = "Manifest input requires a real main file and no external AST";
       return {};
     }
@@ -226,16 +227,15 @@ struct RTContextManifest {
     }
     llvm::json::Array Bindings;
     std::set<std::string> Seen;
-    for (const Decl *D : C.getASTContext().getTranslationUnitDecl()->decls())
+    for (const Decl *D : Ctx.getTranslationUnitDecl()->decls())
       if (const auto *FD = dyn_cast<FunctionDecl>(D))
-        if (auto B = binding(FD, C)) {
+        if (auto B = binding(FD, Ctx)) {
           std::string Key = std::string(*B->getString("source_path")) + ":" +
                             std::to_string(*B->getInteger("offset"));
           if (Seen.insert(Key).second)
             Bindings.push_back(std::move(*B));
         }
     llvm::json::Object Macros;
-    Preprocessor &PP = C.getBugReporter().getPreprocessor();
     for (StringRef Name : {"CONFIG_PREEMPT_RT", "CONFIG_PREEMPT_RT_NEEDS_BH_LOCK"}) {
       if (auto *History = PP.getLocalMacroDirectiveHistory(PP.getIdentifierInfo(Name)))
         if (History->getPrevious()) {
@@ -253,7 +253,7 @@ struct RTContextManifest {
     }
     return llvm::json::Object{
         {"schema", 1}, {"effect_model", "linux-rt-context-1"},
-        {"target_triple", C.getASTContext().getTargetInfo().getTriple().str()},
+        {"target_triple", Ctx.getTargetInfo().getTriple().str()},
         {"predefines_sha256", contentHash(PP.getPredefines())},
         {"translation_unit", llvm::json::Object{
             {"path", SM.getFileManager().getCanonicalName(*Main)},
@@ -268,11 +268,11 @@ struct RTContextManifest {
     return false;
   }
 
-  void initialize(CheckerContext &C) const {
+  void initialize(ASTContext &Ctx, Preprocessor &PP) const {
     if (Initialized)
       return;
     Initialized = true;
-    auto Actual = facts(C, Error);
+    auto Actual = facts(Ctx, PP, Error);
     if (!Error.empty())
       return;
     if (!Output.empty()) {
@@ -293,7 +293,8 @@ struct RTContextManifest {
     }
     if (Path.empty())
       return;
-    auto Buffer = C.getSourceManager().getFileManager().getBufferForFile(Path);
+    FileManager &FM = Ctx.getSourceManager().getFileManager();
+    auto Buffer = FM.getBufferForFile(Path);
     if (!Buffer || (*Buffer)->getBufferSize() > 16 * 1024 * 1024) {
       fail("Cannot read bounded RT context manifest");
       return;
@@ -328,7 +329,7 @@ struct RTContextManifest {
         fail("Invalid RT context manifest file pin");
         return;
       }
-      auto Bytes = C.getSourceManager().getFileManager().getBufferForFile(Name);
+      auto Bytes = FM.getBufferForFile(Name);
       if (!Bytes || contentHash((*Bytes)->getBuffer()) != *Hash) {
         fail("RT context manifest source bytes differ");
         return;
@@ -431,7 +432,7 @@ struct RTContextManifest {
   const RTManifestFunction *find(const FunctionDecl *FD, CheckerContext &C) const {
     if (!Error.empty())
       return nullptr;
-    auto B = binding(FD, C);
+    auto B = binding(FD, C.getASTContext());
     if (!B)
       return nullptr;
     for (const auto &F : Functions)
@@ -563,7 +564,8 @@ static CallRole classify(StringRef Name) {
 namespace {
 
 class LinuxAtomicSleepChecker
-    : public Checker<check::BeginFunction, check::PreCall, check::PostCall> {
+    : public Checker<check::BeginFunction, check::PreCall, check::PostCall,
+                     check::EndOfTranslationUnit> {
   const BugType SleepBug{this, "Sleeping call in atomic context",
                          "Linux kernel"};
   const BugType RTLockBug{this, "RT lock acquisition in atomic context",
@@ -598,6 +600,9 @@ public:
   void checkBeginFunction(CheckerContext &C) const;
   void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
   void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
+  void checkEndOfTranslationUnit(const TranslationUnitDecl *TU,
+                                 AnalysisManager &Mgr,
+                                 BugReporter &BR) const;
 
   /// Functions that the -flinux-kernel-contracts= file says always sleep.
   llvm::StringSet<> Sleepers;
@@ -958,7 +963,7 @@ void LinuxAtomicSleepChecker::checkBeginFunction(CheckerContext &C) const {
   if (!RTContext)
     Manifest.fail("RT context manifests require RTContext=true");
   else
-    Manifest.initialize(C);
+    Manifest.initialize(C.getASTContext(), C.getBugReporter().getPreprocessor());
   if (!Manifest.Error.empty()) {
     if (ExplodedNode *N = C.generateNonFatalErrorNode()) {
       auto R = std::make_unique<PathSensitiveBugReport>(
@@ -993,6 +998,34 @@ void LinuxAtomicSleepChecker::checkBeginFunction(CheckerContext &C) const {
   else if (F->EntryKind == "softirq" && !F->BH)
     Add(SectionKind::BottomHalf, 1);
   C.addTransition(State->set<ActiveAtomicSections>(Sections));
+}
+
+void LinuxAtomicSleepChecker::checkEndOfTranslationUnit(
+    const TranslationUnitDecl *TU, AnalysisManager &Mgr,
+    BugReporter &BR) const {
+  if ((Manifest.Path.empty() && Manifest.Output.empty()) ||
+      Manifest.Initialized || !Manifest.Error.empty())
+    return;
+
+  if (!RTContext)
+    Manifest.fail("RT context manifests require RTContext=true");
+  else
+    Manifest.initialize(Mgr.getASTContext(), BR.getPreprocessor());
+  if (Manifest.Error.empty())
+    return;
+
+  SourceManager &SM = Mgr.getASTContext().getSourceManager();
+  SourceLocation Loc = SM.getLocForStartOfFile(SM.getMainFileID());
+  for (const Decl *D : TU->decls()) {
+    SourceLocation Candidate = SM.getExpansionLoc(D->getLocation());
+    if (Candidate.isValid() && SM.isWrittenInMainFile(Candidate)) {
+      Loc = Candidate;
+      break;
+    }
+  }
+  auto Report = std::make_unique<BasicBugReport>(
+      UnknownBug, Manifest.Error, PathDiagnosticLocation(Loc, SM));
+  BR.emitReport(std::move(Report));
 }
 
 void LinuxAtomicSleepChecker::checkPreCall(const CallEvent &Call,

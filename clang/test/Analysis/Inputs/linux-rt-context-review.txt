@@ -1,0 +1,5 @@
+Reviewed API-fixture evidence for the RISC-V RT context importer test.
+
+imported_rt_wait may wait on an rtmutex-backed lock under PREEMPT_RT.
+imported_sleep is an ordinary sleeping operation.
+imported_unknown has an opaque and unreviewed context effect.

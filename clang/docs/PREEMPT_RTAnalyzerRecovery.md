@@ -99,9 +99,18 @@ RT-lock cases; balanced context exits; IRQ save/restore and query refinement;
 and preemption-counter decoding for preempt, hard-IRQ, NMI, and RT bottom-half
 fields.  The default mode reports none of the RT-specific diagnostics.
 
-This is a bounded primitive-model qualification, not qualification of the V4
-manifest importer.  Manifest validation, entry/effect import, opaque-call
-invalidation, and real-kernel translation-unit coverage remain open.
+The first bounded V4 importer regression is also now in-tree.  It captures the
+compiler-generated identity for a RISC-V translation unit, constructs a fully
+pinned API-fixture manifest from those exact bindings, and imports hard-IRQ,
+task, RCU, and softirq entries together with RT-wait, ordinary-sleep, and
+unknown effects.  It checks both the operation diagnostic and the mandatory
+post-call incomplete-context diagnostic.  A separate no-function translation
+unit proves that malformed input and use without `RTContext=true` are visible;
+manifest initialization no longer depends on beginning path analysis.
+
+This remains bounded API-fixture qualification.  The frozen 174-record matrix,
+opaque unlisted-call invalidation, foreign-static policy, and real-kernel
+translation-unit coverage remain open.
 
 The larger generated evidence archive, binaries, kernel objects, and frozen
 test outputs are intentionally not committed to the LLVM source repository.
