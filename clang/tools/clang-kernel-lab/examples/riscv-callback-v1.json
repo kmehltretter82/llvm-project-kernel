@@ -1,0 +1,41 @@
+{
+  "schema": 1,
+  "target_os": "any",
+  "strict": true,
+  "require_site": true,
+  "events": [
+    {
+      "match": "call",
+      "symbol": "irq_enter_rcu",
+      "position": "after",
+      "event": "hardirq-state-published",
+      "event_id": 1,
+      "action": "callback"
+    },
+    {
+      "match": "call",
+      "symbol": "spin_trylock",
+      "position": "before",
+      "event": "atomic-allocator-trylock",
+      "event_id": 2,
+      "action": "callback+perturb",
+      "perturb_class": 1
+    },
+    {
+      "match": "function",
+      "symbol": "probe",
+      "position": "entry",
+      "event": "probe-entry",
+      "event_id": 3,
+      "action": "callback"
+    },
+    {
+      "match": "function",
+      "symbol": "probe",
+      "position": "exit",
+      "event": "probe-exit",
+      "event_id": 4,
+      "action": "callback"
+    }
+  ]
+}

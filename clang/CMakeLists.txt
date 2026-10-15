@@ -508,6 +508,9 @@ option(CLANG_ENABLE_OBJC_REWRITER "Build the Objective-C rewriter tool" OFF)
 option(CLANG_ENABLE_STATIC_ANALYZER
   "Include static analyzer in clang binary." ON)
 
+option(CLANG_ENABLE_KERNEL_LAB
+  "Build the experimental Linux kernel laboratory tools." OFF)
+
 option(CLANG_ENABLE_PROTO_FUZZER "Build Clang protobuf fuzzer." OFF)
 
 option(CLANG_USE_EXPERIMENTAL_CONST_INTERP

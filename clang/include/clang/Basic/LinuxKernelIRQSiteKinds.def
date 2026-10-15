@@ -1,0 +1,58 @@
+//===-- LinuxKernelIRQSiteKinds.def - Experimental IRQ site kinds -*- C++ -*-===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// Define KLAB_IRQ_SITE_KIND(NAME, VALUE, TEXT) before including this file.
+// Values are the version-one binary namespace.  Function and subsystem names
+// belong in the sidecar and must not be substituted for these semantic kinds.
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef KLAB_IRQ_SITE_KIND
+#error "Define KLAB_IRQ_SITE_KIND before including this file"
+#endif
+
+KLAB_IRQ_SITE_KIND(USER_EXPERIMENT, 1, "user-experiment")
+KLAB_IRQ_SITE_KIND(ARCH_VECTOR_ENTRY, 2, "arch-vector-entry")
+KLAB_IRQ_SITE_KIND(ARCH_VECTOR_RETURN, 3, "arch-vector-return")
+KLAB_IRQ_SITE_KIND(HARDIRQ_ENTRY, 4, "hardirq-entry")
+KLAB_IRQ_SITE_KIND(HARDIRQ_EXIT, 5, "hardirq-exit")
+KLAB_IRQ_SITE_KIND(NMI_ENTRY, 6, "nmi-entry")
+KLAB_IRQ_SITE_KIND(NMI_EXIT, 7, "nmi-exit")
+KLAB_IRQ_SITE_KIND(EXCEPTION_ENTRY, 8, "exception-entry")
+KLAB_IRQ_SITE_KIND(EXCEPTION_EXIT, 9, "exception-exit")
+KLAB_IRQ_SITE_KIND(SOFTIRQ_ENTRY, 10, "softirq-entry")
+KLAB_IRQ_SITE_KIND(SOFTIRQ_EXIT, 11, "softirq-exit")
+KLAB_IRQ_SITE_KIND(IRQ_MASK_DISABLE, 12, "irq-mask-disable")
+KLAB_IRQ_SITE_KIND(IRQ_MASK_ENABLE, 13, "irq-mask-enable")
+KLAB_IRQ_SITE_KIND(IRQ_MASK_SAVE, 14, "irq-mask-save")
+KLAB_IRQ_SITE_KIND(IRQ_MASK_RESTORE, 15, "irq-mask-restore")
+KLAB_IRQ_SITE_KIND(PREEMPT_COUNT_ADD, 16, "preempt-count-add")
+KLAB_IRQ_SITE_KIND(PREEMPT_COUNT_SUB, 17, "preempt-count-sub")
+KLAB_IRQ_SITE_KIND(PREEMPT_COUNT_TEST, 18, "preempt-count-test")
+KLAB_IRQ_SITE_KIND(TRACE_RECURSION_ACQUIRE, 19, "trace-recursion-acquire")
+KLAB_IRQ_SITE_KIND(TRACE_RECURSION_RELEASE, 20, "trace-recursion-release")
+KLAB_IRQ_SITE_KIND(TRACE_RECURSION_REJECT, 21, "trace-recursion-reject")
+KLAB_IRQ_SITE_KIND(TASK_IRQ_PROVENANCE_SET, 22, "task-irq-provenance-set")
+KLAB_IRQ_SITE_KIND(TASK_IRQ_PROVENANCE_CLEAR, 23, "task-irq-provenance-clear")
+KLAB_IRQ_SITE_KIND(TASK_IRQ_PROVENANCE_SAVE, 24, "task-irq-provenance-save")
+KLAB_IRQ_SITE_KIND(TASK_IRQ_PROVENANCE_RESTORE, 25,
+                   "task-irq-provenance-restore")
+KLAB_IRQ_SITE_KIND(RCU_ENTRY, 26, "rcu-entry")
+KLAB_IRQ_SITE_KIND(RCU_EXIT, 27, "rcu-exit")
+KLAB_IRQ_SITE_KIND(RCU_EQS_ENTER, 28, "rcu-eqs-enter")
+KLAB_IRQ_SITE_KIND(RCU_EQS_EXIT, 29, "rcu-eqs-exit")
+KLAB_IRQ_SITE_KIND(LOCK_ACQUIRE, 30, "lock-acquire")
+KLAB_IRQ_SITE_KIND(LOCK_RELEASE, 31, "lock-release")
+KLAB_IRQ_SITE_KIND(RT_LOCK_WAIT_BEGIN, 32, "rt-lock-wait-begin")
+KLAB_IRQ_SITE_KIND(RT_LOCK_WAIT_END, 33, "rt-lock-wait-end")
+KLAB_IRQ_SITE_KIND(MIGRATION_DISABLE, 34, "migration-disable")
+KLAB_IRQ_SITE_KIND(MIGRATION_ENABLE, 35, "migration-enable")
+KLAB_IRQ_SITE_KIND(SCHEDULE, 36, "schedule")
+KLAB_IRQ_SITE_KIND(RESCHEDULE_CHECK, 37, "reschedule-check")
+KLAB_IRQ_SITE_KIND(BARRIER, 38, "barrier")
+KLAB_IRQ_SITE_KIND(ATOMIC_STATE_PUBLISH, 39, "atomic-state-publish")
