@@ -18,5 +18,14 @@ the kernel-lab compiler is intentionally built with only the RISC-V backend.
 Keep fixes and the RISC-V adaptation separate from the frozen runner and
 oracle.
 
+`run-riscv.py` is that separate adaptation.  It executes three RISC-V API
+profiles (non-RT, RT with the BH-lock option, and RT without it), for 87
+records.  The fixtures have no architecture-dependent operations, so each
+RISC-V profile uses the corresponding frozen Arm64 semantic predicate while
+recording that provenance in every verdict.  Unlike the archived runner, it
+classifies manifest-validation failures independently from post-call context
+gaps: mutation cases require validation failure, and intended-valid cases
+forbid it.
+
 Generated campaign runs are evidence artifacts and must use a fresh output
 directory.  They are not source inputs and should not be committed here.
