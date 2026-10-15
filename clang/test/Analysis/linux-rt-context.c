@@ -16,6 +16,8 @@ typedef struct rt_spinlock { int v; } rt_spinlock_t;
 
 void _raw_spin_lock(raw_spinlock_t *lock);
 void _raw_spin_unlock(raw_spinlock_t *lock);
+void raw_spin_lock(raw_spinlock_t *lock);
+void raw_spin_unlock(raw_spinlock_t *lock);
 void rt_spin_lock(rt_spinlock_t *lock);
 void rt_spin_unlock(rt_spinlock_t *lock);
 
@@ -46,6 +48,13 @@ void rt_wait_under_raw_spin(raw_spinlock_t *raw, rt_spinlock_t *rt) {
   rt_spin_lock(rt); // rt-warning {{Call to RT lock 'rt_spin_lock' with a raw spinlock held}}
   rt_spin_unlock(rt);
   _raw_spin_unlock(raw);
+}
+
+void rt_wait_under_public_raw_spin(raw_spinlock_t *raw, rt_spinlock_t *rt) {
+  raw_spin_lock(raw);
+  rt_spin_lock(rt); // rt-warning {{Call to RT lock 'rt_spin_lock' with a raw spinlock held}}
+  rt_spin_unlock(rt);
+  raw_spin_unlock(raw);
 }
 
 void rt_wait_with_preemption_off(rt_spinlock_t *rt) {

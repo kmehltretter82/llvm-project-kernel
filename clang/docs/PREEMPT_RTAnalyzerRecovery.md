@@ -108,9 +108,17 @@ post-call incomplete-context diagnostic.  A separate no-function translation
 unit proves that malformed input and use without `RTContext=true` are visible;
 manifest initialization no longer depends on beginning path analysis.
 
-This remains bounded API-fixture qualification.  The frozen 174-record matrix,
-opaque unlisted-call invalidation, foreign-static policy, and real-kernel
-translation-unit coverage remain open.
+Multi-translation-unit manifests are isolated by the full captured binding,
+not by function spelling.  A structurally valid record from an unloaded,
+hash-pinned source is validated and ignored for the current AST.  An unbound
+record claiming to come from a source that is loaded in the current AST still
+rejects the manifest.  The primitive model also recognizes the public
+`raw_spin_lock()`/`raw_spin_unlock()` spellings used by API fixtures, in
+addition to the `_raw_*` and `__raw_*` leaves emitted by kernel wrappers.
+
+This remains bounded API-fixture qualification.  The frozen campaign,
+opaque unlisted-call invalidation, broader cross-TU qualification, and
+real-kernel translation-unit coverage remain open.
 
 The larger generated evidence archive, binaries, kernel objects, and frozen
 test outputs are intentionally not committed to the LLVM source repository.

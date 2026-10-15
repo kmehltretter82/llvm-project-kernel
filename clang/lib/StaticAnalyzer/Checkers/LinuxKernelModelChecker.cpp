@@ -163,7 +163,10 @@ LockCall linuxkernel::classifyLockCall(StringRef Name) {
       // use instead of the out-of-line ones.
       .Cases({"_raw_spin_lock", "_raw_spin_lock_bh", "_raw_spin_lock_irq",
               "_raw_spin_lock_irqsave", "_raw_spin_lock_nested",
-              "_raw_spin_lock_nest_lock", "_raw_spin_lock_irqsave_nested"},
+              "_raw_spin_lock_nest_lock", "_raw_spin_lock_irqsave_nested",
+              "raw_spin_lock", "raw_spin_lock_bh", "raw_spin_lock_irq",
+              "raw_spin_lock_irqsave", "raw_spin_lock_nested",
+              "raw_spin_lock_nest_lock"},
              {O::Acquire, K::Spin})
       .Cases({"_raw_read_lock", "_raw_read_lock_bh", "_raw_read_lock_irq",
               "_raw_read_lock_irqsave", "_raw_write_lock",
@@ -180,14 +183,17 @@ LockCall linuxkernel::classifyLockCall(StringRef Name) {
       .Cases({"_raw_spin_trylock", "_raw_spin_trylock_bh", "_raw_read_trylock",
               "_raw_write_trylock", "__raw_spin_trylock",
               "__raw_spin_trylock_bh", "__raw_read_trylock",
-              "__raw_write_trylock"},
+              "__raw_write_trylock", "raw_spin_trylock",
+              "raw_spin_trylock_bh"},
              {O::TryAcquire, K::Spin})
       .Cases({"_raw_spin_unlock", "_raw_spin_unlock_bh", "_raw_spin_unlock_irq",
               "_raw_spin_unlock_irqrestore", "_raw_read_unlock",
               "_raw_read_unlock_bh", "_raw_read_unlock_irq",
               "_raw_read_unlock_irqrestore", "_raw_write_unlock",
               "_raw_write_unlock_bh", "_raw_write_unlock_irq",
-              "_raw_write_unlock_irqrestore"},
+              "_raw_write_unlock_irqrestore", "raw_spin_unlock",
+              "raw_spin_unlock_bh", "raw_spin_unlock_irq",
+              "raw_spin_unlock_irqrestore"},
              {O::Release, K::Spin})
       .Cases({"__raw_spin_unlock", "__raw_spin_unlock_bh",
               "__raw_spin_unlock_irq", "__raw_spin_unlock_irqrestore",

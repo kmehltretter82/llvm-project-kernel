@@ -391,8 +391,12 @@ struct RTContextManifest {
             Obj->getString("source_sha256") == Hash && Obj->getInteger("offset") == Offset)
           Bound = true;
       }
-      if (!Bound || !Seen.insert((Source->str() + ":" + std::to_string(*Offset))).second) {
-        fail("Unbound or conflicting RT context manifest function"); return;
+      if (!Seen.insert((Source->str() + ":" + std::to_string(*Offset))).second) {
+        fail("Conflicting RT context manifest function"); return;
+      }
+      bool SourceLoaded = Actual.getObject("files")->get(*Source) != nullptr;
+      if (!Bound && SourceLoaded) {
+        fail("Unbound RT context manifest function in a loaded source"); return;
       }
       F.Name = Name->str(); F.Type = Type->str(); F.Linkage = Link->str();
       F.Source = Source->str(); F.SourceHash = Hash->str(); F.Offset = *Offset; F.Kind = Role->str();
@@ -425,7 +429,11 @@ struct RTContextManifest {
         if (!Depth("preempt", F.Preempt) || !Depth("bh", F.BH) || !Depth("rcu", F.RCU) ||
             !Depth("migration", F.Migration)) { fail("Unsupported RT context manifest entry depth"); return; }
       } else { fail("Unsupported RT context manifest function role"); return; }
-      Functions.push_back(std::move(F));
+      // A reviewed manifest may cover more than one translation unit.  An
+      // exact record for a pinned but unloaded source is foreign to this AST,
+      // not an identity failure and not a fact that may affect this AST.
+      if (Bound)
+        Functions.push_back(std::move(F));
     }
   }
 
@@ -475,7 +483,10 @@ static CallRole classify(StringRef Name) {
       // that some configurations use instead of the out-of-line ones.
       .Cases({"_raw_spin_lock", "_raw_spin_lock_bh", "_raw_spin_lock_irq",
               "_raw_spin_lock_irqsave", "_raw_spin_lock_nested",
-              "_raw_spin_lock_nest_lock", "_raw_spin_lock_irqsave_nested"},
+              "_raw_spin_lock_nest_lock", "_raw_spin_lock_irqsave_nested",
+              "raw_spin_lock", "raw_spin_lock_bh", "raw_spin_lock_irq",
+              "raw_spin_lock_irqsave", "raw_spin_lock_nested",
+              "raw_spin_lock_nest_lock"},
              {Role::Enter, SK::Lock})
       .Cases({"_raw_read_lock", "_raw_read_lock_bh", "_raw_read_lock_irq",
               "_raw_read_lock_irqsave", "_raw_write_lock",
@@ -492,14 +503,17 @@ static CallRole classify(StringRef Name) {
       .Cases({"_raw_spin_trylock", "_raw_spin_trylock_bh", "_raw_read_trylock",
               "_raw_write_trylock", "__raw_spin_trylock",
               "__raw_spin_trylock_bh", "__raw_read_trylock",
-              "__raw_write_trylock"},
+              "__raw_write_trylock", "raw_spin_trylock",
+              "raw_spin_trylock_bh"},
              {Role::TryEnter, SK::Lock})
       .Cases({"_raw_spin_unlock", "_raw_spin_unlock_bh", "_raw_spin_unlock_irq",
               "_raw_spin_unlock_irqrestore", "_raw_read_unlock",
               "_raw_read_unlock_bh", "_raw_read_unlock_irq",
               "_raw_read_unlock_irqrestore", "_raw_write_unlock",
               "_raw_write_unlock_bh", "_raw_write_unlock_irq",
-              "_raw_write_unlock_irqrestore"},
+              "_raw_write_unlock_irqrestore", "raw_spin_unlock",
+              "raw_spin_unlock_bh", "raw_spin_unlock_irq",
+              "raw_spin_unlock_irqrestore"},
              {Role::Leave, SK::Lock})
       .Cases({"__raw_spin_unlock", "__raw_spin_unlock_bh",
               "__raw_spin_unlock_irq", "__raw_spin_unlock_irqrestore",
