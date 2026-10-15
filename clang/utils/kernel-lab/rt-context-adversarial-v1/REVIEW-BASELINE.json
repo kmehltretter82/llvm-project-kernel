@@ -1,0 +1,51 @@
+{
+  "time_utc": "2026-10-12T20:04:36.701849+00:00",
+  "scope": "independent phase3 importer design/API review; root model source read only",
+  "files": [
+    {
+      "path": "/home/karl/linux-work/clang-warning/llvm-project/clang/include/clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h",
+      "sha256": "c25bc86f5d007f1fce55b616722af3461a15b5d7533cc7d6af4403da5b73be84",
+      "frozen_copy": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/kernel-profiles/phase3-review/CheckerContext.h.review-baseline"
+    },
+    {
+      "path": "/home/karl/linux-work/clang-warning/llvm-project/clang/include/clang/AST/Decl.h",
+      "sha256": "b362d2781cfbe0b0260768b8e87cc12ff440289fc2efa7375d8c6caac293d44c",
+      "frozen_copy": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/kernel-profiles/phase3-review/Decl.h.review-baseline"
+    },
+    {
+      "path": "/home/karl/linux-work/clang-warning/llvm-project/clang/include/clang/Basic/SourceManager.h",
+      "sha256": "de0c3bd0176cef66ab333cc26e56bdba8cb747757508aff9ad05c92f479e8244",
+      "frozen_copy": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/kernel-profiles/phase3-review/SourceManager.h.review-baseline"
+    },
+    {
+      "path": "/home/karl/linux-work/clang-warning/llvm-project/clang/include/clang/Basic/FileManager.h",
+      "sha256": "68ea1a4168592168266843dfe003ac90ba0b1e2a72875693e7054c77cd21e235",
+      "frozen_copy": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/kernel-profiles/phase3-review/FileManager.h.review-baseline"
+    },
+    {
+      "path": "/home/karl/linux-work/clang-warning/llvm-project/clang/include/clang/Lex/Preprocessor.h",
+      "sha256": "2eb7b79043bc12c2d6a188b0eb142b3b75d4b46bb362fc6d64e12037ffbffc2d",
+      "frozen_copy": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/kernel-profiles/phase3-review/Preprocessor.h.review-baseline"
+    },
+    {
+      "path": "/home/karl/linux-work/clang-warning/llvm-project/llvm/lib/Support/JSON.cpp",
+      "sha256": "6d25200062b3f674b242385d2e68a9009c9446895b8aa662d03df1ded6e4b7f0",
+      "frozen_copy": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/kernel-profiles/phase3-review/JSON.cpp.review-baseline"
+    },
+    {
+      "path": "/home/karl/linux-work/clang-warning/llvm-project/llvm/include/llvm/Support/SHA256.h",
+      "sha256": "cb5576bc01142a1d2613bff86149dd696e59c46d53a2846ba967c1cc6c26fa1c",
+      "frozen_copy": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/kernel-profiles/phase3-review/SHA256.h.review-baseline"
+    },
+    {
+      "path": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/llvm-project/clang/lib/StaticAnalyzer/Checkers/LinuxAtomicSleepChecker.cpp",
+      "sha256": "0ada8d893a09577c9c705a6deb3570b4ce6b8e803da1f3886b5239c492816adb",
+      "frozen_copy": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/kernel-profiles/phase3-review/LinuxAtomicSleepChecker.cpp.review-baseline"
+    },
+    {
+      "path": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/llvm-project/clang/lib/StaticAnalyzer/Checkers/LinuxKernelModeling.h",
+      "sha256": "63ce1d90f880dcf7fb4f465c92979808b508b954627b46df3f3cec5dcb0e7e89",
+      "frozen_copy": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/kernel-profiles/phase3-review/LinuxKernelModeling.h.review-baseline"
+    }
+  ]
+}

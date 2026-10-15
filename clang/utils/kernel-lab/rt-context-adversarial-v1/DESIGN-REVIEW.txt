@@ -1,0 +1,183 @@
+Independent design review: AtomicSleep RTContextManifest importer
+Prepared before reading implementation output, 2026-10-12 UTC
+
+The importer should only add precisely scoped entry assumptions and two
+pre-call effect observations. It must not advertise a function, callback,
+translation unit or source arm as clean. Hashes establish identity, not the
+truth of an entry-context assumption or effect contract. Provenance for those
+assumptions must remain a separate, reviewable input.
+
+Suggested acceptance boundary
+
+1. Option is explicitly set AND RTContext=true. Absent option preserves the
+   existing analysis exactly. An option set with RTContext=false emits a clear
+   configuration gap and imports nothing; it must not silently enable RT mode.
+2. Read and validate the entire manifest before applying any row. Reject unknown
+   schema/effect model, incomplete required fields, wrong JSON types, duplicate
+   keys, duplicate/conflicting rows and unknown effect/context enum values.
+   No good-prefix/bad-suffix partial import. Unsupported fields that could
+   change context/effects must be rejected rather than silently ignored.
+3. Match the actual cc1 canonical target triple, main TU buffer identity,
+   compiler-visible configuration macro values AND definedness, and all pinned
+   source/dependency/generated-header bytes. A correct disk config hash alone
+   is insufficient: -D/-U and VFS overlays can change what Clang analyzed.
+4. Bind entries/effects to one unambiguous declaration identity. For entry
+   seeds require a real function definition in the allowed TU. Define how
+   external prototypes are keyed for pre-call effects; never opportunistically
+   change key location between canonical prototype, latest redeclaration and
+   definition. No name-only fallback after any mismatch.
+5. Only the exact top frame can receive an entry seed. A listed helper in an
+   inlined, recursive or callback frame inherits the caller's actual state.
+   It cannot use its independent top-level manifest entry to reset that state.
+6. A pre-call effect says ordinary-sleep or rt-lock-wait. It does not acquire a
+   lock, discharge a caller context, establish a clean exit, preserve IRQs,
+   resolve an unknown callback, or suppress subsequent opaque invalidation.
+   Use current reportSleep legality rules and keep ordinary built-in modeling.
+7. Rejected, unmatched, stale or conflicting imports create a visible gap even
+   when no analyzed path reaches a matching function or callee. No import is
+   distinguishable from validated-but-unused, validated-and-used and rejected.
+
+Compiler API findings (frozen source copies in REVIEW-BASELINE.json)
+
+CheckerContext.h:116-122: getStackFrame() and inTopFrame() are direct interfaces.
+Use C.inTopFrame() before applying a BeginFunction seed. getParent()==nullptr
+is the underlying top-frame predicate (AnalysisDeclContext.h:320).
+
+Decl.h:2356-2370: hasBody(const FunctionDecl *&Definition) returns the declaration
+that owns the actual body. Decl.h:2396-2403: getDefinition() also exists, but
+isDefined includes some definitions without user bodies (alias/ifunc/deleted
+definitions). Use a real body for an entry seed. getCanonicalDecl() alone can
+be the earlier prototype, whose source path and offset are different.
+
+Decl.h:423-427 gives getFormalLinkage(); getStorageClass()==SC_Static is not a
+complete linkage test. Specify accepted linkage spelling and language linkage.
+A minimal Linux-C-only importer can reject C++ overloads/methods/templates and
+alias/ifunc declarations with an explicit unsupported gap. If it accepts them,
+qualified name, signature, calling convention and special declaration identity
+must be part of the matching rule.
+
+For types, specify canonical QualType plus a fixed PrintingPolicy and compiler
+identity, or serialize structural function type properties. Default
+getAsString() varies with typedef spellings and printing policy. Preserve
+FunctionNoProto versus FunctionProto, variadic bit, argument/return types,
+calling convention and relevant address-space attributes. No substring or
+whitespace-insensitive prototype matching. Signedness/const pointer changes
+must not match. Typedef equivalence is either deliberately canonicalized or
+deliberately rejected, with its rule tested in both generator and consumer.
+
+SourceManager.h:1282-1315 gives decomposed locations and byte offsets. Prefer the
+function-name token location over getBeginLoc(), which can begin at an
+attribute macro. Choose and document spelling location; reject a macro name
+token for the initial implementation. Do not use #line presumed paths/line
+numbers as identity. Scratch/builtin/invalid source locations cannot match.
+A whole-file SHA plus token offset suffices if their exact interpretation is
+fixed; if the schema has a declaration/function range hash, use a contiguous
+same-FileID byte range with end-token extent, not an inclusive end offset.
+
+SourceManager.h:1118 gives getBufferDataOrNone(FileID), which can hash the
+compiler-loaded TU/function-source bytes. getBufferOrFake() is an error
+recovery interface and must not validate a pin. A fresh MemoryBuffer::getFile
+reads physical disk rather than the source buffer Clang already parsed. This
+can falsely accept when a VFS overlay or overridden/in-memory buffer differs.
+FileManager.h:240,273-282 exposes the active VFS and VFS-aware reads. Match
+compiler-loaded buffers for loaded source/header files; when checking other
+pins, use the same FileManager/VFS or explicitly reject unsupported overlays.
+
+TargetInfo.h:1324 gives getTriple().str(). Match the canonical cc1 value, e.g.
+aarch64-unknown-linux-gnu, not only the original driver --target spelling.
+Triple/config/source pins do not bind all compile semantics: include order,
+forced includes, command-line macro overrides, language/ABI/target features
+and PCH/module state can change the AST with the same files. Either bind a
+normalized compile-configuration identity too or clearly restrict/reject the
+unsupported cases. At minimum, validate the files actually loaded by Clang,
+not only a manifest-supplied subset chosen by the manifest itself.
+
+CheckerContext.h:135-138 exposes the actual Preprocessor. Preprocessor.h:1437
+and 1449 provide current and source-location-specific macro definitions.
+CheckerHelpers.h:74 provides tryExpandAsInteger. An absent macro is distinct
+from an unexpandable macro and from a defined zero. Kernel n normally means
+undefined; do not turn a failed macro evaluation into an implicit n match.
+Malformed/recursive/function-like macro values must produce a gap. Macro
+definitions can change inside one TU; checking only the final PP table can
+misrepresent the state used while parsing an earlier definition. A minimal
+implementation can reject CONFIG redefinitions or require the relevant macro
+definition/value at the matched function location to agree with the TU pin.
+
+LLVM JSON.cpp:465-483 parses object values into O[std::move(K)]. Repeated
+decoded keys overwrite earlier values. llvm::json::parse alone does not reject
+duplicates, including keys spelled with Unicode escapes. A naive regex over
+raw key spelling is insufficient. Enforce duplicate rejection through a
+validated parser/token layer, or explicitly define and validate a unique
+canonical serialized form before consuming it. No Core/JSON parser patch is
+required for the checker, but the rejection requirement needs an actual test.
+
+Required fail-closed corner cases
+
+File/path identity:
+  - Absolute path rule and current cwd are explicit. Reject relative paths if
+    the schema does not define resolution. Do not infer path from basename.
+  - Normalize deliberately; distinguish aliases, symlinks, hardlinks, case,
+    trailing separators and dot components. If aliases are permitted, all
+    aliases to one underlying file must have one consistent SHA. A lexical
+    path and matching hash do not prove the same file was included by Clang.
+  - Read failures, missing files, directories, truncated/uppercase/nonhex
+    digests, embedded NULs and invalid byte offsets never become empty/default
+    values. Avoid accepting a file that was not compiler-visible solely
+    because a different disk file with that name matches.
+  - Validate every required dependency and loaded generated header. A subset
+    or omitted decisive header is a visible coverage gap. Unknown external
+    dependencies are not made complete by hashing the listed ones.
+
+Function binding:
+  - Reject multiple matches for one entry or effect key, and conflicting rows
+    for the same exact function after normalization. Even identical duplicates
+    should be rejected in the minimal schema so order cannot affect meaning.
+  - Match definition/prototype kind, source file hash, name-token byte offset,
+    exact type and linkage together. A wrong offset must not fall back to name.
+  - Support resolved function-pointer calls only if Call.getDecl() denotes the
+    same exact FunctionDecl. An unknown callback/member/field name cannot
+    resolve to a function effect merely because its name/type resembles a row.
+  - Alias/ifunc, macro-generated declarations, CTU/PCH/modules and non-C
+    functions require deliberate support or visible rejection.
+
+State/effect integration:
+  - Seed each top-level analysis independently and once. Cache validated TU
+    metadata, not ProgramState facts or mutable path state across functions.
+  - A seed cannot apply during inlining or recursion and cannot clear inherited
+    raw/preempt/NMI/hardirq/IRQ-off facts. Entry assumptions are not exit facts.
+  - Ordinary-sleep and rt-lock-wait have different legality. On RT, RT wait is
+    allowed under ordinary RCU, RT BH exclusion, migration-only context and
+    another RT lock; ordinary sleep remains forbidden in the applicable atomic
+    contexts. Both remain forbidden under raw locking, IRQ-off, preempt-off,
+    hardirq or NMI. Keep nonRT interpretation separate.
+  - Imported effects must not replace built-in context/lock/save accounting or
+    a more restrictive built-in sleep effect. A contradictory built-in/import
+    combination is a visible gap; an early return cannot downgrade it.
+  - Imported rt-lock-wait is an observation, not proof of successful lock
+    acquisition. Do not add a held lock, a balanced release or saved IRQ token.
+  - No post-call preservation is imported. Opaque unlock/side-effect/callback
+    gaps and uncertainty remain visible, including after an imported effect.
+  - A model report with unknown context is not a legality pass. Make use and
+    uncertainty visible in raw diagnostics/status, not only in a test script.
+
+Validation and reporting transaction
+
+Parse/shape errors can be diagnosed at checker registration via
+CheckerManager::getDiagnostics(). TU/buffer/config and declaration validation
+need the AST/PP and can occur at the first BeginFunction or TU callback.
+Use a TU-final status path so filtering, syntax-only analysis, path pruning or
+zero analyzed bodies cannot hide a failed option. Report validation once per
+TU with a precise reason and affected manifest/function; do not terminate a
+valid program path merely to report a coverage gap. A malformed importer file
+must not crash assertions-enabled Clang or quietly mark a scan complete.
+
+For auditable qualification, preserve manifest bytes/hash, compiler/build
+identity, exact argv/cwd, actual macro/triple, all validated pins, binding
+identities, number of seeds/effects used, unused/unmatched keys, rejected
+reasons and raw diagnostic/stat coverage. The external harness still needs
+before/after hashes and engine-limit reports. Importer acceptance alone is
+not semantic qualification, complete call-graph coverage or runtime evidence.
+
+Independent adversarial cases are specified in ADVERSARIAL-TESTS.json. They
+are proposed tests, not executed results. No compiler/model/source or runtime
+change was made by this review.

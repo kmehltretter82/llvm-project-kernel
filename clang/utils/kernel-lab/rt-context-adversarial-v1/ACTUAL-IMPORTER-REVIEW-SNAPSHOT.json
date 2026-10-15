@@ -1,0 +1,31 @@
+{
+  "time_utc": "2026-10-12T20:26:47.635058+00:00",
+  "scope": "Read-only implementation review at requested pause checkpoint. No tests, scans, model/source edits, hardware or runtime actions. Source copied once to stabilize cited line numbers; root may subsequently repair integration errors.",
+  "sources": [
+    {
+      "source_path": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/llvm-project/clang/lib/StaticAnalyzer/Checkers/LinuxAtomicSleepChecker.cpp",
+      "frozen_copy": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/kernel-profiles/phase3-review/LinuxAtomicSleepChecker.cpp.actual-importer-review",
+      "sha256": "0e26e377df9f0dce442b7860b328c6c42cb0383e5ab0e394c60e6896ffac9da2",
+      "line_count": 1499
+    },
+    {
+      "source_path": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/llvm-project/clang/lib/StaticAnalyzer/Checkers/LinuxKernelModelChecker.cpp",
+      "frozen_copy": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/kernel-profiles/phase3-review/LinuxKernelModelChecker.cpp.actual-importer-review",
+      "sha256": "49e950f1e598bc871cd877fd84183fa98cc138e02a53105eb08bce1692fb1517",
+      "line_count": 532
+    },
+    {
+      "source_path": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/llvm-project/clang/lib/StaticAnalyzer/Checkers/LinuxKernelModeling.h",
+      "frozen_copy": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/kernel-profiles/phase3-review/LinuxKernelModeling.h.actual-importer-review",
+      "sha256": "63ce1d90f880dcf7fb4f465c92979808b508b954627b46df3f3cec5dcb0e7e89",
+      "line_count": 131
+    },
+    {
+      "source_path": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/llvm-project/clang/include/clang/StaticAnalyzer/Checkers/Checkers.td",
+      "frozen_copy": "/home/karl/linux-work/dmadebug/rt-clang-work-20261012/kernel-profiles/phase3-review/Checkers.td.actual-importer-review",
+      "sha256": "75a444b5b19a2abaa45559b7673398610c5e6652e55c7173adfd97b259d17bd3",
+      "line_count": 1889
+    }
+  ],
+  "validation": "Source inspection only; importer is not qualified; prior 89-case design inventory remains NOT_RUN."
+}

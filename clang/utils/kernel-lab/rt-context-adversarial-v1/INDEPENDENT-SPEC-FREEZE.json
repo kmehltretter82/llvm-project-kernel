@@ -1,0 +1,19 @@
+{
+  "time_utc": "2026-10-12T20:10:42.004899+00:00",
+  "status": "independent design and89 adversarial cases specified before implementation review; not executed",
+  "file_sha256": {
+    "ADVERSARIAL-TESTS.json": "aad7fc76a40fc1a8f5098bdb09fd4ece1170e0559496bd7ce965115826b0630a",
+    "CheckerContext.h.review-baseline": "c25bc86f5d007f1fce55b616722af3461a15b5d7533cc7d6af4403da5b73be84",
+    "DESIGN-REVIEW.txt": "c7acccfd0f7863a8ab791d4c1f3f3a68cad4851f50d6909468e7633d58400045",
+    "Decl.h.review-baseline": "b362d2781cfbe0b0260768b8e87cc12ff440289fc2efa7375d8c6caac293d44c",
+    "FileManager.h.review-baseline": "68ea1a4168592168266843dfe003ac90ba0b1e2a72875693e7054c77cd21e235",
+    "JSON.cpp.review-baseline": "6d25200062b3f674b242385d2e68a9009c9446895b8aa662d03df1ded6e4b7f0",
+    "LinuxAtomicSleepChecker.cpp.review-baseline": "0ada8d893a09577c9c705a6deb3570b4ce6b8e803da1f3886b5239c492816adb",
+    "LinuxKernelModeling.h.review-baseline": "63ce1d90f880dcf7fb4f465c92979808b508b954627b46df3f3cec5dcb0e7e89",
+    "Preprocessor.h.review-baseline": "2eb7b79043bc12c2d6a188b0eb142b3b75d4b46bb362fc6d64e12037ffbffc2d",
+    "REVIEW-BASELINE.json": "febe15002baddde138ecb9ec23aba7b513cb4ee3f5b8e5c3ecae30dfb8788925",
+    "SHA256.h.review-baseline": "cb5576bc01142a1d2613bff86149dd696e59c46d53a2846ba967c1cc6c26fa1c",
+    "SourceManager.h.review-baseline": "de0c3bd0176cef66ab333cc26e56bdba8cb747757508aff9ad05c92f479e8244",
+    "entry-effect-fixture.c": "9016c09f2bc626e6f64c1ecba7ebb6da16da346192d61a354e33d822449445ab"
+  }
+}

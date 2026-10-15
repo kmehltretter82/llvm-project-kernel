@@ -1,0 +1,120 @@
+Independent phase3 actual importer review — pause checkpoint
+
+Scope: read-only source inspection. No importer tests, analyzer scans, source edits,
+hardware or runtime work performed. C++ integration repairs and build qualification
+are root-owned. All references below use frozen *.actual-importer-review copies and
+the SHA256 pins in ACTUAL-IMPORTER-REVIEW-SNAPSHOT.json. Prior independent design
+and 89-case ADVERSARIAL-TESTS.json remain unexecuted. This is not a semantic pass.
+
+Findings requiring qualification or a documented limitation
+
+1. P1 — A requested invalid manifest is invisible when no top frame is analyzed.
+   LinuxAtomicSleepChecker.cpp:565–566 registers BeginFunction/PreCall/PostCall only.
+   Lines 955–968 initialize and report rejection only in top-frame BeginFunction.
+   Registration at 1483–1494 merely stores options. An empty TU, a TU with no
+   analyzed definition, or unmatched -analyze-function therefore performs no
+   manifest validation and emits no manifest-gap diagnostic. Disabling the
+   KernelModel SkipIrrelevant filter (KernelModel.cpp:335–340,522–527) does not make
+   a nonexistent top frame run. This fails the independent design requirement that
+   stale/conflicting explicit input be visible even when zero paths are explored.
+   Suggested eventual test: missing/invalid manifest on an empty TU and on a
+   valid TU with an unmatched function filter. Expected zero imported facts plus
+   an invocation-level visible rejection or a wrapper-verifiable failure status.
+   This consequence follows directly from callback placement; it was not run.
+
+2. P1 — Unresolved calls do not expose or invalidate imported entry facts.
+   AtomicSleep.cpp:1000–1002 and 1058–1060 return if getCallee cannot produce a
+   file-context FunctionDecl. getCallee at 611–615 has no callback-resolution
+   guarantee. A genuinely unknown function pointer therefore carries a known
+   imported task/IRQ-enabled or positive entry context through an opaque call
+   without an importer-specific gap. There is also no blanket unknown invalidation
+   for an ordinary unlisted external declaration: affectedContexts at 734–736
+   returns only name-classified effects, and 1433–1442 gaps only known potential
+   release effects. This was largely inherited behavior, but explicit entry seeds
+   make the preservation assumption newly relevant. Do not claim callback safety,
+   context preservation across all unknown calls, or a clean proof from silence.
+   Suggested tests: seeded entry -> unknown callback -> lock wait/sleep; seeded
+   entry -> unlisted external helper -> lock wait/sleep. Assess actual-state
+   unknowns and visible gaps independently of the typed effect-import tests.
+
+3. P2 — Manifest BH entry units do not cover a complete BH-disabled nesting level.
+   Entry depth fields accept only 0/1 (419–425), then bh is inserted verbatim as
+   AtomicSection.Amount (985–988). The actual non-inlined raw _bh lock accounting
+   adds Amount=2 and removes two softirq units (1322–1329,1395–1411); a real
+   local_bh_enable counter path similarly decodes SOFTIRQ_DISABLE_OFFSET as two
+   units (1147–1163,1181–1194). If context.bh=1 means one local_bh_disable nesting
+   level, a matching enable reports underflow. If it means a raw softirq counter
+   unit, the current 0/1 restriction cannot express that level at all. This is a
+   coverage/schema ambiguity, usually conservative rather than a false clean
+   state. Document units and test matched entry/enable behavior before using
+   positive BH entry facts. NMI entry seeds only NMI, not the accompanying hardirq
+   counter component; test the real nmi_exit counter chain separately as well.
+
+Identity and configuration limitations to keep explicit
+
+- facts() hashes SourceManager's actual loaded buffers, not merely reread disk
+  files (207–226). It rejects overridden/invalid file buffers and external AST,
+  requires every actual loaded file in the manifest (337–342), then separately
+  hashes every listed file through FileManager/VFS (325–335). This is strong
+  loaded-file coverage; it is not a proof of every build dependency or every
+  unmaterialized AST/header source. Exported facts intentionally infer no effects.
+- target_triple, predefines hash, TU identity, and actual RT macro facts must match
+  exactly (313–319). Macro definedness is represented explicitly as absent vs a
+  numeric string; changing local macro directive history is rejected (239–251).
+  Target triple plus predefines are not a complete compile-argv/LangOptions/CPU/
+  ABI/analyzer-policy identity. Those exact pins still belong in the external
+  invocation manifest; do not describe this JSON alone as complete compiler input
+  equivalence. No compiler behavior was experimentally compared in this review.
+- configuration.kind=kernel requires config/autoconf pins and actual loaded
+  autoconf (344–357), but it does not establish .config -> generated-header
+  derivation or that config_path denotes a .config. api-fixture is accepted for
+  any matching TU (358–360). Profile provenance/config equality remain external
+  generator checks. This is not Kconfig resolution validation inside the checker.
+- Unrecognized extra object fields are ignored. Unsupported known enum values,
+  roles, schema/effect model and conflicting function keys are rejected, but an
+  extra purported preservation/callback field is not explicitly rejected. Such
+  fields confer no effects in this code and must not be treated as evidence.
+- Evidence is content-pinned, not authenticated or independently interpreted
+  (382–384). Assertions still need human review. Root's conservative importer
+  does not and should not turn an arbitrary evidence file into a proof.
+
+Confirmed safeguards by source inspection
+
+- Whole-manifest rollback: every fail() clears Functions (265–268); initialization
+  returns immediately on a later invalid record; runtime find() refuses Error
+  (431–442). Pre/Post effects also require empty Error. Early valid records do not
+  survive a later invalid record. Duplicate raw/escaped JSON keys are checked
+  before use, beyond LLVM JSON's replace-on-duplicate representation (122–164).
+- Exact binding uses definition when available, canonical printed function type,
+  formal linkage, canonical source path, loaded-buffer hash and source offset
+  (181–205,385–394,431–442). Macro-located function identifiers and unsupported
+  non-file declarations fail binding. Direct TU declarations only are enumerated;
+  unsupported nested C++ contexts are not silently matched by name.
+- Numeric handling in the importer is bounded: negative/noninteger offsets fail;
+  an accepted offset equals SourceManager's actual file offset before storage in
+  uint64_t. Entry depths are 0/1 before unsigned assignment, so no 32-bit unsigned
+  wrap is admitted by these fields. This does not qualify existing bulk
+  preemption-counter width/slot modeling; its adversarial cases remain queued.
+- Only top-frame exact entry functions receive the seed (955–995); inlined callees
+  do not acquire callback/task entry assumptions. No callback traversal is added.
+- Effect imports cannot override a shared modeled lock or context primitive
+  (398–402). Imported pre-call reporting continues into the normal primitive
+  accounting (1005–1028). AtomicSleep's Enter/TryEnter/Leave classifier names are
+  covered by those shared lock/context classifications in the inspected version.
+- Every non-inlined imported effect, including effect=unknown, retains existing
+  sections as uncertain, marks all nine context kinds unknown, sets IRQ-save
+  balance unknown, sets current IRQ unknown, and emits a gap (1065–1083).
+  No imported clean/preserve postcondition exists. Actual inlined bodies retain
+  their ordinary modeled execution; this is not an imported preservation claim.
+- Output uses create-new semantics and checks stream errors (278–292), so an
+  existing identity file is not overwritten. Output-only identities are distinct
+  from reviewed entry/effect records and do not seed contexts.
+
+Handoff
+
+Finish the root-owned C++ integration checkpoint and keep this importer development
+only. Qualification remains queued: the independent 89 semantic cases, actual
+schema-specific positive/negative fixtures, zero-path visibility, unresolved-call
+handling, positive BH/NMI entry accounting, whole-manifest stale-pin rejection,
+and a matched real-TU entry/effect experiment. No new tests were launched because
+Karl requested stopping RT Clang after the next good checkpoint.
