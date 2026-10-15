@@ -85,6 +85,24 @@ Known follow-up items include:
 * perform a clean build plus focused analyzer regression tests before making
   correctness claims.
 
+## In-tree qualification progress
+
+The RISC-V kernel-lab branch now builds this snapshot as part of a complete
+LLVM 24 Clang build.  `clang/test/Analysis/linux-rt-context.c` is the first
+V4-specific regression test.  It runs for `riscv64-unknown-linux-gnu` and
+checks both the opt-in RT model and the unchanged default mode.
+
+The fixture currently covers raw-spin, preemption-disabled, hard-IRQ, NMI,
+and IRQ-disabled rejection of an rtmutex-backed spinlock wait.  It also covers
+the RT-permitted RCU, bottom-half-disabled, migration-disabled, and nested
+RT-lock cases; balanced context exits; IRQ save/restore and query refinement;
+and preemption-counter decoding for preempt, hard-IRQ, NMI, and RT bottom-half
+fields.  The default mode reports none of the RT-specific diagnostics.
+
+This is a bounded primitive-model qualification, not qualification of the V4
+manifest importer.  Manifest validation, entry/effect import, opaque-call
+invalidation, and real-kernel translation-unit coverage remain open.
+
 The larger generated evidence archive, binaries, kernel objects, and frozen
 test outputs are intentionally not committed to the LLVM source repository.
 At recovery time they remained on the mounted HETZNER volume under
