@@ -61,3 +61,12 @@ deliberately wrong-width relocation.
 The C-map test additionally proves disabled/enabled object and linked `.text`
 identity, validates the PC-relative relocation pair across linker relaxation,
 and proves that the tool rejects a requested site dropped by code generation.
+It exercises the same four-site policy in two backend lanes: default RISC-V
+SelectionDAG is the expected coverage-failure control, while experimental
+GlobalISel must preserve all four records with byte-identical `.text`.
+
+The map records identify final machine PCs, not source-level adjacency.  For
+example, an IR instruction selected as "after call" can move away from the
+call during instruction scheduling.  Consumers schedule only the resolved PC
+and use the policy description as provenance, not as an unchecked assertion
+about neighboring instructions.

@@ -51,8 +51,13 @@ The first C path is a separate optimizer-last `ClangKernelLabMap` pass.  It
 attaches LLVM `!pcsections` metadata to selected existing instructions under
 an explicit RV64/ELF/medium-code-model gate.  A companion expected-site table
 makes dropped metadata fatal in the object reader.  This is already useful for
-surviving store/atomic publication instructions; call, entry, and return
-propagation remain backend work and are covered by a negative fixture.
+surviving store/atomic publication instructions with the default SelectionDAG
+backend.  An explicitly experimental `-fglobal-isel` lane preserves the four
+entry/call/publication/return anchors in the current fixture without changing
+`.text`.  SelectionDAG still drops three of those anchors and is retained as a
+required negative test.  Neither result turns an IR-relative description such
+as "after call" into a promise that the final instruction is adjacent to the
+call; the resolved machine PC is the only scheduleable boundary.
 
 ### Layer B: explicit callback and perturb mode
 
@@ -268,6 +273,9 @@ As of 2026-10-15 on `kernel-lab-riscv`:
   `ADD64`/`SUB64` relocation pair resolves correctly across linker relaxation;
 - a four-site call/entry/return negative deliberately loses three backend
   markers and is rejected by the emitted-versus-expected coverage gate;
+- compiling that same four-site fixture through RISC-V GlobalISel preserves
+  all four expected records, and both its object and linked `.text` remain
+  byte-identical to GlobalISel controls;
 - the callback/perturb plugin builds against installed LLVM 22 using `-j1`;
 - its RISC-V opt-in/disabled smoke test passes with four callbacks and one
   perturbation point;
@@ -277,8 +285,10 @@ As of 2026-10-15 on `kernel-lab-riscv`:
 - no Linux boot, QEMU injection, FPGA run, or correctness verdict has yet been
   claimed from this new branch.
 
-The next compiler task is to preserve PC-section metadata on RISC-V calls,
-returns, and explicit statement sites, then expand inertness checks to all
-executable sections, symbols, relaxation, and unwind data.  The next QEMU task
-is the RV64 exact-site TB stop without injection, followed by the real PLIC
-endpoint and deterministic schedule.
+The next compiler task is to add an explicit statement/instruction selector,
+then preserve PC-section metadata through the default RISC-V backend (or emit
+the records at final Machine IR/AsmPrinter) so the lab does not depend on
+experimental GlobalISel.  Inertness checks must then expand to all executable
+sections, symbols, relaxation, and unwind data.  The next QEMU task is the RV64
+exact-site TB stop without injection, followed by the real PLIC endpoint and
+deterministic schedule.

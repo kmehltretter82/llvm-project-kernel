@@ -32,7 +32,8 @@ def run(command: list[str], *, environment: dict[str, str] | None = None,
 
 
 def compile_object(arguments: argparse.Namespace, output: pathlib.Path,
-                   *, plugin: bool, spec: pathlib.Path | None
+                   *, plugin: bool, spec: pathlib.Path | None,
+                   global_isel: bool = False,
                    ) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     if spec is None:
@@ -50,6 +51,8 @@ def compile_object(arguments: argparse.Namespace, output: pathlib.Path,
         "-ffreestanding",
         "-fno-addrsig",
     ]
+    if global_isel:
+        command.extend(["-fglobal-isel", "-Wno-global-isel"])
     if plugin:
         command.append(f"-fpass-plugin={arguments.plugin.resolve()}")
     command.extend(["-c", str(SOURCE), "-o", str(output)])
@@ -96,6 +99,8 @@ def main() -> int:
         disabled_obj = directory / "disabled.o"
         mapped_obj = directory / "mapped.o"
         gap_obj = directory / "gap.o"
+        gisel_baseline_obj = directory / "gisel-baseline.o"
+        gisel_mapped_obj = directory / "gisel-mapped.o"
 
         compile_object(arguments, baseline_obj, plugin=False, spec=None)
         compile_object(arguments, disabled_obj, plugin=True, spec=None)
@@ -203,6 +208,72 @@ def main() -> int:
         if "C carrier/expectation mismatch" not in rejected.stderr:
             raise AssertionError(f"unexpected coverage error: {rejected.stderr!r}")
 
+        compile_object(
+            arguments,
+            gisel_baseline_obj,
+            plugin=False,
+            spec=None,
+            global_isel=True,
+        )
+        gisel_compile = compile_object(
+            arguments,
+            gisel_mapped_obj,
+            plugin=True,
+            spec=GAP_SPEC,
+            global_isel=True,
+        )
+        if "loosing !pcsections" in gisel_compile.stderr:
+            raise AssertionError(
+                f"GlobalISel lost requested sites: {gisel_compile.stderr}"
+            )
+        gisel_baseline_obj_text = dump_section(
+            arguments,
+            gisel_baseline_obj,
+            ".text",
+            directory / "gisel-baseline-o.text",
+        )
+        gisel_mapped_obj_text = dump_section(
+            arguments,
+            gisel_mapped_obj,
+            ".text",
+            directory / "gisel-mapped-o.text",
+        )
+        if gisel_baseline_obj_text != gisel_mapped_obj_text:
+            raise AssertionError("GlobalISel C map changed object .text")
+        gisel_object_map = json.loads(run([
+            str(arguments.site_tool.resolve()),
+            "--validate-relocatable",
+            str(gisel_mapped_obj),
+        ]).stdout)
+        if len(gisel_object_map["sites"]) != 4:
+            raise AssertionError("GlobalISel object did not preserve four sites")
+
+        gisel_baseline_elf = directory / "gisel-baseline.elf"
+        gisel_mapped_elf = directory / "gisel-mapped.elf"
+        link(arguments, gisel_baseline_obj, gisel_baseline_elf)
+        link(arguments, gisel_mapped_obj, gisel_mapped_elf)
+        gisel_baseline_elf_text = dump_section(
+            arguments,
+            gisel_baseline_elf,
+            ".text",
+            directory / "gisel-baseline-e.text",
+        )
+        gisel_mapped_elf_text = dump_section(
+            arguments,
+            gisel_mapped_elf,
+            ".text",
+            directory / "gisel-mapped-e.text",
+        )
+        if gisel_baseline_elf_text != gisel_mapped_elf_text:
+            raise AssertionError("GlobalISel C map changed linked .text")
+        gisel_sidecar = json.loads(run([
+            str(arguments.site_tool.resolve()), str(gisel_mapped_elf)
+        ]).stdout)
+        if {entry["kind"] for entry in gisel_sidecar["sites"]} != {
+            4, 5, 37, 39,
+        }:
+            raise AssertionError("GlobalISel sidecar has unexpected site kinds")
+
         print(json.dumps({
             "result": "PASS",
             "target": "riscv64-unknown-linux-gnu",
@@ -211,6 +282,8 @@ def main() -> int:
             "site_count": 1,
             "object_relocations": "PASS",
             "lost_site_negative": "PASS",
+            "global_isel_site_count": 4,
+            "global_isel_text_identity": "PASS",
             "trigger_phase": sidecar["trigger_phase"],
         }, indent=2))
     return 0
