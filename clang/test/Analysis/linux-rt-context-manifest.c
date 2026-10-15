@@ -14,7 +14,13 @@
 // RUN:   -analyzer-config alpha.linux.AtomicSleep:RTContext=true \
 // RUN:   -analyzer-config alpha.linux.AtomicSleep:RTContextManifest=%t/manifest.json \
 // RUN:   -verify=manifest %s
+// RUN: %clang_analyze_cc1 -triple riscv64-unknown-linux-gnu \
+// RUN:   -D CONFIG_PREEMPT_RT=1 \
+// RUN:   -analyzer-checker=core,alpha.linux.AtomicSleep \
+// RUN:   -analyzer-config alpha.linux.AtomicSleep:RTContext=true \
+// RUN:   -verify=default %s
 // REQUIRES: riscv-registered-target
+// default-no-diagnostics
 
 typedef struct rt_spinlock { int v; } rt_spinlock_t;
 
@@ -23,6 +29,7 @@ void rt_spin_unlock(rt_spinlock_t *lock);
 void imported_rt_wait(void);
 void imported_sleep(void);
 void imported_unknown(void);
+void unlisted_external(void);
 
 void manifest_identity_anchor(void) {}
 
@@ -56,5 +63,15 @@ void manifest_rcu_effect(void) {
 }
 
 void manifest_softirq_effect(void) {
+  imported_rt_wait(); // manifest-warning {{Imported effect has no proved post-call context preservation}}
+}
+
+void manifest_unlisted_external_then_wait(void) {
+  unlisted_external(); // manifest-warning {{Imported entry context became unknown after unmodeled call}}
+  imported_rt_wait(); // manifest-warning {{Imported effect has no proved post-call context preservation}}
+}
+
+void manifest_callback_then_wait(void (*callback)(void)) {
+  callback(); // manifest-warning {{Imported entry context became unknown after unresolved call}}
   imported_rt_wait(); // manifest-warning {{Imported effect has no proved post-call context preservation}}
 }

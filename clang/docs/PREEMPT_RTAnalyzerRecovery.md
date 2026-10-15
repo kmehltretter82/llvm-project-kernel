@@ -116,6 +116,13 @@ rejects the manifest.  The primitive model also recognizes the public
 `raw_spin_lock()`/`raw_spin_unlock()` spellings used by API fixtures, in
 addition to the `_raw_*` and `__raw_*` leaves emitted by kernel wrappers.
 
+Imported top-frame facts are now explicitly tagged in program state.  A
+non-inlined unmodeled external call or an unresolved function-pointer call
+invalidates those facts once, marks the tracked contexts and IRQ state
+unknown, and emits a coverage-gap diagnostic at the call.  This prevents a
+later imported wait/sleep effect from reusing a stale clean entry assumption.
+The same calls without a manifest entry retain the pre-existing behavior.
+
 The separate RISC-V port of the frozen campaign has now passed all 87 records
 (29 cases under non-RT and both RT/BH fixture profiles) on clean commit
 `b5294bcb4282`.  All 24 identity mutations were rejected as validation

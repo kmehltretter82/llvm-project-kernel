@@ -459,6 +459,7 @@ REGISTER_MAP_WITH_PROGRAMSTATE(PendingIRQSave, const Expr *, IRQState)
 REGISTER_MAP_WITH_PROGRAMSTATE(OutstandingIRQSaves, SymbolRef, const Expr *)
 REGISTER_TRAIT_WITH_PROGRAMSTATE(IRQSaveBalanceUnknown, bool)
 REGISTER_TRAIT_WITH_PROGRAMSTATE(UnknownContextKinds, unsigned)
+REGISTER_TRAIT_WITH_PROGRAMSTATE(ImportedEntryContext, bool)
 
 ContextBalanceFacts linuxkernel::getContextBalanceFacts(ProgramStateRef State) {
   ContextBalanceFacts Facts;
@@ -605,6 +606,8 @@ class LinuxAtomicSleepChecker
   void reportUnknown(const CallEvent &Call, CheckerContext &C,
                      ProgramStateRef State,
                      StringRef Why = "Atomic context became unknown after opaque unlock helper") const;
+  void invalidateImportedEntry(const CallEvent &Call, CheckerContext &C,
+                               ProgramStateRef State, StringRef Why) const;
   CallRole role(const CallEvent &Call, CheckerContext &C) const;
   bool isRT(CheckerContext &C) const;
   const NoteTag *createEntryNote(AtomicSection Section,
@@ -971,6 +974,29 @@ void LinuxAtomicSleepChecker::reportUnknown(const CallEvent &Call,
   }
 }
 
+void LinuxAtomicSleepChecker::invalidateImportedEntry(
+    const CallEvent &Call, CheckerContext &C, ProgramStateRef State,
+    StringRef Why) const {
+  if (!State->get<ImportedEntryContext>())
+    return;
+
+  auto &Factory = State->get_context<ActiveAtomicSections>();
+  llvm::ImmutableList<AtomicSection> List = Factory.getEmptyList();
+  llvm::SmallVector<AtomicSection, 8> Open(
+      State->get<ActiveAtomicSections>().begin(),
+      State->get<ActiveAtomicSections>().end());
+  for (AtomicSection Section : llvm::reverse(Open)) {
+    Section.Uncertain = true;
+    List = Factory.add(Section, List);
+  }
+  State = setIRQState(State->set<ActiveAtomicSections>(List)
+                          ->set<UnknownContextKinds>((1u << 9) - 1)
+                          ->set<IRQSaveBalanceUnknown>(true)
+                          ->set<ImportedEntryContext>(false),
+                      {});
+  reportUnknown(Call, C, State, Why);
+}
+
 void LinuxAtomicSleepChecker::checkBeginFunction(CheckerContext &C) const {
   if (!C.inTopFrame() || (Manifest.Path.empty() && Manifest.Output.empty()))
     return;
@@ -1011,7 +1037,8 @@ void LinuxAtomicSleepChecker::checkBeginFunction(CheckerContext &C) const {
     Add(SectionKind::NMI, 1);
   else if (F->EntryKind == "softirq" && !F->BH)
     Add(SectionKind::BottomHalf, 1);
-  C.addTransition(State->set<ActiveAtomicSections>(Sections));
+  C.addTransition(State->set<ActiveAtomicSections>(Sections)
+                      ->set<ImportedEntryContext>(true));
 }
 
 void LinuxAtomicSleepChecker::checkEndOfTranslationUnit(
@@ -1103,8 +1130,13 @@ void LinuxAtomicSleepChecker::checkPreCall(const CallEvent &Call,
 void LinuxAtomicSleepChecker::checkPostCall(const CallEvent &Call,
                                             CheckerContext &C) const {
   const FunctionDecl *FD = getCallee(Call);
-  if (!FD)
+  if (!FD) {
+    if (RTContext)
+      invalidateImportedEntry(
+          Call, C, C.getState(),
+          "Imported entry context became unknown after unresolved call");
     return;
+  }
   ProgramStateRef State = C.getState();
   auto &Factory = State->get_context<ActiveAtomicSections>();
   const auto Sections = State->get<ActiveAtomicSections>();
@@ -1124,7 +1156,8 @@ void LinuxAtomicSleepChecker::checkPostCall(const CallEvent &Call,
           List = Factory.add(*I, List);
         State = setIRQState(State->set<ActiveAtomicSections>(List)
                                 ->set<UnknownContextKinds>((1u << 9) - 1)
-                                ->set<IRQSaveBalanceUnknown>(true), {});
+                                ->set<IRQSaveBalanceUnknown>(true)
+                                ->set<ImportedEntryContext>(false), {});
         reportUnknown(Call, C, State,
                       "Imported effect has no proved post-call context preservation");
         return;
@@ -1474,6 +1507,13 @@ void LinuxAtomicSleepChecker::checkPostCall(const CallEvent &Call,
   case Role::None:
     break;
   default:
+    return;
+  }
+
+  if (RTContext && !C.wasInlined && State->get<ImportedEntryContext>()) {
+    invalidateImportedEntry(
+        Call, C, State,
+        "Imported entry context became unknown after unmodeled call");
     return;
   }
 
