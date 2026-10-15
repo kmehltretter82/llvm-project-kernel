@@ -50,7 +50,8 @@ python3 clang/tools/clang-kernel-lab/tests/test_map_plugin.py \
   --clang /path/to/clang --ld-lld /path/to/ld.lld \
   --llvm-objcopy /path/to/llvm-objcopy \
   --plugin ../build-kernel-lab/ClangKernelLabMap.so \
-  --site-tool ../build-kernel-lab/llvm-riscv-irq-sites
+  --site-tool ../build-kernel-lab/llvm-riscv-irq-sites \
+  --selectiondag-expect complete --global-isel-expect loss
 python3 clang/tools/clang-kernel-lab/tests/test_selectiondag_backend.py \
   --clang /path/to/plugin-compatible/clang \
   --llc ../build-riscv-llvm/bin/llc \
@@ -69,9 +70,12 @@ deliberately wrong-width relocation.
 The C-map test additionally proves disabled/enabled object and linked `.text`
 identity, validates the PC-relative relocation pair across linker relaxation,
 and proves that the tool rejects a requested site dropped by code generation.
-It exercises the same four-site policy in two backend lanes: default RISC-V
-SelectionDAG is the expected coverage-failure control, while experimental
-GlobalISel must preserve all four records with byte-identical `.text`.
+Its expectation switches make backend/revision behavior explicit.  Stock LLVM
+22 uses the defaults: SelectionDAG loses three sites and GlobalISel preserves
+four.  The lab LLVM 24 command shown above requires four SelectionDAG sites and
+expects GlobalISel to lose only the publication-store site.  All four object
+and linked outputs remain text-identical to their matching controls; incomplete
+coverage is still fatal.
 
 The lab branch also patches LLVM 24 SelectionDAG.  Its target test verifies
 that PC-section labels are immediately before the RISC-V call and return:
@@ -85,9 +89,9 @@ build-riscv-llvm/bin/llc -O2 -code-model=medium \
 `test_selectiondag_backend.py` is the wider gate.  It feeds optimizer-last IR
 from the map plugin to the patched `llc`, requires all four expected records in
 object and linked modes, compares mapped and unmapped `.text`, and checks the
-resolved final PCs against `jal`, `sw`, and `ret`.  This deliberately permits
-the frontend/plugin and backend to be built separately while the complete
-patched Clang driver is still being qualified.
+resolved final PCs against `jal`, `sw`, and `ret`.  It supports a split
+frontend/backend compatibility lane, and it now also passes with the complete
+same-revision LLVM 24 Clang, plugin, and backend.
 
 The map records identify final machine PCs, not source-level adjacency.  For
 example, an IR instruction selected as "after call" can move away from the

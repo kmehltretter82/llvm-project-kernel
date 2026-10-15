@@ -88,6 +88,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llvm-objcopy", required=True)
     parser.add_argument("--plugin", required=True, type=pathlib.Path)
     parser.add_argument("--site-tool", required=True, type=pathlib.Path)
+    parser.add_argument(
+        "--selectiondag-expect",
+        choices=("loss", "complete"),
+        default="loss",
+        help="expected handling of the four-site SelectionDAG fixture",
+    )
+    parser.add_argument(
+        "--global-isel-expect",
+        choices=("loss", "complete"),
+        default="complete",
+        help="expected handling of the four-site experimental GlobalISel fixture",
+    )
     return parser.parse_args()
 
 
@@ -196,17 +208,68 @@ def main() -> int:
         gap_compile = compile_object(
             arguments, gap_obj, plugin=True, spec=GAP_SPEC
         )
-        if "loosing !pcsections" not in gap_compile.stderr:
-            raise AssertionError("negative fixture did not exercise metadata loss")
         gap_elf = directory / "gap.elf"
-        link(arguments, gap_obj, gap_elf)
-        rejected = run(
-            [str(arguments.site_tool.resolve()), str(gap_elf)], check=False
-        )
-        if rejected.returncode == 0:
-            raise AssertionError("site tool accepted silently dropped C sites")
-        if "C carrier/expectation mismatch" not in rejected.stderr:
-            raise AssertionError(f"unexpected coverage error: {rejected.stderr!r}")
+        if arguments.selectiondag_expect == "loss":
+            if "loosing !pcsections" not in gap_compile.stderr:
+                raise AssertionError(
+                    "negative fixture did not exercise metadata loss"
+                )
+            link(arguments, gap_obj, gap_elf)
+            rejected = run(
+                [str(arguments.site_tool.resolve()), str(gap_elf)], check=False
+            )
+            if rejected.returncode == 0:
+                raise AssertionError("site tool accepted silently dropped C sites")
+            if "C carrier/expectation mismatch" not in rejected.stderr:
+                raise AssertionError(
+                    f"unexpected coverage error: {rejected.stderr!r}"
+                )
+            selectiondag_site_count = 1
+            selectiondag_text_identity = "coverage-rejected"
+        else:
+            if "loosing !pcsections" in gap_compile.stderr:
+                raise AssertionError(
+                    f"patched SelectionDAG lost requested sites: "
+                    f"{gap_compile.stderr}"
+                )
+            gap_obj_text = dump_section(
+                arguments, gap_obj, ".text", directory / "gap-o.text"
+            )
+            if baseline_obj_text != gap_obj_text:
+                raise AssertionError("patched SelectionDAG map changed object .text")
+            gap_object_map = json.loads(run([
+                str(arguments.site_tool.resolve()),
+                "--validate-relocatable",
+                str(gap_obj),
+            ]).stdout)
+            if {entry["kind"] for entry in gap_object_map["sites"]} != {
+                4, 5, 37, 39,
+            }:
+                raise AssertionError(
+                    "patched SelectionDAG object has unexpected site kinds"
+                )
+            if len(gap_object_map["sites"]) != 4:
+                raise AssertionError(
+                    "patched SelectionDAG object did not preserve four sites"
+                )
+
+            link(arguments, gap_obj, gap_elf)
+            gap_elf_text = dump_section(
+                arguments, gap_elf, ".text", directory / "gap-e.text"
+            )
+            if baseline_elf_text != gap_elf_text:
+                raise AssertionError("patched SelectionDAG map changed linked .text")
+            gap_sidecar = json.loads(run([
+                str(arguments.site_tool.resolve()), str(gap_elf)
+            ]).stdout)
+            if {entry["kind"] for entry in gap_sidecar["sites"]} != {
+                4, 5, 37, 39,
+            }:
+                raise AssertionError(
+                    "patched SelectionDAG sidecar has unexpected site kinds"
+                )
+            selectiondag_site_count = 4
+            selectiondag_text_identity = "PASS"
 
         compile_object(
             arguments,
@@ -222,7 +285,10 @@ def main() -> int:
             spec=GAP_SPEC,
             global_isel=True,
         )
-        if "loosing !pcsections" in gisel_compile.stderr:
+        if (
+            arguments.global_isel_expect == "complete"
+            and "loosing !pcsections" in gisel_compile.stderr
+        ):
             raise AssertionError(
                 f"GlobalISel lost requested sites: {gisel_compile.stderr}"
             )
@@ -240,13 +306,48 @@ def main() -> int:
         )
         if gisel_baseline_obj_text != gisel_mapped_obj_text:
             raise AssertionError("GlobalISel C map changed object .text")
-        gisel_object_map = json.loads(run([
+        gisel_object_command = [
             str(arguments.site_tool.resolve()),
             "--validate-relocatable",
             str(gisel_mapped_obj),
-        ]).stdout)
-        if len(gisel_object_map["sites"]) != 4:
-            raise AssertionError("GlobalISel object did not preserve four sites")
+        ]
+        if arguments.global_isel_expect == "complete":
+            gisel_object_map = json.loads(run(gisel_object_command).stdout)
+            global_isel_site_kinds = sorted(
+                entry["kind"] for entry in gisel_object_map["sites"]
+            )
+            if global_isel_site_kinds != [4, 5, 37, 39]:
+                raise AssertionError(
+                    "GlobalISel object did not preserve the four expected sites"
+                )
+            global_isel_site_count = 4
+        else:
+            rejected = run(gisel_object_command, check=False)
+            if rejected.returncode == 0:
+                raise AssertionError(
+                    "GlobalISel unexpectedly preserved every requested site"
+                )
+            if "C carrier/expectation mismatch" not in rejected.stderr:
+                raise AssertionError(
+                    f"unexpected GlobalISel coverage error: {rejected.stderr!r}"
+                )
+            carrier = dump_section(
+                arguments,
+                gisel_mapped_obj,
+                ".riscv.linux_irq_c_sites",
+                directory / "gisel-sites.bin",
+            )
+            if len(carrier) % 32:
+                raise AssertionError("GlobalISel emitted a partial site record")
+            global_isel_site_count = len(carrier) // 32
+            global_isel_site_kinds = sorted(
+                int.from_bytes(carrier[offset + 10:offset + 12], "little")
+                for offset in range(0, len(carrier), 32)
+            )
+            if global_isel_site_kinds != [4, 5, 37]:
+                raise AssertionError(
+                    "GlobalISel did not drop only the publication-store site"
+                )
 
         gisel_baseline_elf = directory / "gisel-baseline.elf"
         gisel_mapped_elf = directory / "gisel-mapped.elf"
@@ -266,13 +367,29 @@ def main() -> int:
         )
         if gisel_baseline_elf_text != gisel_mapped_elf_text:
             raise AssertionError("GlobalISel C map changed linked .text")
-        gisel_sidecar = json.loads(run([
+        gisel_sidecar_command = [
             str(arguments.site_tool.resolve()), str(gisel_mapped_elf)
-        ]).stdout)
-        if {entry["kind"] for entry in gisel_sidecar["sites"]} != {
-            4, 5, 37, 39,
-        }:
-            raise AssertionError("GlobalISel sidecar has unexpected site kinds")
+        ]
+        if arguments.global_isel_expect == "complete":
+            gisel_sidecar = json.loads(run(gisel_sidecar_command).stdout)
+            if {entry["kind"] for entry in gisel_sidecar["sites"]} != {
+                4, 5, 37, 39,
+            }:
+                raise AssertionError(
+                    "GlobalISel sidecar has unexpected site kinds"
+                )
+            global_isel_coverage = "complete"
+        else:
+            rejected = run(gisel_sidecar_command, check=False)
+            if rejected.returncode == 0:
+                raise AssertionError(
+                    "linked GlobalISel map unexpectedly passed its coverage gate"
+                )
+            if "C carrier/expectation mismatch" not in rejected.stderr:
+                raise AssertionError(
+                    f"unexpected linked GlobalISel error: {rejected.stderr!r}"
+                )
+            global_isel_coverage = "coverage-rejected"
 
         print(json.dumps({
             "result": "PASS",
@@ -281,8 +398,14 @@ def main() -> int:
             "text_bytes": len(mapped_elf_text),
             "site_count": 1,
             "object_relocations": "PASS",
-            "lost_site_negative": "PASS",
-            "global_isel_site_count": 4,
+            "selectiondag_expectation": arguments.selectiondag_expect,
+            "selectiondag_site_count": selectiondag_site_count,
+            "selectiondag_text_identity": selectiondag_text_identity,
+            "selectiondag_coverage_gate": "PASS",
+            "global_isel_expectation": arguments.global_isel_expect,
+            "global_isel_site_count": global_isel_site_count,
+            "global_isel_site_kinds": global_isel_site_kinds,
+            "global_isel_coverage": global_isel_coverage,
             "global_isel_text_identity": "PASS",
             "trigger_phase": sidecar["trigger_phase"],
         }, indent=2))

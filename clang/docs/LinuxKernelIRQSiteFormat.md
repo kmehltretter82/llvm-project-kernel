@@ -75,14 +75,16 @@ to propagate it.  Therefore the pass also emits one 24-byte entry in
 flags, and the 128-bit ID.  The object/link tool requires the emitted and
 expected sets to be identical.  A warning is not treated as coverage.
 
-The first qualification fixture demonstrates a backend difference that must
-remain visible: stock LLVM 22 RISC-V SelectionDAG preserves a store anchor but
-drops entry, call, and return anchors, while experimental GlobalISel preserves
-all four.  The expected table turns the former into a hard validation failure.
-The lab LLVM 24 backend fixes the default SelectionDAG path by identifying the
-actual target call node and mapping return metadata to the lowered return
-chain.  Its four records are checked in relocatable and linked ELF, and their
-resolved PCs are checked against final `jal`, `sw`, and `ret` instructions.
+The first qualification fixture demonstrates backend and revision differences
+that must remain visible.  Stock LLVM 22 RISC-V SelectionDAG preserves only the
+store anchor, while its experimental GlobalISel preserves all four.  The lab
+LLVM 24 backend fixes default SelectionDAG by identifying the actual target
+call node and mapping return metadata to the lowered return chain; its four
+records are checked in relocatable and linked ELF, and their resolved PCs are
+checked against final `jal`, `sw`, and `ret` instructions.  LLVM 24 GlobalISel
+instead drops only the publication-store record.  The expected table turns
+both incomplete lanes into hard validation failures even when the backend
+emits no warning.
 The initial direct-instruction policy selector names an optimizer-last LLVM IR
 opcode and an optional one-based occurrence inside a function.  Even when a
 record survives, a source- or IR-relative selector does not promise

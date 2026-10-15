@@ -33,6 +33,7 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Plugins/PassPlugin.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/IOSandbox.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
@@ -143,7 +144,10 @@ static Expected<uint8_t> parseActions(StringRef Text) {
 }
 
 static Expected<Config> parseConfig(StringRef Path) {
-  auto Buffer = MemoryBuffer::getFile(Path, /*IsText=*/true);
+  auto Buffer = [&] {
+    auto BypassSandbox = sys::sandbox::scopedDisable();
+    return MemoryBuffer::getFile(Path, /*IsText=*/true);
+  }();
   if (!Buffer)
     return configError(Twine("cannot read specification '") + Path +
                        "': " + Buffer.getError().message());
@@ -357,7 +361,11 @@ static void emitSiteSection(Module &M, ArrayRef<PlannedSite> Sites,
   appendToCompilerUsed(M, {Table});
 }
 
+#if LLVM_VERSION_MAJOR >= 24
+class KernelLabPass : public RequiredPassInfoMixin<KernelLabPass> {
+#else
 class KernelLabPass : public PassInfoMixin<KernelLabPass> {
+#endif
 public:
   explicit KernelLabPass(std::shared_ptr<const LoadedConfig> Loaded)
       : Loaded(std::move(Loaded)) {}
@@ -545,20 +553,11 @@ PreservedAnalyses KernelLabPass::run(Module &M, ModuleAnalysisManager &) {
 
 static void registerCallbacks(PassBuilder &PB) {
   std::shared_ptr<const LoadedConfig> Loaded = loadConfig();
-#if LLVM_VERSION_MAJOR >= 24
-  PB.registerPipelineStartEPCallback([Loaded](ModulePassManager &Manager,
-                                              OptimizationLevel,
-                                              ThinOrFullLTOPhase) {
-    if (Loaded->Requested)
-      Manager.addPass(KernelLabPass(Loaded));
-  });
-#else
   PB.registerPipelineStartEPCallback(
       [Loaded](ModulePassManager &Manager, OptimizationLevel) {
         if (Loaded->Requested)
           Manager.addPass(KernelLabPass(Loaded));
       });
-#endif
   PB.registerPipelineParsingCallback(
       [Loaded](StringRef Name, ModulePassManager &Manager,
                ArrayRef<PassBuilder::PipelineElement>) {

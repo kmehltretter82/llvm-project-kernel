@@ -36,6 +36,7 @@
 #include "llvm/Support/CodeGen.h"
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/IOSandbox.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
@@ -159,7 +160,10 @@ static Expected<std::pair<uint64_t, uint64_t>> parseSiteID(StringRef Text) {
 }
 
 static Expected<Config> parseConfig(StringRef Path) {
-  auto Buffer = MemoryBuffer::getFile(Path, /*IsText=*/true);
+  auto Buffer = [&] {
+    auto BypassSandbox = sys::sandbox::scopedDisable();
+    return MemoryBuffer::getFile(Path, /*IsText=*/true);
+  }();
   if (!Buffer)
     return configError(Twine("cannot read specification '") + Path +
                        "': " + Buffer.getError().message());
@@ -389,7 +393,11 @@ static void emitExpectedSites(Module &M, ArrayRef<PlannedSite> Sites) {
   appendToCompilerUsed(M, {Table});
 }
 
+#if LLVM_VERSION_MAJOR >= 24
+class KernelLabMapPass : public RequiredPassInfoMixin<KernelLabMapPass> {
+#else
 class KernelLabMapPass : public PassInfoMixin<KernelLabMapPass> {
+#endif
 public:
   explicit KernelLabMapPass(std::shared_ptr<const LoadedConfig> Loaded)
       : Loaded(std::move(Loaded)) {}

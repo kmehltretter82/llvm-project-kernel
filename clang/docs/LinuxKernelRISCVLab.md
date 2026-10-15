@@ -58,11 +58,13 @@ lets a policy select the surviving publication `store` directly instead of
 inferring it from "after call."  Stock LLVM 22 SelectionDAG drops the entry,
 call, and return records and remains the coverage-gate negative control.  The
 lab branch adds a generic actual-call-node handoff plus RISC-V call and return
-propagation; its LLVM 24 SelectionDAG preserves all four records.  Experimental
-GlobalISel provides an independent four-record control.  Both successful
-lanes keep object and linked `.text` identical.  An IR-relative selector still
-does not promise final instruction adjacency; the resolved machine PC is the
-only scheduleable boundary.
+propagation; its LLVM 24 SelectionDAG preserves all four records.  LLVM 22
+experimental GlobalISel provides an independent four-record control.  LLVM 24
+GlobalISel instead drops the publication-store record without a diagnostic;
+the expected-site table rejects the resulting three-record object and linked
+image.  Every lane, including rejected lanes, keeps object and linked `.text`
+identical.  An IR-relative selector still does not promise final instruction
+adjacency; the resolved machine PC is the only scheduleable boundary.
 
 ### Layer B: explicit callback and perturb mode
 
@@ -286,21 +288,23 @@ As of 2026-10-16 on `kernel-lab-riscv`:
 - the same patched SelectionDAG preserves all four expected records in a real
   relocatable and linked RV64 ELF; final PCs resolve to `jal`, `sw`, and `ret`,
   and object and linked `.text` match their unmapped controls byte for byte;
-- compiling that same four-site fixture through RISC-V GlobalISel preserves
-  all four expected records, and both its object and linked `.text` remain
-  byte-identical to GlobalISel controls;
-- the callback/perturb plugin builds against installed LLVM 22 using `-j1`;
-- its RISC-V opt-in/disabled smoke test passes with four callbacks and one
-  perturbation point;
+- stock LLVM 22 GlobalISel preserves all four expected records, while LLVM 24
+  GlobalISel drops only kind 39, atomic-state-publish; the coverage gate rejects
+  that three-record object and linked image, and both lanes retain byte-identical
+  `.text` against their own controls;
+- a RISC-V-only, assertions-enabled LLVM 24 `clang`, `llc`, both plugins, and
+  the site tool build together using `-j1`; plugin configuration reads use a
+  narrowly scoped LLVM I/O-sandbox bypass for the explicitly named JSON file;
+- the complete LLVM 24 driver passes the patched SelectionDAG four-site lane;
+  its RISC-V opt-in/disabled callback smoke test passes with four callbacks,
+  one perturbation point, and zero disabled-mode hooks;
 - the source-derived QEMU/Linux inventory checker covers exactly 17 families,
   finds 16 existing CPU interrupt-entry hooks, and keeps Hexagon as the one
   explicit source gap; and
 - no Linux boot, QEMU injection, FPGA run, or correctness verdict has yet been
   claimed from this new branch.
 
-The next compiler task is to build and qualify the complete patched Clang/LLVM
-driver rather than the currently separated frontend-plugin and LLVM 24 `llc`,
-then add a stable source-level statement interface.  Inertness checks must
-expand to all executable sections, symbols, relaxation, and unwind data.  The
-next QEMU task is the RV64 exact-site TB stop without injection, followed by the
-real PLIC endpoint and deterministic schedule.
+The next compiler task is a stable source-level statement interface followed by
+inertness checks over all executable sections, symbols, relaxation, and unwind
+data.  The next QEMU task is the RV64 exact-site TB stop without injection,
+followed by the real PLIC endpoint and deterministic schedule.
