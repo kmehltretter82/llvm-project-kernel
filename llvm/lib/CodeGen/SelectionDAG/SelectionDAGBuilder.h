@@ -97,6 +97,12 @@ class SelectionDAGBuilder {
   /// The current instruction being visited.
   const Instruction *CurInst = nullptr;
 
+  /// Set when call lowering attached instruction metadata directly to the
+  /// target's call node.  The generic value mapping must not attach a second
+  /// copy to a returned-value or call-sequence node.
+  bool CurInstPCSectionsHandled = false;
+  bool CurInstMMRAHandled = false;
+
   DenseMap<const Value*, SDValue> NodeMap;
 
   /// Maps argument value for unused arguments. This is used

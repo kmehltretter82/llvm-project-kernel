@@ -28579,6 +28579,7 @@ SDValue RISCVTargetLowering::LowerCall(CallLoweringInfo &CLI,
     SDValue Ret = DAG.getNode(CallOpc, DL, NodeTys, Ops);
     if (CLI.CFIType)
       Ret.getNode()->setCFIType(CLI.CFIType->getZExtValue());
+    CLI.setCallSiteNode(Ret);
     DAG.addNoMergeSiteInfo(Ret.getNode(), CLI.NoMerge);
     DAG.addCallSiteInfo(Ret.getNode(), std::move(CSInfo));
     return Ret;
@@ -28599,6 +28600,7 @@ SDValue RISCVTargetLowering::LowerCall(CallLoweringInfo &CLI,
   if (CLI.CFIType)
     Chain.getNode()->setCFIType(CLI.CFIType->getZExtValue());
 
+  CLI.setCallSiteNode(Chain);
   DAG.addNoMergeSiteInfo(Chain.getNode(), CLI.NoMerge);
   DAG.addCallSiteInfo(Chain.getNode(), std::move(CSInfo));
   Glue = Chain.getValue(1);

@@ -1382,6 +1382,8 @@ void SelectionDAGBuilder::visit(const Instruction &I) {
 
   ++SDNodeOrder;
   CurInst = &I;
+  CurInstPCSectionsHandled = false;
+  CurInstMMRAHandled = false;
 
   // Set inserted listener only if required.
   bool NodeInserted = false;
@@ -1394,6 +1396,11 @@ void SelectionDAGBuilder::visit(const Instruction &I) {
   }
 
   visit(I.getOpcode(), I);
+
+  if (CurInstPCSectionsHandled)
+    PCSectionsMD = nullptr;
+  if (CurInstMMRAHandled)
+    MMRA = nullptr;
 
   if (!I.isTerminator() && !HasTailCall &&
       !isa<GCStatepointInst>(I)) // statepoints handle their exports internally
@@ -2429,6 +2436,7 @@ void SelectionDAGBuilder::visitRet(const ReturnInst &I) {
 
   // Update the DAG with the new chain value resulting from return lowering.
   DAG.setRoot(Chain);
+  setValue(&I, Chain);
 }
 
 /// CopyToExportRegsIfNeeded - If the given value has virtual registers
@@ -9500,6 +9508,19 @@ void SelectionDAGBuilder::LowerCallTo(const CallBase &CB, SDValue Callee,
   }
 
   std::pair<SDValue, SDValue> Result = lowerInvokable(CLI, EHPadBB);
+
+  if (SDNode *CallSiteNode = CLI.CallSiteNode.getNode()) {
+    if (MDNode *MD = CB.getMetadata(LLVMContext::MD_pcsections)) {
+      DAG.addPCSections(CallSiteNode, MD);
+      if (CurInst == &CB)
+        CurInstPCSectionsHandled = true;
+    }
+    if (MDNode *MD = CB.getMetadata(LLVMContext::MD_mmra)) {
+      DAG.addMMRAMetadata(CallSiteNode, MD);
+      if (CurInst == &CB)
+        CurInstMMRAHandled = true;
+    }
+  }
 
   if (Result.first.getNode()) {
     Result.first = lowerRangeToAssertZExt(DAG, CB, Result.first);

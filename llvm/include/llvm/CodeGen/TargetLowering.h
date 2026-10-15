@@ -5034,6 +5034,10 @@ public:
     SmallVector<SDValue, 32> OutVals;
     SmallVector<ISD::InputArg, 32> Ins;
     SmallVector<SDValue, 4> InVals;
+    /// The target call node that corresponds to CB.  Targets may set this so
+    /// instruction metadata is attached to the call itself instead of a
+    /// returned-value copy or call-sequence bookkeeping node.
+    SDValue CallSiteNode;
     const ConstantInt *CFIType = nullptr;
     SDValue ConvergenceControlToken;
     GlobalValue *DeactivationSymbol = nullptr;
@@ -5192,6 +5196,11 @@ public:
 
     CallLoweringInfo &setDeactivationSymbol(GlobalValue *Sym) {
       DeactivationSymbol = Sym;
+      return *this;
+    }
+
+    CallLoweringInfo &setCallSiteNode(SDValue Node) {
+      CallSiteNode = Node;
       return *this;
     }
 
