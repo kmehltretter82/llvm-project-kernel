@@ -1,9 +1,30 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "evidence": {
     "qemu_commit": "c1c18d1e640b64292859ce9f30f3c344edfb0294",
     "linux_commit": "50d05c7c76c96b90462f24debacca971d2e86713"
   },
+  "schedule_contract": {
+    "trigger_phase": "AFTER_PREVIOUS_RETIRE/BEFORE_INSN_AT_SITE",
+    "hit_count_scopes": ["per-vcpu", "global"],
+    "initial_hit_count_scope": "per-vcpu",
+    "initial_operations": ["assert", "deassert", "pulse"],
+    "direct_cpu_operation": "force-cpu-trap-test-only"
+  },
+  "known_controller_gaps": [
+    {
+      "id": "riscv-sifive-plic-level-lifecycle",
+      "family": "riscv",
+      "status": "open",
+      "source_file": "hw/intc/sifive_plic.c",
+      "source_evidence": [
+        "static void sifive_plic_irq_request",
+        "if (level > 0)",
+        "sifive_plic_set_pending(s, irq, true)"
+      ],
+      "acceptance": "A held level must re-pend after claim/completion until deasserted; a pulse must deliver exactly once; reset and migration must preserve the declared gateway state."
+    }
+  ],
   "excluded": {
     "qemu_system_targets_without_linux_arch": [
       "avr",
@@ -26,7 +47,9 @@
       "controller_files": ["hw/alpha/typhoon.c"],
       "machine": "clipper",
       "interrupt_source": "Typhoon RTC/device input",
-      "interrupt_hook": "present"
+      "interrupt_hook": "present",
+      "replay_doc_names": ["Alpha"],
+      "replay_status": "documented"
     },
     {
       "name": "arm",
@@ -36,7 +59,9 @@
       "controller_files": ["hw/intc/arm_gic.c"],
       "machine": "virt,gic-version=2",
       "interrupt_source": "GICv2 SPI",
-      "interrupt_hook": "present"
+      "interrupt_hook": "present",
+      "replay_doc_names": ["Arm"],
+      "replay_status": "documented"
     },
     {
       "name": "arm64",
@@ -46,7 +71,9 @@
       "controller_files": ["hw/intc/arm_gicv3.c"],
       "machine": "virt,gic-version=3",
       "interrupt_source": "GICv3 SPI/PPI/SGI",
-      "interrupt_hook": "present"
+      "interrupt_hook": "present",
+      "replay_doc_names": ["AArch64"],
+      "replay_status": "documented"
     },
     {
       "name": "hexagon",
@@ -56,7 +83,9 @@
       "controller_files": ["hw/intc/hex-l2vic.c"],
       "machine": "virt",
       "interrupt_source": "L2VIC input",
-      "interrupt_hook": "known-missing"
+      "interrupt_hook": "known-missing",
+      "replay_doc_names": ["Hexagon"],
+      "replay_status": "qualification-required"
     },
     {
       "name": "parisc",
@@ -66,7 +95,9 @@
       "controller_files": ["hw/misc/lasi.c", "hw/pci-host/dino.c"],
       "machine": "B160L",
       "interrupt_source": "LASI UART/Dino input",
-      "interrupt_hook": "present"
+      "interrupt_hook": "present",
+      "replay_doc_names": ["HPPA"],
+      "replay_status": "qualification-required"
     },
     {
       "name": "x86",
@@ -79,7 +110,9 @@
       "controller_files": ["hw/intc/apic.c", "hw/intc/ioapic.c"],
       "machine": "q35",
       "interrupt_source": "IOAPIC/MSI/local APIC",
-      "interrupt_hook": "present"
+      "interrupt_hook": "present",
+      "replay_doc_names": ["i386", "x86_64"],
+      "replay_status": "documented"
     },
     {
       "name": "loongarch",
@@ -92,7 +125,9 @@
       ],
       "machine": "virt",
       "interrupt_source": "PCH PIC through EXTIOI",
-      "interrupt_hook": "present"
+      "interrupt_hook": "present",
+      "replay_doc_names": ["LoongArch"],
+      "replay_status": "qualification-required"
     },
     {
       "name": "m68k",
@@ -102,7 +137,9 @@
       "controller_files": ["hw/intc/goldfish_pic.c"],
       "machine": "virt",
       "interrupt_source": "Goldfish RTC/PIC",
-      "interrupt_hook": "present"
+      "interrupt_hook": "present",
+      "replay_doc_names": ["M68000"],
+      "replay_status": "documented"
     },
     {
       "name": "microblaze",
@@ -112,7 +149,9 @@
       "controller_files": ["hw/intc/xilinx_intc.c"],
       "machine": "petalogix-ml605",
       "interrupt_source": "AXI timer through Xilinx INTC",
-      "interrupt_hook": "present"
+      "interrupt_hook": "present",
+      "replay_doc_names": ["Microblaze"],
+      "replay_status": "documented"
     },
     {
       "name": "mips",
@@ -122,7 +161,9 @@
       "controller_files": ["hw/intc/mips_gic.c", "hw/intc/i8259.c"],
       "machine": "malta",
       "interrupt_source": "CP0 timer and Malta i8259/GIC",
-      "interrupt_hook": "present"
+      "interrupt_hook": "present",
+      "replay_doc_names": ["MIPS", "MIPS64"],
+      "replay_status": "documented"
     },
     {
       "name": "openrisc",
@@ -132,7 +173,9 @@
       "controller_files": ["target/or1k/sys_helper.c"],
       "machine": "virt",
       "interrupt_source": "CPU PIC tick/external input",
-      "interrupt_hook": "present"
+      "interrupt_hook": "present",
+      "replay_doc_names": ["OpenRISC"],
+      "replay_status": "documented"
     },
     {
       "name": "powerpc",
@@ -142,7 +185,9 @@
       "controller_files": ["hw/intc/openpic.c", "hw/intc/spapr_xive.c"],
       "machine": "ppce500",
       "interrupt_source": "OpenPIC external/decrementer",
-      "interrupt_hook": "present-needs-classification-audit"
+      "interrupt_hook": "present-needs-classification-audit",
+      "replay_doc_names": ["PowerPC", "PowerPC64"],
+      "replay_status": "documented"
     },
     {
       "name": "riscv",
@@ -156,7 +201,9 @@
       ],
       "machine": "virt",
       "interrupt_source": "PLIC then APLIC/IMSIC",
-      "interrupt_hook": "present"
+      "interrupt_hook": "present",
+      "replay_doc_names": ["Risc-V"],
+      "replay_status": "documented"
     },
     {
       "name": "s390",
@@ -166,7 +213,9 @@
       "controller_files": ["hw/intc/s390_flic.c"],
       "machine": "s390-ccw-virtio",
       "interrupt_source": "FLIC external/I/O/clock",
-      "interrupt_hook": "present"
+      "interrupt_hook": "present",
+      "replay_doc_names": ["S390X"],
+      "replay_status": "documented"
     },
     {
       "name": "sh",
@@ -176,7 +225,9 @@
       "controller_files": ["hw/intc/sh_intc.c"],
       "machine": "r2d",
       "interrupt_source": "TMU and R2D FPGA IRL through sh-intc",
-      "interrupt_hook": "present"
+      "interrupt_hook": "present",
+      "replay_doc_names": ["SuperH"],
+      "replay_status": "qualification-required"
     },
     {
       "name": "sparc",
@@ -189,7 +240,9 @@
       "controller_files": ["hw/intc/slavio_intctl.c"],
       "machine": "SS-5",
       "interrupt_source": "Slavio timer/PIL",
-      "interrupt_hook": "present-needs-classification-audit"
+      "interrupt_hook": "present-needs-classification-audit",
+      "replay_doc_names": ["SPARC"],
+      "replay_status": "documented"
     },
     {
       "name": "xtensa",
@@ -199,7 +252,9 @@
       "controller_files": ["hw/xtensa/pic_cpu.c"],
       "machine": "virt",
       "interrupt_source": "CPU timer/external interrupt",
-      "interrupt_hook": "present"
+      "interrupt_hook": "present",
+      "replay_doc_names": ["Xtensa"],
+      "replay_status": "documented"
     }
   ]
 }

@@ -31,7 +31,7 @@ SoC has identical latency.
    controller adapter.
 6. Keep the existing QEMU plugin discontinuity callback source-compatible.
    Add a versioned enriched event beside it.
-7. Make disabled support compile away or reduce to an unlikely static-key
+7. Make disabled support compile away or reduce to a cheap empty-subscriber
    check.  It must not alter advertised guest features or machine layout.
 
 ## 2. Source evidence and exact scope
@@ -74,12 +74,19 @@ The executable inventory and its checker live in
 `clang/utils/kernel-lab/qemu/`.  Run:
 
 ```text
-check_architecture_matrix.py --qemu /path/to/qemu --linux /path/to/linux
+check_architecture_matrix.py --qemu /path/to/qemu --linux /path/to/linux \
+  --verify-revisions
 ```
 
-The checker currently finds CPU-entry interrupt callbacks for 16 of 17
-entries.  Hexagon's `hexagon_cpu_do_interrupt()` is the known missing hook.
-This is source coverage, not semantic qualification.
+Matrix schema version two also freezes the exact schedule vocabulary, checks
+the replay-support names in `docs/system/replay.rst`, and carries source
+evidence for open controller gaps.  The checker currently finds CPU-entry
+interrupt callbacks for 16 of 17 entries.  Hexagon's
+`hexagon_cpu_do_interrupt()` is the known missing hook.  PowerPC and SPARC are
+reported as `AUDIT REQUIRED`, rather than being flattened into `PRESENT`.
+This is source coverage, not semantic qualification.  The intentionally
+failing `--require-qualified` mode is the future exit gate after all recorded
+hook, replay, classification, and controller gaps have closed.
 
 Two immediate semantic audit candidates are visible in the inspected source:
 
@@ -97,7 +104,8 @@ QEMU's record/replay documentation names support for x86, Arm, Arm64,
 RISC-V, MIPS, s390x, Alpha, PowerPC, m68k, MicroBlaze, OpenRISC, SPARC, and
 Xtensa.  Hexagon, LoongArch, PA-RISC, and SuperH therefore need explicit
 record/replay qualification or enablement; having an icount-capable TCG target
-alone is not enough.
+alone is not enough.  The matrix records these four as `QUALIFY`, and the
+checker will force a re-audit if QEMU's documented platform list changes.
 
 The inspected QEMU tree already has Intel PT CPUID constants, RTIT MSR state,
 and migration state, but no TCG packet generator.  Arm TCG explicitly clears
@@ -109,6 +117,14 @@ One scope correction is important: the inspected QEMU tree has a
 system emulation is the first MicroBlaze lane; a little-endian system lane is
 a separate QEMU enablement task, not an existing acceptance configuration.
 
+The current SiFive PLIC model has a more immediate semantic limitation.
+`sifive_plic_irq_request()` sets pending state only for `level > 0`, ignores
+deassertion, and retains no input-level or gateway state.  It therefore cannot
+yet prove edge-versus-level lifecycle, or re-pend a held level after guest
+claim and completion.  The matrix pins this source evidence as the open
+`riscv-sifive-plic-level-lifecycle` gap so source drift cannot silently turn
+the limitation into an assumed capability.
+
 ## 3. Compiler-to-QEMU contract
 
 ### 3.1 A site is a boundary, not a callback
@@ -119,10 +135,11 @@ For scheduling, a site address has this normative meaning:
 > Every earlier guest instruction has completed retirement; no instruction at
 > the site's address has begun architectural execution.
 
-Call this phase `after-previous-retire/before-site-instruction`.  A QEMU
-instruction callback normally runs before an instruction but does not by
-itself stop the rest of its translation block.  Therefore exact injection
-requires all of the following:
+Its only version-one wire spelling is
+`AFTER_PREVIOUS_RETIRE/BEFORE_INSN_AT_SITE`.  A QEMU instruction callback
+normally runs before an instruction but does not by itself stop the rest of
+its translation block.  Therefore exact injection requires all of the
+following:
 
 1. load and validate the site map before vCPU execution;
 2. force a translation-block boundary, or emit an internal TCG exit helper,
@@ -161,10 +178,12 @@ The run manifest supplies runtime load bias, the KASLR state, and the hash of
 the sidecar.  Initial qualification uses `nokaslr`.  A hash or build-ID
 mismatch is fatal; QEMU must never make a best-effort match by symbol name.
 
-Hit counts have an explicit scope: `vcpu`, `hart`, or `global`.  The initial
-RISC-V scheduler supports only `vcpu`, which makes replay ordering
-unambiguous.  A global hit count in MTTCG requires a specified atomic ordering
-and is not accepted in the deterministic lane.
+Hit counts use the exact values `per-vcpu` or `global`.  The initial RISC-V
+scheduler supports only `per-vcpu`, matching the linked-image sidecar's
+`default_hit_count_scope`.  A separate `per-hart` synonym is deliberately not
+accepted: QEMU's schedule names vCPUs, while a sidecar or target payload may
+also report architectural hart identity.  A global hit count in MTTCG requires
+a specified atomic ordering and is not accepted in the deterministic lane.
 
 ### 3.3 No marker device in map mode
 
@@ -279,8 +298,8 @@ A minimal rule resembles:
   "icount": "shift=0,align=off,sleep=off",
   "trigger": {
     "site_id": "0123456789abcdef0123456789abcdef",
-    "phase": "before-site-instruction",
-    "scope": "vcpu",
+    "phase": "AFTER_PREVIOUS_RETIRE/BEFORE_INSN_AT_SITE",
+    "scope": "per-vcpu",
     "vcpu": 0,
     "hit": 17
   },
@@ -291,6 +310,20 @@ A minimal rule resembles:
   }
 }
 ```
+
+These strings are not presentation aliases: the checker locks them to the
+same values emitted by `llvm-riscv-irq-sites`.  A schedule parser must reject,
+not normalize, `before-site-instruction`, `vcpu`, an unknown phase, or a
+sidecar whose image hash, site-section hash, load bias, build ID when present,
+architecture, or site ID differs.  The schedule hashes the exact sidecar
+bytes; `image.path` is diagnostic and never part of identity.
+
+Reaching the boundary increments the selected vCPU's hit counter before an
+action is evaluated.  A one-shot rule is consumed before its controller
+operation, so resuming at the same PC cannot fire it twice.  If the site
+instruction faults or is retried and execution later reaches that boundary
+again, that is a new hit.  Accepted, rejected, and already-consumed actions
+all receive semantic records.
 
 Initial operations are assert, deassert, legal pulse, and delay by an exact
 instruction count.  Later operations may hold a level, coalesce legal edges,
@@ -304,7 +337,10 @@ recorded.  Direct CPU trap forcing uses the unmistakable operation name
 The reference command line uses one vCPU, `-accel tcg,thread=single`, and
 icount with an explicit shift.  QEMU virtual time, not host wall time, drives
 the schedule.  Inputs, firmware, disk overlays, network, machine version,
-CPU model, topology, hashes, and random seed are recorded.
+CPU model, topology, hashes, and random seed are recorded.  RISC-V `virt` is
+unversioned in the inspected tree, so its reproducibility key is the exact
+QEMU revision, machine type, CPU model, and complete non-default machine/QOM
+properties; the manifest must not invent a `virt-X.Y` compatibility version.
 
 Phase one writes a companion Kernel Lab event stream and replays the explicit
 schedule.  Phase two adds a Kernel Lab asynchronous event to QEMU
@@ -334,6 +370,24 @@ The first end-to-end implementation is deliberately narrow:
    Linux ordering, and pass the corrected control 100/100 times.
 8. Replay and compare the normalized stream.
 9. Add RV32, SMP, then APLIC/IMSIC in that order.
+
+Step 4 has a mandatory PLIC gateway sub-gate before the Linux 100-run claim:
+
+1. assert a declared level source and observe pending, selection, acceptance,
+   and claim;
+2. complete it while the source remains asserted and require it to become
+   pending and deliverable again;
+3. deassert before completion and require no redelivery;
+4. pulse a declared edge source and require exactly one delivery; and
+5. repeat across reset plus save/restore, with source-level/gateway state in
+   migration data.
+
+The inspected `sifive_plic.c` cannot pass this test because its GPIO callback
+ignores deassertion and has no source-level bitmap.  Either the PLIC gateway or
+an explicit, architecturally honest source-gateway layer must acquire those
+semantics before the endpoint advertises level operations.  The scheduler may
+reject unsupported operations; it must not report a successful level test
+after merely setting the pending bit directly.
 
 Likely QEMU patch locations are a new `include/qemu/kernel-lab.h`,
 `system/kernel-lab.c`, a QAPI schema, a small `hw/misc` test source,
@@ -479,7 +533,8 @@ artifact.
 
 1. Event vocabulary, ordering, capability bits, and binary format.
 2. Site-boundary and schedule specification shared with LLVM/Linux/FPGA.
-3. Architecture matrix checker and CI invocation.
+3. Architecture matrix schema-two checker, replay-doc audit, and CI
+   invocation.
 4. Hand-authored binary/site/schedule fixtures.
 
 ### Series B: common QEMU core
@@ -543,6 +598,13 @@ The architecture checker is source-only and needs no build.  Per-series gates
 are ordered to fail cheaply: schema/unit tests, qtest, one minimal guest boot,
 then the bounded stress or 100-run lane.
 
+Normal source-audit CI uses `--verify-revisions` without strict qualification
+and expects success with all gaps named.  A release-candidate job additionally
+runs `--require-qualified`; it is expected to fail today on Hexagon's missing
+hook, the PowerPC/SPARC classification audits, four replay lanes, and the
+SiFive PLIC lifecycle gap.  Removing a recorded gap to make that job green is
+not closure; its acceptance test and manifest status must change together.
+
 ## 12. Artifact and acceptance contract
 
 Every run bundle contains:
@@ -563,10 +625,33 @@ For a native trace flagship, the bundle also contains the raw packet stream,
 decoder version/output, and a boundary-by-boundary comparison with the common
 event stream.  Decoder acceptance alone is not proof of correct trace.
 
-## 13. Immediate execution order
+## 13. Reconciliation gap ledger
 
-1. Keep the 17-family checker green and convert the two classification
-   candidates into minimal QEMU tests.
+The two authoritative plans describe the intended system.  The following are
+implementation gaps in the inspected trees, not completed capabilities:
+
+| Gap | Current evidence | Closure gate |
+| --- | --- | --- |
+| Schedule/site-map parser | The site tool emits the exact phase and `per-vcpu`; no QEMU parser exists yet, and the old prose used aliases. | Parse a hand-authored schedule, reject every identity/phase/scope mismatch, and round-trip its canonical hash. |
+| Full sidecar provenance | The initial RV64 sidecar has image SHA-256, optional build ID, arch, endian, load bias, section hash, symbols, and sites.  It does not yet carry compiler/linker/config/source identity, inline stacks, kind-1 namespaces, or expected state. | Version the sidecar extension and make missing fields fatal only when that declared version requires them. |
+| Exact site stop | No QEMU translator/TB-exit implementation consumes the sidecar. | Prove the vCPU exits after prior retirement and before the site instruction, including a same-PC resume negative test. |
+| PLIC edge/level lifecycle | `sifive_plic_irq_request()` ignores low levels and stores no gateway input state. | Pass held-level redelivery, deassert-no-redelivery, one-pulse, reset, and migration qtests before advertising those endpoint operations. |
+| Semantic entry/return stream | Existing plugin discontinuity callbacks are entry projections and Hexagon lacks one; target return pairing does not exist. | Add the versioned in-tree event, target return hooks, underflow tests, and old-callback compatibility tests. |
+| Callback classification | PowerPC omits several asynchronously delivered classes; SPARC compares encoded external trap values to the bare base value. | Minimal target tests must fail before and pass after a separately reviewed classification change. |
+| Record/replay breadth | QEMU documents 13 of the 17 families; Hexagon, LoongArch, PA-RISC, and SuperH are unnamed. | Record/replay a bounded timer/external-IRQ fixture twice and compare normalized output before marking each documented/qualified. |
+| Linux boot breadth | In particular, Hexagon's maintained mainline boot path is not established by the source inventory. | Reproducible boot command, config, image hashes, timer event, and watchdog artifact for every lane. |
+| Native trace flagships | There is PT state but no TCG encoder, Arm TCG masks trace features, and no RISC-V E-Trace/TCI model was found. | Packet-vector tests, reference decoder acceptance, and boundary comparison against the common stream; each remains independent of recorder completion. |
+
+The initial QEMU implementation should consume only the fields the current
+sidecar actually emits, while rejecting incompatible versions.  Missing
+future provenance must remain visible as a capability limitation rather than
+being guessed from host paths or symbol names.
+
+## 14. Immediate execution order
+
+1. Keep the schema-two 17-family checker green and convert the two
+   classification candidates plus the PLIC lifecycle gap into minimal QEMU
+   tests.
 2. Freeze the site-boundary semantics and hand-authored manifest fixtures.
 3. Implement the RV64 exact-site TB stop without IRQ injection.
 4. Add the enriched RISC-V event and PLIC endpoint lifecycle.
