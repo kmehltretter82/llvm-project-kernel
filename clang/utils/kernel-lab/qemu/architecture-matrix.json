@@ -1,0 +1,205 @@
+{
+  "schema_version": 1,
+  "evidence": {
+    "qemu_commit": "c1c18d1e640b64292859ce9f30f3c344edfb0294",
+    "linux_commit": "50d05c7c76c96b90462f24debacca971d2e86713"
+  },
+  "excluded": {
+    "qemu_system_targets_without_linux_arch": [
+      "avr",
+      "rx",
+      "tricore"
+    ],
+    "linux_arches_without_qemu_system_target": [
+      "arc",
+      "csky",
+      "nios2",
+      "um"
+    ]
+  },
+  "families": [
+    {
+      "name": "alpha",
+      "linux_arch": "alpha",
+      "qemu_system_targets": ["alpha"],
+      "entry_files": ["target/alpha/helper.c"],
+      "controller_files": ["hw/alpha/typhoon.c"],
+      "machine": "clipper",
+      "interrupt_source": "Typhoon RTC/device input",
+      "interrupt_hook": "present"
+    },
+    {
+      "name": "arm",
+      "linux_arch": "arm",
+      "qemu_system_targets": ["arm"],
+      "entry_files": ["target/arm/helper.c"],
+      "controller_files": ["hw/intc/arm_gic.c"],
+      "machine": "virt,gic-version=2",
+      "interrupt_source": "GICv2 SPI",
+      "interrupt_hook": "present"
+    },
+    {
+      "name": "arm64",
+      "linux_arch": "arm64",
+      "qemu_system_targets": ["aarch64"],
+      "entry_files": ["target/arm/helper.c"],
+      "controller_files": ["hw/intc/arm_gicv3.c"],
+      "machine": "virt,gic-version=3",
+      "interrupt_source": "GICv3 SPI/PPI/SGI",
+      "interrupt_hook": "present"
+    },
+    {
+      "name": "hexagon",
+      "linux_arch": "hexagon",
+      "qemu_system_targets": ["hexagon"],
+      "entry_files": ["target/hexagon/hexswi.c"],
+      "controller_files": ["hw/intc/hex-l2vic.c"],
+      "machine": "virt",
+      "interrupt_source": "L2VIC input",
+      "interrupt_hook": "known-missing"
+    },
+    {
+      "name": "parisc",
+      "linux_arch": "parisc",
+      "qemu_system_targets": ["hppa"],
+      "entry_files": ["target/hppa/int_helper.c"],
+      "controller_files": ["hw/misc/lasi.c", "hw/pci-host/dino.c"],
+      "machine": "B160L",
+      "interrupt_source": "LASI UART/Dino input",
+      "interrupt_hook": "present"
+    },
+    {
+      "name": "x86",
+      "linux_arch": "x86",
+      "qemu_system_targets": ["i386", "x86_64"],
+      "entry_files": [
+        "target/i386/tcg/seg_helper.c",
+        "target/i386/tcg/excp_helper.c"
+      ],
+      "controller_files": ["hw/intc/apic.c", "hw/intc/ioapic.c"],
+      "machine": "q35",
+      "interrupt_source": "IOAPIC/MSI/local APIC",
+      "interrupt_hook": "present"
+    },
+    {
+      "name": "loongarch",
+      "linux_arch": "loongarch",
+      "qemu_system_targets": ["loongarch64"],
+      "entry_files": ["target/loongarch/tcg/tcg_cpu.c"],
+      "controller_files": [
+        "hw/intc/loongarch_pch_pic.c",
+        "hw/intc/loongarch_extioi.c"
+      ],
+      "machine": "virt",
+      "interrupt_source": "PCH PIC through EXTIOI",
+      "interrupt_hook": "present"
+    },
+    {
+      "name": "m68k",
+      "linux_arch": "m68k",
+      "qemu_system_targets": ["m68k"],
+      "entry_files": ["target/m68k/op_helper.c"],
+      "controller_files": ["hw/intc/goldfish_pic.c"],
+      "machine": "virt",
+      "interrupt_source": "Goldfish RTC/PIC",
+      "interrupt_hook": "present"
+    },
+    {
+      "name": "microblaze",
+      "linux_arch": "microblaze",
+      "qemu_system_targets": ["microblaze"],
+      "entry_files": ["target/microblaze/helper.c"],
+      "controller_files": ["hw/intc/xilinx_intc.c"],
+      "machine": "petalogix-ml605",
+      "interrupt_source": "AXI timer through Xilinx INTC",
+      "interrupt_hook": "present"
+    },
+    {
+      "name": "mips",
+      "linux_arch": "mips",
+      "qemu_system_targets": ["mips", "mipsel", "mips64", "mips64el"],
+      "entry_files": ["target/mips/tcg/system/tlb_helper.c"],
+      "controller_files": ["hw/intc/mips_gic.c", "hw/intc/i8259.c"],
+      "machine": "malta",
+      "interrupt_source": "CP0 timer and Malta i8259/GIC",
+      "interrupt_hook": "present"
+    },
+    {
+      "name": "openrisc",
+      "linux_arch": "openrisc",
+      "qemu_system_targets": ["or1k"],
+      "entry_files": ["target/or1k/interrupt.c"],
+      "controller_files": ["target/or1k/sys_helper.c"],
+      "machine": "virt",
+      "interrupt_source": "CPU PIC tick/external input",
+      "interrupt_hook": "present"
+    },
+    {
+      "name": "powerpc",
+      "linux_arch": "powerpc",
+      "qemu_system_targets": ["ppc", "ppc64"],
+      "entry_files": ["target/ppc/excp_helper.c"],
+      "controller_files": ["hw/intc/openpic.c", "hw/intc/spapr_xive.c"],
+      "machine": "ppce500",
+      "interrupt_source": "OpenPIC external/decrementer",
+      "interrupt_hook": "present-needs-classification-audit"
+    },
+    {
+      "name": "riscv",
+      "linux_arch": "riscv",
+      "qemu_system_targets": ["riscv32", "riscv64"],
+      "entry_files": ["target/riscv/tcg/cpu_helper.c"],
+      "controller_files": [
+        "hw/intc/sifive_plic.c",
+        "hw/intc/riscv_aplic.c",
+        "hw/intc/riscv_imsic.c"
+      ],
+      "machine": "virt",
+      "interrupt_source": "PLIC then APLIC/IMSIC",
+      "interrupt_hook": "present"
+    },
+    {
+      "name": "s390",
+      "linux_arch": "s390",
+      "qemu_system_targets": ["s390x"],
+      "entry_files": ["target/s390x/tcg/excp_helper.c"],
+      "controller_files": ["hw/intc/s390_flic.c"],
+      "machine": "s390-ccw-virtio",
+      "interrupt_source": "FLIC external/I/O/clock",
+      "interrupt_hook": "present"
+    },
+    {
+      "name": "sh",
+      "linux_arch": "sh",
+      "qemu_system_targets": ["sh4", "sh4eb"],
+      "entry_files": ["target/sh4/helper.c"],
+      "controller_files": ["hw/intc/sh_intc.c"],
+      "machine": "r2d",
+      "interrupt_source": "TMU and R2D FPGA IRL through sh-intc",
+      "interrupt_hook": "present"
+    },
+    {
+      "name": "sparc",
+      "linux_arch": "sparc",
+      "qemu_system_targets": ["sparc", "sparc64"],
+      "entry_files": [
+        "target/sparc/int32_helper.c",
+        "target/sparc/int64_helper.c"
+      ],
+      "controller_files": ["hw/intc/slavio_intctl.c"],
+      "machine": "SS-5",
+      "interrupt_source": "Slavio timer/PIL",
+      "interrupt_hook": "present-needs-classification-audit"
+    },
+    {
+      "name": "xtensa",
+      "linux_arch": "xtensa",
+      "qemu_system_targets": ["xtensa", "xtensaeb"],
+      "entry_files": ["target/xtensa/exc_helper.c"],
+      "controller_files": ["hw/xtensa/pic_cpu.c"],
+      "machine": "virt",
+      "interrupt_source": "CPU timer/external interrupt",
+      "interrupt_hook": "present"
+    }
+  ]
+}
