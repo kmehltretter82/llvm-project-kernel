@@ -670,6 +670,20 @@ def LinuxAtomicSleepChecker : Checker<"AtomicSleep">,
            "held, inside an RCU read-side critical section, or with "
            "preemption or bottom halves disabled">,
   Dependencies<[LinuxKernelModelChecker]>,
+  CheckerOptions<[
+    CmdLineOption<Boolean, "RTContext",
+                  "Track IRQ state and typed PREEMPT_RT lock waits separately "
+                  "from ordinary sleeping calls; expose unknown effects.",
+                  "false", InAlpha>,
+    CmdLineOption<String, "RTContextManifest",
+                  "Import explicitly reviewed, source/config/target-keyed "
+                  "entry contexts and typed call effects; requires RTContext.",
+                  "", InAlpha>,
+    CmdLineOption<String, "RTContextManifestOutput",
+                  "Write compiler input identities and function bindings to "
+                  "a new JSON file; infers no entry contexts or call effects.",
+                  "", InAlpha>
+  ]>,
   Documentation<NotDocumented>;
 
 def LinuxLockBalanceChecker : Checker<"LockBalance">,

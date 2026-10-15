@@ -23,11 +23,14 @@
 #include "LinuxKernelModeling.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/Expr.h"
+#include "clang/Basic/TargetInfo.h"
 #include "clang/StaticAnalyzer/Checkers/BuiltinCheckerRegistration.h"
 #include "clang/StaticAnalyzer/Core/Checker.h"
 #include "clang/StaticAnalyzer/Core/CheckerManager.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/SymbolManager.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSwitch.h"
@@ -36,10 +39,126 @@ using namespace clang;
 using namespace ento;
 using namespace linuxkernel;
 
+REGISTER_TRAIT_WITH_PROGRAMSTATE(LinuxIRQMode, unsigned)
+REGISTER_TRAIT_WITH_PROGRAMSTATE(LinuxIRQEntry, const Expr *)
+REGISTER_MAP_WITH_PROGRAMSTATE(LinuxIRQQueries, SymbolRef, const Expr *)
+REGISTER_MAP_WITH_PROGRAMSTATE(LinuxSavedIRQStates, SymbolRef, IRQState)
+REGISTER_MAP_WITH_PROGRAMSTATE(LinuxCurrentIRQSamples, SymbolRef, const Expr *)
+
+IRQState linuxkernel::getIRQState(ProgramStateRef State) {
+  return {static_cast<IRQMode>(State->get<LinuxIRQMode>()),
+          State->get<LinuxIRQEntry>()};
+}
+
+ProgramStateRef linuxkernel::setIRQState(ProgramStateRef State, IRQState IRQ) {
+  // A cached query describes the IRQ state at its call, not after a later
+  // disable, enable or restore. Keep its ordinary value constraints, but stop
+  // using it to infer the current state after any IRQ-state effect.
+  return State->remove<LinuxIRQQueries>()
+      ->remove<LinuxCurrentIRQSamples>()
+      ->set<LinuxIRQMode>(static_cast<unsigned>(IRQ.Mode))
+      ->set<LinuxIRQEntry>(IRQ.Entry);
+}
+
+SymbolRef linuxkernel::getIRQFlagsSymbol(ProgramStateRef State, SymbolRef Flags) {
+  const ASTContext &Ctx = State->getStateManager().getContext();
+  while (const auto *Cast = dyn_cast_or_null<SymbolCast>(Flags)) {
+    QualType From = Cast->getOperand()->getType();
+    QualType To = Cast->getType();
+    if (!From->isIntegralOrEnumerationType() ||
+        !To->isIntegralOrEnumerationType() ||
+        Ctx.getIntWidth(From) > Ctx.getIntWidth(To))
+      break;
+    Flags = Cast->getOperand();
+  }
+  return Flags;
+}
+
+std::optional<IRQState> linuxkernel::getSavedIRQState(ProgramStateRef State,
+                                                    SymbolRef Flags) {
+  Flags = getIRQFlagsSymbol(State, Flags);
+  if (Flags)
+    if (const IRQState *Saved = State->get<LinuxSavedIRQStates>(Flags))
+      return *Saved;
+  return std::nullopt;
+}
+
+ProgramStateRef linuxkernel::storeSavedIRQState(ProgramStateRef State,
+                                               SymbolRef Flags, IRQState IRQ) {
+  Flags = getIRQFlagsSymbol(State, Flags);
+  return Flags ? State->set<LinuxSavedIRQStates>(Flags, IRQ) : State;
+}
+
+bool linuxkernel::isEnableOnlyIRQRestore(StringRef Name,
+                                        const CheckerContext &C) {
+  if (!C.getASTContext().getTargetInfo().getTriple().isX86())
+    return false;
+  return Name == "arch_local_irq_restore" ||
+         Name == "native_local_irq_restore" ||
+         ((Name.starts_with("_raw_") || Name.starts_with("__raw_")) &&
+          Name.ends_with("_unlock_irqrestore"));
+}
+
+ContextCall linuxkernel::classifyContextCall(StringRef Name) {
+  using O = ContextOp;
+  using K = ContextKind;
+  return llvm::StringSwitch<ContextCall>(Name)
+      .Cases({"preempt_count_add", "__preempt_count_add", "preempt_disable"},
+             {O::Enter, K::Preempt})
+      .Cases({"preempt_count_sub", "__preempt_count_sub",
+              "__preempt_count_dec_and_test", "preempt_enable"},
+             {O::Leave, K::Preempt})
+      .Cases({"__local_bh_disable_ip", "local_bh_disable"},
+             {O::Enter, K::BottomHalf})
+      .Cases({"__local_bh_enable_ip", "local_bh_enable"},
+             {O::Leave, K::BottomHalf})
+      .Cases({"__rcu_read_lock", "rcu_read_lock"}, {O::Enter, K::RCU})
+      .Cases({"__rcu_read_unlock", "rcu_read_unlock"}, {O::Leave, K::RCU})
+      .Case("migrate_disable", {O::Enter, K::Migration})
+      .Case("migrate_enable", {O::Leave, K::Migration})
+      .Cases({"irq_enter", "__irq_enter", "irq_enter_rcu"},
+             {O::Enter, K::HardIRQ})
+      .Cases({"irq_exit", "__irq_exit", "irq_exit_rcu"},
+             {O::Leave, K::HardIRQ})
+      .Cases({"nmi_enter", "__nmi_enter"}, {O::Enter, K::NMI})
+      .Cases({"nmi_exit", "__nmi_exit"}, {O::Leave, K::NMI})
+      .Cases({"local_irq_disable", "raw_local_irq_disable",
+              "arch_local_irq_disable", "native_irq_disable"},
+             {O::IRQDisable, K::Preempt})
+      .Cases({"local_irq_enable", "raw_local_irq_enable",
+              "arch_local_irq_enable", "native_irq_enable"},
+             {O::IRQEnable, K::Preempt})
+      .Cases({"local_irq_save", "raw_local_irq_save", "arch_local_irq_save",
+              "native_local_irq_save"},
+             {O::IRQSave, K::Preempt})
+      .Cases({"local_irq_restore", "raw_local_irq_restore",
+              "arch_local_irq_restore", "native_local_irq_restore"},
+             {O::IRQRestore, K::Preempt})
+      .Cases({"irqs_disabled", "raw_irqs_disabled", "arch_irqs_disabled"},
+             {O::IRQQuery, K::Preempt})
+      .Cases({"arch_local_save_flags", "native_save_fl"},
+             {O::IRQSample, K::Preempt})
+      .Cases({"arch_irqs_disabled_flags", "native_irqs_disabled_flags",
+              "raw_irqs_disabled_flags", "irqs_disabled_flags"},
+             {O::IRQFlagsQuery, K::Preempt})
+      .Default(ContextCall());
+}
+
 LockCall linuxkernel::classifyLockCall(StringRef Name) {
   using K = LockKind;
   using O = LockOp;
   return llvm::StringSwitch<LockCall>(Name)
+      .Cases({"rt_spin_lock", "rt_spin_lock_nested", "rt_spin_lock_nest_lock"},
+             {O::Acquire, K::RTSpin})
+      .Cases({"rt_spin_trylock", "rt_spin_trylock_bh"},
+             {O::TryAcquire, K::RTSpin})
+      .Case("rt_spin_lock_unlock", {O::AcquireAndRelease, K::RTSpin})
+      .Case("rt_spin_unlock", {O::Release, K::RTSpin})
+      .Cases({"rt_read_lock", "rt_write_lock", "rt_write_lock_nested"},
+             {O::Acquire, K::RTRW})
+      .Cases({"rt_read_trylock", "rt_write_trylock"},
+             {O::TryAcquire, K::RTRW})
+      .Cases({"rt_read_unlock", "rt_write_unlock"}, {O::Release, K::RTRW})
       // The "__raw" forms are the inline versions that some configurations
       // use instead of the out-of-line ones.
       .Cases({"_raw_spin_lock", "_raw_spin_lock_bh", "_raw_spin_lock_irq",
@@ -133,7 +252,8 @@ bool linuxkernel::acquiresNodeReference(StringRef Name, int &Consumed) {
 namespace {
 
 class LinuxKernelModelChecker
-    : public Checker<eval::Call, check::BeginFunction> {
+    : public Checker<eval::Call, eval::Assume, check::DeadSymbols,
+                     check::BeginFunction> {
   /// Whether a function, with everything it calls that has a body, can make
   /// an enabled checker report something.
   mutable llvm::DenseMap<const FunctionDecl *, bool> Relevant;
@@ -144,9 +264,14 @@ class LinuxKernelModelChecker
 public:
   bool SkipIrrelevant = false;
   bool LikelyStaticBranches = false;
+  bool RTContextEnabled = false;
+  bool ReviewedContextInputs = false;
   unsigned Interests = 0;
 
   bool evalCall(const CallEvent &Call, CheckerContext &C) const;
+  ProgramStateRef evalAssume(ProgramStateRef State, SVal Cond,
+                            bool Assumption) const;
+  void checkDeadSymbols(SymbolReaper &SR, CheckerContext &C) const;
   void checkBeginFunction(CheckerContext &C) const;
 };
 
@@ -154,11 +279,16 @@ public:
 
 bool LinuxKernelModelChecker::isTrigger(StringRef Name) const {
   LockCall LC = classifyLockCall(Name);
+  if (isRTLock(LC.Kind) && !RTContextEnabled)
+    LC = LockCall();
   bool Acquires = LC.Op != LockOp::None && LC.Op != LockOp::Release;
   if (Acquires && (Interests & Locks))
     return true;
   if (Interests & AtomicSections) {
-    if (Acquires && LC.Kind == LockKind::Spin)
+    if (Acquires && (LC.Kind == LockKind::Spin || isRTLock(LC.Kind)))
+      return true;
+    if (RTContextEnabled &&
+        classifyContextCall(Name).Op != ContextOp::None)
       return true;
     if (llvm::StringSwitch<bool>(Name)
             .Cases({"__rcu_read_lock", "preempt_count_add",
@@ -203,7 +333,7 @@ bool LinuxKernelModelChecker::isRelevant(const FunctionDecl *FD,
 }
 
 void LinuxKernelModelChecker::checkBeginFunction(CheckerContext &C) const {
-  if (!SkipIrrelevant || !Interests || !C.inTopFrame())
+  if (!SkipIrrelevant || ReviewedContextInputs || !Interests || !C.inTopFrame())
     return;
   const auto *FD = dyn_cast_or_null<FunctionDecl>(C.getStackFrame()->getDecl());
   if (FD && !isRelevant(FD, 0))
@@ -235,26 +365,151 @@ bool LinuxKernelModelChecker::evalCall(const CallEvent &Call,
   // field of *dev, and with it conditions like "if (dev->flags & ATOMIC)"
   // that decide between a spinlock and a mutex and later between a busy wait
   // and a sleep.
-  bool EntersOrLeaves =
+  LockCall LC = classifyLockCall(Name);
+  if (isRTLock(LC.Kind) && !RTContextEnabled)
+    LC = LockCall();
+  ContextCall CC = RTContextEnabled ? classifyContextCall(Name) : ContextCall();
+  bool EntersOrLeaves = CC.Op != ContextOp::None ||
       llvm::StringSwitch<bool>(Name)
           .Cases({"__rcu_read_lock", "__rcu_read_unlock", "preempt_count_add",
                   "preempt_count_sub", "__local_bh_disable_ip",
                   "__local_bh_enable_ip"},
                  true)
           .Default(false);
-  if (FD->hasBody() ||
-      (classifyLockCall(Name).Op == LockOp::None && !EntersOrLeaves))
+  // Model reviewed effect leaves before their bodies. Their implementations
+  // otherwise inline into assembly or accounting details, while wrappers must
+  // inline to reach these leaves and avoid applying the same effect twice.
+  bool ModelBeforeInline = RTContextEnabled &&
+      (CC.Op == ContextOp::IRQDisable || CC.Op == ContextOp::IRQEnable ||
+       CC.Op == ContextOp::IRQSave || CC.Op == ContextOp::IRQRestore ||
+       CC.Op == ContextOp::IRQQuery || CC.Op == ContextOp::IRQSample ||
+       (CC.Op == ContextOp::IRQFlagsQuery &&
+        (Name == "arch_irqs_disabled_flags" ||
+         Name == "native_irqs_disabled_flags")) ||
+       llvm::StringSwitch<bool>(Name)
+           .Cases({"preempt_count_add", "__preempt_count_add",
+                   "preempt_count_sub", "__preempt_count_sub",
+                   "__preempt_count_dec_and_test", "__local_bh_disable_ip",
+                   "__local_bh_enable_ip", "__rcu_read_lock",
+                   "__rcu_read_unlock", "migrate_disable", "migrate_enable"},
+                  true)
+           .Default(false));
+  if ((FD->hasBody() && !ModelBeforeInline) ||
+      (LC.Op == LockOp::None && !EntersOrLeaves))
     return false;
-  if (!Call.getResultType()->isVoidType())
-    State = State->BindExpr(
-        Origin, C.getStackFrame(),
-        C.getSValBuilder().conjureSymbolVal(Call, C.blockCount()));
+  if (!Call.getResultType()->isVoidType()) {
+    IRQMode QueryMode = IRQMode::Unknown;
+    bool ReflectsCurrentIRQ = CC.Op == ContextOp::IRQQuery;
+    if (ReflectsCurrentIRQ)
+      QueryMode = getIRQState(State).Mode;
+    else if (CC.Op == ContextOp::IRQFlagsQuery && Call.getNumArgs()) {
+      SymbolRef Flags = getIRQFlagsSymbol(State, Call.getArgSVal(0).getAsSymbol());
+      if (auto Saved = getSavedIRQState(State, Flags))
+        QueryMode = Saved->Mode;
+      ReflectsCurrentIRQ = Flags && State->get<LinuxCurrentIRQSamples>(Flags);
+    }
+    if (QueryMode != IRQMode::Unknown)
+      State = State->BindExpr(
+          Origin, C.getStackFrame(),
+          C.getSValBuilder().makeTruthVal(
+              QueryMode == IRQMode::Disabled, Call.getResultType()));
+    else {
+      SVal Result = C.getSValBuilder().conjureSymbolVal(Call, C.blockCount());
+      State = State->BindExpr(Origin, C.getStackFrame(), Result);
+      if (CC.Op == ContextOp::IRQSave || CC.Op == ContextOp::IRQSample)
+        if (SymbolRef Sym = Result.getAsSymbol()) {
+          State = storeSavedIRQState(State, Sym, getIRQState(State));
+          if (CC.Op == ContextOp::IRQSample)
+            State = State->set<LinuxCurrentIRQSamples>(Sym, Origin);
+        }
+      if (ReflectsCurrentIRQ) {
+        // These predicates return exactly zero or one, even when declared as
+        // int. Preserve that range so a comparison with two is unreachable.
+        SValBuilder &SVB = C.getSValBuilder();
+        QualType Type = Call.getResultType();
+        if (Type->isIntegerType()) {
+          for (BinaryOperatorKind Op : {BO_GE, BO_LE}) {
+            SVal Bound = SVB.makeIntVal(Op == BO_GE ? 0 : 1, Type);
+            SVal Test = SVB.evalBinOp(State, Op, Result, Bound,
+                                     C.getASTContext().BoolTy);
+            if (auto Cond = Test.getAs<DefinedOrUnknownSVal>())
+              State = State->assume(*Cond, true);
+            if (!State)
+              return true;
+          }
+        }
+        if (SymbolRef Sym = Result.getAsSymbol())
+          State = State->set<LinuxIRQQueries>(Sym, Origin);
+      }
+    }
+  }
   C.addTransition(State);
   return true;
 }
 
+ProgramStateRef LinuxKernelModelChecker::evalAssume(ProgramStateRef State,
+                                                   SVal Cond,
+                                                   bool Assumption) const {
+  if (!RTContextEnabled)
+    return State;
+  // Consult the constraints after the branch assumption rather than matching
+  // only a bare symbol: casts, !query and query == 0 must work as well.
+  for (const auto &[Sym, Origin] : State->get<LinuxIRQQueries>()) {
+    ConditionTruthVal IsZero = State->isNull(nonloc::SymbolVal(Sym));
+    if (IsZero.isUnderconstrained())
+      continue;
+    IRQMode Mode = IsZero.isConstrainedTrue() ? IRQMode::Enabled
+                                             : IRQMode::Disabled;
+    IRQState Current = getIRQState(State);
+    if (Current.Mode != IRQMode::Unknown && Current.Mode != Mode)
+      return nullptr;
+    // This refines the sampled state. It is not an IRQ-state effect, so other
+    // queries from the same unchanged state must retain their associations.
+    State = State->set<LinuxIRQMode>(static_cast<unsigned>(Mode))
+                ->set<LinuxIRQEntry>(Current.Entry ? Current.Entry : Origin);
+    // A current sample captured this same unchanged state. Preserve the newly
+    // proved snapshot for future queries after the sample becomes stale.
+    for (const auto &[Flags, Sample] : State->get<LinuxCurrentIRQSamples>())
+      if (auto Saved = getSavedIRQState(State, Flags))
+        if (Saved->Mode == IRQMode::Unknown)
+          State = storeSavedIRQState(
+              State, Flags, {Mode, Saved->Entry ? Saved->Entry : Origin});
+  }
+  return State;
+}
+
+void LinuxKernelModelChecker::checkDeadSymbols(SymbolReaper &SR,
+                                              CheckerContext &C) const {
+  if (!RTContextEnabled)
+    return;
+  ProgramStateRef State = C.getState();
+  for (const auto &[Sym, Origin] : State->get<LinuxIRQQueries>())
+    if (SR.isDead(Sym))
+      State = State->remove<LinuxIRQQueries>(Sym);
+  for (const auto &[Sym, Saved] : State->get<LinuxSavedIRQStates>())
+    if (SR.isDead(Sym))
+      State = State->remove<LinuxSavedIRQStates>(Sym);
+  for (const auto &[Sym, Origin] : State->get<LinuxCurrentIRQSamples>())
+    if (SR.isDead(Sym))
+      State = State->remove<LinuxCurrentIRQSamples>(Sym);
+  if (State != C.getState())
+    C.addTransition(State);
+}
+
 void linuxkernel::addInterest(CheckerManager &Mgr, unsigned Mask) {
   Mgr.getChecker<LinuxKernelModelChecker>()->Interests |= Mask;
+}
+
+void linuxkernel::enableRTContext(CheckerManager &Mgr) {
+  auto *Checker = Mgr.getChecker<LinuxKernelModelChecker>();
+  Checker->RTContextEnabled = true;
+}
+
+bool linuxkernel::isRTContextEnabled(const CheckerContext &C) {
+  return C.getAnalysisManager()
+      .getCheckerManager()
+      ->getChecker<LinuxKernelModelChecker>()
+      ->RTContextEnabled;
 }
 
 void ento::registerLinuxKernelModelChecker(CheckerManager &Mgr) {
@@ -264,6 +519,12 @@ void ento::registerLinuxKernelModelChecker(CheckerManager &Mgr) {
       Opts.getCheckerBooleanOption(Checker, "SkipIrrelevant");
   Checker->LikelyStaticBranches =
       Opts.getCheckerBooleanOption(Checker, "LikelyStaticBranches");
+  for (StringRef Name : {"alpha.linux.AtomicSleep:RTContextManifest",
+                        "alpha.linux.AtomicSleep:RTContextManifestOutput"}) {
+    auto I = Opts.Config.find(Name.str());
+    if (I != Opts.Config.end() && !I->second.empty())
+      Checker->ReviewedContextInputs = true;
+  }
 }
 
 bool ento::shouldRegisterLinuxKernelModelChecker(const CheckerManager &Mgr) {

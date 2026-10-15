@@ -74,6 +74,7 @@ struct TrackedLock {
 
 /// What kind of result a return path has.
 enum ReturnClass : unsigned { RCVoid, RCFailure, RCSuccess, RCUnknown };
+enum BalanceContext : unsigned { BottomHalfContext, SavedIRQContext };
 
 } // namespace
 
@@ -86,12 +87,22 @@ class LinuxLockBalanceChecker
     : public Checker<check::PostCall, check::EndFunction, check::EndAnalysis> {
   const BugType LeftHeld{this, "Lock left held on a return path",
                          "Linux kernel"};
+  const BugType LeftContext{this, "Atomic context left active on a return path",
+                            "Linux kernel"};
 
   using Exit = std::pair<const MemRegion *, unsigned>;
   /// The return paths of the function under analysis: where a lock was still
   /// held, and with which lock and kind of result one was released.
   mutable llvm::MapVector<Exit, const ExplodedNode *> HeldExits;
   mutable llvm::DenseSet<Exit> ReleasedExits;
+
+  // Context facts describe the current top function's own effects rather than
+  // a lock region. Include the function in the key so exits from distinct
+  // entry points cannot supply evidence for one another.
+  using Context = std::pair<const FunctionDecl *, unsigned>;
+  using ContextExit = std::pair<Context, unsigned>;
+  mutable llvm::MapVector<ContextExit, const ExplodedNode *> HeldContextExits;
+  mutable llvm::DenseSet<ContextExit> BalancedContextExits;
 
   static bool inScopedGuard(const CheckerContext &C);
   static bool keepsLocksByDesign(const FunctionDecl *FD);
@@ -170,7 +181,8 @@ void LinuxLockBalanceChecker::checkPostCall(const CallEvent &Call,
   if (!FD || !FD->getIdentifier() || Call.getNumArgs() < 1)
     return;
   LockCall LC = classifyLockCall(FD->getName());
-  if (LC.Op == LockOp::None)
+  if (LC.Op == LockOp::None || LC.Op == LockOp::AcquireAndRelease ||
+      (isRTLock(LC.Kind) && !isRTContextEnabled(C)))
     return;
   const MemRegion *Lock = Call.getArgSVal(0).getAsRegion();
   if (!Lock)
@@ -257,7 +269,8 @@ void LinuxLockBalanceChecker::checkEndFunction(const ReturnStmt *RS,
     return;
   ProgramStateRef State = C.getState();
   TrackedLocksTy Locks = State->get<TrackedLocks>();
-  if (Locks.isEmpty())
+  bool CheckContexts = isRTContextEnabled(C);
+  if (Locks.isEmpty() && !CheckContexts)
     return;
 
   ReturnClass RC = classifyReturn(RS, C);
@@ -272,6 +285,28 @@ void LinuxLockBalanceChecker::checkEndFunction(const ReturnStmt *RS,
         HeldExits.insert({{Lock, RC}, N});
     }
   }
+
+  if (!CheckContexts)
+    return;
+  ContextBalanceFacts Facts = getContextBalanceFacts(State);
+  auto RememberContext = [&](BalanceContext Kind, unsigned Depth, bool Unknown) {
+    // An opaque release cannot prove that a context remains held or that it
+    // was balanced. AtomicSleep reports that coverage gap separately.
+    if (Unknown)
+      return;
+    Context Key{FD->getCanonicalDecl(), static_cast<unsigned>(Kind)};
+    if (!Depth) {
+      BalancedContextExits.insert({Key, RC});
+    } else if (RC != RCUnknown) {
+      if (!N)
+        N = C.generateNonFatalErrorNode(State);
+      if (N)
+        HeldContextExits.insert({{Key, RC}, N});
+    }
+  };
+  RememberContext(BottomHalfContext, Facts.BottomHalfDepth,
+                  Facts.BottomHalfUnknown);
+  RememberContext(SavedIRQContext, Facts.IRQSaveDepth, Facts.IRQSaveUnknown);
 }
 
 void LinuxLockBalanceChecker::checkEndAnalysis(ExplodedGraph &G,
@@ -300,6 +335,35 @@ void LinuxLockBalanceChecker::checkEndAnalysis(ExplodedGraph &G,
   }
   HeldExits.clear();
   ReleasedExits.clear();
+
+  llvm::DenseSet<Context> ReportedContexts;
+  for (const auto &[Key, N] : HeldContextExits) {
+    const auto &[ContextKey, RC] = Key;
+    bool BalancedElsewhere = false;
+    for (unsigned Other : {RCVoid, RCFailure, RCSuccess, RCUnknown})
+      if (BalancedContextExits.count({ContextKey, Other}) &&
+          (RC == RCFailure || Other == RC))
+        BalancedElsewhere = true;
+    if (!BalancedElsewhere || !ReportedContexts.insert(ContextKey).second)
+      continue;
+    StringRef Message;
+    if (ContextKey.second == BottomHalfContext)
+      Message = RC == RCFailure
+                    ? "Bottom-half context is still active on this failure "
+                      "return path, but other paths release it"
+                    : "Bottom-half context is still active on this return "
+                      "path, but another path with the same result releases it";
+    else
+      Message = RC == RCFailure
+                    ? "Saved IRQ state is not restored on this failure path, "
+                      "but other paths restore it"
+                    : "Saved IRQ state is not restored on this return path, "
+                      "but another path with the same result restores it";
+    BR.emitReport(std::make_unique<PathSensitiveBugReport>(LeftContext, Message,
+                                                          N));
+  }
+  HeldContextExits.clear();
+  BalancedContextExits.clear();
 }
 
 void ento::registerLinuxLockBalanceChecker(CheckerManager &Mgr) {
