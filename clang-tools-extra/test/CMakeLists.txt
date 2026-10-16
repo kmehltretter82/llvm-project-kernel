@@ -76,6 +76,10 @@ if(TARGET CTTestTidyModule)
     endif()
 endif()
 
+if(TARGET DmaBufRfcTidyModule)
+  list(APPEND CLANG_TOOLS_TEST_DEPS DmaBufRfcTidyModule)
+endif()
+
 add_lit_testsuite(check-clang-extra "Running clang-tools-extra/test"
    ${CMAKE_CURRENT_BINARY_DIR}
    DEPENDS ${CLANG_TOOLS_TEST_DEPS}
