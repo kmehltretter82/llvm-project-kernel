@@ -88,6 +88,12 @@ and source checks with section garbage collection.  Its linker script captures
 all fixture `.text.*`, `.rodata.*`, `.data.*`, and `.bss.*` inputs before the
 map sections; this prevents an orphan runtime section from being displaced by
 retained metadata and makes that ordering rule part of the regression.
+The split-DWARF lane compiles every variant through the same output path,
+requires byte-identical `.dwo` files, verifies each file with
+`llvm-dwarfdump`, reapplies the object/linked inertness fingerprint, and checks
+stable policy and source IDs.  Using one output path is intentional: a DWO
+records its output pathname, so comparing different paths would manufacture a
+debug-only difference unrelated to map mode.
 Its expectation switches make backend/revision behavior explicit.  Stock LLVM
 22 uses the defaults: SelectionDAG loses three sites and GlobalISel preserves
 four.  The lab LLVM 24 command shown above requires four SelectionDAG sites and
@@ -106,7 +112,8 @@ for non-inlined ordinary and single-module ThinLTO fixtures, and does not imply
 a compiler or memory barrier.  Loading a Clang that provides the builtin
 without the matching map plugin is deliberately unsupported rather than a
 silent no-op.  This bounded ThinLTO result does not yet qualify cross-TU
-import/inlining or a Linux kernel LTO link.
+import/inlining or a Linux kernel LTO link.  The bounded split-DWARF result
+likewise does not yet qualify the kernel's complete debug packaging flow.
 
 The lab branch also patches LLVM 24 SelectionDAG.  Its target test verifies
 that PC-section labels are immediately before the RISC-V call and return:

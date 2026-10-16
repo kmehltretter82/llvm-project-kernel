@@ -52,6 +52,7 @@ def compile_object(arguments: argparse.Namespace, output: pathlib.Path,
                    global_isel: bool = False,
                    source_site: bool = False,
                    thin_lto: bool = False,
+                   split_dwarf: bool = False,
                    optimization: str = "2",
                    debug_info: bool = True,
                    check: bool = True,
@@ -75,8 +76,12 @@ def compile_object(arguments: argparse.Namespace, output: pathlib.Path,
         "-fno-addrsig",
         f"-ffile-prefix-map={prefix_root}=.",
     ]
+    if split_dwarf and not debug_info:
+        raise ValueError("split DWARF requires debug information")
     if debug_info:
-        command.append("-gline-tables-only")
+        command.append("-g" if split_dwarf else "-gline-tables-only")
+    if split_dwarf:
+        command.append("-gsplit-dwarf")
     if not relax:
         command.append("-mno-relax")
     if global_isel:
@@ -632,6 +637,165 @@ def main() -> int:
             )
             run([str(arguments.site_tool.resolve()), str(gc_source_elf)])
 
+        split_work = directory / "split-work"
+        split_work.mkdir()
+        split_work_obj = split_work / "probe.o"
+        split_work_dwo = split_work / "probe.dwo"
+
+        def compile_split_snapshot(
+            name: str,
+            *,
+            plugin: bool,
+            spec: pathlib.Path | None,
+            source_site: bool = False,
+        ) -> tuple[pathlib.Path, pathlib.Path]:
+            compile_object(
+                arguments,
+                split_work_obj,
+                plugin=plugin,
+                spec=spec,
+                source_site=source_site,
+                split_dwarf=True,
+            )
+            if not split_work_dwo.is_file() or not split_work_dwo.stat().st_size:
+                raise AssertionError("split-DWARF compilation emitted no DWO")
+            snapshot_obj = directory / f"split-{name}.o"
+            snapshot_dwo = directory / f"split-{name}.dwo"
+            shutil.copyfile(split_work_obj, snapshot_obj)
+            shutil.copyfile(split_work_dwo, snapshot_dwo)
+            return snapshot_obj, snapshot_dwo
+
+        split_baseline_obj, split_baseline_dwo = compile_split_snapshot(
+            "baseline", plugin=False, spec=None
+        )
+        split_disabled_obj, split_disabled_dwo = compile_split_snapshot(
+            "disabled", plugin=True, spec=None
+        )
+        split_mapped_obj, split_mapped_dwo = compile_split_snapshot(
+            "mapped", plugin=True, spec=VALID_SPEC
+        )
+        if split_baseline_dwo.read_bytes() != split_disabled_dwo.read_bytes():
+            raise AssertionError("disabled map plugin changed split DWARF")
+        if split_baseline_dwo.read_bytes() != split_mapped_dwo.read_bytes():
+            raise AssertionError("policy map changed split DWARF")
+        require_inertness(
+            arguments,
+            split_baseline_obj,
+            split_disabled_obj,
+            "disabled split-DWARF object map",
+        )
+        require_inertness(
+            arguments,
+            split_baseline_obj,
+            split_mapped_obj,
+            "policy split-DWARF object map",
+        )
+        split_mapped_object_map = json.loads(run([
+            str(arguments.site_tool.resolve()),
+            "--validate-relocatable",
+            str(split_mapped_obj),
+        ]).stdout)
+        if len(split_mapped_object_map["sites"]) != 1:
+            raise AssertionError("policy split-DWARF object map is incomplete")
+        if split_mapped_object_map["sites"][0]["site_id"] != (
+            object_site["site_id"]
+        ):
+            raise AssertionError("policy site ID changed under split DWARF")
+
+        split_source_site_count = 0
+        split_dwo_files = [
+            split_baseline_dwo,
+            split_disabled_dwo,
+            split_mapped_dwo,
+        ]
+        if source_builtin:
+            split_source_obj, split_source_dwo = compile_split_snapshot(
+                "source", plugin=True, spec=None, source_site=True
+            )
+            split_dwo_files.append(split_source_dwo)
+            if split_baseline_dwo.read_bytes() != split_source_dwo.read_bytes():
+                raise AssertionError("source map changed split DWARF")
+            require_inertness(
+                arguments,
+                split_baseline_obj,
+                split_source_obj,
+                "source split-DWARF object map",
+            )
+            split_source_object_map = json.loads(run([
+                str(arguments.site_tool.resolve()),
+                "--validate-relocatable",
+                str(split_source_obj),
+            ]).stdout)
+            if len(split_source_object_map["sites"]) != 1:
+                raise AssertionError(
+                    "source split-DWARF object map is incomplete"
+                )
+            if split_source_object_map["sites"][0]["site_id"] != (
+                source_object_map["sites"][0]["site_id"]
+            ):
+                raise AssertionError("source site ID changed under split DWARF")
+            split_source_site_count = 1
+
+        llvm_dwarfdump = pathlib.Path(arguments.llvm_readobj).with_name(
+            "llvm-dwarfdump"
+        )
+        if not llvm_dwarfdump.is_file():
+            raise AssertionError(
+                f"split-DWARF qualification needs {llvm_dwarfdump}"
+            )
+        for dwo in split_dwo_files:
+            run([str(llvm_dwarfdump), "--verify", str(dwo)])
+
+        split_baseline_elf = directory / "split-baseline.elf"
+        split_disabled_elf = directory / "split-disabled.elf"
+        split_mapped_elf = directory / "split-mapped.elf"
+        link(arguments, split_baseline_obj, split_baseline_elf)
+        link(arguments, split_disabled_obj, split_disabled_elf)
+        link(arguments, split_mapped_obj, split_mapped_elf)
+        require_inertness(
+            arguments,
+            split_baseline_elf,
+            split_disabled_elf,
+            "disabled split-DWARF linked map",
+        )
+        require_inertness(
+            arguments,
+            split_baseline_elf,
+            split_mapped_elf,
+            "policy split-DWARF linked map",
+        )
+        split_mapped_sidecar = json.loads(run([
+            str(arguments.site_tool.resolve()), str(split_mapped_elf)
+        ]).stdout)
+        if len(split_mapped_sidecar["sites"]) != 1:
+            raise AssertionError("policy split-DWARF linked map is incomplete")
+        if split_mapped_sidecar["sites"][0]["site_id"] != (
+            mapped_site["site_id"]
+        ):
+            raise AssertionError("linked policy site ID changed under split DWARF")
+        if source_builtin:
+            split_source_elf = directory / "split-source.elf"
+            link(arguments, split_source_obj, split_source_elf)
+            require_inertness(
+                arguments,
+                split_baseline_elf,
+                split_source_elf,
+                "source split-DWARF linked map",
+            )
+            split_source_sidecar = json.loads(run([
+                str(arguments.site_tool.resolve()), str(split_source_elf)
+            ]).stdout)
+            if len(split_source_sidecar["sites"]) != 1:
+                raise AssertionError(
+                    "source split-DWARF linked map is incomplete"
+                )
+            if split_source_sidecar["sites"][0]["site_id"] != (
+                source_site["site_id"]
+            ):
+                raise AssertionError(
+                    "linked source site ID changed under split DWARF"
+                )
+
         thin_baseline_obj = directory / "thin-baseline.o"
         thin_disabled_obj = directory / "thin-disabled.o"
         thin_mapped_obj = directory / "thin-mapped.o"
@@ -1042,6 +1206,16 @@ def main() -> int:
                 "allocated_sections_symbols_relocations_unwind": "PASS",
                 "site_id_stability": "PASS",
                 "section_gc": "PASS",
+            },
+            "split_dwarf": {
+                "result": "PASS",
+                "policy_site_count": 1,
+                "source_site_count": split_source_site_count,
+                "disabled_plugin_identity": "PASS",
+                "dwo_byte_identity": "PASS",
+                "dwo_verification": "PASS",
+                "object_and_linked_inertness": "PASS",
+                "site_id_stability": "PASS",
             },
             "object_relocations": "PASS",
             "selectiondag_expectation": arguments.selectiondag_expect,

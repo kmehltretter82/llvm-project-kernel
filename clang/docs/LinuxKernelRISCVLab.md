@@ -330,6 +330,10 @@ As of 2026-10-16 on `kernel-lab-riscv`:
 - the ThinLTO fixture exposed and now guards a linker-integration requirement:
   all runtime `.text.*`, `.rodata.*`, `.data.*`, and `.bss.*` inputs must be
   placed before retained map sections so an orphan cannot move runtime state;
+- the split-DWARF lane produces byte-identical verified `.dwo` files across
+  baseline, disabled, policy, and source variants at one controlled output
+  path, while object/link inertness and policy/source site IDs remain stable;
+  the LLVM 22 policy control passes the same gate;
 - the standalone LLVM 22 map plugin still builds and retains its original
   SelectionDAG-loss/GlobalISel-complete control results, with the source
   builtin explicitly unavailable in that lane;
@@ -349,8 +353,7 @@ As of 2026-10-16 on `kernel-lab-riscv`:
 - no Linux boot, QEMU injection, FPGA run, or correctness verdict has yet been
   claimed from this new branch.
 
-The next compiler task is to qualify split debug, then lift the bounded
-inertness gate into a small Linux link and test cross-TU ThinLTO and GNU `ld`
-or reject unsupported modes explicitly.  The next QEMU task is the RV64
-exact-site TB stop without injection, followed by the real PLIC endpoint and
-deterministic schedule.
+The next compiler task is to lift the bounded inertness gate into a small
+Linux link and test cross-TU ThinLTO and GNU `ld` or reject unsupported modes
+explicitly.  The next QEMU task is the RV64 exact-site TB stop without
+injection, followed by the real PLIC endpoint and deterministic schedule.

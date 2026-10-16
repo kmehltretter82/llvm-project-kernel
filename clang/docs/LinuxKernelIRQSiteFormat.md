@@ -203,8 +203,11 @@ linked fingerprint, stable-ID check, and section-GC check pass for a bounded
 single-module ThinLTO fixture with same-revision LLVM 24 tools; the LLVM 22
 policy path is an independent passing control.  The fixture linker script
 places map sections after all wildcarded runtime sections, and the regression
-rejects orphan placement that would move a non-map symbol.  Full Linux LTO,
-cross-TU import/inlining, split-debug, GNU `ld`, and boot-image qualification
+rejects orphan placement that would move a non-map symbol.  A bounded
+split-DWARF lane also has byte-identical verified `.dwo` files, stable site
+IDs, and matching object/linked runtime fingerprints for the LLVM 24 policy
+and source paths and the LLVM 22 policy control.  Full Linux LTO, cross-TU
+import/inlining, kernel debug packaging, GNU `ld`, and boot-image qualification
 remain required.
 
 ## Reference implementation
