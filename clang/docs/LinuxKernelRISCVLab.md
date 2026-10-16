@@ -348,6 +348,32 @@ As of 2026-10-16 on `kernel-lab-riscv`:
   and linked address agreement with `ld.lld`, relaxation enabled/disabled,
   and section garbage collection all pass; this lane intentionally does not
   claim ThinLTO without an LLVM-bitcode linker plugin;
+- a real RISC-V Linux tinyconfig Kbuild at Linux revision `0fcb05b72344`
+  passes baseline, disabled-plugin, and mapped builds of `kernel/softirq.c`
+  and a complete non-LTO `vmlinux` link, always with `-j1`; the disabled
+  object is byte-identical, and both LLD and GNU binutils 2.47 preserve the
+  two site IDs through a relocatable partial link;
+- the Linux linker script retains the map carrier and expectation table as
+  non-allocated `INFO` sections.  Mapped and unmapped final images have
+  identical runtime program headers, `System.map`, executable/allocated data,
+  meaningful symbols, code relocations, and unwind data.  Only the GNU build
+  ID changes, as expected when it hashes the retained host metadata; the
+  qualification separately proves that every other ELF note is identical.
+  The receipt records config SHA-256
+  `2331b13cc90f53802e2a795cacc4b67a96dd04f6e5037ce3bc0494b0811f97de`,
+  baseline build ID `038bff326d6dbcbbcea3289e66aeb23959a3a8f7`, and mapped
+  build ID `fd29523a119d9af4e976ecb0d038872c4c564540`;
+- the linked Linux sites resolve to `handle_softirqs+0x22` at
+  `0xffffffff8000c438` (softirq entry, ID
+  `dcfbbfba966995b4cf1b8ca3357b0322`) and `handle_softirqs+0x17c` at
+  `0xffffffff8000c592` (softirq exit, ID
+  `117d16bff0e9c13476d765549becbba0`) in both `vmlinux.unstripped` and the
+  final `vmlinux`;
+- that Linux link exposed and now guards a decoder bug: a PC-section delta
+  from a zero-VMA non-allocated carrier to canonical high-half kernel text
+  must use 64-bit modular ELF arithmetic.  The corrected decoder still
+  requires the result to land in executable text and a sized function, and a
+  standalone high-half regression passes;
 - the standalone LLVM 22 map plugin still builds and retains its original
   SelectionDAG-loss/GlobalISel-complete control results, with the source
   builtin explicitly unavailable in that lane;
@@ -364,10 +390,11 @@ As of 2026-10-16 on `kernel-lab-riscv`:
 - the source-derived QEMU/Linux inventory checker covers exactly 17 families,
   finds 16 existing CPU interrupt-entry hooks, and keeps Hexagon as the one
   explicit source gap; and
-- no Linux boot, QEMU injection, FPGA run, or correctness verdict has yet been
-  claimed from this new branch.
+- no Linux boot, Linux LTO/debug-package/boot-image qualification, FPGA run,
+  or correctness verdict has yet been claimed from this new branch.
 
-The next compiler task is to lift the bounded inertness gate into a small
-Linux link and design post-LTO identities for multiple physical copies.  The
-next QEMU task is the real PLIC endpoint and deterministic interrupt schedule;
-exact-site TB stop/resume is already proven locally.
+The next compiler task is the Linux feature probe, no-op wrapper, and first
+reviewed source annotation, followed by post-LTO identities for multiple
+physical copies.  The next integration task joins the compiler-produced
+sidecar to the independently qualified real PLIC schedule; exact-site TB
+stop/resume and the controller lifecycle are already proven locally.

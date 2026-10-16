@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "target_os": "linux",
+  "strict": true,
+  "require_each_rule": true,
+  "sites": [
+    {
+      "match": "function",
+      "symbol": "handle_softirqs",
+      "position": "entry",
+      "kind": 10
+    },
+    {
+      "match": "function",
+      "symbol": "handle_softirqs",
+      "position": "exit",
+      "kind": 11
+    }
+  ]
+}

@@ -69,6 +69,38 @@ python3 clang/tools/clang-kernel-lab/tests/test_selectiondag_backend.py \
   --site-tool ../build-kernel-lab/llvm-riscv-irq-sites
 ```
 
+The bounded external-Linux gate drives a real RISC-V Kbuild compile of
+`kernel/softirq.c`, brackets `handle_softirqs()` with entry/exit map records,
+and can continue through a complete tinyconfig `vmlinux` link:
+
+```text
+. /path/to/linux-work/scripts/env.sh
+python3 clang/tools/clang-kernel-lab/tests/test_linux_kbuild_map.py \
+  --linux /case-sensitive/linux \
+  --build /case-sensitive/build/kernel-lab-riscv-softirq \
+  --clang /path/to/lab/clang --ld-lld /path/to/lab/ld.lld \
+  --gnu-ld /path/to/riscv64-elf-ld \
+  --llvm-readobj /path/to/llvm-readobj \
+  --plugin /path/to/ClangKernelLabMap.so \
+  --site-tool /path/to/llvm-riscv-irq-sites \
+  --configure-tiny --full-vmlinux
+```
+
+The driver always uses one make job, checks free space before every build,
+uses fixed Kbuild identity fields, and never invokes a clean target.  Kbuild
+does not track `CLANG_KERNEL_LAB_MAP_SPEC`, so the driver removes only the
+exact `kernel/softirq.o` command/dependency outputs before each variant.  The
+full-image gate additionally requires the Linux linker script to retain the
+three map sections as non-allocated host metadata; allocated orphan placement
+is a failure because it changes runtime layout.  The final-image comparison
+requires every runtime program header, `System.map`, allocated section other
+than `.notes`, meaningful symbol, relocation, and unwind record to match.  It
+normalizes only the GNU build-ID payload after proving that every other note
+field and byte is identical: the build ID is expected to hash deliberately
+retained host metadata.  The file offset of an otherwise identical
+`.riscv.attributes` section may move in the unstripped ELF as non-allocated
+symbol and string tables grow; all runtime headers remain exact.
+
 On macOS the pass-plugin suffix is `.dylib`.  The site-map test checks object
 and linked `.text` identity, linked sidecar identity/load-bias fields, valid
 object relocations, linked/object mode separation, and rejection of a
@@ -77,6 +109,9 @@ deliberately wrong-width relocation.
 The C-map test additionally proves disabled/enabled object and linked `.text`
 identity, validates the PC-relative relocation pair across linker relaxation,
 and proves that the tool rejects a requested site dropped by code generation.
+It also links canonical high-half RISC-V text against a zero-address `INFO`
+carrier, guarding the address-width modular arithmetic needed by Linux
+`vmlinux` metadata.
 Its normalized ELF fingerprint now compares every non-map allocated section,
 every executable section, function/object and non-local symbols, relocations
 targeting executable sections, and raw unwind sections plus their relocations.

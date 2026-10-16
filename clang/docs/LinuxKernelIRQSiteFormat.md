@@ -122,8 +122,10 @@ same-revision ThinLTO link preserves that site and its ID while matching the
 baseline's non-map allocated and executable sections, symbols, relocations,
 and unwind data.  A cross-TU import/inlining fixture is additionally qualified
 when section garbage collection leaves exactly one physical copy; multiple
-surviving copies remain fail-closed and unsupported.  These bounded tests do
-not yet establish whole-kernel inertness.
+surviving copies remain fail-closed and unsupported.  A real non-LTO RISC-V
+Linux tinyconfig link now qualifies `kernel/softirq.c` through final
+`vmlinux`, but this one configuration does not establish whole-kernel
+inertness across LTO, debug packaging, or boot-image conversion.
 
 ## Flags
 
@@ -224,10 +226,17 @@ and source paths and the LLVM 22 policy control.  A single-copy cross-TU
 import/inlining lane passes with section GC; retained and multiply inlined
 copies are explicit negative gates as described above.  Full Linux LTO,
 cross-TU multiple-instance mapping, kernel debug packaging, and boot-image
-qualification remain required.  GNU binutils 2.47 independently passes the
-same non-LTO linked fingerprint, stable-ID/address, relaxation enabled/disabled,
-and section-GC checks for the LLVM 24 policy/source and LLVM 22 policy lanes;
-GNU ThinLTO is not claimed without a compatible LLVM-bitcode linker plugin.
+qualification remain required.  A real RISC-V Linux tinyconfig build now
+passes the object, LLD/GNU relocatable-link, and complete `vmlinux` gates for
+softirq entry and exit.  The Linux linker retains the carrier and expectation
+sections as non-allocated `INFO` metadata; all runtime headers and non-note
+allocated bytes match, while the GNU build-ID payload alone changes because
+it hashes that metadata.  A zero-VMA carrier to high-half-text regression
+guards the required address-width modular PC-delta decoding.  GNU binutils
+2.47 independently passes the same non-LTO linked fingerprint,
+stable-ID/address, relaxation enabled/disabled, and section-GC checks for the
+LLVM 24 policy/source and LLVM 22 policy lanes; GNU ThinLTO is not claimed
+without a compatible LLVM-bitcode linker plugin.
 
 ## Reference implementation
 
