@@ -90,6 +90,7 @@ struct Policy {
   std::vector<std::string> EntrySections;
   std::vector<SymbolRange> EntrySymbolRanges;
   std::vector<IndirectCallTargets> IndirectCalls;
+  std::vector<IndirectCallTargets> IndirectTails;
   std::set<std::string> ForbiddenSymbols;
   std::string Hash;
 };
@@ -130,6 +131,7 @@ struct DiscoveredTarget {
   std::vector<std::string> CallPath;
   std::vector<uint64_t> CallPathAddresses;
   std::vector<uint64_t> CallPathCallsites;
+  std::vector<std::string> PathEdgeKinds;
 };
 
 struct ResolvedFunction {
@@ -140,6 +142,7 @@ struct ResolvedFunction {
   std::vector<std::string> CallPath;
   std::vector<uint64_t> CallPathAddresses;
   std::vector<uint64_t> CallPathCallsites;
+  std::vector<std::string> PathEdgeKinds;
 };
 
 struct Finding {
@@ -155,6 +158,7 @@ struct Finding {
   std::vector<std::string> CallPath;
   std::vector<uint64_t> CallPathAddresses;
   std::vector<uint64_t> CallPathCallsites;
+  std::vector<std::string> PathEdgeKinds;
 };
 
 struct Coverage {
@@ -169,6 +173,11 @@ struct Coverage {
   uint64_t RootRegions = 0;
   uint64_t TransitiveFunctions = 0;
   uint64_t MaxCallDepthReached = 0;
+  uint64_t TailExits = 0;
+  uint64_t ResolvedTailExits = 0;
+  uint64_t UnknownTailExits = 0;
+  uint64_t PolicyResolvedIndirectTails = 0;
+  uint64_t IndirectTailTargetEdges = 0;
 };
 
 struct DisassemblyState {
@@ -289,10 +298,10 @@ static Expected<Policy> parsePolicy(StringRef Path) {
   if (!Root)
     return entryError("top-level policy must be an object");
   std::optional<int64_t> SchemaValue = Root->getInteger("schema");
-  if (!SchemaValue ||
-      (*SchemaValue != 1 && *SchemaValue != 2 && *SchemaValue != 3))
+  if (!SchemaValue || (*SchemaValue != 1 && *SchemaValue != 2 &&
+                       *SchemaValue != 3 && *SchemaValue != 4))
     return entryError(
-        "unsupported or missing policy schema; expected 1, 2, or 3");
+        "unsupported or missing policy schema; expected 1, 2, 3, or 4");
   unsigned Schema = static_cast<unsigned>(*SchemaValue);
   std::set<std::string> KnownFields{"schema",
                                     "architecture",
@@ -302,6 +311,8 @@ static Expected<Policy> parsePolicy(StringRef Path) {
                                     "reject_unknown_calls"};
   if (Schema >= 2)
     KnownFields.insert({"expected_image", "indirect_call_targets"});
+  if (Schema >= 4)
+    KnownFields.insert("indirect_tail_targets");
   if (Error E = rejectUnknownKeys(*Root, KnownFields))
     return std::move(E);
   std::optional<StringRef> Architecture = Root->getString("architecture");
@@ -318,12 +329,15 @@ static Expected<Policy> parsePolicy(StringRef Path) {
   const json::Array *EntrySections = Root->getArray("entry_sections");
   const json::Array *EntrySymbolRanges = Root->getArray("entry_symbol_ranges");
   const json::Array *IndirectCalls = Root->getArray("indirect_call_targets");
+  const json::Array *IndirectTails = Root->getArray("indirect_tail_targets");
   if (Root->get("entry_sections") && !EntrySections)
     return entryError("entry_sections must be an array");
   if (Root->get("entry_symbol_ranges") && !EntrySymbolRanges)
     return entryError("entry_symbol_ranges must be an array");
   if (Root->get("indirect_call_targets") && !IndirectCalls)
     return entryError("indirect_call_targets must be an array");
+  if (Root->get("indirect_tail_targets") && !IndirectTails)
+    return entryError("indirect_tail_targets must be an array");
   if ((EntrySections && EntrySections->empty()) ||
       (EntrySymbolRanges && EntrySymbolRanges->empty()))
     return entryError("an entry-region array cannot be empty when present");
@@ -341,6 +355,11 @@ static Expected<Policy> parsePolicy(StringRef Path) {
   if (Schema == 3 && (!IndirectCalls || IndirectCalls->size() > 4096))
     return entryError(
         "schema three requires 0 through 4096 indirect call target rules");
+  if (Schema == 4 && (!IndirectCalls || IndirectCalls->size() > 4096 ||
+                      !IndirectTails || IndirectTails->size() > 4096))
+    return entryError(
+        "schema four requires 0 through 4096 indirect call and tail target "
+        "rules");
   const json::Array *Forbidden = Root->getArray("forbidden_symbols");
   if (!Forbidden || Forbidden->empty() || Forbidden->size() > 4096)
     return entryError("forbidden_symbols must contain 1 through 4096 names");
@@ -407,30 +426,45 @@ static Expected<Policy> parsePolicy(StringRef Path) {
           {Name->str(), Start->str(), End->str()});
     }
   }
-  if (IndirectCalls) {
-    std::set<std::pair<std::string, uint64_t>> SeenCallsites;
-    for (const json::Value &Value : *IndirectCalls) {
+  auto ParseIndirectRules =
+      [&](const json::Array *Rules, bool IsTail,
+          std::vector<Policy::IndirectCallTargets> &Out) -> Error {
+    if (!Rules)
+      return Error::success();
+    std::set<std::pair<std::string, uint64_t>> SeenSites;
+    for (const json::Value &Value : *Rules) {
       const json::Object *Object = Value.getAsObject();
       if (!Object)
-        return entryError("each indirect call target rule must be an object");
+        return entryError(
+            IsTail ? "each indirect tail target rule must be an object"
+                   : "each indirect call target rule must be an object");
       if (Error E =
               rejectUnknownKeys(*Object, {"caller_symbol", "instruction_offset",
                                           "target_symbols"}))
-        return std::move(E);
+        return E;
       std::optional<StringRef> Caller = Object->getString("caller_symbol");
       std::optional<int64_t> Offset = Object->getInteger("instruction_offset");
       const json::Array *Targets = Object->getArray("target_symbols");
       if (!Caller || Caller->empty() || Caller->size() > 256 || !Offset ||
           *Offset < 0 || static_cast<uint64_t>(*Offset) > MaxInstructionOffset)
-        return entryError(
-            "indirect call rule has an invalid caller or instruction offset");
+        return entryError(IsTail
+                              ? "indirect tail rule has an invalid caller or "
+                                "instruction offset"
+                              : "indirect call rule has an invalid caller or "
+                                "instruction offset");
       if (!Targets || Targets->empty() || Targets->size() > 256)
-        return entryError(
-            "indirect call target_symbols must contain 1 through 256 names");
+        return entryError(IsTail
+                              ? "indirect tail target_symbols must contain 1 "
+                                "through 256 names"
+                              : "indirect call target_symbols must contain 1 "
+                                "through 256 names");
       uint64_t UnsignedOffset = static_cast<uint64_t>(*Offset);
-      if (!SeenCallsites.insert({Caller->str(), UnsignedOffset}).second)
+      if (!SeenSites.insert({Caller->str(), UnsignedOffset}).second)
         return entryError(
-            "indirect call target rules contain a duplicate site");
+            IsTail ? "indirect tail target rules contain a duplicate "
+                     "site"
+                   : "indirect call target rules contain a duplicate "
+                     "site");
 
       Policy::IndirectCallTargets Rule;
       Rule.CallerSymbol = Caller->str();
@@ -439,15 +473,35 @@ static Expected<Policy> parsePolicy(StringRef Path) {
       for (const json::Value &TargetValue : *Targets) {
         std::optional<StringRef> Target = TargetValue.getAsString();
         if (!Target || Target->empty() || Target->size() > 256)
-          return entryError(
-              "indirect call target names must contain 1 through 256 bytes");
+          return entryError(IsTail
+                                ? "indirect tail target names must contain 1 "
+                                  "through 256 bytes"
+                                : "indirect call target names must contain 1 "
+                                  "through 256 bytes");
         if (!SeenTargets.insert(Target->str()).second)
-          return entryError(
-              "an indirect call target rule contains a duplicate target");
+          return entryError(IsTail ? "an indirect tail target rule contains a "
+                                     "duplicate target"
+                                   : "an indirect call target rule contains a "
+                                     "duplicate target");
         Rule.TargetSymbols.push_back(Target->str());
       }
-      Result.IndirectCalls.push_back(std::move(Rule));
+      Out.push_back(std::move(Rule));
     }
+    return Error::success();
+  };
+  if (Error E = ParseIndirectRules(IndirectCalls, /*IsTail=*/false,
+                                   Result.IndirectCalls))
+    return std::move(E);
+  if (Error E = ParseIndirectRules(IndirectTails, /*IsTail=*/true,
+                                   Result.IndirectTails))
+    return std::move(E);
+  std::set<std::pair<std::string, uint64_t>> CallSites;
+  for (const Policy::IndirectCallTargets &Rule : Result.IndirectCalls)
+    CallSites.insert({Rule.CallerSymbol, Rule.InstructionOffset});
+  for (const Policy::IndirectCallTargets &Rule : Result.IndirectTails) {
+    if (CallSites.count({Rule.CallerSymbol, Rule.InstructionOffset}))
+      return entryError(
+          "indirect call and tail target rules overlap at one policy site");
   }
   for (const json::Value &Value : *Forbidden) {
     std::optional<StringRef> Name = Value.getAsString();
@@ -624,14 +678,20 @@ static bool hasCodeName(const SymbolTables &Symbols, uint64_t Address,
 }
 
 static std::map<uint64_t, ResolvedIndirectCall>
-resolveIndirectCalls(const Policy &Configuration, const SymbolTables &Symbols,
-                     std::vector<Finding> &Findings) {
+resolveIndirectTargets(ArrayRef<Policy::IndirectCallTargets> Rules, bool IsTail,
+                       const Policy &Configuration, const SymbolTables &Symbols,
+                       std::vector<Finding> &Findings) {
+  auto RuleName = [IsTail](StringRef Call, StringRef Tail) {
+    return IsTail ? Tail : Call;
+  };
   std::map<uint64_t, ResolvedIndirectCall> Resolved;
-  for (const Policy::IndirectCallTargets &Rule : Configuration.IndirectCalls) {
+  for (const Policy::IndirectCallTargets &Rule : Rules) {
     auto Caller = Symbols.AddressesByName.find(Rule.CallerSymbol);
     if (Caller == Symbols.AddressesByName.end() || Caller->second.size() != 1) {
       Finding F;
-      F.Rule = "unresolved-indirect-caller";
+      F.Rule = RuleName("unresolved-indirect-caller",
+                        "unresolved-indirect-tail-caller")
+                   .str();
       F.Region = Rule.CallerSymbol;
       F.Detail = "caller_symbol must resolve to one defined symbol";
       Findings.push_back(std::move(F));
@@ -642,27 +702,33 @@ resolveIndirectCalls(const Policy &Configuration, const SymbolTables &Symbols,
     if (CallerSizes == Symbols.SizesByName.end() ||
         CallerSizes->second.size() != 1 || !CallerSizes->second.front()) {
       Findings.push_back(addressFinding(
-          "unresolved-indirect-caller-range", Rule.CallerSymbol, CallerAddress,
+          RuleName("unresolved-indirect-caller-range",
+                   "unresolved-indirect-tail-caller-range"),
+          Rule.CallerSymbol, CallerAddress,
           "caller_symbol must have one non-empty linked symbol range"));
       continue;
     }
     uint64_t CallerSize = CallerSizes->second.front();
     if (CallerAddress > std::numeric_limits<uint64_t>::max() - CallerSize) {
-      Findings.push_back(addressFinding(
-          "invalid-indirect-caller-range", Rule.CallerSymbol, CallerAddress,
-          "caller_symbol range overflows uint64"));
+      Findings.push_back(
+          addressFinding(RuleName("invalid-indirect-caller-range",
+                                  "invalid-indirect-tail-caller-range"),
+                         Rule.CallerSymbol, CallerAddress,
+                         "caller_symbol range overflows uint64"));
       continue;
     }
     if (Rule.InstructionOffset >= CallerSize) {
       Findings.push_back(addressFinding(
-          "invalid-indirect-callsite", Rule.CallerSymbol, CallerAddress,
+          RuleName("invalid-indirect-callsite", "invalid-indirect-tail-site"),
+          Rule.CallerSymbol, CallerAddress,
           "instruction offset is outside caller_symbol's linked range"));
       continue;
     }
     if (CallerAddress >
         std::numeric_limits<uint64_t>::max() - Rule.InstructionOffset) {
       Findings.push_back(addressFinding(
-          "invalid-indirect-callsite", Rule.CallerSymbol, CallerAddress,
+          RuleName("invalid-indirect-callsite", "invalid-indirect-tail-site"),
+          Rule.CallerSymbol, CallerAddress,
           "caller address plus instruction offset overflows uint64"));
       continue;
     }
@@ -675,9 +741,13 @@ resolveIndirectCalls(const Policy &Configuration, const SymbolTables &Symbols,
     Candidate.InstructionAddress = CallerAddress + Rule.InstructionOffset;
     if (Candidate.InstructionAddress & 1) {
       Findings.push_back(
-          addressFinding("misaligned-indirect-callsite", Rule.CallerSymbol,
-                         Candidate.InstructionAddress,
-                         "RISC-V indirect callsite must be two-byte aligned"));
+          addressFinding(RuleName("misaligned-indirect-callsite",
+                                  "misaligned-indirect-tail-site"),
+                         Rule.CallerSymbol, Candidate.InstructionAddress,
+                         IsTail ? "RISC-V indirect tail site must be two-byte "
+                                  "aligned"
+                                : "RISC-V indirect callsite must be two-byte "
+                                  "aligned"));
       continue;
     }
     bool Valid = true;
@@ -688,8 +758,9 @@ resolveIndirectCalls(const Policy &Configuration, const SymbolTables &Symbols,
           Target->second.size() != 1 ||
           !hasCodeName(Symbols, Target->second.front(), TargetName)) {
         Finding F = addressFinding(
-            "unresolved-indirect-target", Rule.CallerSymbol,
-            Candidate.InstructionAddress,
+            RuleName("unresolved-indirect-target",
+                     "unresolved-indirect-tail-target"),
+            Rule.CallerSymbol, Candidate.InstructionAddress,
             "target_symbols entry must resolve to one defined code symbol");
         F.MatchedSymbol = TargetName;
         Findings.push_back(std::move(F));
@@ -699,8 +770,9 @@ resolveIndirectCalls(const Policy &Configuration, const SymbolTables &Symbols,
       uint64_t TargetAddress = Target->second.front();
       if (!SeenTargetAddresses.insert(TargetAddress).second) {
         Finding F = addressFinding(
-            "duplicate-indirect-target-address", Rule.CallerSymbol,
-            Candidate.InstructionAddress,
+            RuleName("duplicate-indirect-target-address",
+                     "duplicate-indirect-tail-target-address"),
+            Rule.CallerSymbol, Candidate.InstructionAddress,
             "different target_symbols entries alias the same linked address");
         F.TargetAddress = TargetAddress;
         F.HasTargetAddress = true;
@@ -711,8 +783,9 @@ resolveIndirectCalls(const Policy &Configuration, const SymbolTables &Symbols,
       }
       if (TargetAddress & 1) {
         Finding F =
-            addressFinding("misaligned-indirect-target", Rule.CallerSymbol,
-                           Candidate.InstructionAddress,
+            addressFinding(RuleName("misaligned-indirect-target",
+                                    "misaligned-indirect-tail-target"),
+                           Rule.CallerSymbol, Candidate.InstructionAddress,
                            "RISC-V indirect target must be two-byte aligned");
         F.TargetAddress = TargetAddress;
         F.HasTargetAddress = true;
@@ -734,8 +807,9 @@ resolveIndirectCalls(const Policy &Configuration, const SymbolTables &Symbols,
       }
       if (ForbiddenName) {
         Finding F = addressFinding(
-            "forbidden-indirect-target", Rule.CallerSymbol,
-            Candidate.InstructionAddress,
+            RuleName("forbidden-indirect-target",
+                     "forbidden-indirect-tail-target"),
+            Rule.CallerSymbol, Candidate.InstructionAddress,
             "an approved indirect target aliases a forbidden callback");
         F.TargetAddress = TargetAddress;
         F.HasTargetAddress = true;
@@ -754,7 +828,9 @@ resolveIndirectCalls(const Policy &Configuration, const SymbolTables &Symbols,
         Resolved.emplace(Candidate.InstructionAddress, std::move(Candidate));
     if (!Inserted)
       Findings.push_back(addressFinding(
-          "ambiguous-indirect-callsite", Rule.CallerSymbol, Position->first,
+          RuleName("ambiguous-indirect-callsite",
+                   "ambiguous-indirect-tail-site"),
+          Rule.CallerSymbol, Position->first,
           "multiple policy rules resolve to the same instruction address"));
   }
   return Resolved;
@@ -783,6 +859,7 @@ resolveTransitiveFunction(const DiscoveredTarget &Target, unsigned Depth,
     F.CallPath = Path;
     F.CallPathAddresses = PathAddresses;
     F.CallPathCallsites = Target.CallPathCallsites;
+    F.PathEdgeKinds = Target.PathEdgeKinds;
     Findings.push_back(std::move(F));
   };
   if (Functions == Symbols.FunctionsByAddress.end()) {
@@ -858,6 +935,7 @@ resolveTransitiveFunction(const DiscoveredTarget &Target, unsigned Depth,
   Result.CallPath = std::move(Path);
   Result.CallPathAddresses = std::move(PathAddresses);
   Result.CallPathCallsites = Target.CallPathCallsites;
+  Result.PathEdgeKinds = Target.PathEdgeKinds;
   return std::optional<ResolvedFunction>(std::move(Result));
 }
 
@@ -865,9 +943,10 @@ static Error scanRegion(
     const ResolvedRegion &Region, const Policy &Configuration,
     const SymbolTables &Symbols,
     std::map<uint64_t, ResolvedIndirectCall> &IndirectCalls,
+    std::map<uint64_t, ResolvedIndirectCall> &IndirectTails,
     DisassemblyState &State, Coverage &Counts, std::vector<Finding> &Findings,
     ArrayRef<std::string> CallPath, ArrayRef<uint64_t> CallPathAddresses,
-    ArrayRef<uint64_t> CallPathCallsites,
+    ArrayRef<uint64_t> CallPathCallsites, ArrayRef<std::string> PathEdgeKinds,
     std::vector<DiscoveredTarget> *DiscoveredTargets, bool IsTransitive) {
   auto AddFinding = [&](Finding F) {
     F.CallPath.assign(CallPath.begin(), CallPath.end());
@@ -875,7 +954,27 @@ static Error scanRegion(
                                CallPathAddresses.end());
     F.CallPathCallsites.assign(CallPathCallsites.begin(),
                                CallPathCallsites.end());
+    F.PathEdgeKinds.assign(PathEdgeKinds.begin(), PathEdgeKinds.end());
     Findings.push_back(std::move(F));
+  };
+  auto DiscoverTarget = [&](uint64_t CallsiteAddress, uint64_t TargetAddress,
+                            ArrayRef<std::string> TargetSymbols,
+                            StringRef EdgeKind) {
+    if (!DiscoveredTargets)
+      return;
+    DiscoveredTarget Target;
+    Target.CallsiteAddress = CallsiteAddress;
+    Target.TargetAddress = TargetAddress;
+    Target.TargetSymbols.assign(TargetSymbols.begin(), TargetSymbols.end());
+    Target.CallPath.assign(CallPath.begin(), CallPath.end());
+    Target.CallPathAddresses.assign(CallPathAddresses.begin(),
+                                    CallPathAddresses.end());
+    Target.CallPathCallsites.assign(CallPathCallsites.begin(),
+                                    CallPathCallsites.end());
+    Target.CallPathCallsites.push_back(CallsiteAddress);
+    Target.PathEdgeKinds.assign(PathEdgeKinds.begin(), PathEdgeKinds.end());
+    Target.PathEdgeKinds.push_back(EdgeKind.str());
+    DiscoveredTargets->push_back(std::move(Target));
   };
   if (Region.Bytes.empty()) {
     AddFinding(addressFinding("empty-entry-region", Region.Name, Region.Begin,
@@ -960,22 +1059,13 @@ static Error scanRegion(
             ++Counts.PolicyResolvedIndirectCalls;
             Counts.IndirectTargetEdges +=
                 Approved->second.TargetAddresses.size();
-            if (DiscoveredTargets) {
-              for (size_t Index = 0;
-                   Index < Approved->second.TargetAddresses.size(); ++Index) {
-                DiscoveredTarget Target;
-                Target.CallsiteAddress = InstructionAddress;
-                Target.TargetAddress = Approved->second.TargetAddresses[Index];
-                Target.TargetSymbols = {Approved->second.TargetSymbols[Index]};
-                Target.CallPath.assign(CallPath.begin(), CallPath.end());
-                Target.CallPathAddresses.assign(CallPathAddresses.begin(),
-                                                CallPathAddresses.end());
-                Target.CallPathCallsites.assign(CallPathCallsites.begin(),
-                                                CallPathCallsites.end());
-                Target.CallPathCallsites.push_back(InstructionAddress);
-                DiscoveredTargets->push_back(std::move(Target));
-              }
-            }
+            for (size_t Index = 0;
+                 Index < Approved->second.TargetAddresses.size(); ++Index)
+              DiscoverTarget(InstructionAddress,
+                             Approved->second.TargetAddresses[Index],
+                             ArrayRef<std::string>(
+                                 &Approved->second.TargetSymbols[Index], 1),
+                             "indirect-call-policy");
           }
         } else {
           ++Counts.UnknownCalls;
@@ -1006,18 +1096,92 @@ static Error scanRegion(
         AddFinding(std::move(F));
       } else {
         ++Counts.ResolvedCalls;
-        if (DiscoveredTargets) {
-          DiscoveredTarget Target;
-          Target.CallsiteAddress = InstructionAddress;
-          Target.TargetAddress = TargetAddress;
-          Target.TargetSymbols = Function->second;
-          Target.CallPath.assign(CallPath.begin(), CallPath.end());
-          Target.CallPathAddresses.assign(CallPathAddresses.begin(),
-                                          CallPathAddresses.end());
-          Target.CallPathCallsites.assign(CallPathCallsites.begin(),
-                                          CallPathCallsites.end());
-          Target.CallPathCallsites.push_back(InstructionAddress);
-          DiscoveredTargets->push_back(std::move(Target));
+        DiscoverTarget(InstructionAddress, TargetAddress, Function->second,
+                       "direct-call");
+      }
+    } else if (Configuration.Schema >= 4 &&
+               !State.InstrAnalysis->isReturn(Instruction) &&
+               (State.InstrAnalysis->isBranch(Instruction) ||
+                State.InstrAnalysis->isIndirectBranch(Instruction))) {
+      uint64_t TargetAddress = 0;
+      bool TargetKnown = State.InstrAnalysis->evaluateBranch(
+          Instruction, InstructionAddress, Size, TargetAddress);
+      if (!TargetKnown || TargetAddress < Region.Begin ||
+          TargetAddress >= Region.End) {
+        ++Counts.TailExits;
+        auto Function = TargetKnown
+                            ? Symbols.FunctionsByAddress.find(TargetAddress)
+                            : Symbols.FunctionsByAddress.end();
+        auto Names = TargetKnown ? Symbols.NamesByAddress.find(TargetAddress)
+                                 : Symbols.NamesByAddress.end();
+        std::optional<StringRef> ForbiddenName;
+        if (Names != Symbols.NamesByAddress.end()) {
+          auto Forbidden = std::find_if(
+              Names->second.begin(), Names->second.end(),
+              [&](StringRef Candidate) {
+                return Configuration.ForbiddenSymbols.count(Candidate.str());
+              });
+          if (Forbidden != Names->second.end())
+            ForbiddenName = *Forbidden;
+        }
+        if (!TargetKnown) {
+          auto Approved = IndirectTails.find(InstructionAddress);
+          if (Approved != IndirectTails.end()) {
+            if (InstructionAddress >
+                    std::numeric_limits<uint64_t>::max() - Size ||
+                InstructionAddress + Size > Approved->second.CallerEnd) {
+              ++Counts.UnknownTailExits;
+              AddFinding(addressFinding(
+                  "tail-site-outside-caller", Region.Name, InstructionAddress,
+                  "indirect tail instruction crosses caller_symbol's linked "
+                  "range"));
+            } else {
+              Approved->second.Used = true;
+              ++Counts.ResolvedTailExits;
+              ++Counts.PolicyResolvedIndirectTails;
+              Counts.IndirectTailTargetEdges +=
+                  Approved->second.TargetAddresses.size();
+              for (size_t Index = 0;
+                   Index < Approved->second.TargetAddresses.size(); ++Index)
+                DiscoverTarget(InstructionAddress,
+                               Approved->second.TargetAddresses[Index],
+                               ArrayRef<std::string>(
+                                   &Approved->second.TargetSymbols[Index], 1),
+                               "indirect-tail-policy");
+            }
+          } else {
+            ++Counts.UnknownTailExits;
+            AddFinding(addressFinding(
+                "unknown-tail-exit", Region.Name, InstructionAddress,
+                "indirect control-flow exit has no exact tail-site policy"));
+          }
+        } else if (ForbiddenName) {
+          ++Counts.ResolvedTailExits;
+          Finding F = addressFinding(
+              "forbidden-tail-exit", Region.Name, InstructionAddress,
+              "control-flow exit directly targets a forbidden callback");
+          F.TargetAddress = TargetAddress;
+          F.HasTargetAddress = true;
+          F.TargetSymbols = Names->second;
+          F.MatchedSymbol = ForbiddenName->str();
+          AddFinding(std::move(F));
+        } else if (Function == Symbols.FunctionsByAddress.end()) {
+          ++Counts.UnknownTailExits;
+          Finding F = addressFinding(
+              "unknown-tail-exit", Region.Name, InstructionAddress,
+              "direct control-flow exit target has no defined function "
+              "symbol");
+          F.TargetAddress = TargetAddress;
+          F.HasTargetAddress = true;
+          if (Names != Symbols.NamesByAddress.end())
+            F.TargetSymbols = Names->second;
+          AddFinding(std::move(F));
+        } else {
+          ++Counts.ResolvedTailExits;
+          DiscoverTarget(InstructionAddress, TargetAddress, Function->second,
+                         State.InstrAnalysis->isConditionalBranch(Instruction)
+                             ? "conditional-exit"
+                             : "direct-tail");
         }
       }
     }
@@ -1032,7 +1196,7 @@ static Error scanRegion(
   return Error::success();
 }
 
-static json::Object findingJSON(const Finding &F) {
+static json::Object findingJSON(const Finding &F, bool IncludeEdgeKinds) {
   json::Array Symbols;
   for (const std::string &Name : F.TargetSymbols)
     Symbols.push_back(Name);
@@ -1063,6 +1227,12 @@ static json::Object findingJSON(const Finding &F) {
     for (uint64_t Address : F.CallPathCallsites)
       Callsites.push_back(hex64(Address));
     Result["call_path_callsites"] = std::move(Callsites);
+    if (IncludeEdgeKinds) {
+      json::Array EdgeKinds;
+      for (const std::string &Kind : F.PathEdgeKinds)
+        EdgeKinds.push_back(Kind);
+      Result["path_edge_kinds"] = std::move(EdgeKinds);
+    }
   }
   return Result;
 }
@@ -1133,7 +1303,11 @@ int main(int Argc, char **Argv) {
     }
   }
   std::map<uint64_t, ResolvedIndirectCall> IndirectCalls =
-      resolveIndirectCalls(*Configuration, *Symbols, Findings);
+      resolveIndirectTargets(Configuration->IndirectCalls, /*IsTail=*/false,
+                             *Configuration, *Symbols, Findings);
+  std::map<uint64_t, ResolvedIndirectCall> IndirectTails =
+      resolveIndirectTargets(Configuration->IndirectTails, /*IsTail=*/true,
+                             *Configuration, *Symbols, Findings);
   std::vector<ResolvedRegion> Regions;
   for (const std::string &Name : Configuration->EntrySections) {
     std::vector<SectionRef> Matches;
@@ -1252,15 +1426,17 @@ int main(int Argc, char **Argv) {
     std::vector<std::string> CallPath;
     std::vector<uint64_t> CallPathAddresses;
     std::vector<uint64_t> CallPathCallsites;
+    std::vector<std::string> PathEdgeKinds;
     if (Configuration->Schema >= 3) {
       CallPath.push_back(Region.Name);
       CallPathAddresses.push_back(Region.Begin);
     }
-    if (Error E = scanRegion(
-            Region, *Configuration, *Symbols, IndirectCalls, **State, Counts,
-            Findings, CallPath, CallPathAddresses, CallPathCallsites,
-            Configuration->Schema >= 3 ? &InitialTargets : nullptr,
-            /*IsTransitive=*/false))
+    if (Error E =
+            scanRegion(Region, *Configuration, *Symbols, IndirectCalls,
+                       IndirectTails, **State, Counts, Findings, CallPath,
+                       CallPathAddresses, CallPathCallsites, PathEdgeKinds,
+                       Configuration->Schema >= 3 ? &InitialTargets : nullptr,
+                       /*IsTransitive=*/false))
       return fail(toString(std::move(E)));
   }
 
@@ -1290,6 +1466,7 @@ int main(int Argc, char **Argv) {
           F.CallPath = Target.CallPath;
           F.CallPathAddresses = Target.CallPathAddresses;
           F.CallPathCallsites = Target.CallPathCallsites;
+          F.PathEdgeKinds = Target.PathEdgeKinds;
           F.CallPath.push_back(Target.TargetSymbols.empty()
                                    ? hex64(Target.TargetAddress)
                                    : Target.TargetSymbols.front());
@@ -1318,6 +1495,7 @@ int main(int Argc, char **Argv) {
         F.CallPath = Target.CallPath;
         F.CallPathAddresses = Target.CallPathAddresses;
         F.CallPathCallsites = Target.CallPathCallsites;
+        F.PathEdgeKinds = Target.PathEdgeKinds;
         F.CallPath.push_back(Target.TargetSymbols.empty()
                                  ? hex64(Target.TargetAddress)
                                  : Target.TargetSymbols.front());
@@ -1335,12 +1513,12 @@ int main(int Argc, char **Argv) {
       Counts.MaxCallDepthReached =
           std::max<uint64_t>(Counts.MaxCallDepthReached, Depth);
       std::vector<DiscoveredTarget> ChildTargets;
-      if (Error E =
-              scanRegion((*Function)->Region, *Configuration, *Symbols,
-                         IndirectCalls, **State, Counts, Findings,
-                         (*Function)->CallPath, (*Function)->CallPathAddresses,
-                         (*Function)->CallPathCallsites, &ChildTargets,
-                         /*IsTransitive=*/true))
+      if (Error E = scanRegion(
+              (*Function)->Region, *Configuration, *Symbols, IndirectCalls,
+              IndirectTails, **State, Counts, Findings, (*Function)->CallPath,
+              (*Function)->CallPathAddresses, (*Function)->CallPathCallsites,
+              (*Function)->PathEdgeKinds, &ChildTargets,
+              /*IsTransitive=*/true))
         return fail(toString(std::move(E)));
       TransitiveFunctions.push_back(std::move(**Function));
       for (DiscoveredTarget &Child : ChildTargets)
@@ -1353,10 +1531,18 @@ int main(int Argc, char **Argv) {
           "unused-indirect-callsite", Rule.CallerSymbol, Address,
           "resolved callsite policy did not match an indirect call"));
   }
+  for (const auto &[Address, Rule] : IndirectTails) {
+    if (!Rule.Used)
+      Findings.push_back(addressFinding(
+          "unused-indirect-tail-site", Rule.CallerSymbol, Address,
+          "resolved tail-site policy did not match an indirect control-flow "
+          "exit"));
+  }
 
   json::Array JSONFindings;
   for (const Finding &F : Findings)
-    JSONFindings.push_back(findingJSON(F));
+    JSONFindings.push_back(
+        findingJSON(F, /*IncludeEdgeKinds=*/Configuration->Schema >= 4));
   json::Array JSONSections;
   for (const std::string &Name : Configuration->EntrySections)
     JSONSections.push_back(Name);
@@ -1391,7 +1577,7 @@ int main(int Argc, char **Argv) {
     json::Array PathCallsites;
     for (uint64_t Address : Function.CallPathCallsites)
       PathCallsites.push_back(hex64(Address));
-    JSONTransitiveFunctions.push_back(json::Object{
+    json::Object JSONFunction{
         {"symbol", Function.Region.Name},
         {"aliases", std::move(Aliases)},
         {"source", Function.Region.Source},
@@ -1404,7 +1590,14 @@ int main(int Argc, char **Argv) {
         {"call_path", std::move(Path)},
         {"call_path_vas", std::move(PathAddresses)},
         {"call_path_callsites", std::move(PathCallsites)},
-    });
+    };
+    if (Configuration->Schema >= 4) {
+      json::Array EdgeKinds;
+      for (const std::string &Kind : Function.PathEdgeKinds)
+        EdgeKinds.push_back(Kind);
+      JSONFunction["path_edge_kinds"] = std::move(EdgeKinds);
+    }
+    JSONTransitiveFunctions.push_back(std::move(JSONFunction));
   }
   json::Array JSONForbidden;
   for (const std::string &Name : Configuration->ForbiddenSymbols)
@@ -1420,6 +1613,17 @@ int main(int Argc, char **Argv) {
         {"target_symbols", std::move(Targets)},
     });
   }
+  json::Array JSONIndirectTailPolicy;
+  for (const Policy::IndirectCallTargets &Rule : Configuration->IndirectTails) {
+    json::Array Targets;
+    for (const std::string &Name : Rule.TargetSymbols)
+      Targets.push_back(Name);
+    JSONIndirectTailPolicy.push_back(json::Object{
+        {"caller_symbol", Rule.CallerSymbol},
+        {"instruction_offset", static_cast<int64_t>(Rule.InstructionOffset)},
+        {"target_symbols", std::move(Targets)},
+    });
+  }
   json::Array JSONResolvedIndirectCalls;
   for (const auto &[Address, Rule] : IndirectCalls) {
     json::Array Targets;
@@ -1429,6 +1633,24 @@ int main(int Argc, char **Argv) {
           {"address", hex64(Rule.TargetAddresses[Index])},
       });
     JSONResolvedIndirectCalls.push_back(json::Object{
+        {"caller_symbol", Rule.CallerSymbol},
+        {"caller_begin_va", hex64(Rule.CallerAddress)},
+        {"caller_end_va", hex64(Rule.CallerEnd)},
+        {"instruction_offset", static_cast<int64_t>(Rule.InstructionOffset)},
+        {"instruction_va", hex64(Address)},
+        {"targets", std::move(Targets)},
+        {"used", Rule.Used},
+    });
+  }
+  json::Array JSONResolvedIndirectTails;
+  for (const auto &[Address, Rule] : IndirectTails) {
+    json::Array Targets;
+    for (size_t Index = 0; Index < Rule.TargetSymbols.size(); ++Index)
+      Targets.push_back(json::Object{
+          {"symbol", Rule.TargetSymbols[Index]},
+          {"address", hex64(Rule.TargetAddresses[Index])},
+      });
+    JSONResolvedIndirectTails.push_back(json::Object{
         {"caller_symbol", Rule.CallerSymbol},
         {"caller_begin_va", hex64(Rule.CallerAddress)},
         {"caller_end_va", hex64(Rule.CallerEnd)},
@@ -1471,6 +1693,8 @@ int main(int Argc, char **Argv) {
       {"indirect_call_targets", std::move(JSONIndirectPolicy)},
       {"reject_unknown_calls", true},
   };
+  if (Configuration->Schema >= 4)
+    PolicyJSON["indirect_tail_targets"] = std::move(JSONIndirectTailPolicy);
   json::Object CoverageJSON{
       {"regions", static_cast<int64_t>(Counts.Regions)},
       {"bytes", static_cast<int64_t>(Counts.Bytes)},
@@ -1493,13 +1717,25 @@ int main(int Argc, char **Argv) {
         static_cast<int64_t>(MaxTransitiveFunctions);
     CoverageJSON["call_depth_limit"] = static_cast<int64_t>(MaxCallDepth);
   }
+  if (Configuration->Schema >= 4) {
+    CoverageJSON["tail_exits"] = static_cast<int64_t>(Counts.TailExits);
+    CoverageJSON["resolved_tail_exits"] =
+        static_cast<int64_t>(Counts.ResolvedTailExits);
+    CoverageJSON["unknown_tail_exits"] =
+        static_cast<int64_t>(Counts.UnknownTailExits);
+    CoverageJSON["policy_resolved_indirect_tails"] =
+        static_cast<int64_t>(Counts.PolicyResolvedIndirectTails);
+    CoverageJSON["indirect_tail_target_edges"] =
+        static_cast<int64_t>(Counts.IndirectTailTargetEdges);
+  }
   bool Passed = Findings.empty();
   json::Object Root{
       {"schema", 1},
       {"checker", "rv-entrycheck"},
       {"scope", Configuration->Schema == 1 ? "direct-calls-in-entry-regions-v1"
                 : Configuration->Schema == 2 ? "site-scoped-indirect-targets-v2"
-                                             : "transitive-call-graph-v3"},
+                : Configuration->Schema == 3 ? "transitive-call-graph-v3"
+                                             : "tail-exit-call-graph-v4"},
       {"result", Passed ? "PASS" : "FAIL"},
       {"image", std::move(Image)},
       {"policy", std::move(PolicyJSON)},
@@ -1510,6 +1746,8 @@ int main(int Argc, char **Argv) {
   };
   if (Configuration->Schema >= 3)
     Root["resolved_transitive_functions"] = std::move(JSONTransitiveFunctions);
+  if (Configuration->Schema >= 4)
+    Root["resolved_indirect_tails"] = std::move(JSONResolvedIndirectTails);
   outs() << formatv(Compact ? "{0}\n" : "{0:2}\n",
                     json::Value(std::move(Root)));
   return Passed ? 0 : 1;

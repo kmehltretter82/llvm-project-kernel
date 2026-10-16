@@ -20,9 +20,11 @@ LINKER_SCRIPT = HERE / "entrycheck-link.ld"
 POLICY = TOOL / "examples" / "riscv-entrycheck-v1.json"
 INDIRECT_POLICY = TOOL / "examples" / "riscv-entrycheck-indirect-v2.json"
 TRANSITIVE_POLICY = TOOL / "examples" / "riscv-entrycheck-transitive-v3.json"
+TAIL_POLICY = TOOL / "examples" / "riscv-entrycheck-tail-v4.json"
 LINUX_POLICY_V1 = TOOL / "examples" / "riscv-linux-entrycheck-v1.json"
 LINUX_POLICY_V2 = TOOL / "examples" / "riscv-linux-entrycheck-v2.json"
 LINUX_POLICY_V3 = TOOL / "examples" / "riscv-linux-entrycheck-v3.json"
+LINUX_POLICY_V4 = TOOL / "examples" / "riscv-linux-entrycheck-v4.json"
 
 
 def run(command: list[str], *, expect: int = 0) -> subprocess.CompletedProcess[str]:
@@ -106,8 +108,8 @@ def write_policy(path: pathlib.Path, document: dict[str, object]) -> None:
     path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n")
 
 
-def check_call_path(record: dict[str, object],
-                    expected_names: list[str]) -> None:
+def check_call_path(record: dict[str, object], expected_names: list[str],
+                    expected_edges: list[str] | None = None) -> None:
     names = record.get("call_path")
     addresses = record.get("call_path_vas")
     callsites = record.get("call_path_callsites")
@@ -122,6 +124,9 @@ def check_call_path(record: dict[str, object],
     if reached_from is not None and (
             not callsites or callsites[-1] != reached_from):
         raise AssertionError(f"call path lost its incoming edge: {record}")
+    if expected_edges is not None and record.get(
+            "path_edge_kinds") != expected_edges:
+        raise AssertionError(f"call path lost its edge kinds: {record}")
 
 
 def check_invalid_policies(arguments: argparse.Namespace, image: pathlib.Path,
@@ -179,6 +184,25 @@ def check_invalid_policies(arguments: argparse.Namespace, image: pathlib.Path,
     schema_three_missing["schema"] = 3
     cases.append(("schema-three-missing", schema_three_missing,
                   "schema three requires 0 through 4096 indirect call"))
+
+    schema_three_tail = copy.deepcopy(policy)
+    schema_three_tail["schema"] = 3
+    schema_three_tail["indirect_call_targets"] = []
+    schema_three_tail["indirect_tail_targets"] = []
+    cases.append(("schema-three-tail", schema_three_tail,
+                  "unknown policy field"))
+
+    schema_four_missing = copy.deepcopy(policy)
+    schema_four_missing["schema"] = 4
+    cases.append(("schema-four-missing", schema_four_missing,
+                  "schema four requires 0 through 4096 indirect call and tail"))
+
+    schema_four_wrong_tail = copy.deepcopy(policy)
+    schema_four_wrong_tail["schema"] = 4
+    schema_four_wrong_tail["indirect_call_targets"] = []
+    schema_four_wrong_tail["indirect_tail_targets"] = "entry_path"
+    cases.append(("schema-four-wrong-tail", schema_four_wrong_tail,
+                  "indirect_tail_targets must be an array"))
 
     receipts = {}
     for name, document, expected_error in cases:
@@ -742,6 +766,187 @@ def check_transitive_policies(arguments: argparse.Namespace,
     return receipts
 
 
+def check_tail_policies(arguments: argparse.Namespace,
+                        images: dict[str, pathlib.Path],
+                        root: pathlib.Path) -> dict[str, object]:
+    cases = (
+        ("tail-good", None, 2, 2, 1, 1, 0, "direct-tail"),
+        ("tail-bad", "forbidden-tail-exit", 1, 1, 1, 1, 0, None),
+        ("tail-unknown", "unknown-tail-exit", 1, 1, 1, 0, 1, None),
+        ("tail-local", None, 1, 1, 0, 0, 0, None),
+        ("tail-conditional", None, 2, 2, 1, 1, 0, "conditional-exit"),
+    )
+    receipts = {}
+    for relax in (False, True):
+        mode = "relax" if relax else "no-relax"
+        for (name, expected_rule, expected_functions, expected_depth,
+             expected_tails, expected_resolved, expected_unknown,
+             final_edge) in cases:
+            result = run([
+                str(arguments.checker),
+                "--policy",
+                str(TAIL_POLICY),
+                str(images[f"{name}-{mode}"]),
+            ], expect=1 if expected_rule else 0)
+            document = json.loads(result.stdout)
+            if document.get("scope") != "tail-exit-call-graph-v4":
+                raise AssertionError(f"tail scope changed: {document}")
+            findings = document.get("findings")
+            if not isinstance(findings, list):
+                raise AssertionError(f"tail findings missing: {document}")
+            if expected_rule:
+                if len(findings) != 1 or findings[0].get("rule") != expected_rule:
+                    raise AssertionError(
+                        f"{name}-{mode} returned wrong findings: {findings}"
+                    )
+                check_call_path(
+                    findings[0],
+                    ["noinstr", "entrycheck_tail_source"],
+                    ["direct-call"],
+                )
+            elif findings:
+                raise AssertionError(
+                    f"{name}-{mode} control has findings: {findings}"
+                )
+            coverage = document.get("coverage")
+            if not isinstance(coverage, dict) or coverage.get(
+                    "transitive_functions") != expected_functions or coverage.get(
+                    "max_call_depth_reached") != expected_depth or coverage.get(
+                    "tail_exits") != expected_tails or coverage.get(
+                    "resolved_tail_exits") != expected_resolved or coverage.get(
+                    "unknown_tail_exits") != expected_unknown or coverage.get(
+                    "policy_resolved_indirect_tails") != 0 or coverage.get(
+                    "indirect_tail_target_edges") != 0:
+                raise AssertionError(
+                    f"{name}-{mode} returned wrong tail coverage: {coverage}"
+                )
+            functions = document.get("resolved_transitive_functions")
+            if not isinstance(functions, list) or len(
+                    functions) != expected_functions or functions[0].get(
+                    "symbol") != "entrycheck_tail_source":
+                raise AssertionError(
+                    f"{name}-{mode} returned wrong functions: {functions}"
+                )
+            for function in functions:
+                edges = function.get("path_edge_kinds")
+                if not isinstance(edges, list):
+                    raise AssertionError(
+                        f"{name}-{mode} omitted edge kinds: {function}"
+                    )
+                check_call_path(function, function["call_path"], edges)
+            if final_edge and (
+                    functions[1].get("symbol") != "entrycheck_safe_target" or
+                    functions[1].get("path_edge_kinds") != [
+                        "direct-call", final_edge
+                    ]):
+                raise AssertionError(
+                    f"{name}-{mode} returned wrong tail path: {functions}"
+                )
+            receipts[f"{name}-{mode}"] = {
+                "result": document["result"],
+                "coverage": coverage,
+                "findings": findings,
+                "resolved_transitive_functions": functions,
+            }
+
+    tail_policy = json.loads(TAIL_POLICY.read_text())
+    rule = {
+        "caller_symbol": "entrycheck_tail_source",
+        "instruction_offset": 0,
+        "target_symbols": ["entrycheck_safe_alias"],
+    }
+    tail_policy["indirect_tail_targets"] = [rule]
+    approved_path = root / "policy-approved-indirect-tail.json"
+    write_policy(approved_path, tail_policy)
+    for mode in ("no-relax", "relax"):
+        result = run([
+            str(arguments.checker),
+            "--policy",
+            str(approved_path),
+            str(images[f"tail-unknown-{mode}"]),
+        ])
+        document = json.loads(result.stdout)
+        coverage = document.get("coverage")
+        functions = document.get("resolved_transitive_functions")
+        tails = document.get("resolved_indirect_tails")
+        if document.get("result") != "PASS" or document.get("findings") != []:
+            raise AssertionError(f"approved indirect tail failed: {document}")
+        if not isinstance(coverage, dict) or coverage.get(
+                "tail_exits") != 1 or coverage.get(
+                "resolved_tail_exits") != 1 or coverage.get(
+                "unknown_tail_exits") != 0 or coverage.get(
+                "policy_resolved_indirect_tails") != 1 or coverage.get(
+                "indirect_tail_target_edges") != 1 or coverage.get(
+                "transitive_functions") != 2:
+            raise AssertionError(
+                f"approved indirect tail coverage changed: {coverage}"
+            )
+        if not isinstance(tails, list) or len(tails) != 1 or not tails[0].get(
+                "used"):
+            raise AssertionError(f"indirect tail rule was not consumed: {tails}")
+        if not isinstance(functions, list) or len(functions) != 2 or functions[
+                1].get("symbol") != "entrycheck_safe_alias":
+            raise AssertionError(
+                f"approved indirect tail target was not scanned: {functions}"
+            )
+        check_call_path(
+            functions[1],
+            ["noinstr", "entrycheck_tail_source", "entrycheck_safe_alias"],
+            ["direct-call", "indirect-tail-policy"],
+        )
+        receipts[f"approved-indirect-{mode}"] = {
+            "result": document["result"],
+            "coverage": coverage,
+            "resolved_indirect_tails": tails,
+        }
+
+    wrong_kind_policy = json.loads(TAIL_POLICY.read_text())
+    wrong_kind_policy["indirect_call_targets"] = [rule]
+    wrong_kind_path = root / "policy-tail-as-call.json"
+    write_policy(wrong_kind_path, wrong_kind_policy)
+    result = run([
+        str(arguments.checker),
+        "--policy",
+        str(wrong_kind_path),
+        str(images["tail-unknown-relax"]),
+    ], expect=1)
+    wrong_kind_document = json.loads(result.stdout)
+    wrong_kind_rules = {
+        finding.get("rule")
+        for finding in wrong_kind_document.get("findings", [])
+    }
+    if wrong_kind_rules != {"unknown-tail-exit", "unused-indirect-callsite"}:
+        raise AssertionError(
+            f"call policy incorrectly approved a tail: {wrong_kind_document}"
+        )
+    receipts["wrong-policy-kind"] = {
+        "result": wrong_kind_document["result"],
+        "rules": sorted(wrong_kind_rules),
+    }
+
+    overlap_policy = json.loads(TAIL_POLICY.read_text())
+    overlap_policy["indirect_call_targets"] = [rule]
+    overlap_policy["indirect_tail_targets"] = [rule]
+    overlap_path = root / "policy-overlapping-call-tail.json"
+    write_policy(overlap_path, overlap_policy)
+    overlap_result = run([
+        str(arguments.checker),
+        "--policy",
+        str(overlap_path),
+        str(images["tail-unknown-relax"]),
+    ], expect=2)
+    overlap_error = "indirect call and tail target rules overlap"
+    if overlap_error not in overlap_result.stderr:
+        raise AssertionError(
+            f"overlapping call/tail policy did not fail: {overlap_result.stderr}"
+        )
+    receipts["overlapping-policy-kinds"] = {
+        "result": "REJECTED",
+        "diagnostic": overlap_error,
+    }
+    return receipts
+
+
 def check_linux_image(arguments: argparse.Namespace) -> dict[str, object]:
     v1_result = run([
         str(arguments.checker), "--policy", str(LINUX_POLICY_V1),
@@ -848,6 +1053,73 @@ def check_linux_image(arguments: argparse.Namespace) -> dict[str, object]:
         )
     for function in v3_functions:
         check_call_path(function, function["call_path"])
+
+    v4_result = run([
+        str(arguments.checker), "--policy", str(LINUX_POLICY_V4),
+        str(arguments.linux_image),
+    ], expect=1)
+    v4 = json.loads(v4_result.stdout)
+    v4_coverage = v4.get("coverage")
+    expected_v4_coverage = {
+        "bytes": 211216,
+        "call_depth_limit": 128,
+        "calls": 2770,
+        "function_limit": 4096,
+        "indirect_tail_target_edges": 0,
+        "indirect_target_edges": 22,
+        "instructions": 76904,
+        "max_call_depth_reached": 19,
+        "policy_resolved_indirect_calls": 4,
+        "policy_resolved_indirect_tails": 0,
+        "regions": 1029,
+        "resolved_calls": 2646,
+        "resolved_tail_exits": 480,
+        "root_regions": 3,
+        "tail_exits": 503,
+        "transitive_functions": 1026,
+        "unknown_calls": 124,
+        "unknown_tail_exits": 23,
+    }
+    if v4.get("result") != "FAIL" or v4_coverage != expected_v4_coverage:
+        raise AssertionError(f"schema-four Linux discovery changed: {v4}")
+    v4_findings = v4.get("findings")
+    if not isinstance(v4_findings, list):
+        raise AssertionError(f"schema-four Linux findings missing: {v4}")
+    v4_finding_counts = collections.Counter(
+        finding.get("rule") for finding in v4_findings
+    )
+    expected_v4_findings = {
+        "decode-failure": 10,
+        "unknown-call": 124,
+        "unknown-tail-exit": 23,
+    }
+    if v4_finding_counts != expected_v4_findings:
+        raise AssertionError(
+            f"schema-four Linux findings changed: {v4_finding_counts}"
+        )
+    for finding in v4_findings:
+        edges = finding.get("path_edge_kinds")
+        if not isinstance(edges, list):
+            raise AssertionError(
+                f"schema-four Linux finding lost edge kinds: {finding}"
+            )
+        check_call_path(finding, finding["call_path"], edges)
+    v4_functions = v4.get("resolved_transitive_functions")
+    if not isinstance(v4_functions, list) or len(v4_functions) != 1026:
+        raise AssertionError(
+            f"schema-four Linux function set changed: {v4_functions}"
+        )
+    for function in v4_functions:
+        edges = function.get("path_edge_kinds")
+        if not isinstance(edges, list):
+            raise AssertionError(
+                f"schema-four Linux function lost edge kinds: {function}"
+            )
+        check_call_path(function, function["call_path"], edges)
+    if v4.get("resolved_indirect_tails") != []:
+        raise AssertionError(
+            f"schema-four Linux invented tail policy edges: {v4}"
+        )
     return {
         "schema_one": {
             "result": v1["result"],
@@ -866,6 +1138,13 @@ def check_linux_image(arguments: argparse.Namespace) -> dict[str, object]:
             "finding_counts": dict(sorted(v3_finding_counts.items())),
             "resolved_transitive_functions": len(v3_functions),
             "image": v3["image"],
+        },
+        "schema_four": {
+            "result": v4["result"],
+            "coverage": v4_coverage,
+            "finding_counts": dict(sorted(v4_finding_counts.items())),
+            "resolved_transitive_functions": len(v4_functions),
+            "image": v4["image"],
         },
     }
 
@@ -890,6 +1169,11 @@ def main() -> int:
             ("transitive-unknown", "ENTRYCHECK_TRANSITIVE_UNKNOWN", None),
             ("transitive-zero-size", "ENTRYCHECK_TRANSITIVE_ZERO_SIZE", None),
             ("transitive-cycle", "ENTRYCHECK_TRANSITIVE_CYCLE", None),
+            ("tail-good", "ENTRYCHECK_TAIL_GOOD", None),
+            ("tail-bad", "ENTRYCHECK_TAIL_BAD", None),
+            ("tail-unknown", "ENTRYCHECK_TAIL_UNKNOWN", None),
+            ("tail-local", "ENTRYCHECK_TAIL_LOCAL", None),
+            ("tail-conditional", "ENTRYCHECK_TAIL_CONDITIONAL", None),
         )
         for name, define, _ in fixtures:
             output = root / f"{name}.o"
@@ -936,6 +1220,7 @@ def main() -> int:
         )
         indirect_receipts = check_indirect_policies(arguments, images, root)
         transitive_receipts = check_transitive_policies(arguments, images, root)
+        tail_receipts = check_tail_policies(arguments, images, root)
         linux_receipt = (check_linux_image(arguments)
                          if arguments.linux_image else "not-requested")
 
@@ -949,6 +1234,7 @@ def main() -> int:
             "invalid_images": invalid_image_receipts,
             "indirect_policies": indirect_receipts,
             "transitive_policies": transitive_receipts,
+            "tail_policies": tail_receipts,
             "linux_image": linux_receipt,
         }, indent=2, sort_keys=True))
     return 0

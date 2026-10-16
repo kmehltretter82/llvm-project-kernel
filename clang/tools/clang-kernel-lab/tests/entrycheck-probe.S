@@ -19,6 +19,13 @@ entry_path:
 	defined(ENTRYCHECK_TRANSITIVE_CYCLE)
 	call entrycheck_middle
 #endif
+#if defined(ENTRYCHECK_TAIL_GOOD) || \
+	defined(ENTRYCHECK_TAIL_BAD) || \
+	defined(ENTRYCHECK_TAIL_UNKNOWN) || \
+	defined(ENTRYCHECK_TAIL_LOCAL) || \
+	defined(ENTRYCHECK_TAIL_CONDITIONAL)
+	call entrycheck_tail_source
+#endif
 	addi a0, a0, 1
 	ret
 	.size entry_path, .-entry_path
@@ -36,6 +43,7 @@ entrycheck_callback_impl:
 	.globl entrycheck_safe_target
 	.globl entrycheck_safe_alias
 	.type entrycheck_safe_target,@function
+.Lentrycheck_safe_local:
 entrycheck_safe_alias:
 entrycheck_safe_target:
 	ret
@@ -62,5 +70,24 @@ entrycheck_middle:
 	.type entrycheck_zero_size,@function
 entrycheck_zero_size:
 	ret
+
+	.globl entrycheck_tail_source
+	.type entrycheck_tail_source,@function
+entrycheck_tail_source:
+#ifdef ENTRYCHECK_TAIL_BAD
+	tail __sanitizer_cov_trace_pc
+#elif defined(ENTRYCHECK_TAIL_UNKNOWN)
+	jr a0
+#elif defined(ENTRYCHECK_TAIL_LOCAL)
+	j .Lentrycheck_tail_local
+.Lentrycheck_tail_local:
+	ret
+#elif defined(ENTRYCHECK_TAIL_CONDITIONAL)
+	beqz a0, .Lentrycheck_safe_local
+	ret
+#else
+	tail entrycheck_safe_target
+#endif
+	.size entrycheck_tail_source, .-entrycheck_tail_source
 
 	.section .note.GNU-stack,"",@progbits

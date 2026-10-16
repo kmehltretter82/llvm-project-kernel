@@ -174,10 +174,30 @@ reviewed root indirect rules.  The transitive discovery reaches 560 functions,
 119,746 bytes, 43,315 instructions, 1,605 calls, and depth 14.  It returns
 `FAIL` with 63 further unknown indirect calls and nine decode failures.  Lab
 LLVM 24 and stock LLVM 22.1.8 agree exactly on those counts.  This produces an
-auditable backlog without a terminal-symbol waiver.  The graph is still a
-conservative linear scan of each function range; it does not yet model branch
-feasibility, tail calls, exception edges, or transition state, so neither its
-paths nor the schema-two target assertions are a kernel qualification.
+auditable backlog without a terminal-symbol waiver.  The schema-three graph is
+still a conservative linear scan of each function range; it does not model
+branch feasibility, tail exits, exception edges, or transition state, so
+neither its paths nor the schema-two target assertions are a kernel
+qualification.
+
+Schema four adds linked tail/control-flow exits without guessing from source
+mnemonics.  A decoded non-return branch is local when its target remains inside
+the current function range; otherwise it is a graph edge.  Direct exits require
+a function symbol, while unresolved indirect exits require a distinct exact
+`indirect_tail_targets` rule.  Call and tail policies cannot overlap or approve
+one another.  Each machine-readable path records the edge kind as well as all
+node and callsite addresses.  Fixtures cover linker-relaxed and unrelaxed
+tails, a forbidden target, an unresolved and an approved indirect tail, a local
+jump, a direct conditional exit, and wrong-kind or overlapping policy rules.
+
+The image-bound Linux schema-four discovery deliberately declares no indirect
+tail targets.  It reaches 1,026 functions, 211,216 bytes, 76,904 instructions,
+2,770 calls, and depth 19.  Of 503 exits it resolves 480 and returns `FAIL` for
+23 unknown tail exits, 124 unknown calls, and ten decode failures.  Lab LLVM 24
+and stock LLVM 22.1.8 agree exactly.  The larger graph is evidence for the next
+CFG/state-delimiting gate: following all syntactic exits from broad entry ranges
+is conservative discovery, not a claim that every path executes in protected
+IRQ state and not justification for a blanket terminal list.
 
 The complete checker will also consume the resolved site map, DWARF/BTF where
 available, and expand from RISC-V vectors, irqentry, and noinstr regions to
@@ -185,10 +205,10 @@ conservatively reject or report unknown for:
 
 - fentry, KCOV, KASAN, KCSAN/TSAN, UBSAN, stack-protector, or other callbacks;
 - compiler-generated libcalls, outlined atomics, thunks, and jump tables;
-- unresolved indirect calls;
+- unresolved indirect calls or control-flow exits;
 - tracing or calls reached before required state publication;
 - unbalanced provenance, IRQ, preempt, RCU, migration, or recursion state;
-- tail/exception-table exits that evade the visible graph; and
+- exception-table exits and other edges that evade the visible linked graph;
 - a declared boundary invalidated by relaxation.
 
 Negative linkable fixtures are required before the checker gates a kernel.
@@ -311,8 +331,10 @@ Exit: one command builds, boots, records, replays, and seals a result bundle.
 
 ### Phase 3: linked-image checking
 
-- Implement direct-call graph and forbidden-callback checks.
-- Add unresolved-indirect, state-ordering, tail-exit, and relaxation checks.
+- Keep the implemented direct-call, exact-indirect, tail-exit, forbidden-
+  callback, and relaxation checks regression-locked.
+- Add CFG feasibility and state-ordering checks, then classify every remaining
+  unresolved indirect edge and decode boundary.
 - Require all negative fixtures to fail and corrected fixtures to pass.
 
 Exit: no unexplained edge or callback remains in the qualified early-entry

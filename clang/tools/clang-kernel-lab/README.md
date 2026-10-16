@@ -19,8 +19,9 @@ for the Linux IRQ/PREEMPT_RT laboratory:
   callbacks.  Schema one resolves direct RV64 calls and rejects every unknown;
   schema two can additionally bind an indirect call to exact target symbols at
   one symbol-plus-offset callsite; schema three recursively scans every linked
-  function reached by those direct and declared indirect edges.  All emit a
-  deterministic JSON verdict.
+  function reached by those direct and declared indirect edges; schema four
+  also follows conditional and unconditional exits that leave a linked function
+  range.  All emit a deterministic JSON verdict.
 - `ClangKernelLab` is an LLVM pass plugin for explicit callbacks and
   deterministic perturbation.  Loading a specification through
   `CLANG_KERNEL_LAB_SPEC` changes generated code; it is not map mode.
@@ -91,6 +92,9 @@ python3 clang/tools/clang-kernel-lab/tests/test_rv_entrycheck.py \
 ../build-kernel-lab/rv-entrycheck \
   --policy clang/tools/clang-kernel-lab/examples/riscv-linux-entrycheck-v3.json \
   /path/to/the-matching-vmlinux
+../build-kernel-lab/rv-entrycheck \
+  --policy clang/tools/clang-kernel-lab/examples/riscv-linux-entrycheck-v4.json \
+  /path/to/the-matching-vmlinux
 ```
 
 The initial entry-check lane folds its input `.noinstr.text` into output
@@ -160,14 +164,32 @@ functions and 43,315 instructions at depth 14, then correctly returns `FAIL`:
 63 further indirect calls remain unknown and nine linked function ranges hit a
 decode boundary.  Those counts are cross-checked with lab LLVM 24 and stock
 LLVM 22.1.8.  The result is a reproducible backlog, not a safe-kernel claim.
-Linear function scanning also does not yet model branch feasibility, tail
-calls, exception edges, or state transitions.
+Schema three's linear function scan does not model branch feasibility, tail
+exits, exception edges, or state transitions.
+
+Schema four treats every non-return branch whose linked target leaves the
+current function range as a graph edge.  In-range conditional and unconditional
+branches remain local CFG edges.  Direct exits require a function symbol at the
+target; unresolved indirect exits fail unless a separate exact
+`indirect_tail_targets` rule covers that instruction.  A call rule cannot
+approve a tail site, overlapping call/tail rules are invalid, and every schema-
+four path records whether each edge was a direct call, policy-approved indirect
+call, conditional exit, direct tail, or policy-approved indirect tail.
+
+The matched fixtures cover relaxed and unrelaxed direct tails, forbidden and
+unknown tails, a local jump, a true conditional exit, an approved indirect
+tail, and wrong-kind or overlapping policies.  The image-bound Linux schema-
+four discovery has no indirect-tail rules: it reaches 1,026 functions and
+76,904 instructions at depth 19, resolves 480 of 503 linked tail/control exits,
+and returns `FAIL` for 23 indirect tail exits, 124 unknown calls, and ten decode
+boundaries.  This expansion is evidence that state-aware graph delimiting is
+required; it is not permission to add a broad terminal allowlist.
 
 Symbol-bounded policy regions are necessary for a normal linked Linux image,
 where input `.noinstr.text` is folded into `.text` but
-`__noinstr_text_start` and `__noinstr_text_end` survive.  Tail calls, exception
-edges, state ordering, and compiler-generated helpers still require later
-gates and must not be treated as qualified.
+`__noinstr_text_start` and `__noinstr_text_end` survive.  CFG feasibility,
+exception edges, state ordering, and compiler-generated helpers still require
+later gates and must not be treated as qualified.
 
 The bounded external-Linux gate drives a real RISC-V Kbuild compile of
 `kernel/softirq.c`.  Its default policy mode brackets `handle_softirqs()` with
