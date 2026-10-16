@@ -60,6 +60,7 @@ constexpr uint64_t MaxPolicyBytes = 1024 * 1024;
 constexpr uint64_t MaxEntryRegionBytes = 256 * 1024 * 1024;
 constexpr uint64_t MaxInstructionOffset = 256 * 1024 * 1024;
 constexpr uint64_t MaxTransitiveFunctions = 4096;
+constexpr uint64_t MaxCFGInstructionsPerRegion = 1024 * 1024;
 constexpr unsigned MaxCallDepth = 128;
 
 cl::opt<std::string> InputFilename(cl::Positional, cl::Required,
@@ -113,6 +114,7 @@ struct SymbolTables {
   std::map<uint64_t, std::vector<std::string>> NamesByAddress;
   std::map<std::string, std::vector<uint64_t>> AddressesByName;
   std::map<std::string, std::vector<uint64_t>> SizesByName;
+  std::set<uint64_t> CFGEntryPoints;
 };
 
 struct ResolvedRegion {
@@ -178,6 +180,14 @@ struct Coverage {
   uint64_t UnknownTailExits = 0;
   uint64_t PolicyResolvedIndirectTails = 0;
   uint64_t IndirectTailTargetEdges = 0;
+  uint64_t DecodedInstructions = 0;
+  uint64_t DecodeFailures = 0;
+  uint64_t CFGEntryPoints = 0;
+  uint64_t ReachableBytes = 0;
+  uint64_t ReachableDecodeFailures = 0;
+  uint64_t UnreachableInstructions = 0;
+  uint64_t UnreachableDecodeFailures = 0;
+  uint64_t RejectedSequentialTargets = 0;
 };
 
 struct DisassemblyState {
@@ -218,6 +228,13 @@ static std::string hex64(uint64_t Value) {
   raw_string_ostream OS(Result);
   OS << format_hex(Value, 18, /*Upper=*/false);
   return Result;
+}
+
+static uint32_t read32le(ArrayRef<uint8_t> Bytes, uint64_t Offset) {
+  return static_cast<uint32_t>(Bytes[Offset]) |
+         (static_cast<uint32_t>(Bytes[Offset + 1]) << 8) |
+         (static_cast<uint32_t>(Bytes[Offset + 2]) << 16) |
+         (static_cast<uint32_t>(Bytes[Offset + 3]) << 24);
 }
 
 static Error rejectUnknownKeys(const json::Object &Object,
@@ -298,10 +315,11 @@ static Expected<Policy> parsePolicy(StringRef Path) {
   if (!Root)
     return entryError("top-level policy must be an object");
   std::optional<int64_t> SchemaValue = Root->getInteger("schema");
-  if (!SchemaValue || (*SchemaValue != 1 && *SchemaValue != 2 &&
-                       *SchemaValue != 3 && *SchemaValue != 4))
+  if (!SchemaValue ||
+      (*SchemaValue != 1 && *SchemaValue != 2 && *SchemaValue != 3 &&
+       *SchemaValue != 4 && *SchemaValue != 5))
     return entryError(
-        "unsupported or missing policy schema; expected 1, 2, 3, or 4");
+        "unsupported or missing policy schema; expected 1, 2, 3, 4, or 5");
   unsigned Schema = static_cast<unsigned>(*SchemaValue);
   std::set<std::string> KnownFields{"schema",
                                     "architecture",
@@ -359,6 +377,11 @@ static Expected<Policy> parsePolicy(StringRef Path) {
                       !IndirectTails || IndirectTails->size() > 4096))
     return entryError(
         "schema four requires 0 through 4096 indirect call and tail target "
+        "rules");
+  if (Schema == 5 && (!IndirectCalls || IndirectCalls->size() > 4096 ||
+                      !IndirectTails || IndirectTails->size() > 4096))
+    return entryError(
+        "schema five requires 0 through 4096 indirect call and tail target "
         "rules");
   const json::Array *Forbidden = Root->getArray("forbidden_symbols");
   if (!Forbidden || Forbidden->empty() || Forbidden->size() > 4096)
@@ -541,8 +564,12 @@ static Expected<SymbolTables> readDefinedSymbols(const ObjectFile &Object) {
     if (!Section)
       return Section.takeError();
     if (*Section != Object.section_end() &&
-        (ELFSectionRef(**Section).getFlags() & ELF::SHF_EXECINSTR))
+        (ELFSectionRef(**Section).getFlags() & ELF::SHF_EXECINSTR)) {
       Symbols.CodeNamesByAddress[*Address].push_back(Name->str());
+      if (*Type == SymbolRef::ST_Function ||
+          (*Flags & (SymbolRef::SF_Global | SymbolRef::SF_Weak)))
+        Symbols.CFGEntryPoints.insert(*Address);
+    }
   }
   for (const auto &[Symbol, Size] : computeSymbolSizes(Object)) {
     Expected<uint32_t> Flags = Symbol.getFlags();
@@ -939,6 +966,17 @@ resolveTransitiveFunction(const DiscoveredTarget &Target, unsigned Depth,
   return std::optional<ResolvedFunction>(std::move(Result));
 }
 
+struct DecodedInstruction {
+  MCInst Instruction;
+  MCDisassembler::DecodeStatus Status = MCDisassembler::Fail;
+  uint64_t Address = 0;
+  uint64_t Size = 0;
+  uint64_t TargetAddress = 0;
+  bool TargetKnown = false;
+  bool SequentialTarget = false;
+  bool HasSequentialAUIPCPair = false;
+};
+
 static Error scanRegion(
     const ResolvedRegion &Region, const Policy &Configuration,
     const SymbolTables &Symbols,
@@ -957,9 +995,15 @@ static Error scanRegion(
     F.PathEdgeKinds.assign(PathEdgeKinds.begin(), PathEdgeKinds.end());
     Findings.push_back(std::move(F));
   };
+  std::vector<std::pair<uint64_t, uint64_t>> LocalDiscoveredTargets;
   auto DiscoverTarget = [&](uint64_t CallsiteAddress, uint64_t TargetAddress,
                             ArrayRef<std::string> TargetSymbols,
                             StringRef EdgeKind) {
+    if (Configuration.Schema >= 5 && EdgeKind == "indirect-tail-policy" &&
+        TargetAddress >= Region.Begin && TargetAddress < Region.End) {
+      LocalDiscoveredTargets.emplace_back(TargetAddress, CallsiteAddress);
+      return;
+    }
     if (!DiscoveredTargets)
       return;
     DiscoveredTarget Target;
@@ -1004,29 +1048,13 @@ static Error scanRegion(
   else
     ++Counts.RootRegions;
   Counts.Bytes += Bytes.size();
-  for (uint64_t Offset = 0; Offset < Bytes.size();) {
-    uint64_t InstructionAddress = Region.Begin + Offset;
-    MCInst Instruction;
-    uint64_t Size = 0;
-    MCDisassembler::DecodeStatus Status = State.Disassembler->getInstruction(
-        Instruction, Size, Bytes.drop_front(Offset), InstructionAddress,
-        nulls());
-    if (Status != MCDisassembler::Success || !Size ||
-        Size > Bytes.size() - Offset) {
-      AddFinding(
-          addressFinding("decode-failure", Region.Name, InstructionAddress,
-                         Status == MCDisassembler::SoftFail
-                             ? "instruction decoded as architecturally invalid"
-                             : "instruction could not be decoded completely"));
-      break;
-    }
-
+  auto AnalyzeInstruction = [&](const MCInst &Instruction,
+                                uint64_t InstructionAddress, uint64_t Size,
+                                bool TargetKnown, uint64_t TargetAddress,
+                                bool RejectedSequentialTarget) {
     ++Counts.Instructions;
     if (State.InstrAnalysis->isCall(Instruction)) {
       ++Counts.Calls;
-      uint64_t TargetAddress = 0;
-      bool TargetKnown = State.InstrAnalysis->evaluateBranch(
-          Instruction, InstructionAddress, Size, TargetAddress);
       auto Function = TargetKnown
                           ? Symbols.FunctionsByAddress.find(TargetAddress)
                           : Symbols.FunctionsByAddress.end();
@@ -1071,8 +1099,11 @@ static Error scanRegion(
           ++Counts.UnknownCalls;
           AddFinding(addressFinding(
               "unknown-call", Region.Name, InstructionAddress,
-              "call target cannot be resolved statically and has no exact "
-              "callsite policy"));
+              RejectedSequentialTarget
+                  ? "cached AUIPC/JALR target is not proven within one "
+                    "fallthrough basic block and has no exact callsite policy"
+                  : "call target cannot be resolved statically and has no "
+                    "exact callsite policy"));
         }
       } else if (ForbiddenName) {
         ++Counts.ResolvedCalls;
@@ -1103,9 +1134,6 @@ static Error scanRegion(
                !State.InstrAnalysis->isReturn(Instruction) &&
                (State.InstrAnalysis->isBranch(Instruction) ||
                 State.InstrAnalysis->isIndirectBranch(Instruction))) {
-      uint64_t TargetAddress = 0;
-      bool TargetKnown = State.InstrAnalysis->evaluateBranch(
-          Instruction, InstructionAddress, Size, TargetAddress);
       if (!TargetKnown || TargetAddress < Region.Begin ||
           TargetAddress >= Region.End) {
         ++Counts.TailExits;
@@ -1153,7 +1181,12 @@ static Error scanRegion(
             ++Counts.UnknownTailExits;
             AddFinding(addressFinding(
                 "unknown-tail-exit", Region.Name, InstructionAddress,
-                "indirect control-flow exit has no exact tail-site policy"));
+                RejectedSequentialTarget
+                    ? "cached AUIPC/JALR control-flow target is not proven "
+                      "within one fallthrough basic block and has no exact "
+                      "tail-site policy"
+                    : "indirect control-flow exit has no exact tail-site "
+                      "policy"));
           }
         } else if (ForbiddenName) {
           ++Counts.ResolvedTailExits;
@@ -1185,14 +1218,221 @@ static Error scanRegion(
         }
       }
     }
+  };
+
+  auto Decode = [&](uint64_t Offset) {
+    DecodedInstruction Result;
+    Result.Address = Region.Begin + Offset;
+    Result.Status = State.Disassembler->getInstruction(
+        Result.Instruction, Result.Size, Bytes.drop_front(Offset),
+        Result.Address, nulls());
+    if (Result.Status == MCDisassembler::Success && Result.Size &&
+        Result.Size <= Bytes.size() - Offset &&
+        (State.InstrAnalysis->isCall(Result.Instruction) ||
+         (Configuration.Schema >= 4 &&
+          !State.InstrAnalysis->isReturn(Result.Instruction) &&
+          (State.InstrAnalysis->isBranch(Result.Instruction) ||
+           State.InstrAnalysis->isIndirectBranch(Result.Instruction)))))
+      Result.TargetKnown = State.InstrAnalysis->evaluateBranch(
+          Result.Instruction, Result.Address, Result.Size,
+          Result.TargetAddress);
+    return Result;
+  };
+
+  if (Configuration.Schema < 5) {
+    for (uint64_t Offset = 0; Offset < Bytes.size();) {
+      DecodedInstruction Decoded = Decode(Offset);
+      if (Decoded.Status != MCDisassembler::Success || !Decoded.Size ||
+          Decoded.Size > Bytes.size() - Offset) {
+        AddFinding(addressFinding(
+            "decode-failure", Region.Name, Decoded.Address,
+            Decoded.Status == MCDisassembler::SoftFail
+                ? "instruction decoded as architecturally invalid"
+                : "instruction could not be decoded completely"));
+        break;
+      }
+
+      AnalyzeInstruction(Decoded.Instruction, Decoded.Address, Decoded.Size,
+                         Decoded.TargetKnown, Decoded.TargetAddress,
+                         /*RejectedSequentialTarget=*/false);
 #if LLVM_VERSION_MAJOR >= 24
-    State.InstrAnalysis->updateState(Instruction, State.SubtargetInfo.get(),
-                                     InstructionAddress);
+      State.InstrAnalysis->updateState(
+          Decoded.Instruction, State.SubtargetInfo.get(), Decoded.Address);
 #else
-    State.InstrAnalysis->updateState(Instruction, InstructionAddress);
+      State.InstrAnalysis->updateState(Decoded.Instruction, Decoded.Address);
 #endif
-    Offset += Size;
+      Offset += Decoded.Size;
+    }
+    return Error::success();
   }
+
+  std::vector<DecodedInstruction> Decoded;
+  std::map<uint64_t, size_t> DecodedByAddress;
+  uint64_t SuccessfulDecodes = 0;
+  uint64_t DecodeFailures = 0;
+  for (uint64_t Offset = 0; Offset < Bytes.size();) {
+    if (Decoded.size() >= MaxCFGInstructionsPerRegion)
+      return entryError(Twine("entry region '") + Region.Name +
+                        "' exceeds the schema-five 1048576-instruction "
+                        "safety limit");
+    DecodedInstruction Record = Decode(Offset);
+    bool ValidSize = Record.Size && Record.Size <= Bytes.size() - Offset;
+    if (Record.Status == MCDisassembler::Success && ValidSize &&
+        Record.Size == 4) {
+      uint32_t Encoding = read32le(Bytes, Offset);
+      uint32_t BaseRegister = (Encoding >> 15) & 0x1f;
+      bool IsJALR = (Encoding & 0x707f) == 0x67;
+      if (Record.TargetKnown && IsJALR && BaseRegister) {
+        Record.SequentialTarget = true;
+        if (Offset >= 4 && !Decoded.empty()) {
+          const DecodedInstruction &Previous = Decoded.back();
+          uint32_t PreviousEncoding = read32le(Bytes, Offset - 4);
+          uint32_t DestinationRegister = (PreviousEncoding >> 7) & 0x1f;
+          Record.HasSequentialAUIPCPair =
+              Previous.Status == MCDisassembler::Success &&
+              Previous.Size == 4 &&
+              Previous.Address + Previous.Size == Record.Address &&
+              (PreviousEncoding & 0x7f) == 0x17 &&
+              DestinationRegister == BaseRegister;
+        }
+      }
+    }
+    DecodedByAddress.emplace(Record.Address, Decoded.size());
+    Decoded.push_back(std::move(Record));
+    DecodedInstruction &Stored = Decoded.back();
+    if (Stored.Status == MCDisassembler::Success && ValidSize) {
+      ++SuccessfulDecodes;
+#if LLVM_VERSION_MAJOR >= 24
+      State.InstrAnalysis->updateState(
+          Stored.Instruction, State.SubtargetInfo.get(), Stored.Address);
+#else
+      State.InstrAnalysis->updateState(Stored.Instruction, Stored.Address);
+#endif
+    } else {
+      ++DecodeFailures;
+      State.InstrAnalysis->resetState();
+    }
+    if (!ValidSize)
+      break;
+    Offset += Stored.Size;
+  }
+  Counts.DecodedInstructions += SuccessfulDecodes;
+  Counts.DecodeFailures += DecodeFailures;
+
+  std::set<uint64_t> BlockEntries;
+  BlockEntries.insert(Region.Begin);
+  for (uint64_t Address : Symbols.CFGEntryPoints) {
+    if (Address >= Region.Begin && Address < Region.End)
+      BlockEntries.insert(Address);
+  }
+  for (const DecodedInstruction &Record : Decoded) {
+    if (Record.Status != MCDisassembler::Success || !Record.TargetKnown ||
+        Record.TargetAddress < Region.Begin ||
+        Record.TargetAddress >= Region.End)
+      continue;
+    if (State.InstrAnalysis->isCall(Record.Instruction) ||
+        State.InstrAnalysis->isBranch(Record.Instruction) ||
+        State.InstrAnalysis->isIndirectBranch(Record.Instruction))
+      BlockEntries.insert(Record.TargetAddress);
+  }
+  for (const auto &[Address, Rule] : IndirectTails) {
+    if (Address < Region.Begin || Address >= Region.End)
+      continue;
+    for (uint64_t Target : Rule.TargetAddresses) {
+      if (Target >= Region.Begin && Target < Region.End)
+        BlockEntries.insert(Target);
+    }
+  }
+
+  std::set<uint64_t> Scheduled;
+  std::vector<std::pair<uint64_t, std::optional<uint64_t>>> Worklist;
+  auto Schedule = [&](uint64_t Address, std::optional<uint64_t> ReachedFrom) {
+    if (Address == Region.End || Address < Region.Begin ||
+        Address >= Region.End || !Scheduled.insert(Address).second)
+      return;
+    Worklist.emplace_back(Address, ReachedFrom);
+  };
+  Schedule(Region.Begin, std::nullopt);
+  if (!IsTransitive) {
+    for (uint64_t Address : Symbols.CFGEntryPoints) {
+      if (Address >= Region.Begin && Address < Region.End)
+        Schedule(Address, std::nullopt);
+    }
+  }
+  Counts.CFGEntryPoints += Worklist.size();
+
+  uint64_t ReachableDecodes = 0;
+  uint64_t ReachableDecodeFailures = 0;
+  for (size_t Index = 0; Index < Worklist.size(); ++Index) {
+    auto [Address, ReachedFrom] = Worklist[Index];
+    auto Position = DecodedByAddress.find(Address);
+    if (Position == DecodedByAddress.end()) {
+      Finding F = addressFinding(
+          "invalid-local-cfg-target", Region.Name,
+          ReachedFrom.value_or(Address),
+          "reachable local control-flow target is not a decoded instruction "
+          "boundary");
+      F.TargetAddress = Address;
+      F.HasTargetAddress = true;
+      AddFinding(std::move(F));
+      continue;
+    }
+    const DecodedInstruction &Record = Decoded[Position->second];
+    uint64_t RecordOffset = Record.Address - Region.Begin;
+    bool HasValidSize = RecordOffset <= Bytes.size() && Record.Size &&
+                        Record.Size <= Bytes.size() - RecordOffset;
+    bool Valid = Record.Status == MCDisassembler::Success && HasValidSize;
+    if (!Valid) {
+      ++ReachableDecodeFailures;
+      if (HasValidSize)
+        Counts.ReachableBytes += Record.Size;
+      AddFinding(addressFinding(
+          "decode-failure", Region.Name, Record.Address,
+          Record.Status == MCDisassembler::SoftFail
+              ? "reachable instruction decoded as architecturally invalid"
+              : "reachable instruction could not be decoded completely"));
+      continue;
+    }
+
+    ++ReachableDecodes;
+    Counts.ReachableBytes += Record.Size;
+    bool RejectedSequentialTarget =
+        Record.TargetKnown && Record.SequentialTarget &&
+        (!Record.HasSequentialAUIPCPair || BlockEntries.count(Record.Address));
+    if (RejectedSequentialTarget)
+      ++Counts.RejectedSequentialTargets;
+    bool EffectiveTargetKnown = Record.TargetKnown && !RejectedSequentialTarget;
+    LocalDiscoveredTargets.clear();
+    AnalyzeInstruction(Record.Instruction, Record.Address, Record.Size,
+                       EffectiveTargetKnown, Record.TargetAddress,
+                       RejectedSequentialTarget);
+    for (const auto &[Target, Source] : LocalDiscoveredTargets) {
+      BlockEntries.insert(Target);
+      Schedule(Target, Source);
+    }
+
+    uint64_t Fallthrough = Record.Address + Record.Size;
+    bool IsCall = State.InstrAnalysis->isCall(Record.Instruction);
+    bool IsReturn = State.InstrAnalysis->isReturn(Record.Instruction);
+    bool IsBranch = State.InstrAnalysis->isBranch(Record.Instruction) ||
+                    State.InstrAnalysis->isIndirectBranch(Record.Instruction);
+    if (IsCall) {
+      Schedule(Fallthrough, Record.Address);
+    } else if (IsReturn) {
+      continue;
+    } else if (IsBranch) {
+      if (EffectiveTargetKnown && Record.TargetAddress >= Region.Begin &&
+          Record.TargetAddress < Region.End)
+        Schedule(Record.TargetAddress, Record.Address);
+      if (State.InstrAnalysis->isConditionalBranch(Record.Instruction))
+        Schedule(Fallthrough, Record.Address);
+    } else if (!State.InstrAnalysis->isTerminator(Record.Instruction)) {
+      Schedule(Fallthrough, Record.Address);
+    }
+  }
+  Counts.UnreachableInstructions += SuccessfulDecodes - ReachableDecodes;
+  Counts.ReachableDecodeFailures += ReachableDecodeFailures;
+  Counts.UnreachableDecodeFailures += DecodeFailures - ReachableDecodeFailures;
   return Error::success();
 }
 
@@ -1728,6 +1968,26 @@ int main(int Argc, char **Argv) {
     CoverageJSON["indirect_tail_target_edges"] =
         static_cast<int64_t>(Counts.IndirectTailTargetEdges);
   }
+  if (Configuration->Schema >= 5) {
+    CoverageJSON["decoded_instructions"] =
+        static_cast<int64_t>(Counts.DecodedInstructions);
+    CoverageJSON["decode_failures"] =
+        static_cast<int64_t>(Counts.DecodeFailures);
+    CoverageJSON["cfg_entry_points"] =
+        static_cast<int64_t>(Counts.CFGEntryPoints);
+    CoverageJSON["cfg_instruction_limit_per_region"] =
+        static_cast<int64_t>(MaxCFGInstructionsPerRegion);
+    CoverageJSON["reachable_bytes"] =
+        static_cast<int64_t>(Counts.ReachableBytes);
+    CoverageJSON["reachable_decode_failures"] =
+        static_cast<int64_t>(Counts.ReachableDecodeFailures);
+    CoverageJSON["unreachable_instructions"] =
+        static_cast<int64_t>(Counts.UnreachableInstructions);
+    CoverageJSON["unreachable_decode_failures"] =
+        static_cast<int64_t>(Counts.UnreachableDecodeFailures);
+    CoverageJSON["rejected_sequential_targets"] =
+        static_cast<int64_t>(Counts.RejectedSequentialTargets);
+  }
   bool Passed = Findings.empty();
   json::Object Root{
       {"schema", 1},
@@ -1735,7 +1995,8 @@ int main(int Argc, char **Argv) {
       {"scope", Configuration->Schema == 1 ? "direct-calls-in-entry-regions-v1"
                 : Configuration->Schema == 2 ? "site-scoped-indirect-targets-v2"
                 : Configuration->Schema == 3 ? "transitive-call-graph-v3"
-                                             : "tail-exit-call-graph-v4"},
+                : Configuration->Schema == 4 ? "tail-exit-call-graph-v4"
+                                             : "reachable-cfg-call-graph-v5"},
       {"result", Passed ? "PASS" : "FAIL"},
       {"image", std::move(Image)},
       {"policy", std::move(PolicyJSON)},

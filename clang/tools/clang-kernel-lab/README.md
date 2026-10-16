@@ -21,7 +21,8 @@ for the Linux IRQ/PREEMPT_RT laboratory:
   one symbol-plus-offset callsite; schema three recursively scans every linked
   function reached by those direct and declared indirect edges; schema four
   also follows conditional and unconditional exits that leave a linked function
-  range.  All emit a deterministic JSON verdict.
+  range; schema five scans only structurally reachable instructions within each
+  linked range.  All emit a deterministic JSON verdict.
 - `ClangKernelLab` is an LLVM pass plugin for explicit callbacks and
   deterministic perturbation.  Loading a specification through
   `CLANG_KERNEL_LAB_SPEC` changes generated code; it is not map mode.
@@ -94,6 +95,9 @@ python3 clang/tools/clang-kernel-lab/tests/test_rv_entrycheck.py \
   /path/to/the-matching-vmlinux
 ../build-kernel-lab/rv-entrycheck \
   --policy clang/tools/clang-kernel-lab/examples/riscv-linux-entrycheck-v4.json \
+  /path/to/the-matching-vmlinux
+../build-kernel-lab/rv-entrycheck \
+  --policy clang/tools/clang-kernel-lab/examples/riscv-linux-entrycheck-v5.json \
   /path/to/the-matching-vmlinux
 ```
 
@@ -185,11 +189,43 @@ and returns `FAIL` for 23 indirect tail exits, 124 unknown calls, and ten decode
 boundaries.  This expansion is evidence that state-aware graph delimiting is
 required; it is not permission to add a broad terminal allowlist.
 
+Schema five decodes a linked range in address order, then visits only local CFG
+successors from explicit entries.  A transitive function starts at its linked
+entry; a broad policy root additionally starts at each contained function or
+global/weak executable symbol.  Calls fall through, conditional branches visit
+both arms, local unconditional branches visit only their target, and returns or
+external exits stop the local walk.  A reachable target that lands between
+decoded instruction boundaries fails closed.  Decode failures stop only the
+affected path: reachable failures remain findings, while unreachable failures
+remain visible in coverage rather than becoming waivers.  Decoding is capped at
+1,048,576 instruction slots per range before any untrusted graph can consume
+unbounded memory.  Because RISC-V branch analysis remembers register values
+while decoding in address order, a cached `auipc`/`jalr` target is trusted only
+for an adjacent pair in one fallthrough basic block.  Entering at the `jalr`,
+or resolving it from older sequential state, downgrades the edge to an unknown
+indirect call or tail unless an exact site policy covers it.
+
+Matched relaxation-on/off controls contain a dead forbidden call, the same call
+on a conditional path, dead and reachable unsupported encodings, an exact
+indirect tail into a local block, and a branch into the middle of a four-byte
+instruction.  An adversarial control branches around `auipc` directly into its
+paired `jalr`; both link modes reject the otherwise plausible cached target and
+report it in `rejected_sequential_targets`.  On the bound Linux image schema
+five uses 978 explicit entries,
+reaches 943 functions and 67,147 instructions, and reduces the fail-closed
+backlog to 115 unknown calls, 18 unknown tail/control exits, and one reachable
+decode boundary.  It also reports 2,314 decoded but unreachable instructions
+and 51 unreachable decode failures, with zero rejected sequential targets in
+the current image.  The remaining reachable encoding is
+`0x18000073` in `handle_mm_fault()`; it is present in alternative code but is
+not declared by the linked ELF architecture attributes.  Lab LLVM 24 and stock
+LLVM 22.1.8 agree exactly on these counts.
+
 Symbol-bounded policy regions are necessary for a normal linked Linux image,
 where input `.noinstr.text` is folded into `.text` but
-`__noinstr_text_start` and `__noinstr_text_end` survive.  CFG feasibility,
-exception edges, state ordering, and compiler-generated helpers still require
-later gates and must not be treated as qualified.
+`__noinstr_text_start` and `__noinstr_text_end` survive.  Data-dependent path
+feasibility, exception edges, transition-state ordering, and compiler-generated
+helpers still require later gates and must not be treated as qualified.
 
 The bounded external-Linux gate drives a real RISC-V Kbuild compile of
 `kernel/softirq.c`.  Its default policy mode brackets `handle_softirqs()` with

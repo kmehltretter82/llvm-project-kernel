@@ -199,6 +199,39 @@ CFG/state-delimiting gate: following all syntactic exits from broad entry ranges
 is conservative discovery, not a claim that every path executes in protected
 IRQ state and not justification for a blanket terminal list.
 
+Schema five separates address-order decoding from structural CFG reachability.
+It starts each transitive range at the function entry and starts broad policy
+roots at their boundary plus every contained function or global/weak executable
+symbol.  Calls fall through, conditional branches retain both arms, local
+unconditional branches retain only their target, and returns or external exits
+end that local path.  A reachable edge into the middle of a decoded instruction
+is rejected.  Reachable decode failures stop and fail their path; unreachable
+decode failures remain counted in the receipt instead of being silently lost.
+Each linked range has a 1,048,576-instruction safety cap.  This is structural
+reachability, not data-dependent branch feasibility.  Address-order target
+state is also constrained by the CFG: a cached RISC-V `auipc`/`jalr` target is
+accepted only when the pair is adjacent and the `jalr` is not a basic-block
+entry.  Otherwise the edge becomes an unknown indirect call or tail and needs
+an exact site policy.
+
+Relaxed and unrelaxed controls prove that a dead forbidden call is excluded
+while a conditionally reachable one fails, a dead unsupported encoding is
+reported only as coverage while a reachable one fails, an exact indirect tail
+can enter a local basic block, and a mid-instruction branch target is rejected.
+Another adversarial fixture branches around `auipc` into the paired `jalr` and
+proves, with relaxation both enabled and disabled, that sequential decoder
+state cannot manufacture a direct target across a basic-block boundary.
+On the same bound Linux image schema five uses 978 explicit entries and reaches
+943 functions, 189,952 bytes of linked ranges, and 67,147 reachable
+instructions at depth 19.  It returns `FAIL` for 115 unknown calls, 18 unknown
+tail/control exits, and one reachable decode boundary.  The receipt also
+records 2,314 decoded but unreachable instructions and 51 unreachable decode
+failures, and no sequential target is rejected in this image.  The remaining
+encoding, `0x18000073` in `handle_mm_fault()`, is in
+alternative code but absent from the ELF architecture attributes.  Lab LLVM 24
+and stock LLVM 22.1.8 agree exactly.  Transition-state propagation and
+dominance remain the next qualification gate.
+
 The complete checker will also consume the resolved site map, DWARF/BTF where
 available, and expand from RISC-V vectors, irqentry, and noinstr regions to
 conservatively reject or report unknown for:
@@ -333,8 +366,8 @@ Exit: one command builds, boots, records, replays, and seals a result bundle.
 
 - Keep the implemented direct-call, exact-indirect, tail-exit, forbidden-
   callback, and relaxation checks regression-locked.
-- Add CFG feasibility and state-ordering checks, then classify every remaining
-  unresolved indirect edge and decode boundary.
+- Add data-dependent path feasibility and transition-state ordering, then
+  classify every remaining unresolved indirect edge and decode boundary.
 - Require all negative fixtures to fail and corrected fixtures to pass.
 
 Exit: no unexplained edge or callback remains in the qualified early-entry

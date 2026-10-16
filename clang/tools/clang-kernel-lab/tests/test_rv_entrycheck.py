@@ -21,10 +21,12 @@ POLICY = TOOL / "examples" / "riscv-entrycheck-v1.json"
 INDIRECT_POLICY = TOOL / "examples" / "riscv-entrycheck-indirect-v2.json"
 TRANSITIVE_POLICY = TOOL / "examples" / "riscv-entrycheck-transitive-v3.json"
 TAIL_POLICY = TOOL / "examples" / "riscv-entrycheck-tail-v4.json"
+CFG_POLICY = TOOL / "examples" / "riscv-entrycheck-cfg-v5.json"
 LINUX_POLICY_V1 = TOOL / "examples" / "riscv-linux-entrycheck-v1.json"
 LINUX_POLICY_V2 = TOOL / "examples" / "riscv-linux-entrycheck-v2.json"
 LINUX_POLICY_V3 = TOOL / "examples" / "riscv-linux-entrycheck-v3.json"
 LINUX_POLICY_V4 = TOOL / "examples" / "riscv-linux-entrycheck-v4.json"
+LINUX_POLICY_V5 = TOOL / "examples" / "riscv-linux-entrycheck-v5.json"
 
 
 def run(command: list[str], *, expect: int = 0) -> subprocess.CompletedProcess[str]:
@@ -202,6 +204,18 @@ def check_invalid_policies(arguments: argparse.Namespace, image: pathlib.Path,
     schema_four_wrong_tail["indirect_call_targets"] = []
     schema_four_wrong_tail["indirect_tail_targets"] = "entry_path"
     cases.append(("schema-four-wrong-tail", schema_four_wrong_tail,
+                  "indirect_tail_targets must be an array"))
+
+    schema_five_missing = copy.deepcopy(policy)
+    schema_five_missing["schema"] = 5
+    cases.append(("schema-five-missing", schema_five_missing,
+                  "schema five requires 0 through 4096 indirect call and tail"))
+
+    schema_five_wrong_tail = copy.deepcopy(policy)
+    schema_five_wrong_tail["schema"] = 5
+    schema_five_wrong_tail["indirect_call_targets"] = []
+    schema_five_wrong_tail["indirect_tail_targets"] = "entry_path"
+    cases.append(("schema-five-wrong-tail", schema_five_wrong_tail,
                   "indirect_tail_targets must be an array"))
 
     receipts = {}
@@ -947,6 +961,199 @@ def check_tail_policies(arguments: argparse.Namespace,
     return receipts
 
 
+def check_cfg_policies(arguments: argparse.Namespace,
+                       images: dict[str, pathlib.Path],
+                       root: pathlib.Path) -> dict[str, object]:
+    cases = (
+        ("cfg-unreachable-call", None, 0, 0, 0, True),
+        ("cfg-reachable-call", "forbidden-call", 0, 0, 0, False),
+        ("cfg-unreachable-decode", None, 0, 1, 0, False),
+        ("cfg-reachable-decode", "decode-failure", 1, 0, 0, True),
+        ("cfg-mid-instruction", "invalid-local-cfg-target", 0, 0, 0, True),
+        ("cfg-local-indirect", "unknown-tail-exit", 0, 0, 0, True),
+        ("cfg-bypassed-auipc", "unknown-call", 0, 0, 1, True),
+    )
+    receipts = {}
+    local_policy = json.loads(CFG_POLICY.read_text())
+    local_policy["indirect_tail_targets"] = [{
+        "caller_symbol": "entrycheck_cfg_source",
+        "instruction_offset": 0,
+        "target_symbols": ["entrycheck_cfg_local_target"],
+    }]
+    local_policy_path = root / "policy-cfg-local-indirect.json"
+    write_policy(local_policy_path, local_policy)
+    for relax in (False, True):
+        mode = "relax" if relax else "no-relax"
+        for (
+            name,
+            expected_rule,
+            expected_reachable_decode_failures,
+            expected_unreachable_decode_failures,
+            expected_rejected_sequential_targets,
+            expect_unreachable_code,
+        ) in cases:
+            result = run([
+                str(arguments.checker),
+                "--policy",
+                str(CFG_POLICY),
+                str(images[f"{name}-{mode}"]),
+            ], expect=1 if expected_rule else 0)
+            document = json.loads(result.stdout)
+            if document.get("scope") != "reachable-cfg-call-graph-v5":
+                raise AssertionError(f"CFG scope changed: {document}")
+            findings = document.get("findings")
+            if not isinstance(findings, list):
+                raise AssertionError(f"CFG findings missing: {document}")
+            if expected_rule:
+                if len(findings) != 1 or findings[0].get(
+                        "rule") != expected_rule:
+                    raise AssertionError(
+                        f"{name}-{mode} returned wrong findings: {findings}"
+                    )
+                check_call_path(
+                    findings[0],
+                    ["noinstr", "entrycheck_cfg_source"],
+                    ["direct-call"],
+                )
+                if expected_rule == "invalid-local-cfg-target" and (
+                        not findings[0].get("target_va") or findings[0].get(
+                            "target_va") == findings[0].get("instruction_va")):
+                    raise AssertionError(
+                        f"mid-instruction edge lost source/target: {findings[0]}"
+                    )
+                if expected_rejected_sequential_targets and "AUIPC/JALR" not in (
+                        findings[0].get("detail") or ""):
+                    raise AssertionError(
+                        f"bypassed AUIPC/JALR lost its diagnostic: {findings[0]}"
+                    )
+            elif findings:
+                raise AssertionError(
+                    f"{name}-{mode} control has findings: {findings}"
+                )
+
+            coverage = document.get("coverage")
+            if not isinstance(coverage, dict):
+                raise AssertionError(f"CFG coverage missing: {document}")
+            required = (
+                "bytes",
+                "cfg_entry_points",
+                "cfg_instruction_limit_per_region",
+                "decoded_instructions",
+                "decode_failures",
+                "instructions",
+                "reachable_bytes",
+                "reachable_decode_failures",
+                "rejected_sequential_targets",
+                "unreachable_decode_failures",
+                "unreachable_instructions",
+            )
+            if any(not isinstance(coverage.get(field), int)
+                   for field in required):
+                raise AssertionError(
+                    f"{name}-{mode} omitted CFG coverage: {coverage}"
+                )
+            if coverage["decoded_instructions"] != (
+                    coverage["instructions"] +
+                    coverage["unreachable_instructions"]):
+                raise AssertionError(
+                    f"{name}-{mode} instruction accounting changed: {coverage}"
+                )
+            if coverage["decode_failures"] != (
+                    coverage["reachable_decode_failures"] +
+                    coverage["unreachable_decode_failures"]):
+                raise AssertionError(
+                    f"{name}-{mode} decode accounting changed: {coverage}"
+                )
+            if (
+                coverage["reachable_bytes"] > coverage["bytes"]
+                or coverage["reachable_decode_failures"]
+                != expected_reachable_decode_failures
+                or coverage["rejected_sequential_targets"]
+                != expected_rejected_sequential_targets
+                or coverage["unreachable_decode_failures"]
+                != expected_unreachable_decode_failures
+                or bool(coverage["unreachable_instructions"])
+                != expect_unreachable_code
+            ):
+                raise AssertionError(
+                    f"{name}-{mode} returned wrong CFG coverage: {coverage}"
+                )
+            functions = document.get("resolved_transitive_functions")
+            if (
+                not isinstance(functions, list)
+                or len(functions) != 1
+                or functions[0].get("symbol") != "entrycheck_cfg_source"
+            ):
+                raise AssertionError(
+                    f"{name}-{mode} returned wrong function graph: {functions}"
+                )
+            check_call_path(
+                functions[0],
+                ["noinstr", "entrycheck_cfg_source"],
+                ["direct-call"],
+            )
+            receipts[f"{name}-{mode}"] = {
+                "result": document["result"],
+                "coverage": coverage,
+                "findings": findings,
+            }
+
+        local_result = run([
+            str(arguments.checker),
+            "--policy",
+            str(local_policy_path),
+            str(images[f"cfg-local-indirect-{mode}"]),
+        ])
+        local = json.loads(local_result.stdout)
+        local_coverage = local.get("coverage")
+        local_tails = local.get("resolved_indirect_tails")
+        if (
+            local.get("result") != "PASS"
+            or local.get("findings") != []
+            or not isinstance(local_coverage, dict)
+            or local_coverage.get("tail_exits") != 1
+            or local_coverage.get("resolved_tail_exits") != 1
+            or local_coverage.get("policy_resolved_indirect_tails") != 1
+            or local_coverage.get("indirect_tail_target_edges") != 1
+            or local_coverage.get("unreachable_instructions") != 0
+        ):
+            raise AssertionError(
+                f"approved local indirect CFG edge failed: {local}"
+            )
+        if not isinstance(local_tails, list) or len(local_tails) != 1 or not (
+                local_tails[0].get("used")):
+            raise AssertionError(
+                f"local indirect CFG rule was not consumed: {local_tails}"
+            )
+        receipts[f"approved-local-indirect-{mode}"] = {
+            "result": local["result"],
+            "coverage": local_coverage,
+            "resolved_indirect_tails": local_tails,
+        }
+
+        for name, expected_rule in (
+                ("cfg-unreachable-call", "forbidden-call"),
+                ("cfg-unreachable-decode", "decode-failure")):
+            linear_result = run([
+                str(arguments.checker),
+                "--policy",
+                str(TAIL_POLICY),
+                str(images[f"{name}-{mode}"]),
+            ], expect=1)
+            linear = json.loads(linear_result.stdout)
+            rules = [finding.get("rule") for finding in linear.get(
+                "findings", [])]
+            if expected_rule not in rules:
+                raise AssertionError(
+                    f"schema four did not retain its linear control: {linear}"
+                )
+            receipts[f"linear-{name}-{mode}"] = {
+                "result": linear["result"],
+                "rules": rules,
+            }
+    return receipts
+
+
 def check_linux_image(arguments: argparse.Namespace) -> dict[str, object]:
     v1_result = run([
         str(arguments.checker), "--policy", str(LINUX_POLICY_V1),
@@ -1120,6 +1327,84 @@ def check_linux_image(arguments: argparse.Namespace) -> dict[str, object]:
         raise AssertionError(
             f"schema-four Linux invented tail policy edges: {v4}"
         )
+
+    v5_result = run([
+        str(arguments.checker), "--policy", str(LINUX_POLICY_V5),
+        str(arguments.linux_image),
+    ], expect=1)
+    v5 = json.loads(v5_result.stdout)
+    v5_coverage = v5.get("coverage")
+    expected_v5_coverage = {
+        "bytes": 189952,
+        "call_depth_limit": 128,
+        "calls": 2509,
+        "cfg_entry_points": 978,
+        "cfg_instruction_limit_per_region": 1048576,
+        "decode_failures": 52,
+        "decoded_instructions": 69461,
+        "function_limit": 4096,
+        "indirect_tail_target_edges": 0,
+        "indirect_target_edges": 22,
+        "instructions": 67147,
+        "max_call_depth_reached": 19,
+        "policy_resolved_indirect_calls": 4,
+        "policy_resolved_indirect_tails": 0,
+        "reachable_bytes": 182950,
+        "reachable_decode_failures": 1,
+        "regions": 946,
+        "rejected_sequential_targets": 0,
+        "resolved_calls": 2394,
+        "resolved_tail_exits": 410,
+        "root_regions": 3,
+        "tail_exits": 428,
+        "transitive_functions": 943,
+        "unknown_calls": 115,
+        "unknown_tail_exits": 18,
+        "unreachable_decode_failures": 51,
+        "unreachable_instructions": 2314,
+    }
+    if v5.get("result") != "FAIL" or v5.get(
+            "scope") != "reachable-cfg-call-graph-v5" or v5_coverage != (
+                expected_v5_coverage):
+        raise AssertionError(f"schema-five Linux discovery changed: {v5}")
+    v5_findings = v5.get("findings")
+    if not isinstance(v5_findings, list):
+        raise AssertionError(f"schema-five Linux findings missing: {v5}")
+    v5_finding_counts = collections.Counter(
+        finding.get("rule") for finding in v5_findings
+    )
+    expected_v5_findings = {
+        "decode-failure": 1,
+        "unknown-call": 115,
+        "unknown-tail-exit": 18,
+    }
+    if v5_finding_counts != expected_v5_findings:
+        raise AssertionError(
+            f"schema-five Linux findings changed: {v5_finding_counts}"
+        )
+    for finding in v5_findings:
+        edges = finding.get("path_edge_kinds")
+        if not isinstance(edges, list):
+            raise AssertionError(
+                f"schema-five Linux finding lost edge kinds: {finding}"
+            )
+        check_call_path(finding, finding["call_path"], edges)
+    v5_functions = v5.get("resolved_transitive_functions")
+    if not isinstance(v5_functions, list) or len(v5_functions) != 943:
+        raise AssertionError(
+            f"schema-five Linux function set changed: {v5_functions}"
+        )
+    for function in v5_functions:
+        edges = function.get("path_edge_kinds")
+        if not isinstance(edges, list):
+            raise AssertionError(
+                f"schema-five Linux function lost edge kinds: {function}"
+            )
+        check_call_path(function, function["call_path"], edges)
+    if v5.get("resolved_indirect_tails") != []:
+        raise AssertionError(
+            f"schema-five Linux invented tail policy edges: {v5}"
+        )
     return {
         "schema_one": {
             "result": v1["result"],
@@ -1145,6 +1430,13 @@ def check_linux_image(arguments: argparse.Namespace) -> dict[str, object]:
             "finding_counts": dict(sorted(v4_finding_counts.items())),
             "resolved_transitive_functions": len(v4_functions),
             "image": v4["image"],
+        },
+        "schema_five": {
+            "result": v5["result"],
+            "coverage": v5_coverage,
+            "finding_counts": dict(sorted(v5_finding_counts.items())),
+            "resolved_transitive_functions": len(v5_functions),
+            "image": v5["image"],
         },
     }
 
@@ -1174,6 +1466,21 @@ def main() -> int:
             ("tail-unknown", "ENTRYCHECK_TAIL_UNKNOWN", None),
             ("tail-local", "ENTRYCHECK_TAIL_LOCAL", None),
             ("tail-conditional", "ENTRYCHECK_TAIL_CONDITIONAL", None),
+            ("cfg-unreachable-call", "ENTRYCHECK_CFG_UNREACHABLE_CALL", None),
+            ("cfg-reachable-call", "ENTRYCHECK_CFG_REACHABLE_CALL", None),
+            (
+                "cfg-unreachable-decode",
+                "ENTRYCHECK_CFG_UNREACHABLE_DECODE",
+                None,
+            ),
+            ("cfg-reachable-decode", "ENTRYCHECK_CFG_REACHABLE_DECODE", None),
+            ("cfg-mid-instruction", "ENTRYCHECK_CFG_MID_INSTRUCTION", None),
+            ("cfg-local-indirect", "ENTRYCHECK_CFG_LOCAL_INDIRECT", None),
+            (
+                "cfg-bypassed-auipc",
+                "ENTRYCHECK_CFG_BYPASSED_AUIPC",
+                None,
+            ),
         )
         for name, define, _ in fixtures:
             output = root / f"{name}.o"
@@ -1221,6 +1528,7 @@ def main() -> int:
         indirect_receipts = check_indirect_policies(arguments, images, root)
         transitive_receipts = check_transitive_policies(arguments, images, root)
         tail_receipts = check_tail_policies(arguments, images, root)
+        cfg_receipts = check_cfg_policies(arguments, images, root)
         linux_receipt = (check_linux_image(arguments)
                          if arguments.linux_image else "not-requested")
 
@@ -1235,6 +1543,7 @@ def main() -> int:
             "indirect_policies": indirect_receipts,
             "transitive_policies": transitive_receipts,
             "tail_policies": tail_receipts,
+            "cfg_policies": cfg_receipts,
             "linux_image": linux_receipt,
         }, indent=2, sort_keys=True))
     return 0
