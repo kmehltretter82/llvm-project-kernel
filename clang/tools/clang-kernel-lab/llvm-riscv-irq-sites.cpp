@@ -245,11 +245,13 @@ static Expected<SmallVector<Site, 16>> readSites(const ObjectFile &Object,
             std::numeric_limits<uint64_t>::max() - Offset)
           return createStringError(inconvertibleErrorCode(),
                                    "C carrier record address overflows");
-        Expected<uint64_t> Address =
-            addSigned(SiteSection.getAddress() + Offset, Relative);
-        if (!Address)
-          return Address.takeError();
-        S.Address = *Address;
+        // PC-section expressions use address-width modular arithmetic.  A
+        // non-allocated carrier has an address of zero, so a canonical
+        // high-half kernel PC is encoded as a negative signed delta and must
+        // wrap here.  The text-section and sized-function checks below still
+        // reject a delta that does not resolve to a real instruction.
+        S.Address =
+            SiteSection.getAddress() + Offset + static_cast<uint64_t>(Relative);
       } else if (Relative != 0) {
         return createStringError(inconvertibleErrorCode(),
                                  "relocatable C carrier has nonzero PC data");

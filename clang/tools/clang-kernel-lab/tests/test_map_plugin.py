@@ -21,6 +21,7 @@ LTO_SITE_SOURCE = HERE / "map-lto-site.c"
 LTO_CALLER_SOURCE = HERE / "map-lto-caller.c"
 LTO_MULTI_CALLER_SOURCE = HERE / "map-lto-multi-caller.c"
 LINKER_SCRIPT = HERE / "map-link.ld"
+HIGH_HALF_LINKER_SCRIPT = HERE / "map-link-high-half.ld"
 VALID_SPEC = TOOL / "examples" / "riscv-map-v1.json"
 GAP_SPEC = TOOL / "examples" / "riscv-map-coverage-gap-v1.json"
 CROSS_TU_SPEC = TOOL / "examples" / "riscv-map-cross-tu-v1.json"
@@ -103,13 +104,14 @@ def compile_object(arguments: argparse.Namespace, output: pathlib.Path,
 def link(arguments: argparse.Namespace,
          obj: pathlib.Path | list[pathlib.Path],
          output: pathlib.Path, *, gc_sections: bool = False,
-         entry: str = "irq_map_probe", linker: str | None = None) -> None:
+         entry: str = "irq_map_probe", linker: str | None = None,
+         linker_script: pathlib.Path = LINKER_SCRIPT) -> None:
     objects = [obj] if isinstance(obj, pathlib.Path) else obj
     command = [
         linker or arguments.ld_lld,
         "-m", "elf64lriscv",
         "-e", entry,
-        "-T", str(LINKER_SCRIPT),
+        "-T", str(linker_script),
     ]
     command.extend(str(item) for item in objects)
     command.extend(["-o", str(output)])
@@ -541,6 +543,55 @@ def main() -> int:
             mapped_site["link_va"], 0
         ) + 0x1000:
             raise AssertionError("C site load-bias calculation is incorrect")
+
+        high_half_elf = directory / "high-half-nonalloc-map.elf"
+        link(
+            arguments,
+            mapped_obj,
+            high_half_elf,
+            linker_script=HIGH_HALF_LINKER_SCRIPT,
+        )
+        high_half_sidecar = json.loads(run([
+            str(arguments.site_tool.resolve()), str(high_half_elf)
+        ]).stdout)
+        high_half_sections = json.loads(run([
+            arguments.llvm_readobj,
+            "--elf-output-style=JSON",
+            "--sections",
+            str(high_half_elf),
+        ]).stdout)[0]["Sections"]
+        high_half_map_sections = {
+            entry["Section"]["Name"]["Name"]: entry["Section"]
+            for entry in high_half_sections
+            if entry["Section"]["Name"]["Name"] in MAP_SECTIONS
+        }
+        expected_high_half_sections = {
+            ".riscv.linux_irq_c_sites",
+            ".riscv.linux_irq_expected",
+        }
+        if set(high_half_map_sections) != expected_high_half_sections:
+            raise AssertionError(
+                "high-half link did not retain both C map sections"
+            )
+        for section in high_half_map_sections.values():
+            flags = {
+                flag["Name"] for flag in section["Flags"]["Flags"]
+            }
+            if "SHF_ALLOC" in flags:
+                raise AssertionError("high-half map metadata is allocated")
+        if high_half_map_sections[
+                ".riscv.linux_irq_c_sites"]["Address"] != 0:
+            raise AssertionError("high-half C carrier does not have a zero VMA")
+        if len(high_half_sidecar["sites"]) != 1:
+            raise AssertionError(
+                "high-half non-allocated carrier lost its site"
+            )
+        high_half_site = high_half_sidecar["sites"][0]
+        if high_half_site["symbol"] != "irq_map_probe" or \
+                int(high_half_site["link_va"], 0) < 0xffffffff80000000:
+            raise AssertionError(
+                "high-half non-allocated carrier resolved outside kernel text"
+            )
 
         if source_builtin:
             source_sidecar = json.loads(run([
@@ -1620,6 +1671,7 @@ def main() -> int:
             "mode": "text-inert-pcsections",
             "text_bytes": len(mapped_elf_text),
             "site_count": 1,
+            "high_half_nonalloc_carrier": "PASS",
             "source_builtin_expectation": arguments.source_builtin_expect,
             "source_builtin_site_count": 1 if source_builtin else 0,
             "source_builtin_text_identity": (
