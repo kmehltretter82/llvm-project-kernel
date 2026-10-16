@@ -80,6 +80,17 @@ single-module ThinLTO fixtures are the present qualification boundary;
 cross-TU importing is qualified only when exactly one physical copy survives,
 and a Linux LTO link remains outside it.
 
+The first real-Linux wrapper, `linux_irq_site()`, is inert in normal builds and
+expands to the builtin only when the Kbuild controller explicitly enables map
+mode with the matching plugin.  A compiler feature probe makes mismatched
+activation fail closed.  The marker at the terminal `handle_softirqs()` exit,
+after task flags are restored, survives a tinyconfig RV64 Kbuild and resolves
+to the same object and `vmlinux` PC as the independent optimizer-last policy
+rule.  Baseline, disabled-plugin, and mapped objects retain the same executable
+fingerprint; the final map sections remain non-allocated host metadata.
+Stock Clang 22 leaves the feature probe unset, emits no map sections in a
+normal build, and rejects forced activation at the wrapper's explicit guard.
+
 ### Layer B: explicit callback and perturb mode
 
 `ClangKernelLab` is an early pass-plugin prototype for code-changing

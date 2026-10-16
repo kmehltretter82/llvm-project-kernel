@@ -70,8 +70,9 @@ python3 clang/tools/clang-kernel-lab/tests/test_selectiondag_backend.py \
 ```
 
 The bounded external-Linux gate drives a real RISC-V Kbuild compile of
-`kernel/softirq.c`, brackets `handle_softirqs()` with entry/exit map records,
-and can continue through a complete tinyconfig `vmlinux` link:
+`kernel/softirq.c`.  Its default policy mode brackets `handle_softirqs()` with
+entry/exit map records and can continue through a complete tinyconfig
+`vmlinux` link:
 
 ```text
 . /path/to/linux-work/scripts/env.sh
@@ -86,20 +87,30 @@ python3 clang/tools/clang-kernel-lab/tests/test_linux_kbuild_map.py \
   --configure-tiny --full-vmlinux
 ```
 
+Passing `--source-sites` instead qualifies Linux's opt-in
+`linux_irq_site()` wrapper.  All three variants receive identical line-table
+and prefix-map flags; only the mapped variant loads the plugin and defines
+`__RISCV_LINUX_IRQ_SITE_MAP__`.  The RISC-V Kconfig probe records whether the
+compiler recognizes the builtin, while an ordinary build compiles the wrapper
+to an argument-agnostic no-op.  The first source-qualified marker is the
+terminal softirq-exit boundary after `current_restore_flags()`; it resolves to
+the same object and final-image PC as the independent policy exit rule.
+
 The driver always uses one make job, checks free space before every build,
 uses fixed Kbuild identity fields, and never invokes a clean target.  Kbuild
-does not track `CLANG_KERNEL_LAB_MAP_SPEC`, so the driver removes only the
-exact `kernel/softirq.o` command/dependency outputs before each variant.  The
-full-image gate additionally requires the Linux linker script to retain the
-three map sections as non-allocated host metadata; allocated orphan placement
-is a failure because it changes runtime layout.  The final-image comparison
-requires every runtime program header, `System.map`, allocated section other
-than `.notes`, meaningful symbol, relocation, and unwind record to match.  It
-normalizes only the GNU build-ID payload after proving that every other note
-field and byte is identical: the build ID is expected to hash deliberately
-retained host metadata.  The file offset of an otherwise identical
-`.riscv.attributes` section may move in the unstripped ELF as non-allocated
-symbol and string tables grow; all runtime headers remain exact.
+does not track either the policy environment or source-map activation, so the
+driver removes only the exact `kernel/softirq.o` command/dependency outputs
+before each variant.  The full-image gate additionally requires the Linux
+linker script to retain the three map sections as non-allocated host metadata;
+allocated orphan placement is a failure because it changes runtime layout.
+The final-image comparison requires every runtime program header, `System.map`,
+allocated section other than `.notes`, meaningful symbol, relocation, and
+unwind record to match.  It normalizes only the GNU build-ID payload after
+proving that every other note field and byte is identical: the build ID is
+expected to hash deliberately retained host metadata.  The file offset of an
+otherwise identical `.riscv.attributes` section may move in the unstripped ELF
+as non-allocated symbol and string tables grow; all runtime headers remain
+exact.
 
 On macOS the pass-plugin suffix is `.dylib`.  The site-map test checks object
 and linked `.text` identity, linked sidecar identity/load-bias fields, valid

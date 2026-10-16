@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Qualify the RISC-V IRQ map on Linux kernel/softirq.c via Kbuild.
+"""Qualify policy- or source-selected RISC-V IRQ sites via Linux Kbuild.
 
 The caller must source the kernel workspace's host-tool environment first.
-This driver never runs a clean target.  To make a policy-only environment
-change visible to Kbuild, it removes only kernel/softirq.o and its exact
-dependency/command records before rebuilding that object.
+This driver never runs a clean target.  To make map selection changes visible
+to Kbuild, it removes only kernel/softirq.o and its exact dependency/command
+records before rebuilding that object.
 """
 
 from __future__ import annotations
@@ -84,7 +84,7 @@ def require_disk(build: pathlib.Path, minimum_gib: float) -> int:
 
 
 def make_command(arguments: argparse.Namespace, target: str,
-                 *, plugin: bool) -> list[str]:
+                 *, plugin: bool, source_site: bool = False) -> list[str]:
     command = [
         arguments.make,
         "-C", str(arguments.linux),
@@ -102,8 +102,18 @@ def make_command(arguments: argparse.Namespace, target: str,
     host_cflags = os.environ.get("HOSTCFLAGS")
     if host_cflags:
         command.append(f"HOSTCFLAGS={host_cflags}")
+    softirq_flags = []
+    if arguments.source_sites:
+        softirq_flags.extend([
+            "-gline-tables-only",
+            f"-ffile-prefix-map={arguments.linux}=.",
+        ])
     if plugin:
-        command.append(f"CFLAGS_softirq.o+=-fpass-plugin={arguments.plugin}")
+        softirq_flags.append(f"-fpass-plugin={arguments.plugin}")
+    if source_site:
+        softirq_flags.append("-D__RISCV_LINUX_IRQ_SITE_MAP__")
+    if softirq_flags:
+        command.append(f"CFLAGS_softirq.o+={' '.join(softirq_flags)}")
     command.extend(["-j1", target])
     return command
 
@@ -122,7 +132,8 @@ def force_softirq_rebuild(build: pathlib.Path) -> None:
 
 def build_variant(arguments: argparse.Namespace, name: str, *, plugin: bool,
                   spec: pathlib.Path | None, target: str,
-                  artifacts: pathlib.Path) -> dict[str, pathlib.Path]:
+                  artifacts: pathlib.Path,
+                  source_site: bool = False) -> dict[str, pathlib.Path]:
     require_disk(arguments.build, arguments.min_free_gib)
     force_softirq_rebuild(arguments.build)
     environment = os.environ.copy()
@@ -132,7 +143,9 @@ def build_variant(arguments: argparse.Namespace, name: str, *, plugin: bool,
         environment["CLANG_KERNEL_LAB_MAP_SPEC"] = str(spec)
     print(f"building Linux {name} target={target} with -j1", flush=True)
     run(
-        make_command(arguments, target, plugin=plugin),
+        make_command(
+            arguments, target, plugin=plugin, source_site=source_site
+        ),
         environment=environment,
         capture=False,
     )
@@ -156,16 +169,17 @@ def build_variant(arguments: argparse.Namespace, name: str, *, plugin: bool,
 
 
 def decode_sites(arguments: argparse.Namespace, artifact: pathlib.Path,
-                 *, relocatable: bool) -> dict[str, object]:
+                 *, relocatable: bool,
+                 expected_kinds: list[int]) -> dict[str, object]:
     command = [str(arguments.site_tool)]
     if relocatable:
         command.append("--validate-relocatable")
     command.append(str(artifact))
     document = json.loads(run(command).stdout)
     kinds = sorted(site["kind"] for site in document["sites"])
-    if kinds != [10, 11]:
+    if kinds != expected_kinds:
         raise AssertionError(
-            f"{artifact} has site kinds {kinds}, expected softirq entry/exit"
+            f"{artifact} has site kinds {kinds}, expected {expected_kinds}"
         )
     return document
 
@@ -202,7 +216,8 @@ def partial_link(arguments: argparse.Namespace, linker: pathlib.Path,
         f"Linux Kbuild {linker_name} partial-link map",
     )
     mapped_document = decode_sites(
-        arguments, outputs["mapped"], relocatable=True
+        arguments, outputs["mapped"], relocatable=True,
+        expected_kinds=arguments.expected_kinds,
     )
     return {
         "result": "PASS",
@@ -451,7 +466,8 @@ def qualify_vmlinux(arguments: argparse.Namespace,
             variants["mapped"]["system_map"].read_bytes():
         raise AssertionError("map mode changed System.map")
     linked_document = decode_sites(
-        arguments, variants["mapped"]["vmlinux"], relocatable=False
+        arguments, variants["mapped"]["vmlinux"], relocatable=False,
+        expected_kinds=arguments.expected_kinds,
     )
     return {
         "result": "PASS",
@@ -478,6 +494,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--spec", type=pathlib.Path, default=DEFAULT_SPEC)
     parser.add_argument("--configure-tiny", action="store_true")
     parser.add_argument("--full-vmlinux", action="store_true")
+    parser.add_argument(
+        "--source-sites",
+        action="store_true",
+        help="qualify the opt-in Linux source wrapper instead of policy rules",
+    )
     parser.add_argument("--min-free-gib", type=float, default=1.0)
     return parser.parse_args()
 
@@ -495,7 +516,13 @@ def main() -> int:
     )
     arguments.plugin = require_file(arguments.plugin, "map plugin")
     arguments.site_tool = require_file(arguments.site_tool, "site tool")
-    arguments.spec = require_file(arguments.spec, "softirq map specification")
+    if arguments.source_sites:
+        arguments.spec = None
+    else:
+        arguments.spec = require_file(
+            arguments.spec, "softirq map specification"
+        )
+    arguments.expected_kinds = [11] if arguments.source_sites else [10, 11]
     if arguments.min_free_gib <= 0:
         raise ValueError("--min-free-gib must be positive")
     require_build_layout(arguments.linux, arguments.build)
@@ -532,6 +559,7 @@ def main() -> int:
             "mapped": build_variant(
                 arguments, "mapped", plugin=True, spec=arguments.spec,
                 target=target, artifacts=artifacts,
+                source_site=arguments.source_sites,
             ),
         }
 
@@ -556,7 +584,8 @@ def main() -> int:
             "Linux Kbuild softirq map object",
         )
         object_document = decode_sites(
-            arguments, variants["mapped"]["object"], relocatable=True
+            arguments, variants["mapped"]["object"], relocatable=True,
+            expected_kinds=arguments.expected_kinds,
         )
 
         results: dict[str, object] = {
@@ -566,6 +595,9 @@ def main() -> int:
             ]).stdout.strip(),
             "config_sha256": sha256(arguments.build / ".config"),
             "build_jobs": 1,
+            "selection_mode": (
+                "source-wrapper" if arguments.source_sites else "policy"
+            ),
             "softirq_object": {
                 "result": "PASS",
                 "disabled_byte_identity": "PASS",
