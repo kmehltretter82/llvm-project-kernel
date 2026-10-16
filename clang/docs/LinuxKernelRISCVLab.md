@@ -119,7 +119,7 @@ named sanitizer callbacks, and fails closed on unresolved calls.  Symbol
 ranges are required for a normal linked Linux image because `.noinstr.text` is
 folded into `.text` while `__noinstr_text_start` and `__noinstr_text_end`
 survive.  Matched linkable good/bad fixtures are the current gate; the checker
-does not yet claim a transitive kernel call graph.
+does not infer safety beyond the selected policy scope.
 
 The first real-image run uses all three surviving Linux ranges: `noinstr`,
 `irqentry`, and `softirqentry`.  On the source-wrapper tinyconfig `vmlinux`
@@ -155,6 +155,29 @@ findings.  This is a root-region policy result only: the target sets are
 asserted rather than inferred, and their callees are not recursively scanned.
 It is not a kernel qualification.  The schema-one policy remains the negative
 control that exposes all four sites as unknown.
+
+Schema three recursively scans linked functions reached by both resolved
+direct calls and every declared indirect target.  A reachable function must
+have a defined executable symbol at the target address and one non-empty linked
+size.  The traversal deduplicates cycles, fails closed at 128 call edges or
+4,096 functions, and records the shortest discovered call path with each
+finding, including every node and intervening callsite address.  Its matched
+fixtures cover a safe two-hop chain, a forbidden callback and an unknown
+indirect call in the callee, a zero-sized target, a cycle, and a declared
+indirect target whose body must itself be scanned.  A matched control also
+approves the exact indirect site inside the reached callee and recursively
+checks its target.  Every case runs with linker relaxation enabled and
+disabled.
+
+The image-bound Linux schema-three policy deliberately reuses only the four
+reviewed root indirect rules.  The transitive discovery reaches 560 functions,
+119,746 bytes, 43,315 instructions, 1,605 calls, and depth 14.  It returns
+`FAIL` with 63 further unknown indirect calls and nine decode failures.  Lab
+LLVM 24 and stock LLVM 22.1.8 agree exactly on those counts.  This produces an
+auditable backlog without a terminal-symbol waiver.  The graph is still a
+conservative linear scan of each function range; it does not yet model branch
+feasibility, tail calls, exception edges, or transition state, so neither its
+paths nor the schema-two target assertions are a kernel qualification.
 
 The complete checker will also consume the resolved site map, DWARF/BTF where
 available, and expand from RISC-V vectors, irqentry, and noinstr regions to

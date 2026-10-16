@@ -59,6 +59,8 @@ namespace {
 constexpr uint64_t MaxPolicyBytes = 1024 * 1024;
 constexpr uint64_t MaxEntryRegionBytes = 256 * 1024 * 1024;
 constexpr uint64_t MaxInstructionOffset = 256 * 1024 * 1024;
+constexpr uint64_t MaxTransitiveFunctions = 4096;
+constexpr unsigned MaxCallDepth = 128;
 
 cl::opt<std::string> InputFilename(cl::Positional, cl::Required,
                                    cl::desc("<linked-rv64-elf>"));
@@ -105,6 +107,7 @@ struct ResolvedIndirectCall {
 
 struct SymbolTables {
   std::map<uint64_t, std::vector<std::string>> FunctionsByAddress;
+  std::map<uint64_t, std::vector<uint64_t>> FunctionSizesByAddress;
   std::map<uint64_t, std::vector<std::string>> CodeNamesByAddress;
   std::map<uint64_t, std::vector<std::string>> NamesByAddress;
   std::map<std::string, std::vector<uint64_t>> AddressesByName;
@@ -120,6 +123,25 @@ struct ResolvedRegion {
   StringRef Bytes;
 };
 
+struct DiscoveredTarget {
+  uint64_t CallsiteAddress = 0;
+  uint64_t TargetAddress = 0;
+  std::vector<std::string> TargetSymbols;
+  std::vector<std::string> CallPath;
+  std::vector<uint64_t> CallPathAddresses;
+  std::vector<uint64_t> CallPathCallsites;
+};
+
+struct ResolvedFunction {
+  ResolvedRegion Region;
+  uint64_t ReachedFromAddress = 0;
+  unsigned Depth = 0;
+  std::vector<std::string> Aliases;
+  std::vector<std::string> CallPath;
+  std::vector<uint64_t> CallPathAddresses;
+  std::vector<uint64_t> CallPathCallsites;
+};
+
 struct Finding {
   std::string Rule;
   std::string Region;
@@ -130,6 +152,9 @@ struct Finding {
   std::vector<std::string> TargetSymbols;
   std::string MatchedSymbol;
   std::string Detail;
+  std::vector<std::string> CallPath;
+  std::vector<uint64_t> CallPathAddresses;
+  std::vector<uint64_t> CallPathCallsites;
 };
 
 struct Coverage {
@@ -141,6 +166,9 @@ struct Coverage {
   uint64_t UnknownCalls = 0;
   uint64_t PolicyResolvedIndirectCalls = 0;
   uint64_t IndirectTargetEdges = 0;
+  uint64_t RootRegions = 0;
+  uint64_t TransitiveFunctions = 0;
+  uint64_t MaxCallDepthReached = 0;
 };
 
 struct DisassemblyState {
@@ -261,8 +289,10 @@ static Expected<Policy> parsePolicy(StringRef Path) {
   if (!Root)
     return entryError("top-level policy must be an object");
   std::optional<int64_t> SchemaValue = Root->getInteger("schema");
-  if (!SchemaValue || (*SchemaValue != 1 && *SchemaValue != 2))
-    return entryError("unsupported or missing policy schema; expected 1 or 2");
+  if (!SchemaValue ||
+      (*SchemaValue != 1 && *SchemaValue != 2 && *SchemaValue != 3))
+    return entryError(
+        "unsupported or missing policy schema; expected 1, 2, or 3");
   unsigned Schema = static_cast<unsigned>(*SchemaValue);
   std::set<std::string> KnownFields{"schema",
                                     "architecture",
@@ -304,10 +334,13 @@ static Expected<Policy> parsePolicy(StringRef Path) {
         "policy requires an entry section or symbol-bounded entry range");
   if (EntrySectionCount + EntryRangeCount > 64)
     return entryError("policy exceeds the 64-region limit");
-  if (Schema >= 2 &&
+  if (Schema == 2 &&
       (!IndirectCalls || IndirectCalls->empty() || IndirectCalls->size() > 256))
     return entryError(
         "schema two requires 1 through 256 indirect call target rules");
+  if (Schema == 3 && (!IndirectCalls || IndirectCalls->size() > 4096))
+    return entryError(
+        "schema three requires 0 through 4096 indirect call target rules");
   const json::Array *Forbidden = Root->getArray("forbidden_symbols");
   if (!Forbidden || Forbidden->empty() || Forbidden->size() > 4096)
     return entryError("forbidden_symbols must contain 1 through 4096 names");
@@ -468,6 +501,15 @@ static Expected<SymbolTables> readDefinedSymbols(const ObjectFile &Object) {
       return Name.takeError();
     if (!Name->empty())
       Symbols.SizesByName[Name->str()].push_back(Size);
+    Expected<SymbolRef::Type> Type = Symbol.getType();
+    if (!Type)
+      return Type.takeError();
+    if (*Type == SymbolRef::ST_Function) {
+      Expected<uint64_t> Address = Symbol.getAddress();
+      if (!Address)
+        return Address.takeError();
+      Symbols.FunctionSizesByAddress[*Address].push_back(Size);
+    }
   }
   for (auto &[Address, Names] : Symbols.FunctionsByAddress) {
     (void)Address;
@@ -483,6 +525,11 @@ static Expected<SymbolTables> readDefinedSymbols(const ObjectFile &Object) {
     (void)Address;
     llvm::sort(Names);
     Names.erase(std::unique(Names.begin(), Names.end()), Names.end());
+  }
+  for (auto &[Address, Sizes] : Symbols.FunctionSizesByAddress) {
+    (void)Address;
+    llvm::sort(Sizes);
+    Sizes.erase(std::unique(Sizes.begin(), Sizes.end()), Sizes.end());
   }
   for (auto &[Name, Addresses] : Symbols.AddressesByName) {
     (void)Name;
@@ -634,6 +681,7 @@ resolveIndirectCalls(const Policy &Configuration, const SymbolTables &Symbols,
       continue;
     }
     bool Valid = true;
+    std::set<uint64_t> SeenTargetAddresses;
     for (const std::string &TargetName : Rule.TargetSymbols) {
       auto Target = Symbols.AddressesByName.find(TargetName);
       if (Target == Symbols.AddressesByName.end() ||
@@ -649,6 +697,18 @@ resolveIndirectCalls(const Policy &Configuration, const SymbolTables &Symbols,
         continue;
       }
       uint64_t TargetAddress = Target->second.front();
+      if (!SeenTargetAddresses.insert(TargetAddress).second) {
+        Finding F = addressFinding(
+            "duplicate-indirect-target-address", Rule.CallerSymbol,
+            Candidate.InstructionAddress,
+            "different target_symbols entries alias the same linked address");
+        F.TargetAddress = TargetAddress;
+        F.HasTargetAddress = true;
+        F.MatchedSymbol = TargetName;
+        Findings.push_back(std::move(F));
+        Valid = false;
+        continue;
+      }
       if (TargetAddress & 1) {
         Finding F =
             addressFinding("misaligned-indirect-target", Rule.CallerSymbol,
@@ -700,16 +760,126 @@ resolveIndirectCalls(const Policy &Configuration, const SymbolTables &Symbols,
   return Resolved;
 }
 
-static Error scanRegion(const ResolvedRegion &Region,
-                        const Policy &Configuration,
-                        const SymbolTables &Symbols,
-                        std::map<uint64_t, ResolvedIndirectCall> &IndirectCalls,
-                        DisassemblyState &State, Coverage &Counts,
-                        std::vector<Finding> &Findings) {
+static Expected<std::optional<ResolvedFunction>>
+resolveTransitiveFunction(const DiscoveredTarget &Target, unsigned Depth,
+                          const ObjectFile &Object, const SymbolTables &Symbols,
+                          std::vector<Finding> &Findings) {
+  auto Functions = Symbols.FunctionsByAddress.find(Target.TargetAddress);
+  std::string Name = Target.TargetSymbols.empty()
+                         ? hex64(Target.TargetAddress)
+                         : Target.TargetSymbols.front();
+  std::vector<std::string> Path = Target.CallPath;
+  Path.push_back(Name);
+  std::vector<uint64_t> PathAddresses = Target.CallPathAddresses;
+  PathAddresses.push_back(Target.TargetAddress);
+  auto AddFailure = [&](StringRef Rule, StringRef Detail) {
+    Finding F = addressFinding(Rule, Name, Target.CallsiteAddress, Detail);
+    F.TargetAddress = Target.TargetAddress;
+    F.HasTargetAddress = true;
+    auto Aliases = Symbols.NamesByAddress.find(Target.TargetAddress);
+    F.TargetSymbols = Aliases == Symbols.NamesByAddress.end()
+                          ? Target.TargetSymbols
+                          : Aliases->second;
+    F.CallPath = Path;
+    F.CallPathAddresses = PathAddresses;
+    F.CallPathCallsites = Target.CallPathCallsites;
+    Findings.push_back(std::move(F));
+  };
+  if (Functions == Symbols.FunctionsByAddress.end()) {
+    AddFailure("unresolved-transitive-function",
+               "reachable target has no defined function symbol");
+    return std::optional<ResolvedFunction>();
+  }
+
+  std::set<uint64_t> Sizes;
+  auto FunctionSizes =
+      Symbols.FunctionSizesByAddress.find(Target.TargetAddress);
+  if (FunctionSizes != Symbols.FunctionSizesByAddress.end()) {
+    for (uint64_t Size : FunctionSizes->second) {
+      if (Size)
+        Sizes.insert(Size);
+    }
+  }
+  if (Sizes.size() != 1) {
+    AddFailure("unresolved-transitive-function-range",
+               "reachable function aliases must identify one non-empty linked "
+               "range");
+    return std::optional<ResolvedFunction>();
+  }
+  uint64_t Size = *Sizes.begin();
+  if (Size > MaxEntryRegionBytes) {
+    AddFailure("oversized-transitive-function",
+               "reachable function exceeds the 256 MiB region limit");
+    return std::optional<ResolvedFunction>();
+  }
+  if (Target.TargetAddress > std::numeric_limits<uint64_t>::max() - Size) {
+    AddFailure("invalid-transitive-function-range",
+               "reachable function range overflows uint64");
+    return std::optional<ResolvedFunction>();
+  }
+  uint64_t EndAddress = Target.TargetAddress + Size;
+
+  std::vector<ResolvedRegion> Matches;
+  for (SectionRef Section : Object.sections()) {
+    if (!(ELFSectionRef(Section).getFlags() & ELF::SHF_EXECINSTR))
+      continue;
+    Expected<StringRef> SectionName = Section.getName();
+    if (!SectionName)
+      return SectionName.takeError();
+    Expected<StringRef> Contents = Section.getContents();
+    if (!Contents)
+      return Contents.takeError();
+    uint64_t SectionBegin = Section.getAddress();
+    if (SectionBegin > std::numeric_limits<uint64_t>::max() - Contents->size())
+      return entryError(Twine("executable section '") + *SectionName +
+                        "' address range overflows uint64");
+    uint64_t SectionEnd = SectionBegin + Contents->size();
+    if (Target.TargetAddress < SectionBegin || EndAddress > SectionEnd)
+      continue;
+    uint64_t Offset = Target.TargetAddress - SectionBegin;
+    Matches.push_back({Name, "function:" + Name, SectionName->str(),
+                       Target.TargetAddress, EndAddress,
+                       Contents->substr(Offset, Size)});
+  }
+  if (Matches.size() != 1) {
+    AddFailure("unmapped-transitive-function",
+               "reachable function must belong to one executable section");
+    return std::optional<ResolvedFunction>();
+  }
+
+  ResolvedFunction Result;
+  Result.Region = std::move(Matches.front());
+  Result.ReachedFromAddress = Target.CallsiteAddress;
+  Result.Depth = Depth;
+  auto Aliases = Symbols.NamesByAddress.find(Target.TargetAddress);
+  Result.Aliases = Aliases == Symbols.NamesByAddress.end()
+                       ? Target.TargetSymbols
+                       : Aliases->second;
+  Result.CallPath = std::move(Path);
+  Result.CallPathAddresses = std::move(PathAddresses);
+  Result.CallPathCallsites = Target.CallPathCallsites;
+  return std::optional<ResolvedFunction>(std::move(Result));
+}
+
+static Error scanRegion(
+    const ResolvedRegion &Region, const Policy &Configuration,
+    const SymbolTables &Symbols,
+    std::map<uint64_t, ResolvedIndirectCall> &IndirectCalls,
+    DisassemblyState &State, Coverage &Counts, std::vector<Finding> &Findings,
+    ArrayRef<std::string> CallPath, ArrayRef<uint64_t> CallPathAddresses,
+    ArrayRef<uint64_t> CallPathCallsites,
+    std::vector<DiscoveredTarget> *DiscoveredTargets, bool IsTransitive) {
+  auto AddFinding = [&](Finding F) {
+    F.CallPath.assign(CallPath.begin(), CallPath.end());
+    F.CallPathAddresses.assign(CallPathAddresses.begin(),
+                               CallPathAddresses.end());
+    F.CallPathCallsites.assign(CallPathCallsites.begin(),
+                               CallPathCallsites.end());
+    Findings.push_back(std::move(F));
+  };
   if (Region.Bytes.empty()) {
-    Findings.push_back(addressFinding("empty-entry-region", Region.Name,
-                                      Region.Begin,
-                                      "configured entry region is empty"));
+    AddFinding(addressFinding("empty-entry-region", Region.Name, Region.Begin,
+                              "configured entry region is empty"));
     return Error::success();
   }
   if (Region.Bytes.size() > MaxEntryRegionBytes)
@@ -719,7 +889,7 @@ static Error scanRegion(const ResolvedRegion &Region,
     return entryError(Twine("entry region '") + Region.Name +
                       "' address range overflows uint64");
   if ((Region.Begin | Region.End) & 1) {
-    Findings.push_back(
+    AddFinding(
         addressFinding("misaligned-entry-region", Region.Name, Region.Begin,
                        "RISC-V entry boundaries must be two-byte aligned"));
     return Error::success();
@@ -730,6 +900,10 @@ static Error scanRegion(const ResolvedRegion &Region,
       Region.Bytes.size());
   State.InstrAnalysis->resetState();
   ++Counts.Regions;
+  if (IsTransitive)
+    ++Counts.TransitiveFunctions;
+  else
+    ++Counts.RootRegions;
   Counts.Bytes += Bytes.size();
   for (uint64_t Offset = 0; Offset < Bytes.size();) {
     uint64_t InstructionAddress = Region.Begin + Offset;
@@ -740,7 +914,7 @@ static Error scanRegion(const ResolvedRegion &Region,
         nulls());
     if (Status != MCDisassembler::Success || !Size ||
         Size > Bytes.size() - Offset) {
-      Findings.push_back(
+      AddFinding(
           addressFinding("decode-failure", Region.Name, InstructionAddress,
                          Status == MCDisassembler::SoftFail
                              ? "instruction decoded as architecturally invalid"
@@ -776,7 +950,7 @@ static Error scanRegion(const ResolvedRegion &Region,
                   std::numeric_limits<uint64_t>::max() - Size ||
               InstructionAddress + Size > Approved->second.CallerEnd) {
             ++Counts.UnknownCalls;
-            Findings.push_back(addressFinding(
+            AddFinding(addressFinding(
                 "callsite-outside-caller", Region.Name, InstructionAddress,
                 "indirect call instruction crosses caller_symbol's linked "
                 "range"));
@@ -786,10 +960,26 @@ static Error scanRegion(const ResolvedRegion &Region,
             ++Counts.PolicyResolvedIndirectCalls;
             Counts.IndirectTargetEdges +=
                 Approved->second.TargetAddresses.size();
+            if (DiscoveredTargets) {
+              for (size_t Index = 0;
+                   Index < Approved->second.TargetAddresses.size(); ++Index) {
+                DiscoveredTarget Target;
+                Target.CallsiteAddress = InstructionAddress;
+                Target.TargetAddress = Approved->second.TargetAddresses[Index];
+                Target.TargetSymbols = {Approved->second.TargetSymbols[Index]};
+                Target.CallPath.assign(CallPath.begin(), CallPath.end());
+                Target.CallPathAddresses.assign(CallPathAddresses.begin(),
+                                                CallPathAddresses.end());
+                Target.CallPathCallsites.assign(CallPathCallsites.begin(),
+                                                CallPathCallsites.end());
+                Target.CallPathCallsites.push_back(InstructionAddress);
+                DiscoveredTargets->push_back(std::move(Target));
+              }
+            }
           }
         } else {
           ++Counts.UnknownCalls;
-          Findings.push_back(addressFinding(
+          AddFinding(addressFinding(
               "unknown-call", Region.Name, InstructionAddress,
               "call target cannot be resolved statically and has no exact "
               "callsite policy"));
@@ -803,7 +993,7 @@ static Error scanRegion(const ResolvedRegion &Region,
         F.HasTargetAddress = true;
         F.TargetSymbols = Names->second;
         F.MatchedSymbol = ForbiddenName->str();
-        Findings.push_back(std::move(F));
+        AddFinding(std::move(F));
       } else if (Function == Symbols.FunctionsByAddress.end()) {
         ++Counts.UnknownCalls;
         Finding F =
@@ -813,9 +1003,22 @@ static Error scanRegion(const ResolvedRegion &Region,
         F.HasTargetAddress = true;
         if (Names != Symbols.NamesByAddress.end())
           F.TargetSymbols = Names->second;
-        Findings.push_back(std::move(F));
+        AddFinding(std::move(F));
       } else {
         ++Counts.ResolvedCalls;
+        if (DiscoveredTargets) {
+          DiscoveredTarget Target;
+          Target.CallsiteAddress = InstructionAddress;
+          Target.TargetAddress = TargetAddress;
+          Target.TargetSymbols = Function->second;
+          Target.CallPath.assign(CallPath.begin(), CallPath.end());
+          Target.CallPathAddresses.assign(CallPathAddresses.begin(),
+                                          CallPathAddresses.end());
+          Target.CallPathCallsites.assign(CallPathCallsites.begin(),
+                                          CallPathCallsites.end());
+          Target.CallPathCallsites.push_back(InstructionAddress);
+          DiscoveredTargets->push_back(std::move(Target));
+        }
       }
     }
 #if LLVM_VERSION_MAJOR >= 24
@@ -847,6 +1050,20 @@ static json::Object findingJSON(const Finding &F) {
   Result["matched_symbol"] = F.MatchedSymbol.empty()
                                  ? json::Value(nullptr)
                                  : json::Value(F.MatchedSymbol);
+  if (!F.CallPath.empty()) {
+    json::Array Path;
+    for (const std::string &Name : F.CallPath)
+      Path.push_back(Name);
+    Result["call_path"] = std::move(Path);
+    json::Array Addresses;
+    for (uint64_t Address : F.CallPathAddresses)
+      Addresses.push_back(hex64(Address));
+    Result["call_path_vas"] = std::move(Addresses);
+    json::Array Callsites;
+    for (uint64_t Address : F.CallPathCallsites)
+      Callsites.push_back(hex64(Address));
+    Result["call_path_callsites"] = std::move(Callsites);
+  }
   return Result;
 }
 
@@ -856,7 +1073,7 @@ int main(int Argc, char **Argv) {
   InitLLVM Initialize(Argc, Argv);
   cl::ParseCommandLineOptions(
       Argc, Argv,
-      "Conservatively audit direct calls in RISC-V Linux entry regions\n");
+      "Conservatively audit calls reachable from RISC-V Linux entry regions\n");
 
   Expected<Policy> Configuration = parsePolicy(PolicyFilename);
   if (!Configuration)
@@ -1030,10 +1247,105 @@ int main(int Argc, char **Argv) {
         "overlapping-entry-regions", Regions[Index].Name, Regions[Index].Begin,
         "configured entry regions overlap and would double-count code"));
   }
+  std::vector<DiscoveredTarget> InitialTargets;
   for (const ResolvedRegion &Region : Regions) {
-    if (Error E = scanRegion(Region, *Configuration, *Symbols, IndirectCalls,
-                             **State, Counts, Findings))
+    std::vector<std::string> CallPath;
+    std::vector<uint64_t> CallPathAddresses;
+    std::vector<uint64_t> CallPathCallsites;
+    if (Configuration->Schema >= 3) {
+      CallPath.push_back(Region.Name);
+      CallPathAddresses.push_back(Region.Begin);
+    }
+    if (Error E = scanRegion(
+            Region, *Configuration, *Symbols, IndirectCalls, **State, Counts,
+            Findings, CallPath, CallPathAddresses, CallPathCallsites,
+            Configuration->Schema >= 3 ? &InitialTargets : nullptr,
+            /*IsTransitive=*/false))
       return fail(toString(std::move(E)));
+  }
+
+  std::vector<ResolvedFunction> TransitiveFunctions;
+  if (Configuration->Schema >= 3) {
+    auto InRootRegion = [&](uint64_t Address) {
+      return llvm::any_of(Regions, [&](const ResolvedRegion &Region) {
+        return Address >= Region.Begin && Address < Region.End;
+      });
+    };
+    std::set<uint64_t> Scheduled;
+    std::vector<DiscoveredTarget> Worklist;
+    bool FunctionLimitReported = false;
+    auto Schedule = [&](DiscoveredTarget Target) {
+      if (InRootRegion(Target.TargetAddress) ||
+          Scheduled.count(Target.TargetAddress))
+        return;
+      if (Scheduled.size() >= MaxTransitiveFunctions) {
+        if (!FunctionLimitReported) {
+          Finding F = addressFinding(
+              "transitive-function-limit", Target.CallPath.back(),
+              Target.CallsiteAddress,
+              "call graph exceeds the 4096-function safety limit");
+          F.TargetAddress = Target.TargetAddress;
+          F.HasTargetAddress = true;
+          F.TargetSymbols = Target.TargetSymbols;
+          F.CallPath = Target.CallPath;
+          F.CallPathAddresses = Target.CallPathAddresses;
+          F.CallPathCallsites = Target.CallPathCallsites;
+          F.CallPath.push_back(Target.TargetSymbols.empty()
+                                   ? hex64(Target.TargetAddress)
+                                   : Target.TargetSymbols.front());
+          F.CallPathAddresses.push_back(Target.TargetAddress);
+          Findings.push_back(std::move(F));
+          FunctionLimitReported = true;
+        }
+        return;
+      }
+      Scheduled.insert(Target.TargetAddress);
+      Worklist.push_back(std::move(Target));
+    };
+    for (DiscoveredTarget &Target : InitialTargets)
+      Schedule(std::move(Target));
+
+    for (size_t Index = 0; Index < Worklist.size(); ++Index) {
+      DiscoveredTarget Target = std::move(Worklist[Index]);
+      unsigned Depth = static_cast<unsigned>(Target.CallPath.size());
+      if (Depth > MaxCallDepth) {
+        Finding F = addressFinding(
+            "call-depth-limit", Target.CallPath.back(), Target.CallsiteAddress,
+            "call path exceeds the 128-edge safety limit");
+        F.TargetAddress = Target.TargetAddress;
+        F.HasTargetAddress = true;
+        F.TargetSymbols = Target.TargetSymbols;
+        F.CallPath = Target.CallPath;
+        F.CallPathAddresses = Target.CallPathAddresses;
+        F.CallPathCallsites = Target.CallPathCallsites;
+        F.CallPath.push_back(Target.TargetSymbols.empty()
+                                 ? hex64(Target.TargetAddress)
+                                 : Target.TargetSymbols.front());
+        F.CallPathAddresses.push_back(Target.TargetAddress);
+        Findings.push_back(std::move(F));
+        continue;
+      }
+      Expected<std::optional<ResolvedFunction>> Function =
+          resolveTransitiveFunction(Target, Depth, *Object, *Symbols, Findings);
+      if (!Function)
+        return fail(toString(Function.takeError()));
+      if (!*Function)
+        continue;
+
+      Counts.MaxCallDepthReached =
+          std::max<uint64_t>(Counts.MaxCallDepthReached, Depth);
+      std::vector<DiscoveredTarget> ChildTargets;
+      if (Error E =
+              scanRegion((*Function)->Region, *Configuration, *Symbols,
+                         IndirectCalls, **State, Counts, Findings,
+                         (*Function)->CallPath, (*Function)->CallPathAddresses,
+                         (*Function)->CallPathCallsites, &ChildTargets,
+                         /*IsTransitive=*/true))
+        return fail(toString(std::move(E)));
+      TransitiveFunctions.push_back(std::move(**Function));
+      for (DiscoveredTarget &Child : ChildTargets)
+        Schedule(std::move(Child));
+    }
   }
   for (const auto &[Address, Rule] : IndirectCalls) {
     if (!Rule.Used)
@@ -1065,6 +1377,35 @@ int main(int Argc, char **Argv) {
         {"end_va", hex64(Region.End)},
         {"size", static_cast<int64_t>(Region.Bytes.size())},
     });
+  json::Array JSONTransitiveFunctions;
+  for (const ResolvedFunction &Function : TransitiveFunctions) {
+    json::Array Aliases;
+    for (const std::string &Name : Function.Aliases)
+      Aliases.push_back(Name);
+    json::Array Path;
+    for (const std::string &Name : Function.CallPath)
+      Path.push_back(Name);
+    json::Array PathAddresses;
+    for (uint64_t Address : Function.CallPathAddresses)
+      PathAddresses.push_back(hex64(Address));
+    json::Array PathCallsites;
+    for (uint64_t Address : Function.CallPathCallsites)
+      PathCallsites.push_back(hex64(Address));
+    JSONTransitiveFunctions.push_back(json::Object{
+        {"symbol", Function.Region.Name},
+        {"aliases", std::move(Aliases)},
+        {"source", Function.Region.Source},
+        {"section", Function.Region.Section},
+        {"begin_va", hex64(Function.Region.Begin)},
+        {"end_va", hex64(Function.Region.End)},
+        {"size", static_cast<int64_t>(Function.Region.Bytes.size())},
+        {"reached_from_va", hex64(Function.ReachedFromAddress)},
+        {"depth", static_cast<int64_t>(Function.Depth)},
+        {"call_path", std::move(Path)},
+        {"call_path_vas", std::move(PathAddresses)},
+        {"call_path_callsites", std::move(PathCallsites)},
+    });
+  }
   json::Array JSONForbidden;
   for (const std::string &Name : Configuration->ForbiddenSymbols)
     JSONForbidden.push_back(Name);
@@ -1142,12 +1483,23 @@ int main(int Argc, char **Argv) {
       {"indirect_target_edges",
        static_cast<int64_t>(Counts.IndirectTargetEdges)},
   };
+  if (Configuration->Schema >= 3) {
+    CoverageJSON["root_regions"] = static_cast<int64_t>(Counts.RootRegions);
+    CoverageJSON["transitive_functions"] =
+        static_cast<int64_t>(Counts.TransitiveFunctions);
+    CoverageJSON["max_call_depth_reached"] =
+        static_cast<int64_t>(Counts.MaxCallDepthReached);
+    CoverageJSON["function_limit"] =
+        static_cast<int64_t>(MaxTransitiveFunctions);
+    CoverageJSON["call_depth_limit"] = static_cast<int64_t>(MaxCallDepth);
+  }
   bool Passed = Findings.empty();
   json::Object Root{
       {"schema", 1},
       {"checker", "rv-entrycheck"},
       {"scope", Configuration->Schema == 1 ? "direct-calls-in-entry-regions-v1"
-                                           : "site-scoped-indirect-targets-v2"},
+                : Configuration->Schema == 2 ? "site-scoped-indirect-targets-v2"
+                                             : "transitive-call-graph-v3"},
       {"result", Passed ? "PASS" : "FAIL"},
       {"image", std::move(Image)},
       {"policy", std::move(PolicyJSON)},
@@ -1156,6 +1508,8 @@ int main(int Argc, char **Argv) {
       {"coverage", std::move(CoverageJSON)},
       {"findings", std::move(JSONFindings)},
   };
+  if (Configuration->Schema >= 3)
+    Root["resolved_transitive_functions"] = std::move(JSONTransitiveFunctions);
   outs() << formatv(Compact ? "{0}\n" : "{0:2}\n",
                     json::Value(std::move(Root)));
   return Passed ? 0 : 1;

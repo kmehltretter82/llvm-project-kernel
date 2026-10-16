@@ -1,0 +1,88 @@
+{
+  "schema": 3,
+  "architecture": "riscv64",
+  "expected_image": {
+    "sha256": "6db55c4e53add1746038001c31cfebdfcf01f55d4af562741fbd1a2af08430ca",
+    "build_id": "43105ae71ed6fb22b61788db6d5c2bd56d5b82c6"
+  },
+  "entry_symbol_ranges": [
+    {
+      "name": "noinstr",
+      "start_symbol": "__noinstr_text_start",
+      "end_symbol": "__noinstr_text_end"
+    },
+    {
+      "name": "irqentry",
+      "start_symbol": "__irqentry_text_start",
+      "end_symbol": "__irqentry_text_end"
+    },
+    {
+      "name": "softirqentry",
+      "start_symbol": "__softirqentry_text_start",
+      "end_symbol": "__softirqentry_text_end"
+    }
+  ],
+  "indirect_call_targets": [
+    {
+      "caller_symbol": "handle_riscv_irq",
+      "instruction_offset": 32,
+      "target_symbols": [
+        "riscv_intc_aia_irq",
+        "riscv_intc_irq"
+      ]
+    },
+    {
+      "caller_symbol": "generic_handle_arch_irq",
+      "instruction_offset": 32,
+      "target_symbols": [
+        "riscv_intc_aia_irq",
+        "riscv_intc_irq"
+      ]
+    },
+    {
+      "caller_symbol": "sched_clock_noinstr",
+      "instruction_offset": 40,
+      "target_symbols": [
+        "jiffy_sched_clock_read",
+        "riscv_sched_clock",
+        "suspended_sched_clock_read"
+      ]
+    },
+    {
+      "caller_symbol": "handle_exception",
+      "instruction_offset": 332,
+      "target_symbols": [
+        "do_page_fault",
+        "do_trap_break",
+        "do_trap_ecall_m",
+        "do_trap_ecall_s",
+        "do_trap_ecall_u",
+        "do_trap_hardware_error",
+        "do_trap_insn_fault",
+        "do_trap_insn_illegal",
+        "do_trap_insn_misaligned",
+        "do_trap_load_fault",
+        "do_trap_load_misaligned",
+        "do_trap_software_check",
+        "do_trap_store_fault",
+        "do_trap_store_misaligned",
+        "do_trap_unknown"
+      ]
+    }
+  ],
+  "forbidden_symbols": [
+    "__asan_load1",
+    "__asan_store1",
+    "__cyg_profile_func_enter",
+    "__fentry__",
+    "__kasan_check_read",
+    "__kasan_check_write",
+    "__kcsan_check_access",
+    "__sanitizer_cov_trace_pc",
+    "__sanitizer_cov_trace_pc_guard",
+    "__stack_chk_fail",
+    "__ubsan_handle_type_mismatch_v1",
+    "_mcount"
+  ],
+  "reject_unknown_calls": true
+}

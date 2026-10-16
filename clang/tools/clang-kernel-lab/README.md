@@ -18,7 +18,9 @@ for the Linux IRQ/PREEMPT_RT laboratory:
   policy names executable sections or symbol-bounded regions and forbidden
   callbacks.  Schema one resolves direct RV64 calls and rejects every unknown;
   schema two can additionally bind an indirect call to exact target symbols at
-  one symbol-plus-offset callsite.  Both emit a deterministic JSON verdict.
+  one symbol-plus-offset callsite; schema three recursively scans every linked
+  function reached by those direct and declared indirect edges.  All emit a
+  deterministic JSON verdict.
 - `ClangKernelLab` is an LLVM pass plugin for explicit callbacks and
   deterministic perturbation.  Loading a specification through
   `CLANG_KERNEL_LAB_SPEC` changes generated code; it is not map mode.
@@ -86,6 +88,9 @@ python3 clang/tools/clang-kernel-lab/tests/test_rv_entrycheck.py \
 ../build-kernel-lab/rv-entrycheck \
   --policy clang/tools/clang-kernel-lab/examples/riscv-linux-entrycheck-v2.json \
   /path/to/the-matching-vmlinux
+../build-kernel-lab/rv-entrycheck \
+  --policy clang/tools/clang-kernel-lab/examples/riscv-linux-entrycheck-v3.json \
+  /path/to/the-matching-vmlinux
 ```
 
 The initial entry-check lane folds its input `.noinstr.text` into output
@@ -93,10 +98,14 @@ The initial entry-check lane folds its input `.noinstr.text` into output
 fixtures with relaxation enabled and disabled.  It resolves both relaxed
 `jal` and unrelaxed `auipc`/`jalr`, including a forbidden untyped alias of a
 typed function.  Separate controls cover whole-section selection, missing and
-overlapping regions, malformed schema-one and schema-two policies (including
-escaped duplicate JSON members), an RV64 relocatable object, and a linked RV32
-image.  The checker emits three distinct exit statuses: zero for a clean
-verdict, one for a semantic finding, and two for invalid input.
+overlapping regions, malformed policies (including escaped duplicate JSON
+members), an RV64 relocatable object, and a linked RV32 image.  Schema-three
+controls add safe and forbidden two-hop paths, rejected and exactly approved
+indirect calls in a reached callee, a zero-sized target, cycle deduplication,
+and recursive scanning of a declared indirect target, all with relaxation on
+and off.  The checker emits
+three distinct exit statuses: zero for a clean verdict, one for a semantic
+finding, and two for invalid input.
 
 `examples/riscv-linux-entrycheck-v1.json` is a deliberately strict starter
 policy for Linux's `noinstr`, `irqentry`, and `softirqentry` linker-symbol
@@ -137,12 +146,28 @@ points-to proof, and callees are not recursively scanned yet.  It is therefore
 not a kernel qualification and does not replace the schema-one fail-closed
 discovery result.
 
+Schema three turns every resolved direct target and every declared indirect
+target into a new linked-function work item.  Functions are identified by an
+exact executable address and one non-empty symbol size.  Cycles are scanned
+once, while a 128-edge depth cap and 4,096-function cap fail closed.  Every
+finding in the traversed graph includes the shortest discovered call path with
+both node and intervening callsite addresses.  There is no terminal-symbol or
+blanket external-call waiver.
+
+`examples/riscv-linux-entrycheck-v3.json` deliberately carries the same four
+reviewed root indirect rules into this wider discovery scope.  It reaches 560
+functions and 43,315 instructions at depth 14, then correctly returns `FAIL`:
+63 further indirect calls remain unknown and nine linked function ranges hit a
+decode boundary.  Those counts are cross-checked with lab LLVM 24 and stock
+LLVM 22.1.8.  The result is a reproducible backlog, not a safe-kernel claim.
+Linear function scanning also does not yet model branch feasibility, tail
+calls, exception edges, or state transitions.
+
 Symbol-bounded policy regions are necessary for a normal linked Linux image,
 where input `.noinstr.text` is folded into `.text` but
-`__noinstr_text_start` and `__noinstr_text_end` survive.  Neither current scope
-is a transitive call graph: allowed direct callees, tail calls, exception
-edges, state ordering, and compiler-generated helpers require later gates and
-must not be treated as qualified.
+`__noinstr_text_start` and `__noinstr_text_end` survive.  Tail calls, exception
+edges, state ordering, and compiler-generated helpers still require later
+gates and must not be treated as qualified.
 
 The bounded external-Linux gate drives a real RISC-V Kbuild compile of
 `kernel/softirq.c`.  Its default policy mode brackets `handle_softirqs()` with
