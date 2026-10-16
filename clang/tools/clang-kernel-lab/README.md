@@ -81,7 +81,13 @@ every executable section, function/object and non-local symbols, relocations
 targeting executable sections, and raw unwind sections plus their relocations.
 The fixture contains both `.text` and `.noinstr.text`, runs with linker
 relaxation enabled and disabled, and repeats the linked checks under section
-garbage collection.
+garbage collection.  It also links matching ThinLTO baseline, disabled-plugin,
+policy-map, and source-map objects with a same-revision `ld.lld`, applies the
+same whole-ELF fingerprint, verifies stable site IDs, and repeats the policy
+and source checks with section garbage collection.  Its linker script captures
+all fixture `.text.*`, `.rodata.*`, `.data.*`, and `.bss.*` inputs before the
+map sections; this prevents an orphan runtime section from being displaced by
+retained metadata and makes that ordering rule part of the regression.
 Its expectation switches make backend/revision behavior explicit.  Stock LLVM
 22 uses the defaults: SelectionDAG loses three sites and GlobalISel preserves
 four.  The lab LLVM 24 command shown above requires four SelectionDAG sites and
@@ -96,9 +102,11 @@ same final store as the optimizer-last policy selector.  Two copies below
 different absolute roots produce the same ID when `-ffile-prefix-map` gives
 them the same project-relative name.  The current source prototype requires
 line-table debug locations, rejects a changed/eliminated anchor, is qualified
-only for non-LTO, non-inlined fixtures, and does not imply a compiler or memory
-barrier.  Loading a Clang that provides the builtin without the matching map
-plugin is deliberately unsupported rather than a silent no-op.
+for non-inlined ordinary and single-module ThinLTO fixtures, and does not imply
+a compiler or memory barrier.  Loading a Clang that provides the builtin
+without the matching map plugin is deliberately unsupported rather than a
+silent no-op.  This bounded ThinLTO result does not yet qualify cross-TU
+import/inlining or a Linux kernel LTO link.
 
 The lab branch also patches LLVM 24 SelectionDAG.  Its target test verifies
 that PC-section labels are immediately before the RISC-V call and return:

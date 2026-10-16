@@ -75,8 +75,9 @@ passes text-identity and coverage checks at all six Clang optimization modes,
 uses prefix-mapped project-relative identity, and resolves to the same linked
 store PC as the independent policy selector.  Line tables are currently
 mandatory; changed anchors, missing coverage, and use outside RV64 Linux ELF
-with the medium code model are hard errors.  Non-LTO and non-inlined fixtures
-are the present qualification boundary.
+with the medium code model are hard errors.  Non-inlined ordinary and
+single-module ThinLTO fixtures are the present qualification boundary;
+cross-TU importing and a Linux LTO link remain outside it.
 
 ### Layer B: explicit callback and perturb mode
 
@@ -322,6 +323,13 @@ As of 2026-10-16 on `kernel-lab-riscv`:
   non-map allocated/executable bytes and layout, meaningful symbols, code
   relocations, and unwind sections/relocations in relocatable and linked ELF;
   linker relaxation on/off and section garbage collection all pass;
+- same-revision LLVM 24 ThinLTO preserves both the policy and source-builtin
+  sites, their stable IDs, and the complete linked-ELF inertness fingerprint;
+  disabled-plugin and section-GC controls pass, while an LLVM 22 policy-only
+  ThinLTO lane supplies an independent passing control;
+- the ThinLTO fixture exposed and now guards a linker-integration requirement:
+  all runtime `.text.*`, `.rodata.*`, `.data.*`, and `.bss.*` inputs must be
+  placed before retained map sections so an orphan cannot move runtime state;
 - the standalone LLVM 22 map plugin still builds and retains its original
   SelectionDAG-loss/GlobalISel-complete control results, with the source
   builtin explicitly unavailable in that lane;
@@ -341,7 +349,8 @@ As of 2026-10-16 on `kernel-lab-riscv`:
 - no Linux boot, QEMU injection, FPGA run, or correctness verdict has yet been
   claimed from this new branch.
 
-The next compiler task is to lift the bounded inertness gate into a small
-Linux link, then qualify ThinLTO/split debug and GNU `ld` or reject those modes
-explicitly.  The next QEMU task is the RV64 exact-site TB stop without
-injection, followed by the real PLIC endpoint and deterministic schedule.
+The next compiler task is to qualify split debug, then lift the bounded
+inertness gate into a small Linux link and test cross-TU ThinLTO and GNU `ld`
+or reject unsupported modes explicitly.  The next QEMU task is the RV64
+exact-site TB stop without injection, followed by the real PLIC endpoint and
+deterministic schedule.

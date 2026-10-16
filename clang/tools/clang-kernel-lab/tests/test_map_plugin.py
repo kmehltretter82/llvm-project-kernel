@@ -51,6 +51,7 @@ def compile_object(arguments: argparse.Namespace, output: pathlib.Path,
                    *, plugin: bool, spec: pathlib.Path | None,
                    global_isel: bool = False,
                    source_site: bool = False,
+                   thin_lto: bool = False,
                    optimization: str = "2",
                    debug_info: bool = True,
                    check: bool = True,
@@ -80,6 +81,8 @@ def compile_object(arguments: argparse.Namespace, output: pathlib.Path,
         command.append("-mno-relax")
     if global_isel:
         command.extend(["-fglobal-isel", "-Wno-global-isel"])
+    if thin_lto:
+        command.append("-flto=thin")
     if source_site:
         command.append("-DKERNEL_LAB_SOURCE_SITE=1")
     if plugin:
@@ -629,6 +632,146 @@ def main() -> int:
             )
             run([str(arguments.site_tool.resolve()), str(gc_source_elf)])
 
+        thin_baseline_obj = directory / "thin-baseline.o"
+        thin_disabled_obj = directory / "thin-disabled.o"
+        thin_mapped_obj = directory / "thin-mapped.o"
+        compile_object(
+            arguments,
+            thin_baseline_obj,
+            plugin=False,
+            spec=None,
+            thin_lto=True,
+        )
+        compile_object(
+            arguments,
+            thin_disabled_obj,
+            plugin=True,
+            spec=None,
+            thin_lto=True,
+        )
+        compile_object(
+            arguments,
+            thin_mapped_obj,
+            plugin=True,
+            spec=VALID_SPEC,
+            thin_lto=True,
+        )
+        thin_baseline_elf = directory / "thin-baseline.elf"
+        thin_disabled_elf = directory / "thin-disabled.elf"
+        thin_mapped_elf = directory / "thin-mapped.elf"
+        link(arguments, thin_baseline_obj, thin_baseline_elf)
+        link(arguments, thin_disabled_obj, thin_disabled_elf)
+        link(arguments, thin_mapped_obj, thin_mapped_elf)
+        require_inertness(
+            arguments,
+            thin_baseline_elf,
+            thin_disabled_elf,
+            "disabled ThinLTO linked map",
+        )
+        require_inertness(
+            arguments,
+            thin_baseline_elf,
+            thin_mapped_elf,
+            "policy ThinLTO linked map",
+        )
+        thin_mapped_sidecar = json.loads(run([
+            str(arguments.site_tool.resolve()), str(thin_mapped_elf)
+        ]).stdout)
+        if len(thin_mapped_sidecar["sites"]) != 1:
+            raise AssertionError("policy ThinLTO map is incomplete")
+        thin_mapped_site = thin_mapped_sidecar["sites"][0]
+        if (
+            thin_mapped_site["kind"] != 39
+            or thin_mapped_site["symbol"] != "irq_map_probe"
+        ):
+            raise AssertionError(
+                f"policy ThinLTO site is malformed: {thin_mapped_site!r}"
+            )
+        if thin_mapped_site["site_id"] != mapped_site["site_id"]:
+            raise AssertionError("policy site ID changed under ThinLTO")
+
+        thin_source_site_count = 0
+        if source_builtin:
+            thin_source_obj = directory / "thin-source.o"
+            thin_source_elf = directory / "thin-source.elf"
+            compile_object(
+                arguments,
+                thin_source_obj,
+                plugin=True,
+                spec=None,
+                source_site=True,
+                thin_lto=True,
+            )
+            link(arguments, thin_source_obj, thin_source_elf)
+            require_inertness(
+                arguments,
+                thin_baseline_elf,
+                thin_source_elf,
+                "source ThinLTO linked map",
+            )
+            thin_source_sidecar = json.loads(run([
+                str(arguments.site_tool.resolve()), str(thin_source_elf)
+            ]).stdout)
+            if len(thin_source_sidecar["sites"]) != 1:
+                raise AssertionError("source ThinLTO map is incomplete")
+            thin_source_site = thin_source_sidecar["sites"][0]
+            if (
+                thin_source_site["kind"] != 39
+                or thin_source_site["symbol"] != "irq_map_probe"
+            ):
+                raise AssertionError(
+                    f"source ThinLTO site is malformed: {thin_source_site!r}"
+                )
+            if thin_source_site["site_id"] != source_site["site_id"]:
+                raise AssertionError("source site ID changed under ThinLTO")
+            if thin_source_site["link_va"] != thin_mapped_site["link_va"]:
+                raise AssertionError(
+                    "source and policy ThinLTO sites did not anchor the same "
+                    "store"
+                )
+            thin_source_site_count = 1
+
+        thin_gc_baseline_elf = directory / "thin-gc-baseline.elf"
+        thin_gc_mapped_elf = directory / "thin-gc-mapped.elf"
+        link(
+            arguments,
+            thin_baseline_obj,
+            thin_gc_baseline_elf,
+            gc_sections=True,
+        )
+        link(
+            arguments,
+            thin_mapped_obj,
+            thin_gc_mapped_elf,
+            gc_sections=True,
+        )
+        require_inertness(
+            arguments,
+            thin_gc_baseline_elf,
+            thin_gc_mapped_elf,
+            "section-GC policy ThinLTO linked map",
+        )
+        run([
+            str(arguments.site_tool.resolve()), str(thin_gc_mapped_elf)
+        ])
+        if source_builtin:
+            thin_gc_source_elf = directory / "thin-gc-source.elf"
+            link(
+                arguments,
+                thin_source_obj,
+                thin_gc_source_elf,
+                gc_sections=True,
+            )
+            require_inertness(
+                arguments,
+                thin_gc_baseline_elf,
+                thin_gc_source_elf,
+                "section-GC source ThinLTO linked map",
+            )
+            run([
+                str(arguments.site_tool.resolve()), str(thin_gc_source_elf)
+            ])
+
         gap_compile = compile_object(
             arguments, gap_obj, plugin=True, spec=GAP_SPEC
         )
@@ -888,6 +1031,16 @@ def main() -> int:
                 },
                 "linker_relaxation_enabled": "PASS",
                 "linker_relaxation_disabled": "PASS",
+                "section_gc": "PASS",
+            },
+            "thinlto": {
+                "result": "PASS",
+                "policy_site_count": 1,
+                "source_site_count": thin_source_site_count,
+                "disabled_plugin_identity": "PASS",
+                "all_executable_sections_identity": "PASS",
+                "allocated_sections_symbols_relocations_unwind": "PASS",
+                "site_id_stability": "PASS",
                 "section_gc": "PASS",
             },
             "object_relocations": "PASS",

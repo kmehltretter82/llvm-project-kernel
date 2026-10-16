@@ -114,11 +114,14 @@ The prototype currently requires line-table debug locations and a normalized
 project-relative path supplied through Clang prefix mapping.  Absolute paths
 are reduced to a basename rather than entering a stable ID, so production
 campaigns must use `-ffile-prefix-map` to avoid basename collisions.  It is
-qualified only for non-LTO, non-inlined fixtures.  Across `-O0`, `-O1`, `-O2`,
-`-O3`, `-Os`, and `-Oz`, the current fixture retains one expected kind-39
-record and byte-identical object `.text`; at `-O2` its linked PC equals the
-independent optimizer-last store selector.  These bounded tests do not yet
-establish whole-kernel inertness.
+qualified only for non-inlined ordinary and single-module ThinLTO fixtures.
+Across `-O0`, `-O1`, `-O2`, `-O3`, `-Os`, and `-Oz`, the current fixture
+retains one expected kind-39 record and byte-identical object `.text`; at
+`-O2` its linked PC equals the independent optimizer-last store selector.  A
+same-revision ThinLTO link preserves that site and its ID while matching the
+baseline's non-map allocated and executable sections, symbols, relocations,
+and unwind data.  These bounded tests do not yet establish cross-TU import or
+whole-kernel inertness.
 
 ## Flags
 
@@ -195,9 +198,14 @@ hand-authored RV64 assembly sites.  The C fixture additionally compares a
 normalized object and linked-ELF fingerprint: all non-map allocated sections,
 both executable sections (`.text` and `.noinstr.text`), meaningful symbols,
 code relocations, and unwind bytes/relocations.  It passes with RISC-V linker
-relaxation enabled and disabled and with section garbage collection.  Full
-Linux, ThinLTO, split-debug, GNU `ld`, and boot-image qualification remain
-required.
+relaxation enabled and disabled and with section garbage collection.  The same
+linked fingerprint, stable-ID check, and section-GC check pass for a bounded
+single-module ThinLTO fixture with same-revision LLVM 24 tools; the LLVM 22
+policy path is an independent passing control.  The fixture linker script
+places map sections after all wildcarded runtime sections, and the regression
+rejects orphan placement that would move a non-map symbol.  Full Linux LTO,
+cross-TU import/inlining, split-debug, GNU `ld`, and boot-image qualification
+remain required.
 
 ## Reference implementation
 
