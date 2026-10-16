@@ -632,9 +632,9 @@ implementation gaps in the inspected trees, not completed capabilities:
 
 | Gap | Current evidence | Closure gate |
 | --- | --- | --- |
-| Schedule/site-map parser | The site tool emits the exact phase and `per-vcpu`; no QEMU parser exists yet, and the old prose used aliases. | Parse a hand-authored schedule, reject every identity/phase/scope mismatch, and round-trip its canonical hash. |
+| Schedule/site-map parser | The local `irqsite` plugin now parses the schema-one linked-image sidecar and rejects the wrong phase, scope, target, record format, flags, duplicate ID, or missing selected site.  It does not parse a schedule or verify image/site-map hashes. | Parse a hand-authored schedule, reject every identity/phase/scope/hash mismatch, and round-trip its canonical hash. |
 | Full sidecar provenance | The initial RV64 sidecar has image SHA-256, optional build ID, arch, endian, load bias, section hash, symbols, and sites.  It does not yet carry compiler/linker/config/source identity, inline stacks, kind-1 namespaces, or expected state. | Version the sidecar extension and make missing fields fatal only when that declared version requires them. |
-| Exact site stop | No QEMU translator/TB-exit implementation consumes the sidecar. | Prove the vCPU exits after prior retirement and before the site instruction, including a same-PC resume negative test. |
+| Exact site stop | The public-plugin prototype observes the pre-instruction callback and can terminate QEMU on an Nth per-vCPU hit.  Its result says `observational-stop-only` and `controller_action:false`; there is still no translator/TB-exit implementation. | Prove the vCPU exits after prior retirement and before the site instruction, including a same-PC resume negative test. |
 | PLIC edge/level lifecycle | `sifive_plic_irq_request()` ignores low levels and stores no gateway input state. | Pass held-level redelivery, deassert-no-redelivery, one-pulse, reset, and migration qtests before advertising those endpoint operations. |
 | Semantic entry/return stream | Existing plugin discontinuity callbacks are entry projections and Hexagon lacks one; target return pairing does not exist. | Add the versioned in-tree event, target return hooks, underflow tests, and old-callback compatibility tests. |
 | Callback classification | PowerPC omits several asynchronously delivered classes; SPARC compares encoded external trap values to the bare base value. | Minimal target tests must fail before and pass after a separately reviewed classification change. |
@@ -647,13 +647,32 @@ sidecar actually emits, while rejecting incompatible versions.  Missing
 future provenance must remain visible as a capability limitation rather than
 being guessed from host paths or symbol names.
 
+### 13.1 Local observational checkpoint
+
+The QEMU tree at `c1c18d1e640b64292859ce9f30f3c344edfb0294` has a local
+prototype in `contrib/plugins/irqsite.c` plus an RV64 acceptance fixture in
+`tests/tcg/riscv64/irqsite-observer.*` and
+`tests/tcg/riscv64/test_irqsite_observer.py`.  The test feeds the plugin the
+actual JSON emitted by `llvm-riscv-irq-sites`, reaches both zero-byte sites,
+and stops on hit three for vCPU zero.  Negative cases require rejection of an
+inject mode, a controller operation, the `before-site-instruction` phase
+alias, and the `vcpu` scope alias.
+
+This checkpoint proves sidecar loading, PC correlation, and per-vCPU hit
+counting through the public plugin API.  It does not prove retirement, split a
+translation block, assert a PLIC input, capture architectural trap state, or
+implement replay.  QEMU's source policy also means this AI-assisted local
+prototype is research evidence rather than an upstream submission.
+
 ## 14. Immediate execution order
 
 1. Keep the schema-two 17-family checker green and convert the two
    classification candidates plus the PLIC lifecycle gap into minimal QEMU
    tests.
-2. Freeze the site-boundary semantics and hand-authored manifest fixtures.
-3. Implement the RV64 exact-site TB stop without IRQ injection.
+2. Keep the two-site observational acceptance checkpoint green while the
+   core hook is developed; never relabel its callback as exact injection.
+3. Implement the RV64 exact-site TB stop without IRQ injection, including
+   consume-before-action and same-PC resume tests.
 4. Add the enriched RISC-V event and PLIC endpoint lifecycle.
 5. Add one opt-in edge/level source and deterministic QMP schedule.
 6. Reproduce the deliberate hardirq ordering fixture 100/100 and archive the
