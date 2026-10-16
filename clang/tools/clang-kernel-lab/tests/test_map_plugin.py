@@ -103,10 +103,10 @@ def compile_object(arguments: argparse.Namespace, output: pathlib.Path,
 def link(arguments: argparse.Namespace,
          obj: pathlib.Path | list[pathlib.Path],
          output: pathlib.Path, *, gc_sections: bool = False,
-         entry: str = "irq_map_probe") -> None:
+         entry: str = "irq_map_probe", linker: str | None = None) -> None:
     objects = [obj] if isinstance(obj, pathlib.Path) else obj
     command = [
-        arguments.ld_lld,
+        linker or arguments.ld_lld,
         "-m", "elf64lriscv",
         "-e", entry,
         "-T", str(LINKER_SCRIPT),
@@ -253,6 +253,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--clang", required=True)
     parser.add_argument("--ld-lld", required=True)
+    parser.add_argument(
+        "--gnu-ld",
+        help="optional GNU RISC-V linker for the non-LTO compatibility lane",
+    )
     parser.add_argument("--llvm-objcopy", required=True)
     parser.add_argument("--llvm-readobj", required=True)
     parser.add_argument("--plugin", required=True, type=pathlib.Path)
@@ -643,6 +647,193 @@ def main() -> int:
                 "section-GC source linked map",
             )
             run([str(arguments.site_tool.resolve()), str(gc_source_elf)])
+
+        gnu_ld_result: dict[str, object] = {"result": "not-requested"}
+        if arguments.gnu_ld:
+            gnu_version_output = run([
+                arguments.gnu_ld, "--version"
+            ]).stdout.splitlines()
+            if not gnu_version_output:
+                raise AssertionError("GNU ld produced no version identity")
+
+            gnu_baseline_elf = directory / "gnu-baseline.elf"
+            gnu_disabled_elf = directory / "gnu-disabled.elf"
+            gnu_mapped_elf = directory / "gnu-mapped.elf"
+            link(
+                arguments,
+                baseline_obj,
+                gnu_baseline_elf,
+                linker=arguments.gnu_ld,
+            )
+            link(
+                arguments,
+                disabled_obj,
+                gnu_disabled_elf,
+                linker=arguments.gnu_ld,
+            )
+            link(
+                arguments,
+                mapped_obj,
+                gnu_mapped_elf,
+                linker=arguments.gnu_ld,
+            )
+            require_inertness(
+                arguments,
+                gnu_baseline_elf,
+                gnu_disabled_elf,
+                "disabled GNU-ld linked map",
+            )
+            require_inertness(
+                arguments,
+                gnu_baseline_elf,
+                gnu_mapped_elf,
+                "policy GNU-ld linked map",
+            )
+            gnu_mapped_sidecar = json.loads(run([
+                str(arguments.site_tool.resolve()), str(gnu_mapped_elf)
+            ]).stdout)
+            if len(gnu_mapped_sidecar["sites"]) != 1:
+                raise AssertionError("policy GNU-ld map is incomplete")
+            gnu_mapped_site = gnu_mapped_sidecar["sites"][0]
+            if (
+                gnu_mapped_site["site_id"] != mapped_site["site_id"]
+                or gnu_mapped_site["link_va"] != mapped_site["link_va"]
+            ):
+                raise AssertionError(
+                    "GNU ld changed the policy site's identity or address"
+                )
+
+            gnu_source_site_count = 0
+            if source_builtin:
+                gnu_source_elf = directory / "gnu-source.elf"
+                link(
+                    arguments,
+                    source_obj,
+                    gnu_source_elf,
+                    linker=arguments.gnu_ld,
+                )
+                require_inertness(
+                    arguments,
+                    gnu_baseline_elf,
+                    gnu_source_elf,
+                    "source GNU-ld linked map",
+                )
+                gnu_source_sidecar = json.loads(run([
+                    str(arguments.site_tool.resolve()), str(gnu_source_elf)
+                ]).stdout)
+                if len(gnu_source_sidecar["sites"]) != 1:
+                    raise AssertionError("source GNU-ld map is incomplete")
+                gnu_source_site = gnu_source_sidecar["sites"][0]
+                if (
+                    gnu_source_site["site_id"] != source_site["site_id"]
+                    or gnu_source_site["link_va"] != source_site["link_va"]
+                ):
+                    raise AssertionError(
+                        "GNU ld changed the source site's identity or address"
+                    )
+                gnu_source_site_count = 1
+
+            gnu_norelax_baseline_elf = directory / "gnu-norelax-baseline.elf"
+            gnu_norelax_mapped_elf = directory / "gnu-norelax-mapped.elf"
+            link(
+                arguments,
+                norelax_baseline_obj,
+                gnu_norelax_baseline_elf,
+                linker=arguments.gnu_ld,
+            )
+            link(
+                arguments,
+                norelax_mapped_obj,
+                gnu_norelax_mapped_elf,
+                linker=arguments.gnu_ld,
+            )
+            require_inertness(
+                arguments,
+                gnu_norelax_baseline_elf,
+                gnu_norelax_mapped_elf,
+                "no-relax policy GNU-ld linked map",
+            )
+            run([
+                str(arguments.site_tool.resolve()),
+                str(gnu_norelax_mapped_elf),
+            ])
+            if source_builtin:
+                gnu_norelax_source_elf = directory / "gnu-norelax-source.elf"
+                link(
+                    arguments,
+                    norelax_source_obj,
+                    gnu_norelax_source_elf,
+                    linker=arguments.gnu_ld,
+                )
+                require_inertness(
+                    arguments,
+                    gnu_norelax_baseline_elf,
+                    gnu_norelax_source_elf,
+                    "no-relax source GNU-ld linked map",
+                )
+                run([
+                    str(arguments.site_tool.resolve()),
+                    str(gnu_norelax_source_elf),
+                ])
+
+            gnu_gc_baseline_elf = directory / "gnu-gc-baseline.elf"
+            gnu_gc_mapped_elf = directory / "gnu-gc-mapped.elf"
+            link(
+                arguments,
+                baseline_obj,
+                gnu_gc_baseline_elf,
+                gc_sections=True,
+                linker=arguments.gnu_ld,
+            )
+            link(
+                arguments,
+                mapped_obj,
+                gnu_gc_mapped_elf,
+                gc_sections=True,
+                linker=arguments.gnu_ld,
+            )
+            require_inertness(
+                arguments,
+                gnu_gc_baseline_elf,
+                gnu_gc_mapped_elf,
+                "section-GC policy GNU-ld linked map",
+            )
+            run([
+                str(arguments.site_tool.resolve()), str(gnu_gc_mapped_elf)
+            ])
+            if source_builtin:
+                gnu_gc_source_elf = directory / "gnu-gc-source.elf"
+                link(
+                    arguments,
+                    source_obj,
+                    gnu_gc_source_elf,
+                    gc_sections=True,
+                    linker=arguments.gnu_ld,
+                )
+                require_inertness(
+                    arguments,
+                    gnu_gc_baseline_elf,
+                    gnu_gc_source_elf,
+                    "section-GC source GNU-ld linked map",
+                )
+                run([
+                    str(arguments.site_tool.resolve()),
+                    str(gnu_gc_source_elf),
+                ])
+
+            gnu_ld_result = {
+                "result": "PASS",
+                "version": gnu_version_output[0],
+                "policy_site_count": 1,
+                "source_site_count": gnu_source_site_count,
+                "disabled_plugin_identity": "PASS",
+                "object_and_linked_inertness": "PASS",
+                "site_id_and_address_match_lld": "PASS",
+                "linker_relaxation_enabled": "PASS",
+                "linker_relaxation_disabled": "PASS",
+                "section_gc": "PASS",
+                "thinlto": "not-supported-by-this-lane",
+            }
 
         split_work = directory / "split-work"
         split_work.mkdir()
@@ -1518,6 +1709,7 @@ def main() -> int:
                 "retained_out_of_line_copy": "duplicate-rejected",
                 "multiple_live_inline_copies": "partial-record-rejected",
             },
+            "gnu_ld": gnu_ld_result,
             "split_dwarf": {
                 "result": "PASS",
                 "policy_site_count": 1,

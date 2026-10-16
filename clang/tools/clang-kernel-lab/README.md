@@ -52,6 +52,7 @@ python3 clang/tools/clang-kernel-lab/tests/test_callback_plugin.py \
   --plugin ../build-kernel-lab/ClangKernelLab.so
 python3 clang/tools/clang-kernel-lab/tests/test_map_plugin.py \
   --clang /path/to/clang --ld-lld /path/to/ld.lld \
+  --gnu-ld /path/to/riscv64-elf-ld \
   --llvm-objcopy /path/to/llvm-objcopy \
   --llvm-readobj /path/to/llvm-readobj \
   --plugin ../build-kernel-lab/ClangKernelLabMap.so \
@@ -103,6 +104,14 @@ requires byte-identical `.dwo` files, verifies each file with
 stable policy and source IDs.  Using one output path is intentional: a DWO
 records its output pathname, so comparing different paths would manufacture a
 debug-only difference unrelated to map mode.
+The optional `--gnu-ld` lane repeats the non-LTO linked-image qualification
+with a GNU RISC-V linker.  It covers the disabled, policy, and (when available)
+source-builtin variants, checks the complete inertness fingerprint, requires
+the same site IDs and linked addresses as `ld.lld`, and exercises relaxation
+enabled/disabled plus section garbage collection.  It does not claim GNU
+ThinLTO support: the current lane deliberately supplies no LLVM-bitcode linker
+plugin.  GNU binutils 2.47 passes this lane with both lab LLVM 24 and the
+policy-only LLVM 22 control.
 Its expectation switches make backend/revision behavior explicit.  Stock LLVM
 22 uses the defaults: SelectionDAG loses three sites and GlobalISel preserves
 four.  The lab LLVM 24 command shown above requires four SelectionDAG sites and

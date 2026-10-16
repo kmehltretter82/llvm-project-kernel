@@ -343,6 +343,11 @@ As of 2026-10-16 on `kernel-lab-riscv`:
   baseline, disabled, policy, and source variants at one controlled output
   path, while object/link inertness and policy/source site IDs remain stable;
   the LLVM 22 policy control passes the same gate;
+- GNU binutils 2.47 passes the non-LTO linked-image lane for lab LLVM 24 and
+  the LLVM 22 policy control: disabled/policy/source inertness, site identity
+  and linked address agreement with `ld.lld`, relaxation enabled/disabled,
+  and section garbage collection all pass; this lane intentionally does not
+  claim ThinLTO without an LLVM-bitcode linker plugin;
 - the standalone LLVM 22 map plugin still builds and retains its original
   SelectionDAG-loss/GlobalISel-complete control results, with the source
   builtin explicitly unavailable in that lane;
@@ -363,7 +368,6 @@ As of 2026-10-16 on `kernel-lab-riscv`:
   claimed from this new branch.
 
 The next compiler task is to lift the bounded inertness gate into a small
-Linux link, design post-LTO identities for multiple physical copies, and test
-GNU `ld` or reject unsupported modes explicitly.  The next QEMU task is the
-real PLIC endpoint and deterministic interrupt schedule; exact-site TB
-stop/resume is already proven locally.
+Linux link and design post-LTO identities for multiple physical copies.  The
+next QEMU task is the real PLIC endpoint and deterministic interrupt schedule;
+exact-site TB stop/resume is already proven locally.

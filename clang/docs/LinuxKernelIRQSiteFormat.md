@@ -120,8 +120,10 @@ retains one expected kind-39 record and byte-identical object `.text`; at
 `-O2` its linked PC equals the independent optimizer-last store selector.  A
 same-revision ThinLTO link preserves that site and its ID while matching the
 baseline's non-map allocated and executable sections, symbols, relocations,
-and unwind data.  These bounded tests do not yet establish cross-TU import or
-whole-kernel inertness.
+and unwind data.  A cross-TU import/inlining fixture is additionally qualified
+when section garbage collection leaves exactly one physical copy; multiple
+surviving copies remain fail-closed and unsupported.  These bounded tests do
+not yet establish whole-kernel inertness.
 
 ## Flags
 
@@ -221,8 +223,11 @@ IDs, and matching object/linked runtime fingerprints for the LLVM 24 policy
 and source paths and the LLVM 22 policy control.  A single-copy cross-TU
 import/inlining lane passes with section GC; retained and multiply inlined
 copies are explicit negative gates as described above.  Full Linux LTO,
-cross-TU multiple-instance mapping, kernel debug packaging, GNU `ld`, and
-boot-image qualification remain required.
+cross-TU multiple-instance mapping, kernel debug packaging, and boot-image
+qualification remain required.  GNU binutils 2.47 independently passes the
+same non-LTO linked fingerprint, stable-ID/address, relaxation enabled/disabled,
+and section-GC checks for the LLVM 24 policy/source and LLVM 22 policy lanes;
+GNU ThinLTO is not claimed without a compatible LLVM-bitcode linker plugin.
 
 ## Reference implementation
 
