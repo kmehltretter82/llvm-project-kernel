@@ -1,0 +1,36 @@
+{
+  "schema": 1,
+  "architecture": "riscv64",
+  "entry_symbol_ranges": [
+    {
+      "name": "noinstr",
+      "start_symbol": "__noinstr_text_start",
+      "end_symbol": "__noinstr_text_end"
+    },
+    {
+      "name": "irqentry",
+      "start_symbol": "__irqentry_text_start",
+      "end_symbol": "__irqentry_text_end"
+    },
+    {
+      "name": "softirqentry",
+      "start_symbol": "__softirqentry_text_start",
+      "end_symbol": "__softirqentry_text_end"
+    }
+  ],
+  "forbidden_symbols": [
+    "__asan_load1",
+    "__asan_store1",
+    "__cyg_profile_func_enter",
+    "__fentry__",
+    "__kasan_check_read",
+    "__kasan_check_write",
+    "__kcsan_check_access",
+    "__sanitizer_cov_trace_pc",
+    "__sanitizer_cov_trace_pc_guard",
+    "__stack_chk_fail",
+    "__ubsan_handle_type_mismatch_v1",
+    "_mcount"
+  ],
+  "reject_unknown_calls": true
+}

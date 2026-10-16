@@ -112,9 +112,30 @@ map mode.
 
 ### Layer C: linked-image checker
 
-`rv-entrycheck` will consume `vmlinux`, the resolved site map, DWARF/BTF where
-available, and a policy file.  Starting from RISC-V vectors, `.irqentry.text`,
-and `.noinstr.text`, it will conservatively reject or report unknown for:
+`rv-entrycheck` consumes a linked RV64 ELF and a strict versioned policy.  Its
+first bounded slice disassembles executable sections or symbol-bounded regions,
+resolves direct calls across relaxed `jal` and unrelaxed `auipc`/`jalr`, rejects
+named sanitizer callbacks, and fails closed on unresolved calls.  Symbol
+ranges are required for a normal linked Linux image because `.noinstr.text` is
+folded into `.text` while `__noinstr_text_start` and `__noinstr_text_end`
+survive.  Matched linkable good/bad fixtures are the current gate; the checker
+does not yet claim a transitive kernel call graph.
+
+The first real-image run uses all three surviving Linux ranges: `noinstr`,
+`irqentry`, and `softirqentry`.  On the source-wrapper tinyconfig `vmlinux`
+(build ID `43105ae71ed6fb22b61788db6d5c2bd56d5b82c6`), the checker covered
+2,840 bytes, 1,053 instructions, and 106 calls.  It resolved 102 direct calls
+and returned `FAIL` for four unresolved indirect calls at
+`0xffffffff800ea184`, `0xffffffff800ea1c8`, `0xffffffff800ea2ec`, and
+`0xffffffff800ed6ac`.  These are respectively IRQ dispatch in
+`handle_riscv_irq()` and `generic_handle_arch_irq()`, clocksource dispatch in
+`sched_clock_noinstr()`, and exception-vector dispatch in
+`handle_exception()`.  This is the intended fail-closed discovery result; no
+target-set waiver or kernel qualification has been claimed.
+
+The complete checker will also consume the resolved site map, DWARF/BTF where
+available, and expand from RISC-V vectors, irqentry, and noinstr regions to
+conservatively reject or report unknown for:
 
 - fentry, KCOV, KASAN, KCSAN/TSAN, UBSAN, stack-protector, or other callbacks;
 - compiler-generated libcalls, outlined atomics, thunks, and jump tables;

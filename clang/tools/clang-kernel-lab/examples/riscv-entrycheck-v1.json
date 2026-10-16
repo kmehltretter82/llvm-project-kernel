@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "architecture": "riscv64",
+  "entry_symbol_ranges": [
+    {
+      "name": "noinstr",
+      "start_symbol": "__entrycheck_noinstr_start",
+      "end_symbol": "__entrycheck_noinstr_end"
+    }
+  ],
+  "forbidden_symbols": [
+    "__sanitizer_cov_trace_pc"
+  ],
+  "reject_unknown_calls": true
+}

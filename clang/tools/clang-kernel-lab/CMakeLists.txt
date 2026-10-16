@@ -54,3 +54,28 @@ set_target_properties(llvm-riscv-irq-sites PROPERTIES
   CXX_STANDARD 17
   CXX_STANDARD_REQUIRED YES
   )
+
+llvm_map_components_to_libnames(KERNEL_LAB_ENTRYCHECK_LLVM_LIBS
+  MC
+  MCDisassembler
+  Object
+  RISCVDesc
+  RISCVDisassembler
+  RISCVInfo
+  Support
+  TargetParser
+  )
+
+add_executable(rv-entrycheck
+  rv-entrycheck.cpp
+  )
+
+llvm_update_compile_flags(rv-entrycheck)
+target_link_libraries(rv-entrycheck PRIVATE
+  ${KERNEL_LAB_ENTRYCHECK_LLVM_LIBS}
+  )
+
+set_target_properties(rv-entrycheck PROPERTIES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED YES
+  )

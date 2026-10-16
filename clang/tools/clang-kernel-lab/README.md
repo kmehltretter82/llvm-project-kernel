@@ -1,6 +1,6 @@
 # Clang Kernel Lab prototype
 
-This directory contains three deliberately separated experimental components
+This directory contains four deliberately separated experimental components
 for the Linux IRQ/PREEMPT_RT laboratory:
 
 - `ClangKernelLabMap` is the text-inert map plugin.  Its policy path selects
@@ -14,6 +14,10 @@ for the Linux IRQ/PREEMPT_RT laboratory:
   emits a linked-image JSON sidecar.  Its `--validate-relocatable` mode checks
   that every object record has exactly one `R_RISCV_64` relocation to an
   in-range text boundary before the linker can hide a malformed annotation.
+- `rv-entrycheck` is the first linked-image entry audit.  Its strict versioned
+  policy names executable sections or symbol-bounded regions and forbidden
+  callbacks.  The version-one scope resolves direct RV64 calls, rejects
+  unknown calls, and emits a deterministic JSON verdict.
 - `ClangKernelLab` is an LLVM pass plugin for explicit callbacks and
   deterministic perturbation.  Loading a specification through
   `CLANG_KERNEL_LAB_SPEC` changes generated code; it is not map mode.
@@ -32,11 +36,15 @@ cmake -S clang/tools/clang-kernel-lab \
   -G Ninja \
   -DLLVM_DIR=/path/to/lib/cmake/llvm
 cmake --build ../build-kernel-lab \
-  --target ClangKernelLabMap ClangKernelLab llvm-riscv-irq-sites -- -j1
+  --target ClangKernelLabMap ClangKernelLab llvm-riscv-irq-sites \
+           rv-entrycheck -- -j1
 ```
 
 The in-tree build is opt-in with `-DCLANG_ENABLE_KERNEL_LAB=ON`.  Local
 qualification builds use one job and record disk usage before and after.
+The entry checker is built and fixture-qualified both in-tree with lab LLVM 24
+and standalone with stock LLVM 22.1.8; small MC API differences are selected
+at compile time without changing the policy or output schema.
 
 ## Minimal validation
 
@@ -67,7 +75,41 @@ python3 clang/tools/clang-kernel-lab/tests/test_selectiondag_backend.py \
   --llvm-objdump /path/to/llvm-objdump \
   --plugin ../build-kernel-lab/ClangKernelLabMap.so \
   --site-tool ../build-kernel-lab/llvm-riscv-irq-sites
+python3 clang/tools/clang-kernel-lab/tests/test_rv_entrycheck.py \
+  --clang /path/to/clang --ld-lld /path/to/ld.lld \
+  --checker ../build-kernel-lab/rv-entrycheck
+../build-kernel-lab/rv-entrycheck \
+  --policy clang/tools/clang-kernel-lab/examples/riscv-linux-entrycheck-v1.json \
+  /path/to/vmlinux
 ```
+
+The initial entry-check lane folds its input `.noinstr.text` into output
+`.text`, then exercises matched good, forbidden-callback, and unknown-indirect
+fixtures with relaxation enabled and disabled.  It resolves both relaxed
+`jal` and unrelaxed `auipc`/`jalr`, including a forbidden untyped alias of a
+typed function.  Separate controls cover whole-section selection, a missing
+boundary, overlapping regions, six malformed policy shapes, an RV64
+relocatable object, and a linked RV32 image.  The first scope rejects every
+unknown call and emits three distinct exit statuses: zero for a clean verdict,
+one for a semantic finding, and two for invalid input.
+
+`examples/riscv-linux-entrycheck-v1.json` is a deliberately strict starter
+policy for Linux's `noinstr`, `irqentry`, and `softirqentry` linker-symbol
+ranges.  On the current tinyconfig image it audited 2,840 bytes, 1,053
+instructions, and 106 calls.  It resolved 102 direct calls and failed closed
+on four indirect calls: two IRQ-dispatch callbacks in `handle_riscv_irq()` and
+`generic_handle_arch_irq()`, the clocksource callback in
+`sched_clock_noinstr()`, and the exception-vector dispatch in
+`handle_exception()`.  The result is intentionally `FAIL`, not a waiver or a
+kernel qualification.  The version-one forbidden-symbol list is also an
+exact-name starter set, not complete runtime-family matching.
+
+Symbol-bounded policy regions are necessary for a normal linked Linux image,
+where input `.noinstr.text` is folded into `.text` but
+`__noinstr_text_start` and `__noinstr_text_end` survive.  This first scope is
+not yet a transitive call graph: allowed direct callees, tail calls, exception
+edges, state ordering, and compiler-generated helpers require later gates and
+must not be treated as qualified.
 
 The bounded external-Linux gate drives a real RISC-V Kbuild compile of
 `kernel/softirq.c`.  Its default policy mode brackets `handle_softirqs()` with
