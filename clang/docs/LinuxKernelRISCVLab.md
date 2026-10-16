@@ -77,7 +77,8 @@ store PC as the independent policy selector.  Line tables are currently
 mandatory; changed anchors, missing coverage, and use outside RV64 Linux ELF
 with the medium code model are hard errors.  Non-inlined ordinary and
 single-module ThinLTO fixtures are the present qualification boundary;
-cross-TU importing and a Linux LTO link remain outside it.
+cross-TU importing is qualified only when exactly one physical copy survives,
+and a Linux LTO link remains outside it.
 
 ### Layer B: explicit callback and perturb mode
 
@@ -330,6 +331,14 @@ As of 2026-10-16 on `kernel-lab-riscv`:
 - the ThinLTO fixture exposed and now guards a linker-integration requirement:
   all runtime `.text.*`, `.rodata.*`, `.data.*`, and `.bss.*` inputs must be
   placed before retained map sections so an orphan cannot move runtime state;
+- a two-TU ThinLTO fixture imports and inlines the mapped publisher into its
+  caller; with section GC leaving one physical copy, LLVM 24 policy/source and
+  LLVM 22 policy lanes retain stable IDs, resolve to `lto_irq_entry`, and pass
+  the full linked inertness fingerprint;
+- cross-TU shapes with more than one physical copy fail closed: a retained
+  out-of-line plus inline copy is duplicate-ID rejected, and two live inline
+  clones are partial-record rejected because they share one PC-sections node;
+  map mode deliberately does not change inlining to mask this limitation;
 - the split-DWARF lane produces byte-identical verified `.dwo` files across
   baseline, disabled, policy, and source variants at one controlled output
   path, while object/link inertness and policy/source site IDs remain stable;
@@ -354,6 +363,7 @@ As of 2026-10-16 on `kernel-lab-riscv`:
   claimed from this new branch.
 
 The next compiler task is to lift the bounded inertness gate into a small
-Linux link and test cross-TU ThinLTO and GNU `ld` or reject unsupported modes
-explicitly.  The next QEMU task is the RV64 exact-site TB stop without
-injection, followed by the real PLIC endpoint and deterministic schedule.
+Linux link, design post-LTO identities for multiple physical copies, and test
+GNU `ld` or reject unsupported modes explicitly.  The next QEMU task is the
+real PLIC endpoint and deterministic interrupt schedule; exact-site TB
+stop/resume is already proven locally.

@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "strict": true,
+  "require_each_rule": true,
+  "target_os": "linux",
+  "sites": [
+    {
+      "match": "instruction",
+      "symbol": "lto_publish",
+      "opcode": "store",
+      "occurrence": 1,
+      "position": "before",
+      "kind": 39
+    }
+  ]
+}

@@ -17,9 +17,13 @@ HERE = pathlib.Path(__file__).resolve().parent
 TOOL = HERE.parent
 ROOT = TOOL.parents[2]
 SOURCE = HERE / "map-probe.c"
+LTO_SITE_SOURCE = HERE / "map-lto-site.c"
+LTO_CALLER_SOURCE = HERE / "map-lto-caller.c"
+LTO_MULTI_CALLER_SOURCE = HERE / "map-lto-multi-caller.c"
 LINKER_SCRIPT = HERE / "map-link.ld"
 VALID_SPEC = TOOL / "examples" / "riscv-map-v1.json"
 GAP_SPEC = TOOL / "examples" / "riscv-map-coverage-gap-v1.json"
+CROSS_TU_SPEC = TOOL / "examples" / "riscv-map-cross-tu-v1.json"
 MAP_SECTIONS = {
     ".riscv.linux_irq_c_sites",
     ".riscv.linux_irq_expected",
@@ -96,16 +100,19 @@ def compile_object(arguments: argparse.Namespace, output: pathlib.Path,
     return run(command, environment=environment, check=check)
 
 
-def link(arguments: argparse.Namespace, obj: pathlib.Path,
-         output: pathlib.Path, *, gc_sections: bool = False) -> None:
+def link(arguments: argparse.Namespace,
+         obj: pathlib.Path | list[pathlib.Path],
+         output: pathlib.Path, *, gc_sections: bool = False,
+         entry: str = "irq_map_probe") -> None:
+    objects = [obj] if isinstance(obj, pathlib.Path) else obj
     command = [
         arguments.ld_lld,
         "-m", "elf64lriscv",
-        "-e", "irq_map_probe",
+        "-e", entry,
         "-T", str(LINKER_SCRIPT),
-        str(obj),
-        "-o", str(output),
     ]
+    command.extend(str(item) for item in objects)
+    command.extend(["-o", str(output)])
     if gc_sections:
         command.append("--gc-sections")
     run(command)
@@ -936,6 +943,298 @@ def main() -> int:
                 str(arguments.site_tool.resolve()), str(thin_gc_source_elf)
             ])
 
+        cross_caller_obj = directory / "cross-caller.o"
+        cross_multi_caller_obj = directory / "cross-multi-caller.o"
+        cross_baseline_obj = directory / "cross-baseline.o"
+        cross_disabled_obj = directory / "cross-disabled.o"
+        cross_mapped_obj = directory / "cross-mapped.o"
+        compile_object(
+            arguments,
+            cross_caller_obj,
+            plugin=False,
+            spec=None,
+            thin_lto=True,
+            source=LTO_CALLER_SOURCE,
+        )
+        compile_object(
+            arguments,
+            cross_multi_caller_obj,
+            plugin=False,
+            spec=None,
+            thin_lto=True,
+            source=LTO_MULTI_CALLER_SOURCE,
+        )
+        compile_object(
+            arguments,
+            cross_baseline_obj,
+            plugin=False,
+            spec=None,
+            thin_lto=True,
+            source=LTO_SITE_SOURCE,
+        )
+        compile_object(
+            arguments,
+            cross_disabled_obj,
+            plugin=True,
+            spec=None,
+            thin_lto=True,
+            source=LTO_SITE_SOURCE,
+        )
+        compile_object(
+            arguments,
+            cross_mapped_obj,
+            plugin=True,
+            spec=CROSS_TU_SPEC,
+            thin_lto=True,
+            source=LTO_SITE_SOURCE,
+        )
+
+        cross_baseline_elf = directory / "cross-baseline.elf"
+        cross_disabled_elf = directory / "cross-disabled.elf"
+        cross_mapped_elf = directory / "cross-mapped.elf"
+        cross_objects = [cross_caller_obj, cross_baseline_obj]
+        link(
+            arguments,
+            cross_objects,
+            cross_baseline_elf,
+            gc_sections=True,
+            entry="lto_irq_entry",
+        )
+        link(
+            arguments,
+            [cross_caller_obj, cross_disabled_obj],
+            cross_disabled_elf,
+            gc_sections=True,
+            entry="lto_irq_entry",
+        )
+        link(
+            arguments,
+            [cross_caller_obj, cross_mapped_obj],
+            cross_mapped_elf,
+            gc_sections=True,
+            entry="lto_irq_entry",
+        )
+        require_inertness(
+            arguments,
+            cross_baseline_elf,
+            cross_disabled_elf,
+            "disabled cross-TU ThinLTO linked map",
+        )
+        require_inertness(
+            arguments,
+            cross_baseline_elf,
+            cross_mapped_elf,
+            "policy cross-TU ThinLTO linked map",
+        )
+        cross_mapped_sidecar = json.loads(run([
+            str(arguments.site_tool.resolve()), str(cross_mapped_elf)
+        ]).stdout)
+        if len(cross_mapped_sidecar["sites"]) != 1:
+            raise AssertionError("policy cross-TU ThinLTO map is incomplete")
+        cross_mapped_site = cross_mapped_sidecar["sites"][0]
+        if (
+            cross_mapped_site["kind"] != 39
+            or cross_mapped_site["symbol"] != "lto_irq_entry"
+        ):
+            raise AssertionError(
+                "policy cross-TU site was not imported into the live caller: "
+                f"{cross_mapped_site!r}"
+            )
+
+        direct_mapped_obj = directory / "cross-direct-mapped.o"
+        compile_object(
+            arguments,
+            direct_mapped_obj,
+            plugin=True,
+            spec=CROSS_TU_SPEC,
+            source=LTO_SITE_SOURCE,
+        )
+        direct_mapped_map = json.loads(run([
+            str(arguments.site_tool.resolve()),
+            "--validate-relocatable",
+            str(direct_mapped_obj),
+        ]).stdout)
+        if direct_mapped_map["sites"][0]["site_id"] != (
+            cross_mapped_site["site_id"]
+        ):
+            raise AssertionError("policy site ID changed across ThinLTO import")
+
+        cross_source_site_count = 0
+        if source_builtin:
+            cross_source_obj = directory / "cross-source.o"
+            cross_source_elf = directory / "cross-source.elf"
+            compile_object(
+                arguments,
+                cross_source_obj,
+                plugin=True,
+                spec=None,
+                source_site=True,
+                thin_lto=True,
+                source=LTO_SITE_SOURCE,
+            )
+            link(
+                arguments,
+                [cross_caller_obj, cross_source_obj],
+                cross_source_elf,
+                gc_sections=True,
+                entry="lto_irq_entry",
+            )
+            require_inertness(
+                arguments,
+                cross_baseline_elf,
+                cross_source_elf,
+                "source cross-TU ThinLTO linked map",
+            )
+            cross_source_sidecar = json.loads(run([
+                str(arguments.site_tool.resolve()), str(cross_source_elf)
+            ]).stdout)
+            if len(cross_source_sidecar["sites"]) != 1:
+                raise AssertionError(
+                    "source cross-TU ThinLTO map is incomplete"
+                )
+            cross_source_site = cross_source_sidecar["sites"][0]
+            if (
+                cross_source_site["kind"] != 39
+                or cross_source_site["symbol"] != "lto_irq_entry"
+            ):
+                raise AssertionError(
+                    "source cross-TU site was not imported into the live "
+                    f"caller: {cross_source_site!r}"
+                )
+            direct_source_obj = directory / "cross-direct-source.o"
+            compile_object(
+                arguments,
+                direct_source_obj,
+                plugin=True,
+                spec=None,
+                source_site=True,
+                source=LTO_SITE_SOURCE,
+            )
+            direct_source_map = json.loads(run([
+                str(arguments.site_tool.resolve()),
+                "--validate-relocatable",
+                str(direct_source_obj),
+            ]).stdout)
+            if direct_source_map["sites"][0]["site_id"] != (
+                cross_source_site["site_id"]
+            ):
+                raise AssertionError(
+                    "source site ID changed across ThinLTO import"
+                )
+            if cross_source_site["link_va"] != cross_mapped_site["link_va"]:
+                raise AssertionError(
+                    "source and policy cross-TU sites did not anchor the same "
+                    "imported store"
+                )
+            cross_source_site_count = 1
+
+        def require_map_rejection(
+            image: pathlib.Path, description: str, expected_error: str
+        ) -> None:
+            rejected = run(
+                [str(arguments.site_tool.resolve()), str(image)], check=False
+            )
+            if rejected.returncode == 0:
+                raise AssertionError(
+                    f"{description} unexpectedly passed map validation"
+                )
+            if expected_error not in rejected.stderr:
+                raise AssertionError(
+                    f"unexpected {description} error: {rejected.stderr!r}"
+                )
+
+        cross_retained_baseline_elf = directory / "cross-retained-baseline.elf"
+        cross_retained_mapped_elf = directory / "cross-retained-mapped.elf"
+        link(
+            arguments,
+            cross_objects,
+            cross_retained_baseline_elf,
+            entry="lto_irq_entry",
+        )
+        link(
+            arguments,
+            [cross_caller_obj, cross_mapped_obj],
+            cross_retained_mapped_elf,
+            entry="lto_irq_entry",
+        )
+        require_inertness(
+            arguments,
+            cross_retained_baseline_elf,
+            cross_retained_mapped_elf,
+            "retained-copy policy cross-TU ThinLTO linked map",
+        )
+        require_map_rejection(
+            cross_retained_mapped_elf,
+            "retained-copy policy map",
+            "duplicate site identifier",
+        )
+
+        cross_multi_baseline_elf = directory / "cross-multi-baseline.elf"
+        cross_multi_mapped_elf = directory / "cross-multi-mapped.elf"
+        link(
+            arguments,
+            [cross_multi_caller_obj, cross_baseline_obj],
+            cross_multi_baseline_elf,
+            gc_sections=True,
+            entry="lto_multi_irq_entry",
+        )
+        link(
+            arguments,
+            [cross_multi_caller_obj, cross_mapped_obj],
+            cross_multi_mapped_elf,
+            gc_sections=True,
+            entry="lto_multi_irq_entry",
+        )
+        require_inertness(
+            arguments,
+            cross_multi_baseline_elf,
+            cross_multi_mapped_elf,
+            "multi-copy policy cross-TU ThinLTO linked map",
+        )
+        require_map_rejection(
+            cross_multi_mapped_elf,
+            "multi-copy policy map",
+            "site section ends with a partial record",
+        )
+        if source_builtin:
+            cross_retained_source_elf = directory / "cross-retained-source.elf"
+            cross_multi_source_elf = directory / "cross-multi-source.elf"
+            link(
+                arguments,
+                [cross_caller_obj, cross_source_obj],
+                cross_retained_source_elf,
+                entry="lto_irq_entry",
+            )
+            link(
+                arguments,
+                [cross_multi_caller_obj, cross_source_obj],
+                cross_multi_source_elf,
+                gc_sections=True,
+                entry="lto_multi_irq_entry",
+            )
+            require_inertness(
+                arguments,
+                cross_retained_baseline_elf,
+                cross_retained_source_elf,
+                "retained-copy source cross-TU ThinLTO linked map",
+            )
+            require_inertness(
+                arguments,
+                cross_multi_baseline_elf,
+                cross_multi_source_elf,
+                "multi-copy source cross-TU ThinLTO linked map",
+            )
+            require_map_rejection(
+                cross_retained_source_elf,
+                "retained-copy source map",
+                "duplicate site identifier",
+            )
+            require_map_rejection(
+                cross_multi_source_elf,
+                "multi-copy source map",
+                "site section ends with a partial record",
+            )
+
         gap_compile = compile_object(
             arguments, gap_obj, plugin=True, spec=GAP_SPEC
         )
@@ -1206,6 +1505,18 @@ def main() -> int:
                 "allocated_sections_symbols_relocations_unwind": "PASS",
                 "site_id_stability": "PASS",
                 "section_gc": "PASS",
+            },
+            "cross_tu_thinlto": {
+                "result": "PASS_WITH_EXPLICIT_COPY_LIMIT",
+                "final_symbol": "lto_irq_entry",
+                "policy_site_count": 1,
+                "source_site_count": cross_source_site_count,
+                "import_and_inline": "PASS",
+                "disabled_plugin_identity": "PASS",
+                "object_and_linked_inertness": "PASS",
+                "site_id_stability": "PASS",
+                "retained_out_of_line_copy": "duplicate-rejected",
+                "multiple_live_inline_copies": "partial-record-rejected",
             },
             "split_dwarf": {
                 "result": "PASS",

@@ -166,6 +166,18 @@ Absolute developer paths must not enter the digest.  Assembly and frequently
 moved sites may carry a reviewed manual ID.  Duplicate IDs in one linked image
 are fatal.
 
+Version one requires one physical linked instruction for each automatic ID.
+A bounded ThinLTO test permits a mapped function to be imported and inlined
+when section garbage collection removes its out-of-line body; the surviving
+record resolves inside the caller and keeps the logical source ID.  Retaining
+both bodies is rejected as a duplicate ID.  Two live inline copies currently
+share a single LLVM PC-sections metadata node, causing AsmPrinter to emit two
+PC deltas followed by one auxiliary payload; the resulting partial record is
+also rejected.  Map mode must not prevent inlining to hide either condition,
+because that would change generated code.  Supporting multiple physical
+instances requires a future post-LTO instance identity and metadata-uniquing
+scheme.
+
 ## Sidecar and schedule identity
 
 The linked-image sidecar supplies information deliberately omitted from the
@@ -206,9 +218,11 @@ places map sections after all wildcarded runtime sections, and the regression
 rejects orphan placement that would move a non-map symbol.  A bounded
 split-DWARF lane also has byte-identical verified `.dwo` files, stable site
 IDs, and matching object/linked runtime fingerprints for the LLVM 24 policy
-and source paths and the LLVM 22 policy control.  Full Linux LTO, cross-TU
-import/inlining, kernel debug packaging, GNU `ld`, and boot-image qualification
-remain required.
+and source paths and the LLVM 22 policy control.  A single-copy cross-TU
+import/inlining lane passes with section GC; retained and multiply inlined
+copies are explicit negative gates as described above.  Full Linux LTO,
+cross-TU multiple-instance mapping, kernel debug packaging, GNU `ld`, and
+boot-image qualification remain required.
 
 ## Reference implementation
 

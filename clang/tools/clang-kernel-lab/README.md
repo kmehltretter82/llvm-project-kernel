@@ -88,6 +88,15 @@ and source checks with section garbage collection.  Its linker script captures
 all fixture `.text.*`, `.rodata.*`, `.data.*`, and `.bss.*` inputs before the
 map sections; this prevents an orphan runtime section from being displaced by
 retained metadata and makes that ordering rule part of the regression.
+The cross-translation-unit ThinLTO fixture imports and inlines a mapped
+publisher into `lto_irq_entry`.  With section GC leaving exactly one physical
+copy, policy and source maps both resolve to the caller's store, preserve their
+non-LTO IDs, and match the baseline ELF fingerprint.  Two unqualified shapes
+are fail-closed regressions: retaining the out-of-line body as well as its
+inline copy produces a duplicate ID, while two live inline copies share one
+LLVM PC-sections metadata node and produce a partial fixed-size carrier.  The
+decoder must reject both.  Map mode does not add `noinline`, because doing so
+would violate text inertness.
 The split-DWARF lane compiles every variant through the same output path,
 requires byte-identical `.dwo` files, verifies each file with
 `llvm-dwarfdump`, reapplies the object/linked inertness fingerprint, and checks
@@ -112,8 +121,9 @@ for non-inlined ordinary and single-module ThinLTO fixtures, and does not imply
 a compiler or memory barrier.  Loading a Clang that provides the builtin
 without the matching map plugin is deliberately unsupported rather than a
 silent no-op.  This bounded ThinLTO result does not yet qualify cross-TU
-import/inlining or a Linux kernel LTO link.  The bounded split-DWARF result
-likewise does not yet qualify the kernel's complete debug packaging flow.
+functions that produce multiple live physical copies or a Linux kernel LTO
+link.  The bounded split-DWARF result likewise does not yet qualify the
+kernel's complete debug packaging flow.
 
 The lab branch also patches LLVM 24 SelectionDAG.  Its target test verifies
 that PC-section labels are immediately before the RISC-V call and return:
