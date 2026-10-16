@@ -153,6 +153,14 @@ def ntl_store : RISCVBuiltin<"void(...)">;
 let Features = "zihintpause", Attributes = [NoThrow] in
 def pause : RISCVBuiltin<"void()">;
 
+// Experimental Linux kernel IRQ/RT laboratory source marker.  The first
+// argument is a version-one semantic kind and the second is a source-local
+// ordinal.  A loaded kernel-lab map pass must consume the resulting intrinsic
+// before instruction selection.
+let Attributes = [NoThrow] in
+def linux_irq_site : RISCVBuiltin<
+    "void(_Constant unsigned int, _Constant unsigned int)">;
+
 //===----------------------------------------------------------------------===//
 // P extension.
 //===----------------------------------------------------------------------===//

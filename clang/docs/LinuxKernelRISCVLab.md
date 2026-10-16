@@ -66,6 +66,18 @@ image.  Every lane, including rejected lanes, keeps object and linked `.text`
 identical.  An IR-relative selector still does not promise final instruction
 adjacency; the resolved machine PC is the only scheduleable boundary.
 
+Lab Clang now has the first source-facing interface,
+`__builtin_riscv_linux_irq_site(kind, ordinal)`.  A dedicated intrinsic carries
+the marker through only the initial canonicalization needed to expose its
+surviving IR anchor.  The map plugin then removes it, records a strict pending
+descriptor, and attaches `!pcsections` at optimizer exit.  The initial fixture
+passes text-identity and coverage checks at all six Clang optimization modes,
+uses prefix-mapped project-relative identity, and resolves to the same linked
+store PC as the independent policy selector.  Line tables are currently
+mandatory; changed anchors, missing coverage, and use outside RV64 Linux ELF
+with the medium code model are hard errors.  Non-LTO and non-inlined fixtures
+are the present qualification boundary.
+
 ### Layer B: explicit callback and perturb mode
 
 `ClangKernelLab` is an early pass-plugin prototype for code-changing
@@ -298,6 +310,17 @@ As of 2026-10-16 on `kernel-lab-riscv`:
 - the complete LLVM 24 driver passes the patched SelectionDAG four-site lane;
   its RISC-V opt-in/disabled callback smoke test passes with four callbacks,
   one perturbation point, and zero disabled-mode hooks;
+- the RISC-V source builtin accepts only assigned kind and bounded ordinal
+  constants, lowers to a dedicated fail-closed intrinsic, and is consumed by
+  a two-stage map pass; its kind-39 fixture has identical `.text`, a complete
+  object/link sidecar, and the same linked store PC as the independent policy
+  selector at `-O2`;
+- the source fixture passes object text-identity and coverage at `-O0`, `-O1`,
+  `-O2`, `-O3`, `-Os`, and `-Oz`; missing line tables are rejected, and two
+  prefix-mapped checkout roots derive the same 128-bit ID;
+- the standalone LLVM 22 map plugin still builds and retains its original
+  SelectionDAG-loss/GlobalISel-complete control results, with the source
+  builtin explicitly unavailable in that lane;
 - the recovered PREEMPT_RT analyzer has RISC-V primitive-context regressions,
   a compiler-identity-to-manifest round trip, and visible empty-TU validation;
 - imported BH depths now use logical `local_bh_disable()` units, while NMI
@@ -314,7 +337,8 @@ As of 2026-10-16 on `kernel-lab-riscv`:
 - no Linux boot, QEMU injection, FPGA run, or correctness verdict has yet been
   claimed from this new branch.
 
-The next compiler task is a stable source-level statement interface followed by
-inertness checks over all executable sections, symbols, relaxation, and unwind
-data.  The next QEMU task is the RV64 exact-site TB stop without injection,
-followed by the real PLIC endpoint and deterministic schedule.
+The next compiler task is to extend inertness checks over all executable
+sections, symbols, relaxation, and unwind data, then qualify the source
+interface through section GC and LTO or reject those modes explicitly.  The
+next QEMU task is the RV64 exact-site TB stop without injection, followed by
+the real PLIC endpoint and deterministic schedule.

@@ -2322,6 +2322,12 @@ Value *CodeGenFunction::EmitRISCVBuiltinExpr(unsigned BuiltinID,
     return Builder.CreateCall(Fn, {});
   }
 
+  case RISCV::BI__builtin_riscv_linux_irq_site: {
+    llvm::Function *Fn =
+        CGM.getIntrinsic(llvm::Intrinsic::riscv_linux_irq_site);
+    return Builder.CreateCall(Fn, Ops);
+  }
+
   // XCValu
   case RISCV::BI__builtin_riscv_cv_alu_addN:
     ID = Intrinsic::riscv_cv_alu_addN;

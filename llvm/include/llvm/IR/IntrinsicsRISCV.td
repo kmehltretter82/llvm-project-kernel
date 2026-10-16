@@ -2044,6 +2044,15 @@ let TargetPrefix = "riscv" in {
 let TargetPrefix = "riscv" in
 def int_riscv_pause : DefaultAttrsIntrinsic<[], [], [IntrNoMem, IntrHasSideEffects]>;
 
+// Experimental source marker for the Linux IRQ/RT laboratory.  It is consumed
+// by an early map pass and must not reach instruction selection.  IntrNoMem is
+// deliberate: map mode is not a compiler or hardware memory barrier.
+let TargetPrefix = "riscv" in
+def int_riscv_linux_irq_site :
+    DefaultAttrsIntrinsic<[], [llvm_i32_ty, llvm_i32_ty],
+                          [IntrNoMem, IntrHasSideEffects,
+                           ImmArg<ArgIndex<0>>, ImmArg<ArgIndex<1>>]>;
+
 // Packed SIMD extensions
 //===----------------------------------------------------------------------===//
 let TargetPrefix = "riscv" in {

@@ -92,6 +92,34 @@ machine-instruction adjacency after scheduling.  The linked record's resolved
 PC is authoritative for triggering; richer predecessor/successor claims need
 an independent final-machine-code checker.
 
+### Source marker prototype
+
+The lab RISC-V Clang provides the experimental statement builtin
+`__builtin_riscv_linux_irq_site(kind, ordinal)`.  Both arguments are constant
+unsigned integers; version one accepts assigned kinds 1 through 39 and local
+ordinals 0 through 65535.  It lowers to
+`llvm.riscv.linux.irq.site`, which has no memory effects and is not a compiler
+barrier.  The builtin is usable only with the matching map plugin.
+
+The plugin deliberately does not attach final PC metadata to unoptimized IR.
+It lets LLVM's initial SimplifyCFG, SROA, and EarlyCSE canonicalization expose
+the surviving instruction, records that instruction's exact opcode and mapped
+source location, removes the intrinsic, and rematerializes the anchor at the
+optimizer-last extension point.  A missing, eliminated, duplicated, or changed
+anchor is a compilation error.  This keeps the marker out of the main
+optimizer while avoiding the metadata loss observed when `!pcsections` was
+attached before SROA.
+
+The prototype currently requires line-table debug locations and a normalized
+project-relative path supplied through Clang prefix mapping.  Absolute paths
+are reduced to a basename rather than entering a stable ID, so production
+campaigns must use `-ffile-prefix-map` to avoid basename collisions.  It is
+qualified only for non-LTO, non-inlined fixtures.  Across `-O0`, `-O1`, `-O2`,
+`-O3`, `-Os`, and `-Oz`, the current fixture retains one expected kind-39
+record and byte-identical object `.text`; at `-O2` its linked PC equals the
+independent optimizer-last store selector.  These bounded tests do not yet
+establish whole-kernel inertness.
+
 ## Flags
 
 | Bit | Name | Requirement |
@@ -171,8 +199,9 @@ garbage collection, ThinLTO, and split-debug qualification remain required.
 `clang/utils/kernel-lab/irq_site_format.py` is the bounded reference encoder
 and decoder for resolved records.  `riscv/linux_irq_sites.inc` emits the
 assembly form.  `ClangKernelLabMap` attaches late C PC-section records selected
-by a bounded policy file.  `llvm-riscv-irq-sites` validates linked RV64 images
-and emits the initial sidecar; its `--validate-relocatable` mode additionally
-requires either one `R_RISCV_64` assembly relocation or the exact C-carrier
-`ADD64`/`SUB64` pair to an in-range text boundary.  These remain experimental
-tools and do not establish an installed Linux ABI.
+by a bounded policy file or planned by the RISC-V source builtin.
+`llvm-riscv-irq-sites` validates linked RV64 images and emits the initial
+sidecar; its `--validate-relocatable` mode additionally requires either one
+`R_RISCV_64` assembly relocation or the exact C-carrier `ADD64`/`SUB64` pair
+to an in-range text boundary.  These remain experimental tools and do not
+establish an installed Linux ABI.

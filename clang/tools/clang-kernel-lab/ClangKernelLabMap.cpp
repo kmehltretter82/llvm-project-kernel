@@ -6,11 +6,13 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This late IR pass attaches LLVM !pcsections metadata to selected existing
-// instructions.  LLVM guarantees that PC sections metadata does not affect
-// optimization or generated code outside the requested data section.  The
-// emitted C carrier is deliberately separate from callback/perturb mode and
-// is normalized with assembly records by llvm-riscv-irq-sites.
+// These IR passes attach LLVM !pcsections metadata to selected existing
+// instructions.  The source path plans its dedicated marker after early
+// canonicalization and emits it at pipeline exit; the policy pass selects
+// optimized IR at that same exit.  LLVM guarantees that PC sections metadata
+// does not affect generated code outside the requested data section.  The
+// emitted C carrier is deliberately separate from callback/perturb mode and is
+// normalized with assembly records by llvm-riscv-irq-sites.
 //
 //===----------------------------------------------------------------------===//
 
@@ -63,6 +65,8 @@ namespace {
 constexpr StringLiteral SpecEnvironment = "CLANG_KERNEL_LAB_MAP_SPEC";
 constexpr StringLiteral CarrierSection = ".riscv.linux_irq_c_sites";
 constexpr StringLiteral ExpectedSection = ".riscv.linux_irq_expected";
+constexpr StringLiteral SourcePendingMetadata =
+    "clang.kernel.lab.source.pending";
 constexpr uint64_t MaxSpecBytes = 1024 * 1024;
 constexpr uint8_t SiteVersion = 1;
 constexpr uint8_t SiteRecordSize = 32;
@@ -101,7 +105,10 @@ struct LoadedConfig {
 
 struct PlannedSite {
   Instruction *Anchor = nullptr;
-  const Rule *Descriptor = nullptr;
+  uint16_t Kind = 0;
+  SitePhase Phase = SitePhase::Before;
+  bool NoInstr = false;
+  std::optional<std::pair<uint64_t, uint64_t>> ManualID;
   uint64_t IDLow = 0;
   uint64_t IDHigh = 0;
   unsigned Line = 0;
@@ -279,18 +286,37 @@ static std::shared_ptr<const LoadedConfig> loadConfig() {
   return Result;
 }
 
+static std::string normalizedSourcePath(StringRef Directory,
+                                        StringRef Filename) {
+  SmallString<256> Path;
+  if (sys::path::is_absolute(Filename)) {
+    Path = Filename;
+  } else if (!Directory.empty() && !sys::path::is_absolute(Directory)) {
+    Path = Directory;
+    sys::path::append(Path, Filename);
+  } else {
+    Path = Filename;
+  }
+  sys::path::remove_dots(Path, /*remove_dot_dot=*/true);
+  if (sys::path::is_absolute(Path))
+    return sys::path::filename(Path).str();
+  return sys::path::convert_to_slash(Path);
+}
+
 static void findLocation(const Instruction &I, const Function &F,
                          const Module &M, std::string &Source, unsigned &Line,
                          unsigned &Column) {
-  Source = sys::path::filename(M.getSourceFileName()).str();
+  Source = normalizedSourcePath({}, M.getSourceFileName());
   if (const DebugLoc &Location = I.getDebugLoc()) {
-    Source = sys::path::filename(Location->getFilename()).str();
+    Source =
+        normalizedSourcePath(Location->getDirectory(), Location->getFilename());
     Line = Location.getLine();
     Column = Location.getCol();
     return;
   }
   if (const DISubprogram *Subprogram = F.getSubprogram()) {
-    Source = sys::path::filename(Subprogram->getFilename()).str();
+    Source = normalizedSourcePath(Subprogram->getDirectory(),
+                                  Subprogram->getFilename());
     Line = Subprogram->getLine();
   }
 }
@@ -299,10 +325,9 @@ static std::pair<uint64_t, uint64_t> automaticSiteID(const PlannedSite &Site) {
   SmallString<256> Key;
   raw_svector_ostream OS(Key);
   OS << "clang-kernel-lab-map-v1" << '\0' << Site.SourceName << '\0'
-     << Site.FunctionName << '\0' << Site.CalleeName << '\0'
-     << Site.Descriptor->Kind << '\0'
-     << static_cast<unsigned>(Site.Descriptor->Phase) << '\0' << Site.Line
-     << '\0' << Site.Column << '\0' << Site.Ordinal;
+     << Site.FunctionName << '\0' << Site.CalleeName << '\0' << Site.Kind
+     << '\0' << static_cast<unsigned>(Site.Phase) << '\0' << Site.Line << '\0'
+     << Site.Column << '\0' << Site.Ordinal;
   std::array<uint8_t, 32> Digest =
       SHA256::hash(arrayRefFromStringRef(OS.str()));
   uint64_t High = support::endian::read64be(Digest.data());
@@ -319,7 +344,7 @@ static MDNode *siteMetadata(LLVMContext &Context, const PlannedSite &Site) {
       ConstantAsMetadata::get(
           ConstantInt::get(Type::getInt64Ty(Context), Site.IDHigh)),
       ConstantAsMetadata::get(
-          ConstantInt::get(Type::getInt16Ty(Context), Site.Descriptor->Kind)),
+          ConstantInt::get(Type::getInt16Ty(Context), Site.Kind)),
       MDString::get(Context, Site.FunctionName),
       MDString::get(Context, Site.CalleeName),
       MDString::get(Context, Site.SourceName),
@@ -333,9 +358,9 @@ static MDNode *siteMetadata(LLVMContext &Context, const PlannedSite &Site) {
 
 static uint32_t siteFlags(const PlannedSite &Site) {
   uint32_t Flags = FlagAfterPreviousRetire | FlagBeforeInsnAtSite | FlagC;
-  if (Site.Descriptor->NoInstr)
+  if (Site.NoInstr)
     Flags |= FlagNoInstr;
-  if (Site.Descriptor->ManualID)
+  if (Site.ManualID)
     Flags |= FlagManualID;
   return Flags;
 }
@@ -345,7 +370,7 @@ static void attachSite(Instruction &Anchor, const PlannedSite &Site) {
   SmallVector<Constant *> Aux{
       ConstantInt::get(Type::getInt8Ty(Context), SiteVersion),
       ConstantInt::get(Type::getInt8Ty(Context), SiteRecordSize),
-      ConstantInt::get(Type::getInt16Ty(Context), Site.Descriptor->Kind),
+      ConstantInt::get(Type::getInt16Ty(Context), Site.Kind),
       ConstantInt::get(Type::getInt32Ty(Context), siteFlags(Site)),
       ConstantInt::get(Type::getInt64Ty(Context), Site.IDLow),
       ConstantInt::get(Type::getInt64Ty(Context), Site.IDHigh),
@@ -376,7 +401,7 @@ static void emitExpectedSites(Module &M, ArrayRef<PlannedSite> Sites) {
   SmallVector<Constant *, 16> Records;
   for (const PlannedSite &Site : Sites) {
     Constant *Fields[] = {
-        ConstantInt::get(I16, Site.Descriptor->Kind),
+        ConstantInt::get(I16, Site.Kind),
         ConstantInt::get(I16, 0),
         ConstantInt::get(I32, siteFlags(Site)),
         ConstantInt::get(I64, Site.IDLow),
@@ -391,6 +416,321 @@ static void emitExpectedSites(Module &M, ArrayRef<PlannedSite> Sites) {
   Table->setSection(ExpectedSection);
   Table->setAlignment(Align(8));
   appendToCompilerUsed(M, {Table});
+}
+
+static bool assignSiteIDs(Module &M, MutableArrayRef<PlannedSite> Sites,
+                          StringRef Component) {
+  std::set<std::pair<uint64_t, uint64_t>> IDs;
+  for (PlannedSite &Site : Sites) {
+    if (Site.ManualID) {
+      Site.IDLow = Site.ManualID->first;
+      Site.IDHigh = Site.ManualID->second;
+    } else {
+      std::tie(Site.IDLow, Site.IDHigh) = automaticSiteID(Site);
+    }
+    if (!IDs.insert({Site.IDHigh, Site.IDLow}).second) {
+      M.getContext().emitError(Twine(Component) +
+                               ": duplicate generated or manual site ID");
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool isSourceMarker(const Instruction &I) {
+  const auto *Call = dyn_cast<CallInst>(&I);
+  const Function *Callee = Call ? Call->getCalledFunction() : nullptr;
+  // Match the reserved intrinsic spelling instead of the generated enum so
+  // the map-only plugin remains buildable against the LLVM 22 control lane,
+  // whose headers predate this lab intrinsic.
+  return Callee && Callee->getName() == "llvm.riscv.linux.irq.site";
+}
+
+static bool isNoInstrFunction(const Function &F) {
+  if (!F.hasSection())
+    return false;
+  StringRef Section = F.getSection();
+  return Section == ".noinstr.text" || Section == ".irqentry.text" ||
+         Section == ".entry.text";
+}
+
+struct PendingSourceSite {
+  PlannedSite Site;
+  std::string AnchorOpcode;
+  std::string AnchorSource;
+  unsigned AnchorLine = 0;
+  unsigned AnchorColumn = 0;
+  unsigned AnchorOccurrence = 0;
+  unsigned AnchorCount = 0;
+};
+
+static bool hasExactLocation(const Instruction &I) {
+  return static_cast<bool>(I.getDebugLoc());
+}
+
+static bool matchesSourceAnchor(const Instruction &I, const Function &F,
+                                const Module &M,
+                                const PendingSourceSite &Pending) {
+  if (I.getOpcodeName() != Pending.AnchorOpcode || !hasExactLocation(I))
+    return false;
+  std::string Source;
+  unsigned Line = 0;
+  unsigned Column = 0;
+  findLocation(I, F, M, Source, Line, Column);
+  return Source == Pending.AnchorSource && Line == Pending.AnchorLine &&
+         Column == Pending.AnchorColumn;
+}
+
+static MDNode *pendingSourceMetadata(LLVMContext &Context,
+                                     const PendingSourceSite &Pending) {
+  Metadata *Fields[] = {
+      ConstantAsMetadata::get(
+          ConstantInt::get(Type::getInt16Ty(Context), Pending.Site.Kind)),
+      ConstantAsMetadata::get(
+          ConstantInt::get(Type::getInt32Ty(Context), Pending.Site.Ordinal)),
+      ConstantAsMetadata::get(
+          ConstantInt::get(Type::getInt1Ty(Context), Pending.Site.NoInstr)),
+      MDString::get(Context, Pending.Site.FunctionName),
+      MDString::get(Context, Pending.Site.SourceName),
+      ConstantAsMetadata::get(
+          ConstantInt::get(Type::getInt32Ty(Context), Pending.Site.Line)),
+      ConstantAsMetadata::get(
+          ConstantInt::get(Type::getInt32Ty(Context), Pending.Site.Column)),
+      MDString::get(Context, Pending.AnchorOpcode),
+      MDString::get(Context, Pending.AnchorSource),
+      ConstantAsMetadata::get(
+          ConstantInt::get(Type::getInt32Ty(Context), Pending.AnchorLine)),
+      ConstantAsMetadata::get(
+          ConstantInt::get(Type::getInt32Ty(Context), Pending.AnchorColumn)),
+      ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(Context),
+                                               Pending.AnchorOccurrence)),
+      ConstantAsMetadata::get(
+          ConstantInt::get(Type::getInt32Ty(Context), Pending.AnchorCount)),
+  };
+  return MDNode::get(Context, Fields);
+}
+
+static bool readPendingSourceMetadata(const MDNode &Node,
+                                      PendingSourceSite &Pending) {
+  if (Node.getNumOperands() != 13)
+    return false;
+  auto UInt = [&](unsigned Index) -> std::optional<uint64_t> {
+    auto *Value = mdconst::dyn_extract<ConstantInt>(Node.getOperand(Index));
+    if (!Value)
+      return std::nullopt;
+    return Value->getZExtValue();
+  };
+  auto Text = [&](unsigned Index) -> MDString * {
+    return dyn_cast_or_null<MDString>(Node.getOperand(Index));
+  };
+  std::optional<uint64_t> Kind = UInt(0);
+  std::optional<uint64_t> Ordinal = UInt(1);
+  std::optional<uint64_t> NoInstr = UInt(2);
+  MDString *FunctionName = Text(3);
+  MDString *SourceName = Text(4);
+  std::optional<uint64_t> Line = UInt(5);
+  std::optional<uint64_t> Column = UInt(6);
+  MDString *AnchorOpcode = Text(7);
+  MDString *AnchorSource = Text(8);
+  std::optional<uint64_t> AnchorLine = UInt(9);
+  std::optional<uint64_t> AnchorColumn = UInt(10);
+  std::optional<uint64_t> AnchorOccurrence = UInt(11);
+  std::optional<uint64_t> AnchorCount = UInt(12);
+  if (!Kind || !Ordinal || !NoInstr || !FunctionName || !SourceName || !Line ||
+      !Column || !AnchorOpcode || !AnchorSource || !AnchorLine ||
+      !AnchorColumn || !AnchorOccurrence || !AnchorCount ||
+      *Kind > std::numeric_limits<uint16_t>::max() || !isKnownKind(*Kind) ||
+      *Ordinal > 65535 || *NoInstr > 1 || !*Line || !*AnchorLine ||
+      *Line > std::numeric_limits<unsigned>::max() ||
+      *Column > std::numeric_limits<unsigned>::max() ||
+      *AnchorLine > std::numeric_limits<unsigned>::max() ||
+      *AnchorColumn > std::numeric_limits<unsigned>::max() ||
+      !*AnchorOccurrence ||
+      *AnchorOccurrence > std::numeric_limits<unsigned>::max() ||
+      !*AnchorCount || *AnchorCount > std::numeric_limits<unsigned>::max())
+    return false;
+  Pending.Site.Kind = static_cast<uint16_t>(*Kind);
+  Pending.Site.Phase = SitePhase::Before;
+  Pending.Site.NoInstr = static_cast<bool>(*NoInstr);
+  Pending.Site.FunctionName = FunctionName->getString().str();
+  Pending.Site.SourceName = SourceName->getString().str();
+  Pending.Site.Line = static_cast<unsigned>(*Line);
+  Pending.Site.Column = static_cast<unsigned>(*Column);
+  Pending.Site.Ordinal = static_cast<unsigned>(*Ordinal);
+  Pending.AnchorOpcode = AnchorOpcode->getString().str();
+  Pending.AnchorSource = AnchorSource->getString().str();
+  Pending.AnchorLine = static_cast<unsigned>(*AnchorLine);
+  Pending.AnchorColumn = static_cast<unsigned>(*AnchorColumn);
+  Pending.AnchorOccurrence = static_cast<unsigned>(*AnchorOccurrence);
+  Pending.AnchorCount = static_cast<unsigned>(*AnchorCount);
+  return true;
+}
+
+#if LLVM_VERSION_MAJOR >= 24
+class KernelLabSourcePlanPass
+    : public RequiredPassInfoMixin<KernelLabSourcePlanPass> {
+#else
+class KernelLabSourcePlanPass : public PassInfoMixin<KernelLabSourcePlanPass> {
+#endif
+public:
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &);
+  static bool isRequired() { return true; }
+};
+
+PreservedAnalyses KernelLabSourcePlanPass::run(Module &M,
+                                               ModuleAnalysisManager &) {
+  if (M.getModuleFlag("clang.kernel.lab.source-plan"))
+    return PreservedAnalyses::all();
+
+  SmallVector<CallInst *, 16> Markers;
+  for (Function &F : M)
+    if (!F.isDeclaration())
+      for (Instruction &I : instructions(F))
+        if (isSourceMarker(I))
+          Markers.push_back(cast<CallInst>(&I));
+  if (Markers.empty())
+    return PreservedAnalyses::all();
+
+  Triple Target(M.getTargetTriple());
+  if (Target.getArch() != Triple::riscv64 || !Target.isOSBinFormatELF() ||
+      !Target.isOSLinux()) {
+    M.getContext().emitError(
+        "clang-kernel-lab-source-map: version one requires RV64 Linux ELF");
+    return PreservedAnalyses::all();
+  }
+  std::optional<CodeModel::Model> CM = M.getCodeModel();
+  if (!CM || (*CM != CodeModel::Medium && *CM != CodeModel::Large)) {
+    M.getContext().emitError("clang-kernel-lab-source-map: use -mcmodel=medany "
+                             "so PC records are 64-bit");
+    return PreservedAnalyses::all();
+  }
+
+  NamedMDNode *PendingList = M.getOrInsertNamedMetadata(SourcePendingMetadata);
+  for (CallInst *Marker : Markers) {
+    auto *Kind = dyn_cast<ConstantInt>(Marker->getArgOperand(0));
+    auto *Ordinal = dyn_cast<ConstantInt>(Marker->getArgOperand(1));
+    if (!Kind || !Ordinal || !isKnownKind(Kind->getZExtValue()) ||
+        Ordinal->getZExtValue() > 65535) {
+      M.getContext().emitError(
+          "clang-kernel-lab-source-map: malformed source marker operands");
+      return PreservedAnalyses::all();
+    }
+
+    Instruction *Anchor = Marker->getNextNode();
+    while (Anchor && isSourceMarker(*Anchor))
+      Anchor = Anchor->getNextNode();
+    if (!Anchor) {
+      M.getContext().emitError("clang-kernel-lab-source-map: source marker has "
+                               "no following instruction");
+      return PreservedAnalyses::all();
+    }
+    if (!hasExactLocation(*Marker) || !hasExactLocation(*Anchor)) {
+      M.getContext().emitError(
+          "clang-kernel-lab-source-map: source markers require line-table "
+          "debug information");
+      return PreservedAnalyses::all();
+    }
+
+    Function &F = *Marker->getFunction();
+    PendingSourceSite Pending;
+    Pending.Site.Kind = static_cast<uint16_t>(Kind->getZExtValue());
+    Pending.Site.Phase = SitePhase::Before;
+    Pending.Site.NoInstr = isNoInstrFunction(F);
+    Pending.Site.FunctionName = F.getName().str();
+    Pending.Site.Ordinal = static_cast<unsigned>(Ordinal->getZExtValue());
+    findLocation(*Marker, F, M, Pending.Site.SourceName, Pending.Site.Line,
+                 Pending.Site.Column);
+    Pending.AnchorOpcode = Anchor->getOpcodeName();
+    findLocation(*Anchor, F, M, Pending.AnchorSource, Pending.AnchorLine,
+                 Pending.AnchorColumn);
+    for (Instruction &I : instructions(F)) {
+      if (!matchesSourceAnchor(I, F, M, Pending))
+        continue;
+      ++Pending.AnchorCount;
+      if (&I == Anchor)
+        Pending.AnchorOccurrence = Pending.AnchorCount;
+    }
+    if (!Pending.AnchorOccurrence) {
+      M.getContext().emitError(
+          "clang-kernel-lab-source-map: cannot identify source marker anchor");
+      return PreservedAnalyses::all();
+    }
+    PendingList->addOperand(pendingSourceMetadata(M.getContext(), Pending));
+  }
+
+  M.addModuleFlag(Module::Error, "clang.kernel.lab.source-plan", 1);
+  for (CallInst *Marker : Markers)
+    Marker->eraseFromParent();
+  return PreservedAnalyses::none();
+}
+
+#if LLVM_VERSION_MAJOR >= 24
+class KernelLabSourceMapPass
+    : public RequiredPassInfoMixin<KernelLabSourceMapPass> {
+#else
+class KernelLabSourceMapPass : public PassInfoMixin<KernelLabSourceMapPass> {
+#endif
+public:
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &);
+  static bool isRequired() { return true; }
+};
+
+PreservedAnalyses KernelLabSourceMapPass::run(Module &M,
+                                              ModuleAnalysisManager &) {
+  NamedMDNode *PendingList = M.getNamedMetadata(SourcePendingMetadata);
+  if (!PendingList)
+    return PreservedAnalyses::all();
+  if (M.getModuleFlag("clang.kernel.lab.source-map")) {
+    M.getContext().emitError(
+        "clang-kernel-lab-source-map: pending sites were already processed");
+    return PreservedAnalyses::all();
+  }
+
+  std::vector<PlannedSite> Sites;
+  Sites.reserve(PendingList->getNumOperands());
+  for (const MDNode *Node : PendingList->operands()) {
+    PendingSourceSite Pending;
+    if (!Node || !readPendingSourceMetadata(*Node, Pending)) {
+      M.getContext().emitError(
+          "clang-kernel-lab-source-map: malformed pending source site");
+      return PreservedAnalyses::all();
+    }
+    Function *F = M.getFunction(Pending.Site.FunctionName);
+    if (!F || F->isDeclaration()) {
+      M.getContext().emitError(
+          "clang-kernel-lab-source-map: source marker function was eliminated");
+      return PreservedAnalyses::all();
+    }
+    SmallVector<Instruction *, 4> Candidates;
+    for (Instruction &I : instructions(*F))
+      if (matchesSourceAnchor(I, *F, M, Pending))
+        Candidates.push_back(&I);
+    if (Candidates.size() != Pending.AnchorCount ||
+        Pending.AnchorOccurrence > Candidates.size()) {
+      M.getContext().emitError(
+          Twine("clang-kernel-lab-source-map: source marker anchor changed "
+                "during optimization; expected ") +
+          Pending.AnchorOpcode + " at " + Pending.AnchorSource + ":" +
+          Twine(Pending.AnchorLine) + ":" + Twine(Pending.AnchorColumn) +
+          " with " + Twine(Pending.AnchorCount) + " match(es), found " +
+          Twine(Candidates.size()));
+      return PreservedAnalyses::all();
+    }
+    Pending.Site.Anchor = Candidates[Pending.AnchorOccurrence - 1];
+    Sites.push_back(std::move(Pending.Site));
+  }
+
+  if (!assignSiteIDs(M, Sites, "clang-kernel-lab-source-map"))
+    return PreservedAnalyses::all();
+  NamedMDNode *SiteList = M.getOrInsertNamedMetadata("clang.kernel.lab.sites");
+  for (PlannedSite &Site : Sites) {
+    attachSite(*Site.Anchor, Site);
+    SiteList->addOperand(siteMetadata(M.getContext(), Site));
+  }
+  emitExpectedSites(M, Sites);
+  M.eraseNamedMetadata(PendingList);
+  M.addModuleFlag(Module::Error, "clang.kernel.lab.source-map", 1);
+  return PreservedAnalyses::none();
 }
 
 #if LLVM_VERSION_MAJOR >= 24
@@ -464,7 +804,10 @@ PreservedAnalyses KernelLabMapPass::run(Module &M, ModuleAnalysisManager &) {
         }
         PlannedSite Site;
         Site.Anchor = &*Point;
-        Site.Descriptor = &R;
+        Site.Kind = R.Kind;
+        Site.Phase = R.Phase;
+        Site.NoInstr = R.NoInstr;
+        Site.ManualID = R.ManualID;
         Site.FunctionName = F.getName().str();
         findLocation(*Site.Anchor, F, M, Site.SourceName, Site.Line,
                      Site.Column);
@@ -476,7 +819,10 @@ PreservedAnalyses KernelLabMapPass::run(Module &M, ModuleAnalysisManager &) {
             continue;
           PlannedSite Site;
           Site.Anchor = &I;
-          Site.Descriptor = &R;
+          Site.Kind = R.Kind;
+          Site.Phase = R.Phase;
+          Site.NoInstr = R.NoInstr;
+          Site.ManualID = R.ManualID;
           Site.FunctionName = F.getName().str();
           Site.Ordinal = Ordinals.lookup(&I);
           findLocation(I, F, M, Site.SourceName, Site.Line, Site.Column);
@@ -498,7 +844,10 @@ PreservedAnalyses KernelLabMapPass::run(Module &M, ModuleAnalysisManager &) {
           continue;
         PlannedSite Site;
         Site.Anchor = &I;
-        Site.Descriptor = &R;
+        Site.Kind = R.Kind;
+        Site.Phase = R.Phase;
+        Site.NoInstr = R.NoInstr;
+        Site.ManualID = R.ManualID;
         Site.FunctionName = F.getName().str();
         Site.CalleeName = R.Opcode;
         Site.Ordinal = Ordinals.lookup(&I);
@@ -535,7 +884,10 @@ PreservedAnalyses KernelLabMapPass::run(Module &M, ModuleAnalysisManager &) {
         }
         PlannedSite Site;
         Site.Anchor = Anchor;
-        Site.Descriptor = &R;
+        Site.Kind = R.Kind;
+        Site.Phase = R.Phase;
+        Site.NoInstr = R.NoInstr;
+        Site.ManualID = R.ManualID;
         Site.FunctionName = F.getName().str();
         Site.CalleeName = Callee->getName().str();
         Site.Ordinal = Ordinals.lookup(&I);
@@ -558,20 +910,8 @@ PreservedAnalyses KernelLabMapPass::run(Module &M, ModuleAnalysisManager &) {
   if (Sites.empty())
     return PreservedAnalyses::all();
 
-  std::set<std::pair<uint64_t, uint64_t>> IDs;
-  for (PlannedSite &Site : Sites) {
-    if (Site.Descriptor->ManualID) {
-      Site.IDLow = Site.Descriptor->ManualID->first;
-      Site.IDHigh = Site.Descriptor->ManualID->second;
-    } else {
-      std::tie(Site.IDLow, Site.IDHigh) = automaticSiteID(Site);
-    }
-    if (!IDs.insert({Site.IDHigh, Site.IDLow}).second) {
-      M.getContext().emitError(
-          "clang-kernel-lab-map: duplicate generated or manual site ID");
-      return PreservedAnalyses::all();
-    }
-  }
+  if (!assignSiteIDs(M, Sites, "clang-kernel-lab-map"))
+    return PreservedAnalyses::all();
 
   NamedMDNode *SiteList = M.getOrInsertNamedMetadata("clang.kernel.lab.sites");
   for (PlannedSite &Site : Sites) {
@@ -589,9 +929,14 @@ PreservedAnalyses KernelLabMapPass::run(Module &M, ModuleAnalysisManager &) {
 
 static void registerCallbacks(PassBuilder &PB) {
   std::shared_ptr<const LoadedConfig> Loaded = loadConfig();
+  PB.registerPipelineEarlySimplificationEPCallback(
+      [](ModulePassManager &Manager, OptimizationLevel, ThinOrFullLTOPhase) {
+        Manager.addPass(KernelLabSourcePlanPass());
+      });
   PB.registerOptimizerLastEPCallback([Loaded](ModulePassManager &Manager,
                                               OptimizationLevel,
                                               ThinOrFullLTOPhase) {
+    Manager.addPass(KernelLabSourceMapPass());
     if (Loaded->Requested)
       Manager.addPass(KernelLabMapPass(Loaded));
   });

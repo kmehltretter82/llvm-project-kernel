@@ -8,12 +8,14 @@ import hashlib
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import tempfile
 
 
 HERE = pathlib.Path(__file__).resolve().parent
 TOOL = HERE.parent
+ROOT = TOOL.parents[2]
 SOURCE = HERE / "map-probe.c"
 LINKER_SCRIPT = HERE / "map-link.ld"
 VALID_SPEC = TOOL / "examples" / "riscv-map-v1.json"
@@ -34,6 +36,12 @@ def run(command: list[str], *, environment: dict[str, str] | None = None,
 def compile_object(arguments: argparse.Namespace, output: pathlib.Path,
                    *, plugin: bool, spec: pathlib.Path | None,
                    global_isel: bool = False,
+                   source_site: bool = False,
+                   optimization: str = "2",
+                   debug_info: bool = True,
+                   check: bool = True,
+                   source: pathlib.Path = SOURCE,
+                   prefix_root: pathlib.Path = ROOT,
                    ) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     if spec is None:
@@ -46,17 +54,21 @@ def compile_object(arguments: argparse.Namespace, output: pathlib.Path,
         "-march=rv64ima",
         "-mabi=lp64",
         "-mcmodel=medany",
-        "-O2",
-        "-gline-tables-only",
+        f"-O{optimization}",
         "-ffreestanding",
         "-fno-addrsig",
+        f"-ffile-prefix-map={prefix_root}=.",
     ]
+    if debug_info:
+        command.append("-gline-tables-only")
     if global_isel:
         command.extend(["-fglobal-isel", "-Wno-global-isel"])
+    if source_site:
+        command.append("-DKERNEL_LAB_SOURCE_SITE=1")
     if plugin:
         command.append(f"-fpass-plugin={arguments.plugin.resolve()}")
-    command.extend(["-c", str(SOURCE), "-o", str(output)])
-    return run(command, environment=environment)
+    command.extend(["-c", str(source), "-o", str(output)])
+    return run(command, environment=environment, check=check)
 
 
 def link(arguments: argparse.Namespace, obj: pathlib.Path,
@@ -100,16 +112,24 @@ def parse_args() -> argparse.Namespace:
         default="complete",
         help="expected handling of the four-site experimental GlobalISel fixture",
     )
+    parser.add_argument(
+        "--source-builtin-expect",
+        choices=("unavailable", "complete"),
+        default="unavailable",
+        help="whether this Clang provides the experimental source builtin",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     arguments = parse_args()
+    source_builtin = arguments.source_builtin_expect == "complete"
     with tempfile.TemporaryDirectory(prefix="clang-kernel-lab-map-") as temp:
         directory = pathlib.Path(temp)
         baseline_obj = directory / "baseline.o"
         disabled_obj = directory / "disabled.o"
         mapped_obj = directory / "mapped.o"
+        source_obj = directory / "source.o"
         gap_obj = directory / "gap.o"
         gisel_baseline_obj = directory / "gisel-baseline.o"
         gisel_mapped_obj = directory / "gisel-mapped.o"
@@ -119,9 +139,19 @@ def main() -> int:
         mapped_compile = compile_object(
             arguments, mapped_obj, plugin=True, spec=VALID_SPEC
         )
+        source_compile = None
+        if source_builtin:
+            source_compile = compile_object(
+                arguments, source_obj, plugin=True, spec=None, source_site=True
+            )
         if "loosing !pcsections" in mapped_compile.stderr:
             raise AssertionError(
                 f"qualified map unexpectedly lost metadata: {mapped_compile.stderr}"
+            )
+        if source_compile and "loosing !pcsections" in source_compile.stderr:
+            raise AssertionError(
+                f"source marker unexpectedly lost metadata: "
+                f"{source_compile.stderr}"
             )
 
         baseline_obj_text = dump_section(
@@ -137,6 +167,12 @@ def main() -> int:
             raise AssertionError("loading disabled map plugin changed object .text")
         if baseline_obj_text != mapped_obj_text:
             raise AssertionError("enabled C map changed object .text")
+        if source_builtin:
+            source_obj_text = dump_section(
+                arguments, source_obj, ".text", directory / "source-o.text"
+            )
+            if baseline_obj_text != source_obj_text:
+                raise AssertionError("source builtin map changed object .text")
 
         object_result = run([
             str(arguments.site_tool.resolve()),
@@ -156,12 +192,122 @@ def main() -> int:
         if object_site["text_section"] != ".text":
             raise AssertionError("C carrier relocation does not target .text")
 
+        source_optimization_levels: dict[str, str] = {}
+        if source_builtin:
+            source_object_map = json.loads(run([
+                str(arguments.site_tool.resolve()),
+                "--validate-relocatable",
+                str(source_obj),
+            ]).stdout)
+            if len(source_object_map["sites"]) != 1:
+                raise AssertionError(
+                    "source builtin did not emit exactly one site"
+                )
+            if source_object_map["sites"][0]["kind"] != 39:
+                raise AssertionError("source builtin emitted the wrong site kind")
+
+            relocated_root = directory / "relocated-root"
+            relocated_source = relocated_root / SOURCE.relative_to(ROOT)
+            relocated_source.parent.mkdir(parents=True)
+            shutil.copyfile(SOURCE, relocated_source)
+            relocated_obj = directory / "source-relocated.o"
+            compile_object(
+                arguments,
+                relocated_obj,
+                plugin=True,
+                spec=None,
+                source_site=True,
+                source=relocated_source,
+                prefix_root=relocated_root,
+            )
+            relocated_map = json.loads(run([
+                str(arguments.site_tool.resolve()),
+                "--validate-relocatable",
+                str(relocated_obj),
+            ]).stdout)
+            if (
+                relocated_map["sites"][0]["site_id"]
+                != source_object_map["sites"][0]["site_id"]
+            ):
+                raise AssertionError(
+                    "source builtin ID changed across prefix-mapped roots"
+                )
+
+            no_debug = compile_object(
+                arguments,
+                directory / "source-no-debug.o",
+                plugin=True,
+                spec=None,
+                source_site=True,
+                debug_info=False,
+                check=False,
+            )
+            if no_debug.returncode == 0:
+                raise AssertionError(
+                    "source builtin unexpectedly accepted missing line tables"
+                )
+            if "source markers require line-table debug information" not in (
+                no_debug.stderr
+            ):
+                raise AssertionError(
+                    f"unexpected missing-line-table error: {no_debug.stderr!r}"
+                )
+
+            source_optimization_levels["O2"] = "PASS"
+            for level in ("0", "1", "3", "s", "z"):
+                level_baseline = directory / f"source-base-O{level}.o"
+                level_source = directory / f"source-map-O{level}.o"
+                compile_object(
+                    arguments,
+                    level_baseline,
+                    plugin=False,
+                    spec=None,
+                    optimization=level,
+                )
+                compile_object(
+                    arguments,
+                    level_source,
+                    plugin=True,
+                    spec=None,
+                    source_site=True,
+                    optimization=level,
+                )
+                baseline_text = dump_section(
+                    arguments,
+                    level_baseline,
+                    ".text",
+                    directory / f"source-base-O{level}.text",
+                )
+                source_text = dump_section(
+                    arguments,
+                    level_source,
+                    ".text",
+                    directory / f"source-map-O{level}.text",
+                )
+                if baseline_text != source_text:
+                    raise AssertionError(
+                        f"source builtin changed object .text at -O{level}"
+                    )
+                level_map = json.loads(run([
+                    str(arguments.site_tool.resolve()),
+                    "--validate-relocatable",
+                    str(level_source),
+                ]).stdout)
+                if len(level_map["sites"]) != 1:
+                    raise AssertionError(
+                        f"source builtin lost coverage at -O{level}"
+                    )
+                source_optimization_levels[f"O{level}"] = "PASS"
+
         baseline_elf = directory / "baseline.elf"
         disabled_elf = directory / "disabled.elf"
         mapped_elf = directory / "mapped.elf"
+        source_elf = directory / "source.elf"
         link(arguments, baseline_obj, baseline_elf)
         link(arguments, disabled_obj, disabled_elf)
         link(arguments, mapped_obj, mapped_elf)
+        if source_builtin:
+            link(arguments, source_obj, source_elf)
         baseline_elf_text = dump_section(
             arguments, baseline_elf, ".text", directory / "baseline-e.text"
         )
@@ -175,6 +321,12 @@ def main() -> int:
             raise AssertionError("loading disabled map plugin changed linked .text")
         if baseline_elf_text != mapped_elf_text:
             raise AssertionError("enabled C map changed linked .text")
+        if source_builtin:
+            source_elf_text = dump_section(
+                arguments, source_elf, ".text", directory / "source-e.text"
+            )
+            if baseline_elf_text != source_elf_text:
+                raise AssertionError("source builtin map changed linked .text")
 
         sidecar_result = run([
             str(arguments.site_tool.resolve()),
@@ -204,6 +356,26 @@ def main() -> int:
             mapped_site["link_va"], 0
         ) + 0x1000:
             raise AssertionError("C site load-bias calculation is incorrect")
+
+        if source_builtin:
+            source_sidecar = json.loads(run([
+                str(arguments.site_tool.resolve()), str(source_elf)
+            ]).stdout)
+            if len(source_sidecar["sites"]) != 1:
+                raise AssertionError("source builtin linked map is incomplete")
+            source_site = source_sidecar["sites"][0]
+            if (
+                source_site["kind"] != 39
+                or source_site["symbol"] != "irq_map_probe"
+            ):
+                raise AssertionError(
+                    f"source builtin linked site is malformed: {source_site!r}"
+                )
+            if source_site["link_va"] != mapped_site["link_va"]:
+                raise AssertionError(
+                    "source builtin and policy selector did not anchor the same "
+                    "store"
+                )
 
         gap_compile = compile_object(
             arguments, gap_obj, plugin=True, spec=GAP_SPEC
@@ -397,6 +569,21 @@ def main() -> int:
             "mode": "text-inert-pcsections",
             "text_bytes": len(mapped_elf_text),
             "site_count": 1,
+            "source_builtin_expectation": arguments.source_builtin_expect,
+            "source_builtin_site_count": 1 if source_builtin else 0,
+            "source_builtin_text_identity": (
+                "PASS" if source_builtin else "unavailable"
+            ),
+            "source_builtin_anchor_matches_policy": (
+                True if source_builtin else None
+            ),
+            "source_builtin_optimization_levels": source_optimization_levels,
+            "source_builtin_prefix_map_identity": (
+                "PASS" if source_builtin else "unavailable"
+            ),
+            "source_builtin_missing_line_tables": (
+                "coverage-rejected" if source_builtin else "unavailable"
+            ),
             "object_relocations": "PASS",
             "selectiondag_expectation": arguments.selectiondag_expect,
             "selectiondag_site_count": selectiondag_site_count,

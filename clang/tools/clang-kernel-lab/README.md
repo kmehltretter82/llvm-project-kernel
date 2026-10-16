@@ -3,9 +3,13 @@
 This directory contains three deliberately separated experimental components
 for the Linux IRQ/PREEMPT_RT laboratory:
 
-- `ClangKernelLabMap` is the text-inert, optimizer-last map pass.  It emits
-  LLVM PC-section records plus an independently checked expectation table and
-  requires RV64 ELF with `-mcmodel=medany`.
+- `ClangKernelLabMap` is the text-inert map plugin.  Its policy path selects
+  optimized IR at pipeline exit.  Lab Clang additionally lowers
+  `__builtin_riscv_linux_irq_site(kind, ordinal)` to a dedicated marker: the
+  plugin records its anchor after early canonicalization, removes the marker,
+  and emits LLVM PC-section records at pipeline exit.  Both paths emit an
+  independently checked expectation table and require RV64 Linux ELF with
+  `-mcmodel=medany`.
 - `llvm-riscv-irq-sites` validates the text-inert 32-byte site records and
   emits a linked-image JSON sidecar.  Its `--validate-relocatable` mode checks
   that every object record has exactly one `R_RISCV_64` relocation to an
@@ -51,7 +55,8 @@ python3 clang/tools/clang-kernel-lab/tests/test_map_plugin.py \
   --llvm-objcopy /path/to/llvm-objcopy \
   --plugin ../build-kernel-lab/ClangKernelLabMap.so \
   --site-tool ../build-kernel-lab/llvm-riscv-irq-sites \
-  --selectiondag-expect complete --global-isel-expect loss
+  --selectiondag-expect complete --global-isel-expect loss \
+  --source-builtin-expect complete
 python3 clang/tools/clang-kernel-lab/tests/test_selectiondag_backend.py \
   --clang /path/to/plugin-compatible/clang \
   --llc ../build-riscv-llvm/bin/llc \
@@ -76,6 +81,17 @@ four.  The lab LLVM 24 command shown above requires four SelectionDAG sites and
 expects GlobalISel to lose only the publication-store site.  All four object
 and linked outputs remain text-identical to their matching controls; incomplete
 coverage is still fatal.
+
+The lab-Clang lane also checks the source builtin at `-O0`, `-O1`, `-O2`,
+`-O3`, `-Os`, and `-Oz`.  Each lane emits one coverage-checked kind-39 site,
+keeps object `.text` identical to its unannotated control, and resolves to the
+same final store as the optimizer-last policy selector.  Two copies below
+different absolute roots produce the same ID when `-ffile-prefix-map` gives
+them the same project-relative name.  The current source prototype requires
+line-table debug locations, rejects a changed/eliminated anchor, is qualified
+only for non-LTO, non-inlined fixtures, and does not imply a compiler or memory
+barrier.  Loading a Clang that provides the builtin without the matching map
+plugin is deliberately unsupported rather than a silent no-op.
 
 The lab branch also patches LLVM 24 SelectionDAG.  Its target test verifies
 that PC-section labels are immediately before the RISC-V call and return:

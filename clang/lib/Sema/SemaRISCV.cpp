@@ -694,6 +694,12 @@ bool SemaRISCV::CheckBuiltinFunctionCall(const TargetInfo &TI,
            CheckLMUL(TheCall, LMULOffset);
   };
   switch (BuiltinID) {
+  case RISCV::BI__builtin_riscv_linux_irq_site:
+    // Version one currently assigns the complete contiguous range 1..39.
+    // Keep the ordinal bounded so it remains an unambiguous source-local
+    // component of the stable identifier.
+    return SemaRef.BuiltinConstantArgRange(TheCall, 0, 1, 39) ||
+           SemaRef.BuiltinConstantArgRange(TheCall, 1, 0, 65535);
   case RISCVVector::BI__builtin_rvv_vsetvli:
     return CheckVSetVL(1, 2);
   case RISCVVector::BI__builtin_rvv_vsetvlimax:
