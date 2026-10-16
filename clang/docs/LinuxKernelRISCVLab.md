@@ -318,6 +318,10 @@ As of 2026-10-16 on `kernel-lab-riscv`:
 - the source fixture passes object text-identity and coverage at `-O0`, `-O1`,
   `-O2`, `-O3`, `-Os`, and `-Oz`; missing line tables are rejected, and two
   prefix-mapped checkout roots derive the same 128-bit ID;
+- the C-map inertness gate covers two executable sections and compares all
+  non-map allocated/executable bytes and layout, meaningful symbols, code
+  relocations, and unwind sections/relocations in relocatable and linked ELF;
+  linker relaxation on/off and section garbage collection all pass;
 - the standalone LLVM 22 map plugin still builds and retains its original
   SelectionDAG-loss/GlobalISel-complete control results, with the source
   builtin explicitly unavailable in that lane;
@@ -337,8 +341,7 @@ As of 2026-10-16 on `kernel-lab-riscv`:
 - no Linux boot, QEMU injection, FPGA run, or correctness verdict has yet been
   claimed from this new branch.
 
-The next compiler task is to extend inertness checks over all executable
-sections, symbols, relaxation, and unwind data, then qualify the source
-interface through section GC and LTO or reject those modes explicitly.  The
-next QEMU task is the RV64 exact-site TB stop without injection, followed by
-the real PLIC endpoint and deterministic schedule.
+The next compiler task is to lift the bounded inertness gate into a small
+Linux link, then qualify ThinLTO/split debug and GNU `ld` or reject those modes
+explicitly.  The next QEMU task is the RV64 exact-site TB stop without
+injection, followed by the real PLIC endpoint and deterministic schedule.

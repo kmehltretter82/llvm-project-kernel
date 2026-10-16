@@ -3,6 +3,7 @@ OUTPUT_ARCH(riscv)
 SECTIONS
 {
   . = 0x80000000;
+  .noinstr.text : { KEEP(*(.noinstr.text)) }
   .text : { *(.text) }
   .bss : { *(.bss) *(COMMON) }
   .riscv.linux_irq_expected : {

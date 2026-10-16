@@ -53,6 +53,7 @@ python3 clang/tools/clang-kernel-lab/tests/test_callback_plugin.py \
 python3 clang/tools/clang-kernel-lab/tests/test_map_plugin.py \
   --clang /path/to/clang --ld-lld /path/to/ld.lld \
   --llvm-objcopy /path/to/llvm-objcopy \
+  --llvm-readobj /path/to/llvm-readobj \
   --plugin ../build-kernel-lab/ClangKernelLabMap.so \
   --site-tool ../build-kernel-lab/llvm-riscv-irq-sites \
   --selectiondag-expect complete --global-isel-expect loss \
@@ -75,6 +76,12 @@ deliberately wrong-width relocation.
 The C-map test additionally proves disabled/enabled object and linked `.text`
 identity, validates the PC-relative relocation pair across linker relaxation,
 and proves that the tool rejects a requested site dropped by code generation.
+Its normalized ELF fingerprint now compares every non-map allocated section,
+every executable section, function/object and non-local symbols, relocations
+targeting executable sections, and raw unwind sections plus their relocations.
+The fixture contains both `.text` and `.noinstr.text`, runs with linker
+relaxation enabled and disabled, and repeats the linked checks under section
+garbage collection.
 Its expectation switches make backend/revision behavior explicit.  Stock LLVM
 22 uses the defaults: SelectionDAG loses three sites and GlobalISel preserves
 four.  The lab LLVM 24 command shown above requires four SelectionDAG sites and

@@ -4,6 +4,11 @@ __attribute__((noinline)) int reschedule_check(int value) {
 
 volatile int published_irq_state;
 
+__attribute__((used, noinline, section(".noinstr.text"))) int
+noinstr_map_probe(int value) {
+  return value - 1;
+}
+
 __attribute__((noinline)) int irq_map_probe(int value) {
   int published = reschedule_check(value);
 #ifdef KERNEL_LAB_SOURCE_SITE

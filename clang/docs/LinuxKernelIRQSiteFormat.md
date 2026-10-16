@@ -190,9 +190,14 @@ For a matched build with map mode disabled and enabled:
 - after removing map/note sections, the boot-image difference must be fully
   explained.
 
-The phase-zero test currently proves object and linked `.text` identity for
-two hand-authored RV64 assembly sites.  Full Linux, linker-relaxation, section
-garbage collection, ThinLTO, and split-debug qualification remain required.
+The phase-zero test proves object and linked `.text` identity for two
+hand-authored RV64 assembly sites.  The C fixture additionally compares a
+normalized object and linked-ELF fingerprint: all non-map allocated sections,
+both executable sections (`.text` and `.noinstr.text`), meaningful symbols,
+code relocations, and unwind bytes/relocations.  It passes with RISC-V linker
+relaxation enabled and disabled and with section garbage collection.  Full
+Linux, ThinLTO, split-debug, GNU `ld`, and boot-image qualification remain
+required.
 
 ## Reference implementation
 

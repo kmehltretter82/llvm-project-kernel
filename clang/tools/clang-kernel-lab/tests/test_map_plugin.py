@@ -20,6 +20,20 @@ SOURCE = HERE / "map-probe.c"
 LINKER_SCRIPT = HERE / "map-link.ld"
 VALID_SPEC = TOOL / "examples" / "riscv-map-v1.json"
 GAP_SPEC = TOOL / "examples" / "riscv-map-coverage-gap-v1.json"
+MAP_SECTIONS = {
+    ".riscv.linux_irq_c_sites",
+    ".riscv.linux_irq_expected",
+    ".riscv.linux_irq_sites",
+}
+UNWIND_SECTIONS = {
+    ".ARM.exidx",
+    ".ARM.extab",
+    ".debug_frame",
+    ".eh_frame",
+    ".orc_unwind",
+    ".orc_unwind_ip",
+    ".sframe",
+}
 
 
 def run(command: list[str], *, environment: dict[str, str] | None = None,
@@ -42,6 +56,7 @@ def compile_object(arguments: argparse.Namespace, output: pathlib.Path,
                    check: bool = True,
                    source: pathlib.Path = SOURCE,
                    prefix_root: pathlib.Path = ROOT,
+                   relax: bool = True,
                    ) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     if spec is None:
@@ -61,6 +76,8 @@ def compile_object(arguments: argparse.Namespace, output: pathlib.Path,
     ]
     if debug_info:
         command.append("-gline-tables-only")
+    if not relax:
+        command.append("-mno-relax")
     if global_isel:
         command.extend(["-fglobal-isel", "-Wno-global-isel"])
     if source_site:
@@ -72,15 +89,18 @@ def compile_object(arguments: argparse.Namespace, output: pathlib.Path,
 
 
 def link(arguments: argparse.Namespace, obj: pathlib.Path,
-         output: pathlib.Path) -> None:
-    run([
+         output: pathlib.Path, *, gc_sections: bool = False) -> None:
+    command = [
         arguments.ld_lld,
         "-m", "elf64lriscv",
         "-e", "irq_map_probe",
         "-T", str(LINKER_SCRIPT),
         str(obj),
         "-o", str(output),
-    ])
+    ]
+    if gc_sections:
+        command.append("--gc-sections")
+    run(command)
 
 
 def dump_section(arguments: argparse.Namespace, binary: pathlib.Path,
@@ -93,11 +113,133 @@ def dump_section(arguments: argparse.Namespace, binary: pathlib.Path,
     return output.read_bytes()
 
 
+def elf_inertness_fingerprint(arguments: argparse.Namespace,
+                              binary: pathlib.Path) -> dict[str, object]:
+    document = json.loads(run([
+        arguments.llvm_readobj,
+        "--elf-output-style=JSON",
+        "--sections",
+        "--section-data",
+        "--symbols",
+        "--relocations",
+        str(binary),
+    ]).stdout)[0]
+    sections = [entry["Section"] for entry in document["Sections"]]
+    by_index = {section["Index"]: section for section in sections}
+
+    def section_name(section: dict[str, object]) -> str:
+        return section["Name"]["Name"]
+
+    def section_flags(section: dict[str, object]) -> tuple[str, ...]:
+        return tuple(sorted(
+            flag["Name"] for flag in section["Flags"]["Flags"]
+        ))
+
+    def section_bytes(section: dict[str, object]) -> tuple[int, ...]:
+        return tuple(section.get("SectionData", {}).get("Bytes", []))
+
+    allocated_sections = []
+    executable_sections = []
+    unwind_sections = []
+    for section in sections:
+        name = section_name(section)
+        flags = section_flags(section)
+        normalized = (
+            name,
+            section["Type"]["Name"],
+            flags,
+            section["Address"],
+            section["Size"],
+            section["AddressAlignment"],
+            section["EntrySize"],
+            section_bytes(section),
+        )
+        if "SHF_ALLOC" in flags and name not in MAP_SECTIONS:
+            allocated_sections.append(normalized)
+        if "SHF_EXECINSTR" in flags:
+            executable_sections.append(normalized)
+        if name in UNWIND_SECTIONS:
+            unwind_sections.append(normalized)
+
+    symbols = []
+    for entry in document.get("Symbols", []):
+        symbol = entry["Symbol"]
+        binding = symbol["Binding"]["Name"]
+        symbol_type = symbol["Type"]["Name"]
+        target_section = symbol["Section"]["Name"]
+        if target_section in MAP_SECTIONS:
+            continue
+        if binding == "Local" and symbol_type not in ("Function", "Object"):
+            continue
+        symbols.append((
+            symbol["Name"]["Name"],
+            symbol["Value"],
+            symbol["Size"],
+            binding,
+            symbol_type,
+            symbol["Other"]["Value"],
+            target_section,
+        ))
+
+    relocation_targets = {}
+    for section in sections:
+        if section["Type"]["Name"] not in ("SHT_REL", "SHT_RELA"):
+            continue
+        target = by_index.get(section["Info"])
+        if target is not None:
+            relocation_targets[section["Index"]] = section_name(target)
+
+    code_relocations = []
+    unwind_relocations = []
+    for group in document.get("Relocations", []):
+        target = relocation_targets.get(group["SectionIndex"])
+        if target is None:
+            continue
+        relocation_section = by_index[group["SectionIndex"]]
+        target_section = by_index[relocation_section["Info"]]
+        normalized_relocations = []
+        for entry in group["Relocs"]:
+            relocation = entry["Relocation"]
+            normalized_relocations.append((
+                relocation["Offset"],
+                relocation["Type"]["Name"],
+                relocation["Symbol"]["Name"],
+                relocation.get("Addend", 0),
+            ))
+        if "SHF_EXECINSTR" in section_flags(target_section):
+            code_relocations.extend((target, *item)
+                                    for item in normalized_relocations)
+        if target in UNWIND_SECTIONS:
+            unwind_relocations.extend((target, *item)
+                                      for item in normalized_relocations)
+
+    return {
+        "allocated_sections": sorted(allocated_sections),
+        "executable_sections": sorted(executable_sections),
+        "symbols": sorted(symbols),
+        "code_relocations": sorted(code_relocations),
+        "unwind_sections": sorted(unwind_sections),
+        "unwind_relocations": sorted(unwind_relocations),
+    }
+
+
+def require_inertness(arguments: argparse.Namespace, baseline: pathlib.Path,
+                       mapped: pathlib.Path, description: str) -> None:
+    baseline_fingerprint = elf_inertness_fingerprint(arguments, baseline)
+    mapped_fingerprint = elf_inertness_fingerprint(arguments, mapped)
+    for component in baseline_fingerprint:
+        if baseline_fingerprint[component] != mapped_fingerprint[component]:
+            raise AssertionError(
+                f"{description} changed ELF inertness component {component}"
+            )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--clang", required=True)
     parser.add_argument("--ld-lld", required=True)
     parser.add_argument("--llvm-objcopy", required=True)
+    parser.add_argument("--llvm-readobj", required=True)
     parser.add_argument("--plugin", required=True, type=pathlib.Path)
     parser.add_argument("--site-tool", required=True, type=pathlib.Path)
     parser.add_argument(
@@ -167,12 +309,21 @@ def main() -> int:
             raise AssertionError("loading disabled map plugin changed object .text")
         if baseline_obj_text != mapped_obj_text:
             raise AssertionError("enabled C map changed object .text")
+        require_inertness(
+            arguments, baseline_obj, disabled_obj, "disabled object map"
+        )
+        require_inertness(
+            arguments, baseline_obj, mapped_obj, "policy object map"
+        )
         if source_builtin:
             source_obj_text = dump_section(
                 arguments, source_obj, ".text", directory / "source-o.text"
             )
             if baseline_obj_text != source_obj_text:
                 raise AssertionError("source builtin map changed object .text")
+            require_inertness(
+                arguments, baseline_obj, source_obj, "source object map"
+            )
 
         object_result = run([
             str(arguments.site_tool.resolve()),
@@ -288,6 +439,12 @@ def main() -> int:
                     raise AssertionError(
                         f"source builtin changed object .text at -O{level}"
                     )
+                require_inertness(
+                    arguments,
+                    level_baseline,
+                    level_source,
+                    f"source object map at -O{level}",
+                )
                 level_map = json.loads(run([
                     str(arguments.site_tool.resolve()),
                     "--validate-relocatable",
@@ -321,12 +478,21 @@ def main() -> int:
             raise AssertionError("loading disabled map plugin changed linked .text")
         if baseline_elf_text != mapped_elf_text:
             raise AssertionError("enabled C map changed linked .text")
+        require_inertness(
+            arguments, baseline_elf, disabled_elf, "disabled linked map"
+        )
+        require_inertness(
+            arguments, baseline_elf, mapped_elf, "policy linked map"
+        )
         if source_builtin:
             source_elf_text = dump_section(
                 arguments, source_elf, ".text", directory / "source-e.text"
             )
             if baseline_elf_text != source_elf_text:
                 raise AssertionError("source builtin map changed linked .text")
+            require_inertness(
+                arguments, baseline_elf, source_elf, "source linked map"
+            )
 
         sidecar_result = run([
             str(arguments.site_tool.resolve()),
@@ -376,6 +542,92 @@ def main() -> int:
                     "source builtin and policy selector did not anchor the same "
                     "store"
                 )
+
+        norelax_baseline_obj = directory / "norelax-baseline.o"
+        norelax_mapped_obj = directory / "norelax-mapped.o"
+        compile_object(
+            arguments,
+            norelax_baseline_obj,
+            plugin=False,
+            spec=None,
+            relax=False,
+        )
+        compile_object(
+            arguments,
+            norelax_mapped_obj,
+            plugin=True,
+            spec=VALID_SPEC,
+            relax=False,
+        )
+        require_inertness(
+            arguments,
+            norelax_baseline_obj,
+            norelax_mapped_obj,
+            "no-relax policy object map",
+        )
+        run([
+            str(arguments.site_tool.resolve()),
+            "--validate-relocatable",
+            str(norelax_mapped_obj),
+        ])
+        norelax_baseline_elf = directory / "norelax-baseline.elf"
+        norelax_mapped_elf = directory / "norelax-mapped.elf"
+        link(arguments, norelax_baseline_obj, norelax_baseline_elf)
+        link(arguments, norelax_mapped_obj, norelax_mapped_elf)
+        require_inertness(
+            arguments,
+            norelax_baseline_elf,
+            norelax_mapped_elf,
+            "no-relax policy linked map",
+        )
+        run([str(arguments.site_tool.resolve()), str(norelax_mapped_elf)])
+        if source_builtin:
+            norelax_source_obj = directory / "norelax-source.o"
+            norelax_source_elf = directory / "norelax-source.elf"
+            compile_object(
+                arguments,
+                norelax_source_obj,
+                plugin=True,
+                spec=None,
+                source_site=True,
+                relax=False,
+            )
+            require_inertness(
+                arguments,
+                norelax_baseline_obj,
+                norelax_source_obj,
+                "no-relax source object map",
+            )
+            link(arguments, norelax_source_obj, norelax_source_elf)
+            require_inertness(
+                arguments,
+                norelax_baseline_elf,
+                norelax_source_elf,
+                "no-relax source linked map",
+            )
+            run([str(arguments.site_tool.resolve()), str(norelax_source_elf)])
+
+        gc_baseline_elf = directory / "gc-baseline.elf"
+        gc_mapped_elf = directory / "gc-mapped.elf"
+        link(arguments, baseline_obj, gc_baseline_elf, gc_sections=True)
+        link(arguments, mapped_obj, gc_mapped_elf, gc_sections=True)
+        require_inertness(
+            arguments,
+            gc_baseline_elf,
+            gc_mapped_elf,
+            "section-GC policy linked map",
+        )
+        run([str(arguments.site_tool.resolve()), str(gc_mapped_elf)])
+        if source_builtin:
+            gc_source_elf = directory / "gc-source.elf"
+            link(arguments, source_obj, gc_source_elf, gc_sections=True)
+            require_inertness(
+                arguments,
+                gc_baseline_elf,
+                gc_source_elf,
+                "section-GC source linked map",
+            )
+            run([str(arguments.site_tool.resolve()), str(gc_source_elf)])
 
         gap_compile = compile_object(
             arguments, gap_obj, plugin=True, spec=GAP_SPEC
@@ -563,6 +815,8 @@ def main() -> int:
                 )
             global_isel_coverage = "coverage-rejected"
 
+        object_fingerprint = elf_inertness_fingerprint(arguments, baseline_obj)
+        linked_fingerprint = elf_inertness_fingerprint(arguments, baseline_elf)
         print(json.dumps({
             "result": "PASS",
             "target": "riscv64-unknown-linux-gnu",
@@ -584,6 +838,58 @@ def main() -> int:
             "source_builtin_missing_line_tables": (
                 "coverage-rejected" if source_builtin else "unavailable"
             ),
+            "elf_inertness": {
+                "allocated_sections": {
+                    "result": "PASS",
+                    "object_count": len(
+                        object_fingerprint["allocated_sections"]
+                    ),
+                    "linked_count": len(
+                        linked_fingerprint["allocated_sections"]
+                    ),
+                },
+                "executable_sections": {
+                    "result": "PASS",
+                    "object_count": len(
+                        object_fingerprint["executable_sections"]
+                    ),
+                    "linked_count": len(
+                        linked_fingerprint["executable_sections"]
+                    ),
+                },
+                "meaningful_symbols": {
+                    "result": "PASS",
+                    "object_count": len(object_fingerprint["symbols"]),
+                    "linked_count": len(linked_fingerprint["symbols"]),
+                },
+                "code_relocations": {
+                    "result": "PASS",
+                    "object_count": len(
+                        object_fingerprint["code_relocations"]
+                    ),
+                    "linked_count": len(
+                        linked_fingerprint["code_relocations"]
+                    ),
+                },
+                "unwind_sections_and_relocations": {
+                    "result": "PASS",
+                    "object_sections": len(
+                        object_fingerprint["unwind_sections"]
+                    ),
+                    "linked_sections": len(
+                        linked_fingerprint["unwind_sections"]
+                    ),
+                    "object_relocations": len(
+                        object_fingerprint["unwind_relocations"]
+                    ),
+                    "linked_relocations": len(
+                        linked_fingerprint["unwind_relocations"]
+                    ),
+                },
+                "linker_relaxation_enabled": "PASS",
+                "linker_relaxation_disabled": "PASS",
+                "section_gc": "PASS",
+            },
             "object_relocations": "PASS",
             "selectiondag_expectation": arguments.selectiondag_expect,
             "selectiondag_site_count": selectiondag_site_count,
