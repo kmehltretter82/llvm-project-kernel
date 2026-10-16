@@ -25,6 +25,7 @@
 #include "llvm/Object/BuildID.h"
 #include "llvm/Object/ELFObjectFile.h"
 #include "llvm/Object/ObjectFile.h"
+#include "llvm/Object/SymbolSize.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/Format.h"
@@ -57,12 +58,13 @@ namespace {
 
 constexpr uint64_t MaxPolicyBytes = 1024 * 1024;
 constexpr uint64_t MaxEntryRegionBytes = 256 * 1024 * 1024;
+constexpr uint64_t MaxInstructionOffset = 256 * 1024 * 1024;
 
 cl::opt<std::string> InputFilename(cl::Positional, cl::Required,
                                    cl::desc("<linked-rv64-elf>"));
 cl::opt<std::string>
     PolicyFilename("policy", cl::Required,
-                   cl::desc("Version-one entry-check policy in JSON format"));
+                   cl::desc("Versioned entry-check policy in JSON format"));
 cl::opt<bool> Compact("compact", cl::init(false),
                       cl::desc("Write compact rather than indented JSON"));
 
@@ -73,16 +75,40 @@ struct Policy {
     std::string EndSymbol;
   };
 
+  struct IndirectCallTargets {
+    std::string CallerSymbol;
+    uint64_t InstructionOffset = 0;
+    std::vector<std::string> TargetSymbols;
+  };
+
+  unsigned Schema = 0;
+  bool HasExpectedImage = false;
+  std::string ExpectedImageSHA256;
+  std::optional<std::string> ExpectedBuildID;
   std::vector<std::string> EntrySections;
   std::vector<SymbolRange> EntrySymbolRanges;
+  std::vector<IndirectCallTargets> IndirectCalls;
   std::set<std::string> ForbiddenSymbols;
   std::string Hash;
 };
 
+struct ResolvedIndirectCall {
+  std::string CallerSymbol;
+  uint64_t CallerAddress = 0;
+  uint64_t CallerEnd = 0;
+  uint64_t InstructionOffset = 0;
+  uint64_t InstructionAddress = 0;
+  std::vector<std::string> TargetSymbols;
+  std::vector<uint64_t> TargetAddresses;
+  bool Used = false;
+};
+
 struct SymbolTables {
   std::map<uint64_t, std::vector<std::string>> FunctionsByAddress;
+  std::map<uint64_t, std::vector<std::string>> CodeNamesByAddress;
   std::map<uint64_t, std::vector<std::string>> NamesByAddress;
   std::map<std::string, std::vector<uint64_t>> AddressesByName;
+  std::map<std::string, std::vector<uint64_t>> SizesByName;
 };
 
 struct ResolvedRegion {
@@ -113,6 +139,8 @@ struct Coverage {
   uint64_t Calls = 0;
   uint64_t ResolvedCalls = 0;
   uint64_t UnknownCalls = 0;
+  uint64_t PolicyResolvedIndirectCalls = 0;
+  uint64_t IndirectTargetEdges = 0;
 };
 
 struct DisassemblyState {
@@ -141,6 +169,13 @@ static std::string sha256(StringRef Bytes) {
   return toHex(Hasher.final(), /*LowerCase=*/true);
 }
 
+static bool isLowerHex(StringRef Value) {
+  return llvm::all_of(Value, [](char Character) {
+    return (Character >= '0' && Character <= '9') ||
+           (Character >= 'a' && Character <= 'f');
+  });
+}
+
 static std::string hex64(uint64_t Value) {
   std::string Result;
   raw_string_ostream OS(Result);
@@ -158,6 +193,53 @@ static Error rejectUnknownKeys(const json::Object &Object,
   return Error::success();
 }
 
+// LLVM's JSON object representation replaces duplicate keys. Check decoded
+// keys before accepting its parsed object, including escaped spellings.
+static bool uniqueJSONKeys(StringRef Text) {
+  struct Scope {
+    bool Object;
+    std::set<std::string> Keys;
+  };
+  std::vector<Scope> Stack;
+  for (size_t I = 0; I < Text.size(); ++I) {
+    char C = Text[I];
+    if (C == '{' || C == '[') {
+      if (Stack.size() >= 128)
+        return false;
+      Stack.push_back({C == '{', {}});
+    } else if (C == '}' || C == ']') {
+      if (Stack.empty())
+        return false;
+      Stack.pop_back();
+    } else if (C == '"') {
+      size_t Start = I++;
+      for (; I < Text.size(); ++I) {
+        if (Text[I] == '\\')
+          ++I;
+        else if (Text[I] == '"')
+          break;
+      }
+      if (I >= Text.size())
+        return false;
+      size_t Next = I + 1;
+      while (Next < Text.size() && llvm::isSpace(Text[Next]))
+        ++Next;
+      if (Next < Text.size() && Text[Next] == ':') {
+        Expected<json::Value> Key = json::parse(Text.slice(Start, I + 1));
+        if (!Key) {
+          consumeError(Key.takeError());
+          return false;
+        }
+        std::optional<StringRef> Name = Key->getAsString();
+        if (!Name || Stack.empty() || !Stack.back().Object ||
+            !Stack.back().Keys.insert(Name->str()).second)
+          return false;
+      }
+    }
+  }
+  return Stack.empty();
+}
+
 static Expected<Policy> parsePolicy(StringRef Path) {
   ErrorOr<std::unique_ptr<MemoryBuffer>> Buffer =
       MemoryBuffer::getFile(Path, /*IsText=*/true);
@@ -168,6 +250,9 @@ static Expected<Policy> parsePolicy(StringRef Path) {
     return entryError("policy exceeds the 1 MiB input limit");
 
   StringRef Text = (*Buffer)->getBuffer();
+  if (!uniqueJSONKeys(Text))
+    return entryError(
+        "policy JSON has duplicate object keys or excessive nesting");
   Expected<json::Value> Parsed = json::parse(Text);
   if (!Parsed)
     return entryError(Twine("invalid policy JSON: ") +
@@ -175,25 +260,40 @@ static Expected<Policy> parsePolicy(StringRef Path) {
   const json::Object *Root = Parsed->getAsObject();
   if (!Root)
     return entryError("top-level policy must be an object");
-  if (Error E =
-          rejectUnknownKeys(*Root, {"schema", "architecture", "entry_sections",
-                                    "entry_symbol_ranges", "forbidden_symbols",
-                                    "reject_unknown_calls"}))
+  std::optional<int64_t> SchemaValue = Root->getInteger("schema");
+  if (!SchemaValue || (*SchemaValue != 1 && *SchemaValue != 2))
+    return entryError("unsupported or missing policy schema; expected 1 or 2");
+  unsigned Schema = static_cast<unsigned>(*SchemaValue);
+  std::set<std::string> KnownFields{"schema",
+                                    "architecture",
+                                    "entry_sections",
+                                    "entry_symbol_ranges",
+                                    "forbidden_symbols",
+                                    "reject_unknown_calls"};
+  if (Schema >= 2)
+    KnownFields.insert({"expected_image", "indirect_call_targets"});
+  if (Error E = rejectUnknownKeys(*Root, KnownFields))
     return std::move(E);
-  if (Root->getInteger("schema") != 1)
-    return entryError("unsupported or missing policy schema; expected 1");
   std::optional<StringRef> Architecture = Root->getString("architecture");
   if (!Architecture || *Architecture != "riscv64")
     return entryError("policy architecture must be 'riscv64'");
   if (Root->getBoolean("reject_unknown_calls") != true)
-    return entryError("version-one policy requires reject_unknown_calls=true");
+    return entryError(
+        "all supported policy schemas require reject_unknown_calls=true");
+
+  const json::Object *ExpectedImage = Root->getObject("expected_image");
+  if (Root->get("expected_image") && !ExpectedImage)
+    return entryError("expected_image must be an object");
 
   const json::Array *EntrySections = Root->getArray("entry_sections");
   const json::Array *EntrySymbolRanges = Root->getArray("entry_symbol_ranges");
+  const json::Array *IndirectCalls = Root->getArray("indirect_call_targets");
   if (Root->get("entry_sections") && !EntrySections)
     return entryError("entry_sections must be an array");
   if (Root->get("entry_symbol_ranges") && !EntrySymbolRanges)
     return entryError("entry_symbol_ranges must be an array");
+  if (Root->get("indirect_call_targets") && !IndirectCalls)
+    return entryError("indirect_call_targets must be an array");
   if ((EntrySections && EntrySections->empty()) ||
       (EntrySymbolRanges && EntrySymbolRanges->empty()))
     return entryError("an entry-region array cannot be empty when present");
@@ -204,12 +304,35 @@ static Expected<Policy> parsePolicy(StringRef Path) {
         "policy requires an entry section or symbol-bounded entry range");
   if (EntrySectionCount + EntryRangeCount > 64)
     return entryError("policy exceeds the 64-region limit");
+  if (Schema >= 2 &&
+      (!IndirectCalls || IndirectCalls->empty() || IndirectCalls->size() > 256))
+    return entryError(
+        "schema two requires 1 through 256 indirect call target rules");
   const json::Array *Forbidden = Root->getArray("forbidden_symbols");
   if (!Forbidden || Forbidden->empty() || Forbidden->size() > 4096)
     return entryError("forbidden_symbols must contain 1 through 4096 names");
 
   Policy Result;
+  Result.Schema = Schema;
   Result.Hash = sha256(Text);
+  if (ExpectedImage) {
+    if (Error E = rejectUnknownKeys(*ExpectedImage, {"sha256", "build_id"}))
+      return std::move(E);
+    std::optional<StringRef> ExpectedSHA = ExpectedImage->getString("sha256");
+    const json::Value *ExpectedBuild = ExpectedImage->get("build_id");
+    if (!ExpectedSHA || ExpectedSHA->size() != 64 ||
+        !isLowerHex(*ExpectedSHA) || !ExpectedBuild)
+      return entryError("expected_image has an invalid or missing field");
+    Result.HasExpectedImage = true;
+    Result.ExpectedImageSHA256 = ExpectedSHA->str();
+    if (!ExpectedBuild->getAsNull()) {
+      std::optional<StringRef> BuildID = ExpectedBuild->getAsString();
+      if (!BuildID || BuildID->empty() || BuildID->size() > 128 ||
+          (BuildID->size() & 1) || !isLowerHex(*BuildID))
+        return entryError("expected_image build_id must be null or even hex");
+      Result.ExpectedBuildID = BuildID->str();
+    }
+  }
   std::set<std::string> SeenSections;
   std::set<std::string> SeenRegionNames;
   if (EntrySections) {
@@ -251,6 +374,48 @@ static Expected<Policy> parsePolicy(StringRef Path) {
           {Name->str(), Start->str(), End->str()});
     }
   }
+  if (IndirectCalls) {
+    std::set<std::pair<std::string, uint64_t>> SeenCallsites;
+    for (const json::Value &Value : *IndirectCalls) {
+      const json::Object *Object = Value.getAsObject();
+      if (!Object)
+        return entryError("each indirect call target rule must be an object");
+      if (Error E =
+              rejectUnknownKeys(*Object, {"caller_symbol", "instruction_offset",
+                                          "target_symbols"}))
+        return std::move(E);
+      std::optional<StringRef> Caller = Object->getString("caller_symbol");
+      std::optional<int64_t> Offset = Object->getInteger("instruction_offset");
+      const json::Array *Targets = Object->getArray("target_symbols");
+      if (!Caller || Caller->empty() || Caller->size() > 256 || !Offset ||
+          *Offset < 0 || static_cast<uint64_t>(*Offset) > MaxInstructionOffset)
+        return entryError(
+            "indirect call rule has an invalid caller or instruction offset");
+      if (!Targets || Targets->empty() || Targets->size() > 256)
+        return entryError(
+            "indirect call target_symbols must contain 1 through 256 names");
+      uint64_t UnsignedOffset = static_cast<uint64_t>(*Offset);
+      if (!SeenCallsites.insert({Caller->str(), UnsignedOffset}).second)
+        return entryError(
+            "indirect call target rules contain a duplicate site");
+
+      Policy::IndirectCallTargets Rule;
+      Rule.CallerSymbol = Caller->str();
+      Rule.InstructionOffset = UnsignedOffset;
+      std::set<std::string> SeenTargets;
+      for (const json::Value &TargetValue : *Targets) {
+        std::optional<StringRef> Target = TargetValue.getAsString();
+        if (!Target || Target->empty() || Target->size() > 256)
+          return entryError(
+              "indirect call target names must contain 1 through 256 bytes");
+        if (!SeenTargets.insert(Target->str()).second)
+          return entryError(
+              "an indirect call target rule contains a duplicate target");
+        Rule.TargetSymbols.push_back(Target->str());
+      }
+      Result.IndirectCalls.push_back(std::move(Rule));
+    }
+  }
   for (const json::Value &Value : *Forbidden) {
     std::optional<StringRef> Name = Value.getAsString();
     if (!Name || Name->empty() || Name->size() > 256)
@@ -285,6 +450,24 @@ static Expected<SymbolTables> readDefinedSymbols(const ObjectFile &Object) {
       return Type.takeError();
     if (*Type == SymbolRef::ST_Function)
       Symbols.FunctionsByAddress[*Address].push_back(Name->str());
+    Expected<section_iterator> Section = Symbol.getSection();
+    if (!Section)
+      return Section.takeError();
+    if (*Section != Object.section_end() &&
+        (ELFSectionRef(**Section).getFlags() & ELF::SHF_EXECINSTR))
+      Symbols.CodeNamesByAddress[*Address].push_back(Name->str());
+  }
+  for (const auto &[Symbol, Size] : computeSymbolSizes(Object)) {
+    Expected<uint32_t> Flags = Symbol.getFlags();
+    if (!Flags)
+      return Flags.takeError();
+    if (*Flags & SymbolRef::SF_Undefined)
+      continue;
+    Expected<StringRef> Name = Symbol.getName();
+    if (!Name)
+      return Name.takeError();
+    if (!Name->empty())
+      Symbols.SizesByName[Name->str()].push_back(Size);
   }
   for (auto &[Address, Names] : Symbols.FunctionsByAddress) {
     (void)Address;
@@ -296,11 +479,21 @@ static Expected<SymbolTables> readDefinedSymbols(const ObjectFile &Object) {
     llvm::sort(Names);
     Names.erase(std::unique(Names.begin(), Names.end()), Names.end());
   }
+  for (auto &[Address, Names] : Symbols.CodeNamesByAddress) {
+    (void)Address;
+    llvm::sort(Names);
+    Names.erase(std::unique(Names.begin(), Names.end()), Names.end());
+  }
   for (auto &[Name, Addresses] : Symbols.AddressesByName) {
     (void)Name;
     llvm::sort(Addresses);
     Addresses.erase(std::unique(Addresses.begin(), Addresses.end()),
                     Addresses.end());
+  }
+  for (auto &[Name, Sizes] : Symbols.SizesByName) {
+    (void)Name;
+    llvm::sort(Sizes);
+    Sizes.erase(std::unique(Sizes.begin(), Sizes.end()), Sizes.end());
   }
   return Symbols;
 }
@@ -374,10 +567,145 @@ static Finding addressFinding(StringRef Rule, StringRef Region,
   return Result;
 }
 
+static bool hasCodeName(const SymbolTables &Symbols, uint64_t Address,
+                        StringRef Name) {
+  if (Name.starts_with("$x") || Name.starts_with("$d"))
+    return false;
+  auto CodeNames = Symbols.CodeNamesByAddress.find(Address);
+  return CodeNames != Symbols.CodeNamesByAddress.end() &&
+         llvm::is_contained(CodeNames->second, Name.str());
+}
+
+static std::map<uint64_t, ResolvedIndirectCall>
+resolveIndirectCalls(const Policy &Configuration, const SymbolTables &Symbols,
+                     std::vector<Finding> &Findings) {
+  std::map<uint64_t, ResolvedIndirectCall> Resolved;
+  for (const Policy::IndirectCallTargets &Rule : Configuration.IndirectCalls) {
+    auto Caller = Symbols.AddressesByName.find(Rule.CallerSymbol);
+    if (Caller == Symbols.AddressesByName.end() || Caller->second.size() != 1) {
+      Finding F;
+      F.Rule = "unresolved-indirect-caller";
+      F.Region = Rule.CallerSymbol;
+      F.Detail = "caller_symbol must resolve to one defined symbol";
+      Findings.push_back(std::move(F));
+      continue;
+    }
+    uint64_t CallerAddress = Caller->second.front();
+    auto CallerSizes = Symbols.SizesByName.find(Rule.CallerSymbol);
+    if (CallerSizes == Symbols.SizesByName.end() ||
+        CallerSizes->second.size() != 1 || !CallerSizes->second.front()) {
+      Findings.push_back(addressFinding(
+          "unresolved-indirect-caller-range", Rule.CallerSymbol, CallerAddress,
+          "caller_symbol must have one non-empty linked symbol range"));
+      continue;
+    }
+    uint64_t CallerSize = CallerSizes->second.front();
+    if (CallerAddress > std::numeric_limits<uint64_t>::max() - CallerSize) {
+      Findings.push_back(addressFinding(
+          "invalid-indirect-caller-range", Rule.CallerSymbol, CallerAddress,
+          "caller_symbol range overflows uint64"));
+      continue;
+    }
+    if (Rule.InstructionOffset >= CallerSize) {
+      Findings.push_back(addressFinding(
+          "invalid-indirect-callsite", Rule.CallerSymbol, CallerAddress,
+          "instruction offset is outside caller_symbol's linked range"));
+      continue;
+    }
+    if (CallerAddress >
+        std::numeric_limits<uint64_t>::max() - Rule.InstructionOffset) {
+      Findings.push_back(addressFinding(
+          "invalid-indirect-callsite", Rule.CallerSymbol, CallerAddress,
+          "caller address plus instruction offset overflows uint64"));
+      continue;
+    }
+
+    ResolvedIndirectCall Candidate;
+    Candidate.CallerSymbol = Rule.CallerSymbol;
+    Candidate.CallerAddress = CallerAddress;
+    Candidate.CallerEnd = CallerAddress + CallerSize;
+    Candidate.InstructionOffset = Rule.InstructionOffset;
+    Candidate.InstructionAddress = CallerAddress + Rule.InstructionOffset;
+    if (Candidate.InstructionAddress & 1) {
+      Findings.push_back(
+          addressFinding("misaligned-indirect-callsite", Rule.CallerSymbol,
+                         Candidate.InstructionAddress,
+                         "RISC-V indirect callsite must be two-byte aligned"));
+      continue;
+    }
+    bool Valid = true;
+    for (const std::string &TargetName : Rule.TargetSymbols) {
+      auto Target = Symbols.AddressesByName.find(TargetName);
+      if (Target == Symbols.AddressesByName.end() ||
+          Target->second.size() != 1 ||
+          !hasCodeName(Symbols, Target->second.front(), TargetName)) {
+        Finding F = addressFinding(
+            "unresolved-indirect-target", Rule.CallerSymbol,
+            Candidate.InstructionAddress,
+            "target_symbols entry must resolve to one defined code symbol");
+        F.MatchedSymbol = TargetName;
+        Findings.push_back(std::move(F));
+        Valid = false;
+        continue;
+      }
+      uint64_t TargetAddress = Target->second.front();
+      if (TargetAddress & 1) {
+        Finding F =
+            addressFinding("misaligned-indirect-target", Rule.CallerSymbol,
+                           Candidate.InstructionAddress,
+                           "RISC-V indirect target must be two-byte aligned");
+        F.TargetAddress = TargetAddress;
+        F.HasTargetAddress = true;
+        F.MatchedSymbol = TargetName;
+        Findings.push_back(std::move(F));
+        Valid = false;
+        continue;
+      }
+      auto Names = Symbols.NamesByAddress.find(TargetAddress);
+      std::optional<StringRef> ForbiddenName;
+      if (Names != Symbols.NamesByAddress.end()) {
+        auto Forbidden = std::find_if(
+            Names->second.begin(), Names->second.end(),
+            [&](StringRef CandidateName) {
+              return Configuration.ForbiddenSymbols.count(CandidateName.str());
+            });
+        if (Forbidden != Names->second.end())
+          ForbiddenName = *Forbidden;
+      }
+      if (ForbiddenName) {
+        Finding F = addressFinding(
+            "forbidden-indirect-target", Rule.CallerSymbol,
+            Candidate.InstructionAddress,
+            "an approved indirect target aliases a forbidden callback");
+        F.TargetAddress = TargetAddress;
+        F.HasTargetAddress = true;
+        F.TargetSymbols = Names->second;
+        F.MatchedSymbol = ForbiddenName->str();
+        Findings.push_back(std::move(F));
+        Valid = false;
+        continue;
+      }
+      Candidate.TargetSymbols.push_back(TargetName);
+      Candidate.TargetAddresses.push_back(TargetAddress);
+    }
+    if (!Valid)
+      continue;
+    auto [Position, Inserted] =
+        Resolved.emplace(Candidate.InstructionAddress, std::move(Candidate));
+    if (!Inserted)
+      Findings.push_back(addressFinding(
+          "ambiguous-indirect-callsite", Rule.CallerSymbol, Position->first,
+          "multiple policy rules resolve to the same instruction address"));
+  }
+  return Resolved;
+}
+
 static Error scanRegion(const ResolvedRegion &Region,
                         const Policy &Configuration,
-                        const SymbolTables &Symbols, DisassemblyState &State,
-                        Coverage &Counts, std::vector<Finding> &Findings) {
+                        const SymbolTables &Symbols,
+                        std::map<uint64_t, ResolvedIndirectCall> &IndirectCalls,
+                        DisassemblyState &State, Coverage &Counts,
+                        std::vector<Finding> &Findings) {
   if (Region.Bytes.empty()) {
     Findings.push_back(addressFinding("empty-entry-region", Region.Name,
                                       Region.Begin,
@@ -441,7 +769,32 @@ static Error scanRegion(const ResolvedRegion &Region,
         if (Forbidden != Names->second.end())
           ForbiddenName = *Forbidden;
       }
-      if (TargetKnown && ForbiddenName) {
+      if (!TargetKnown) {
+        auto Approved = IndirectCalls.find(InstructionAddress);
+        if (Approved != IndirectCalls.end()) {
+          if (InstructionAddress >
+                  std::numeric_limits<uint64_t>::max() - Size ||
+              InstructionAddress + Size > Approved->second.CallerEnd) {
+            ++Counts.UnknownCalls;
+            Findings.push_back(addressFinding(
+                "callsite-outside-caller", Region.Name, InstructionAddress,
+                "indirect call instruction crosses caller_symbol's linked "
+                "range"));
+          } else {
+            Approved->second.Used = true;
+            ++Counts.ResolvedCalls;
+            ++Counts.PolicyResolvedIndirectCalls;
+            Counts.IndirectTargetEdges +=
+                Approved->second.TargetAddresses.size();
+          }
+        } else {
+          ++Counts.UnknownCalls;
+          Findings.push_back(addressFinding(
+              "unknown-call", Region.Name, InstructionAddress,
+              "call target cannot be resolved statically and has no exact "
+              "callsite policy"));
+        }
+      } else if (ForbiddenName) {
         ++Counts.ResolvedCalls;
         Finding F =
             addressFinding("forbidden-call", Region.Name, InstructionAddress,
@@ -451,18 +804,15 @@ static Error scanRegion(const ResolvedRegion &Region,
         F.TargetSymbols = Names->second;
         F.MatchedSymbol = ForbiddenName->str();
         Findings.push_back(std::move(F));
-      } else if (!TargetKnown || Function == Symbols.FunctionsByAddress.end()) {
+      } else if (Function == Symbols.FunctionsByAddress.end()) {
         ++Counts.UnknownCalls;
-        Finding F = addressFinding(
-            "unknown-call", Region.Name, InstructionAddress,
-            TargetKnown ? "direct call target has no defined symbol"
-                        : "call target cannot be resolved statically");
-        if (TargetKnown) {
-          F.TargetAddress = TargetAddress;
-          F.HasTargetAddress = true;
-          if (Names != Symbols.NamesByAddress.end())
-            F.TargetSymbols = Names->second;
-        }
+        Finding F =
+            addressFinding("unknown-call", Region.Name, InstructionAddress,
+                           "direct call target has no defined function symbol");
+        F.TargetAddress = TargetAddress;
+        F.HasTargetAddress = true;
+        if (Names != Symbols.NamesByAddress.end())
+          F.TargetSymbols = Names->second;
         Findings.push_back(std::move(F));
       } else {
         ++Counts.ResolvedCalls;
@@ -527,11 +877,17 @@ int main(int Argc, char **Argv) {
   if (!Object->isELF())
     return fail("input is not an ELF image");
   if (Object->getArch() != Triple::riscv64 || Object->getBytesInAddress() != 8)
-    return fail("version one requires an RV64 ELF image");
+    return fail("entry checking requires an RV64 ELF image");
   if (!Object->isLittleEndian())
-    return fail("version one requires a little-endian ELF image");
+    return fail("entry checking requires a little-endian ELF image");
   if (Object->isRelocatableObject())
     return fail("entry checking requires a linked ELF image");
+
+  std::string ImageSHA256 = sha256((*Buffer)->getBuffer());
+  BuildIDRef BuildID = getBuildID(Object.get());
+  std::optional<std::string> ImageBuildID;
+  if (!BuildID.empty())
+    ImageBuildID = toHex(BuildID, /*LowerCase=*/true);
 
   Expected<SymbolTables> Symbols = readDefinedSymbols(*Object);
   if (!Symbols)
@@ -543,6 +899,24 @@ int main(int Argc, char **Argv) {
 
   Coverage Counts;
   std::vector<Finding> Findings;
+  if (Configuration->HasExpectedImage) {
+    if (Configuration->ExpectedImageSHA256 != ImageSHA256) {
+      Finding F;
+      F.Rule = "image-sha256-mismatch";
+      F.Region = "image";
+      F.Detail = "linked image does not match expected_image sha256";
+      Findings.push_back(std::move(F));
+    }
+    if (Configuration->ExpectedBuildID != ImageBuildID) {
+      Finding F;
+      F.Rule = "image-build-id-mismatch";
+      F.Region = "image";
+      F.Detail = "linked image does not match expected_image build_id";
+      Findings.push_back(std::move(F));
+    }
+  }
+  std::map<uint64_t, ResolvedIndirectCall> IndirectCalls =
+      resolveIndirectCalls(*Configuration, *Symbols, Findings);
   std::vector<ResolvedRegion> Regions;
   for (const std::string &Name : Configuration->EntrySections) {
     std::vector<SectionRef> Matches;
@@ -657,9 +1031,15 @@ int main(int Argc, char **Argv) {
         "configured entry regions overlap and would double-count code"));
   }
   for (const ResolvedRegion &Region : Regions) {
-    if (Error E = scanRegion(Region, *Configuration, *Symbols, **State, Counts,
-                             Findings))
+    if (Error E = scanRegion(Region, *Configuration, *Symbols, IndirectCalls,
+                             **State, Counts, Findings))
       return fail(toString(std::move(E)));
+  }
+  for (const auto &[Address, Rule] : IndirectCalls) {
+    if (!Rule.Used)
+      Findings.push_back(addressFinding(
+          "unused-indirect-callsite", Rule.CallerSymbol, Address,
+          "resolved callsite policy did not match an indirect call"));
   }
 
   json::Array JSONFindings;
@@ -688,25 +1068,66 @@ int main(int Argc, char **Argv) {
   json::Array JSONForbidden;
   for (const std::string &Name : Configuration->ForbiddenSymbols)
     JSONForbidden.push_back(Name);
+  json::Array JSONIndirectPolicy;
+  for (const Policy::IndirectCallTargets &Rule : Configuration->IndirectCalls) {
+    json::Array Targets;
+    for (const std::string &Name : Rule.TargetSymbols)
+      Targets.push_back(Name);
+    JSONIndirectPolicy.push_back(json::Object{
+        {"caller_symbol", Rule.CallerSymbol},
+        {"instruction_offset", static_cast<int64_t>(Rule.InstructionOffset)},
+        {"target_symbols", std::move(Targets)},
+    });
+  }
+  json::Array JSONResolvedIndirectCalls;
+  for (const auto &[Address, Rule] : IndirectCalls) {
+    json::Array Targets;
+    for (size_t Index = 0; Index < Rule.TargetSymbols.size(); ++Index)
+      Targets.push_back(json::Object{
+          {"symbol", Rule.TargetSymbols[Index]},
+          {"address", hex64(Rule.TargetAddresses[Index])},
+      });
+    JSONResolvedIndirectCalls.push_back(json::Object{
+        {"caller_symbol", Rule.CallerSymbol},
+        {"caller_begin_va", hex64(Rule.CallerAddress)},
+        {"caller_end_va", hex64(Rule.CallerEnd)},
+        {"instruction_offset", static_cast<int64_t>(Rule.InstructionOffset)},
+        {"instruction_va", hex64(Address)},
+        {"targets", std::move(Targets)},
+        {"used", Rule.Used},
+    });
+  }
 
-  BuildIDRef BuildID = getBuildID(Object.get());
+  json::Value JSONExpectedImage(nullptr);
+  if (Configuration->HasExpectedImage) {
+    JSONExpectedImage = json::Object{
+        {"sha256", Configuration->ExpectedImageSHA256},
+        {"build_id", Configuration->ExpectedBuildID
+                         ? json::Value(*Configuration->ExpectedBuildID)
+                         : json::Value(nullptr)},
+    };
+  }
+
   json::Object Image{
       {"path", InputFilename},
-      {"sha256", sha256((*Buffer)->getBuffer())},
-      {"build_id", BuildID.empty()
-                       ? json::Value(nullptr)
-                       : json::Value(toHex(BuildID, /*LowerCase=*/true))},
+      {"sha256", ImageSHA256},
+      {"build_id",
+       ImageBuildID ? json::Value(*ImageBuildID) : json::Value(nullptr)},
       {"format", Object->getFileFormatName()},
       {"arch", "riscv64"},
       {"address_bits", 64},
       {"endianness", "little"},
   };
   json::Object PolicyJSON{
+      {"schema", static_cast<int64_t>(Configuration->Schema)},
       {"path", PolicyFilename},
       {"sha256", Configuration->Hash},
+      {"expected_image", std::move(JSONExpectedImage)},
+      {"identity_bound", Configuration->HasExpectedImage},
       {"entry_sections", std::move(JSONSections)},
       {"entry_symbol_ranges", std::move(JSONSymbolRanges)},
       {"forbidden_symbols", std::move(JSONForbidden)},
+      {"indirect_call_targets", std::move(JSONIndirectPolicy)},
       {"reject_unknown_calls", true},
   };
   json::Object CoverageJSON{
@@ -716,16 +1137,22 @@ int main(int Argc, char **Argv) {
       {"calls", static_cast<int64_t>(Counts.Calls)},
       {"resolved_calls", static_cast<int64_t>(Counts.ResolvedCalls)},
       {"unknown_calls", static_cast<int64_t>(Counts.UnknownCalls)},
+      {"policy_resolved_indirect_calls",
+       static_cast<int64_t>(Counts.PolicyResolvedIndirectCalls)},
+      {"indirect_target_edges",
+       static_cast<int64_t>(Counts.IndirectTargetEdges)},
   };
   bool Passed = Findings.empty();
   json::Object Root{
       {"schema", 1},
       {"checker", "rv-entrycheck"},
-      {"scope", "direct-calls-in-entry-regions-v1"},
+      {"scope", Configuration->Schema == 1 ? "direct-calls-in-entry-regions-v1"
+                                           : "site-scoped-indirect-targets-v2"},
       {"result", Passed ? "PASS" : "FAIL"},
       {"image", std::move(Image)},
       {"policy", std::move(PolicyJSON)},
       {"resolved_regions", std::move(JSONRegions)},
+      {"resolved_indirect_calls", std::move(JSONResolvedIndirectCalls)},
       {"coverage", std::move(CoverageJSON)},
       {"findings", std::move(JSONFindings)},
   };

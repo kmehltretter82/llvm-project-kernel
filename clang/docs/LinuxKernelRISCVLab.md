@@ -133,6 +133,29 @@ and returned `FAIL` for four unresolved indirect calls at
 `handle_exception()`.  This is the intended fail-closed discovery result; no
 target-set waiver or kernel qualification has been claimed.
 
+Schema two adds a narrow, fail-closed way to state possible targets for those
+four sites.  Every rule is anchored by a unique symbol, a non-empty linked
+symbol range, and an instruction offset inside that range.  Every named target
+must resolve to an executable code symbol; every rule must be consumed by an
+actual indirect call; and forbidden aliases, missing targets, duplicate sites,
+out-of-range offsets, and stale rules remain failures.  This also supports
+assembly anchors such as the untyped `handle_exception` symbol without
+treating arbitrary RISC-V mapping symbols as functions.
+
+Schema two may bind a policy to an expected image SHA-256 and build ID.  The
+Linux policy uses both and mismatch tests fail before a clean verdict can be
+reported.  Synthetic cross-toolchain fixtures deliberately omit this optional
+binding; their receipts say `identity_bound=false`.
+
+For this exact image, the reviewed policy contains the two compiled RISC-V
+root-IRQ handlers, the three possible sched-clock readers, and the 15 unique
+exception-vector handlers.  The schema-two run resolves all 106 calls, uses
+four exact callsite rules, and records 22 possible target edges with no
+findings.  This is a root-region policy result only: the target sets are
+asserted rather than inferred, and their callees are not recursively scanned.
+It is not a kernel qualification.  The schema-one policy remains the negative
+control that exposes all four sites as unknown.
+
 The complete checker will also consume the resolved site map, DWARF/BTF where
 available, and expand from RISC-V vectors, irqentry, and noinstr regions to
 conservatively reject or report unknown for:

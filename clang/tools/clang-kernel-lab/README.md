@@ -16,8 +16,9 @@ for the Linux IRQ/PREEMPT_RT laboratory:
   in-range text boundary before the linker can hide a malformed annotation.
 - `rv-entrycheck` is the first linked-image entry audit.  Its strict versioned
   policy names executable sections or symbol-bounded regions and forbidden
-  callbacks.  The version-one scope resolves direct RV64 calls, rejects
-  unknown calls, and emits a deterministic JSON verdict.
+  callbacks.  Schema one resolves direct RV64 calls and rejects every unknown;
+  schema two can additionally bind an indirect call to exact target symbols at
+  one symbol-plus-offset callsite.  Both emit a deterministic JSON verdict.
 - `ClangKernelLab` is an LLVM pass plugin for explicit callbacks and
   deterministic perturbation.  Loading a specification through
   `CLANG_KERNEL_LAB_SPEC` changes generated code; it is not map mode.
@@ -77,21 +78,25 @@ python3 clang/tools/clang-kernel-lab/tests/test_selectiondag_backend.py \
   --site-tool ../build-kernel-lab/llvm-riscv-irq-sites
 python3 clang/tools/clang-kernel-lab/tests/test_rv_entrycheck.py \
   --clang /path/to/clang --ld-lld /path/to/ld.lld \
-  --checker ../build-kernel-lab/rv-entrycheck
+  --checker ../build-kernel-lab/rv-entrycheck \
+  --linux-image /path/to/the-matching-vmlinux
 ../build-kernel-lab/rv-entrycheck \
   --policy clang/tools/clang-kernel-lab/examples/riscv-linux-entrycheck-v1.json \
   /path/to/vmlinux
+../build-kernel-lab/rv-entrycheck \
+  --policy clang/tools/clang-kernel-lab/examples/riscv-linux-entrycheck-v2.json \
+  /path/to/the-matching-vmlinux
 ```
 
 The initial entry-check lane folds its input `.noinstr.text` into output
 `.text`, then exercises matched good, forbidden-callback, and unknown-indirect
 fixtures with relaxation enabled and disabled.  It resolves both relaxed
 `jal` and unrelaxed `auipc`/`jalr`, including a forbidden untyped alias of a
-typed function.  Separate controls cover whole-section selection, a missing
-boundary, overlapping regions, six malformed policy shapes, an RV64
-relocatable object, and a linked RV32 image.  The first scope rejects every
-unknown call and emits three distinct exit statuses: zero for a clean verdict,
-one for a semantic finding, and two for invalid input.
+typed function.  Separate controls cover whole-section selection, missing and
+overlapping regions, malformed schema-one and schema-two policies (including
+escaped duplicate JSON members), an RV64 relocatable object, and a linked RV32
+image.  The checker emits three distinct exit statuses: zero for a clean
+verdict, one for a semantic finding, and two for invalid input.
 
 `examples/riscv-linux-entrycheck-v1.json` is a deliberately strict starter
 policy for Linux's `noinstr`, `irqentry`, and `softirqentry` linker-symbol
@@ -104,10 +109,38 @@ on four indirect calls: two IRQ-dispatch callbacks in `handle_riscv_irq()` and
 kernel qualification.  The version-one forbidden-symbol list is also an
 exact-name starter set, not complete runtime-family matching.
 
+Schema two has no general "allow indirect calls" setting.  Each rule names a
+caller symbol with a non-empty linked range, an instruction offset inside that
+range, and one or more exact linked code symbols.  A rule must match an actual
+indirect call, duplicate and stale rules fail, missing targets fail, and a
+target cannot hide a forbidden alias.  The fixtures exercise typed and
+untyped assembly aliases, relaxation on/off, a valid target set, a forbidden
+target, a missing target, and an out-of-range or unused callsite.  An optional
+`expected_image` object binds SHA-256 and build ID; both mismatch directions
+are negative controls.  Portable synthetic fixtures omit the binding, while
+the real-Linux policy requires it.
+
+`examples/riscv-linux-entrycheck-v2.json` supplies reviewed target assertions
+for the four schema-one findings in the current image.  The two IRQ sites use
+the pair selected by the only linked `set_handle_irq()` caller,
+`riscv_intc_irq` and `riscv_intc_aia_irq`; the clock site uses the three linked
+sched-clock readers; and the assembly exception site lists the 15 unique
+handlers represented by its vector table.  This bounded run resolves all 106
+calls, consumes four exact callsite rules, and records 22 possible target
+edges with no findings.  The policy is bound to image SHA-256
+`6db55c4e53add1746038001c31cfebdfcf01f55d4af562741fbd1a2af08430ca`
+and build ID `43105ae71ed6fb22b61788db6d5c2bd56d5b82c6`.
+
+That schema-two `PASS` means only that the declared root regions satisfy the
+declared exact target policy.  The target sets are reviewed assertions, not a
+points-to proof, and callees are not recursively scanned yet.  It is therefore
+not a kernel qualification and does not replace the schema-one fail-closed
+discovery result.
+
 Symbol-bounded policy regions are necessary for a normal linked Linux image,
 where input `.noinstr.text` is folded into `.text` but
-`__noinstr_text_start` and `__noinstr_text_end` survive.  This first scope is
-not yet a transitive call graph: allowed direct callees, tail calls, exception
+`__noinstr_text_start` and `__noinstr_text_end` survive.  Neither current scope
+is a transitive call graph: allowed direct callees, tail calls, exception
 edges, state ordering, and compiler-generated helpers require later gates and
 must not be treated as qualified.
 
