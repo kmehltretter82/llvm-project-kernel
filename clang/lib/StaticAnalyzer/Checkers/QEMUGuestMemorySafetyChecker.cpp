@@ -248,7 +248,8 @@ static bool hasUsableExtent(ProgramStateRef State, SVal Extent,
 class QEMUGuestMemorySafetyChecker
     : public Checker<check::ASTDecl<TranslationUnitDecl>, check::BeginFunction,
                      check::PreCall, check::PostCall, check::Bind,
-                     check::DeadSymbols, check::PreStmt<ArraySubscriptExpr>> {
+                     check::DeadSymbols, check::PostStmt<ImplicitCastExpr>,
+                     check::PreStmt<ArraySubscriptExpr>> {
   mutable llvm::DenseMap<const FunctionDecl *, CallbackInfo> Callbacks;
   mutable llvm::DenseMap<const FieldDecl *, const FieldDecl *>
       DynamicArrayCounts;
@@ -2319,13 +2320,14 @@ class QEMUGuestMemorySafetyChecker
     ProgramStateRef State = C.getState();
     SVal Length = Call.getArgSVal(Sink.LengthArgument);
     std::string SourceDetail;
+    std::optional<PersistentFieldInfo> Persistent =
+        persistentGuestField(Call.getArgExpr(Sink.LengthArgument));
+    if (Persistent)
+      SourceDetail = persistentSourceDescription(*Persistent);
     if (!taint::isTainted(State, Length)) {
-      std::optional<PersistentFieldInfo> Persistent =
-          persistentGuestField(Call.getArgExpr(Sink.LengthArgument));
       if (!Persistent)
         return;
       State = taint::addTaint(State, Length);
-      SourceDetail = persistentSourceDescription(*Persistent);
     }
 
     SVal Required = Length;
@@ -2923,6 +2925,36 @@ public:
     C.addTransition(Tainted, Tag);
   }
 
+  void checkPostStmt(const ImplicitCastExpr *Cast, CheckerContext &C) const {
+    if (Cast->getCastKind() != CK_LValueToRValue)
+      return;
+    std::optional<PersistentFieldInfo> Persistent =
+        persistentGuestField(Cast->getSubExpr());
+    if (!Persistent)
+      return;
+
+    // A VMState entry makes the field of the migrated device object
+    // untrusted, not every automatic object that happens to have the same
+    // record type.  This distinction matters for temporary request and event
+    // records whose fields are populated from already-validated state.
+    if (const MemRegion *Region = C.getSVal(Cast->getSubExpr()).getAsRegion())
+      if (const auto *Base = dyn_cast<VarRegion>(Region->getBaseRegion()))
+        if (Base->getDecl()->hasLocalStorage())
+          return;
+
+    SVal Value = C.getSVal(Cast);
+    ProgramStateRef State = C.getState();
+    if (Value.isUnknownOrUndef() || taint::isTainted(State, Value))
+      return;
+    State = taint::addTaint(State, Value);
+    std::string Detail = "stored field '" +
+                         Persistent->Field->getNameAsString() +
+                         "' is guest-controlled";
+    const NoteTag *Tag =
+        sourceNote(C, State, Value, Persistent->Source, Detail);
+    C.addTransition(State, Tag);
+  }
+
   void checkBind(SVal Location, SVal Value, const Stmt *S, bool AtDeclInit,
                  CheckerContext &C) const {
     const auto *Region = dyn_cast_or_null<VarRegion>(Location.getAsRegion());
@@ -2956,11 +2988,12 @@ public:
     std::string SourceDetail;
     std::optional<PersistentFieldInfo> Persistent =
         persistentGuestField(ASE->getIdx());
+    if (Persistent)
+      SourceDetail = persistentSourceDescription(*Persistent);
     if (!taint::isTainted(State, Index)) {
       if (!Persistent)
         return;
       State = taint::addTaint(State, Index);
-      SourceDetail = persistentSourceDescription(*Persistent);
     }
     const Expr *Base = ASE->getBase()->IgnoreParenImpCasts();
     const auto *Member = dyn_cast<MemberExpr>(Base);

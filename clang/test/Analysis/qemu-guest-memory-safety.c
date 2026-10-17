@@ -80,6 +80,8 @@ enum {
   { .offset = __builtin_offsetof(_state, _field) }
 #define VMSTATE_UINT8(_field, _state)                                      \
   { .offset = __builtin_offsetof(_state, _field) }
+#define VMSTATE_UINT16(_field, _state)                                     \
+  { .offset = __builtin_offsetof(_state, _field) }
 #define VMSTATE_VALIDATE(_name, _test)                                     \
   { .flags = VMS_MUST_EXIST | VMS_NO_STATE, .field_exists = (_test) }
 #define VMSTATE_END_OF_LIST()                                              \
@@ -153,7 +155,7 @@ static void mmio_persistent_packet_overread(void *opaque, uint64_t addr,
     s->packet_length = data;
   } else if (addr == 4) { // expected-note {{Assuming 'addr' is equal to 4}}
                           // expected-note@-1 {{Taking true branch}}
-    qemu_send_packet(opaque, s->packet, s->packet_length); // expected-warning {{Level B: guest-controlled packet length may exceed the host object extent}}
+    qemu_send_packet(opaque, s->packet, s->packet_length); // expected-warning {{Level B: guest-controlled packet length may exceed the host object extent}} expected-note {{MMIO stored field 'packet_length' is guest-controlled}}
                                                            // expected-note@-1 {{Level B: guest-controlled packet length may exceed the host object extent}}
   }
 }
@@ -213,7 +215,7 @@ static void mmio_persistent_off_by_one_channel(void *opaque, uint64_t addr,
     s->channel = data < 3 ? data : 0;
   } else if (addr == 4) { // expected-note {{Assuming 'addr' is equal to 4}}
                           // expected-note@-1 {{Taking true branch}}
-    s->channels[s->channel] = 1; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
+    s->channels[s->channel] = 1; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}} expected-note {{MMIO stored field 'channel' is guest-controlled}}
                                  // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
   }
 }
@@ -243,7 +245,7 @@ static const MemoryRegionOps mmio_persistent_guarded_channel_ops = {
 
 static int persistent_bounded_field_in_unsafe_expression(
     PersistentChannelState *s) {
-  return s->channels[s->channel * 4]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
+  return s->channels[s->channel * 4]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}} expected-note {{MMIO stored field 'channel' is guest-controlled}}
                                       // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
 }
 
@@ -275,12 +277,58 @@ static const VMStateField migrated_index_fields[] = {
 };
 
 static int migrated_persistent_index(MigratedIndexState *s) {
-  return s->slots[s->index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
+  return s->slots[s->index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}} expected-note {{migration stored field 'index' is guest-controlled}}
                              // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
 }
 
 static int migrated_bounded_byte_index(MigratedIndexState *s) {
   return s->byte_slots[s->byte_index];
+}
+
+typedef struct MigratedAliasState {
+  unsigned short next_channel;
+  unsigned packet_index;
+  int packets[8];
+  int registers[64];
+} MigratedAliasState;
+
+static const VMStateField migrated_alias_fields[] = {
+    VMSTATE_UINT16(next_channel, MigratedAliasState),
+    VMSTATE_UINT32(packet_index, MigratedAliasState),
+    VMSTATE_END_OF_LIST(),
+};
+
+static int migrated_assignment_alias(MigratedAliasState *s) {
+  unsigned channel;
+  channel = s->next_channel; // expected-note {{migration stored field 'next_channel' is guest-controlled}}
+  return s->packets[channel]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
+                              // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
+}
+
+static int migrated_index_helper(MigratedAliasState *s, unsigned index) {
+  return s->registers[index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
+                              // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
+}
+
+static int migrated_argument_alias(MigratedAliasState *s) {
+  return migrated_index_helper( // expected-note {{Calling 'migrated_index_helper'}}
+      s, s->packet_index); // expected-note {{migration stored field 'packet_index' is guest-controlled}}
+}
+
+static int migrated_guarded_assignment_alias(MigratedAliasState *s) {
+  unsigned channel;
+  channel = s->next_channel;
+  if (channel >= 8)
+    return 0;
+  return s->packets[channel];
+}
+
+static int trusted_local_migrated_record(unsigned index) {
+  MigratedAliasState local = {0};
+  unsigned copied_index;
+  local.packet_index = index;
+  copied_index = local.packet_index;
+  return local.registers[copied_index];
 }
 
 typedef struct ValidatedMigratedIndexState {
@@ -316,7 +364,7 @@ static int migrated_validated_dynamic_index(
 static int migrated_validated_cross_object_index(
     ValidatedMigratedIndexState *array,
     ValidatedMigratedIndexState *selector) {
-  if (selector->index == array->count) // expected-note {{Assuming field 'index' is not equal to field 'count'}} expected-note {{Taking false branch}}
+  if (selector->index == array->count) // expected-note {{migration stored field 'index' is guest-controlled}} expected-note {{Assuming field 'index' is not equal to field 'count'}} expected-note {{Taking false branch}}
     return 0;
   return array->slots[selector->index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
                                          // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
@@ -347,7 +395,7 @@ static void allocate_weakly_validated_migrated_index(
 
 static int migrated_weakly_validated_dynamic_index(
     WeaklyValidatedMigratedIndexState *s) {
-  if (s->index == s->count) // expected-note {{Assuming field 'index' is not equal to field 'count'}} expected-note {{Taking false branch}}
+  if (s->index == s->count) // expected-note {{migration stored field 'index' is guest-controlled}} expected-note {{Assuming field 'index' is not equal to field 'count'}} expected-note {{Taking false branch}}
     return 0;
   return s->slots[s->index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
                               // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
@@ -398,7 +446,7 @@ static const VMStateDescription post_load_upper_only_vmsd = {
 };
 
 static int migrated_post_load_upper_only_index(PostLoadUpperOnlyState *s) {
-  return s->slots[s->index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
+  return s->slots[s->index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}} expected-note {{migration stored field 'index' is guest-controlled}}
                               // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
 }
 
@@ -424,7 +472,7 @@ static const VMStateDescription post_load_off_by_one_vmsd = {
 
 static int migrated_post_load_off_by_one_index(
     PostLoadOffByOneIndexState *s) {
-  return s->slots[s->index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
+  return s->slots[s->index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}} expected-note {{migration stored field 'index' is guest-controlled}}
                               // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
 }
 
@@ -441,7 +489,7 @@ typedef struct PostLoadEarlyAccessState {
 
 static int validate_post_load_after_access(void *opaque, int version) {
   PostLoadEarlyAccessState *s = opaque;
-  int result = s->slots[s->index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
+  int result = s->slots[s->index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}} expected-note {{migration stored field 'index' is guest-controlled}}
                                     // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
   if (s->index < 0 || s->index >= 4)
     return -1;
@@ -484,7 +532,7 @@ static const VMStateDescription unvalidated_alternate_vmsd = {
 };
 
 static int migrated_alternate_unvalidated_index(AlternateUnvalidatedState *s) {
-  return s->slots[s->index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
+  return s->slots[s->index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}} expected-note {{migration stored field 'index' is guest-controlled}}
                               // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
 }
 
@@ -514,7 +562,7 @@ static void mmio_overrides_post_load_index(void *opaque, uint64_t addr,
   if (addr == 0) { // expected-note {{Assuming 'addr' is not equal to 0}} expected-note {{Taking false branch}}
     s->index = data;
   } else if (addr == 4) { // expected-note {{Assuming 'addr' is equal to 4}} expected-note {{Taking true branch}}
-    s->slots[s->index] = 1; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
+    s->slots[s->index] = 1; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}} expected-note {{mixed guest input stored field 'index' is guest-controlled}}
                              // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
   }
 }
