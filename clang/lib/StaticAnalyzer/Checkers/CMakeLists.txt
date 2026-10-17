@@ -98,6 +98,7 @@ add_clang_library(clangStaticAnalyzerCheckers
   PutenvStackArrayChecker.cpp
   QEMUErrorOwnershipChecker.cpp
   QEMUGuestInputChecker.cpp
+  QEMUGuestMemorySafetyChecker.cpp
   QEMULockContextChecker.cpp
   QEMUMigrationConsistencyChecker.cpp
   QEMUResourceLifetimeChecker.cpp

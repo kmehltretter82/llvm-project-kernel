@@ -1755,6 +1755,11 @@ def QEMUGuestInputChecker : Checker<"GuestInput">,
   Dependencies<[TaintPropagationChecker]>,
   Documentation<NotDocumented>;
 
+def QEMUGuestMemorySafetyChecker : Checker<"GuestMemorySafety">,
+  HelpText<"Check guest-controlled QEMU host-memory accesses">,
+  Dependencies<[DynamicMemoryModeling, TaintPropagationChecker]>,
+  Documentation<NotDocumented>;
+
 } // end "alpha.qemu"
 
 //===----------------------------------------------------------------------===//
