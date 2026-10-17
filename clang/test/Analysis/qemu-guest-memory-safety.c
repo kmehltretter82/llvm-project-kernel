@@ -62,12 +62,21 @@ typedef struct VirtioDeviceClass {
 
 typedef struct VMStateField {
   size_t offset;
+  unsigned flags;
+  _Bool (*field_exists)(void *, int);
 } VMStateField;
+
+enum {
+  VMS_NO_STATE = 0x080,
+  VMS_MUST_EXIST = 0x1000,
+};
 
 #define VMSTATE_UINT32(_field, _state)                                     \
   { .offset = __builtin_offsetof(_state, _field) }
 #define VMSTATE_UINT8(_field, _state)                                      \
   { .offset = __builtin_offsetof(_state, _field) }
+#define VMSTATE_VALIDATE(_name, _test)                                     \
+  { .flags = VMS_MUST_EXIST | VMS_NO_STATE, .field_exists = (_test) }
 #define VMSTATE_END_OF_LIST()                                              \
   { .offset = (size_t)-1 }
 
@@ -267,6 +276,76 @@ static int migrated_persistent_index(MigratedIndexState *s) {
 
 static int migrated_bounded_byte_index(MigratedIndexState *s) {
   return s->byte_slots[s->byte_index];
+}
+
+typedef struct ValidatedMigratedIndexState {
+  unsigned index;
+  unsigned count;
+  int *slots;
+} ValidatedMigratedIndexState;
+
+static _Bool migrated_index_within_count(void *opaque, int version) {
+  ValidatedMigratedIndexState *s = opaque;
+  return s->index <= s->count;
+}
+
+static const VMStateField validated_migrated_index_fields[] = {
+    VMSTATE_UINT32(index, ValidatedMigratedIndexState),
+    VMSTATE_UINT32(count, ValidatedMigratedIndexState),
+    VMSTATE_VALIDATE("index <= count", migrated_index_within_count),
+    VMSTATE_END_OF_LIST(),
+};
+
+static void allocate_validated_migrated_index(
+    ValidatedMigratedIndexState *s) {
+  s->slots = malloc(s->count * sizeof(*s->slots));
+}
+
+static int migrated_validated_dynamic_index(
+    ValidatedMigratedIndexState *s) {
+  if (s->index == s->count)
+    return 0;
+  return s->slots[s->index];
+}
+
+static int migrated_validated_cross_object_index(
+    ValidatedMigratedIndexState *array,
+    ValidatedMigratedIndexState *selector) {
+  if (selector->index == array->count) // expected-note {{Assuming field 'index' is not equal to field 'count'}} expected-note {{Taking false branch}}
+    return 0;
+  return array->slots[selector->index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
+                                         // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
+}
+
+typedef struct WeaklyValidatedMigratedIndexState {
+  unsigned index;
+  unsigned count;
+  int *slots;
+} WeaklyValidatedMigratedIndexState;
+
+static _Bool migrated_index_one_past_count(void *opaque, int version) {
+  WeaklyValidatedMigratedIndexState *s = opaque;
+  return s->index <= s->count + 1;
+}
+
+static const VMStateField weakly_validated_migrated_index_fields[] = {
+    VMSTATE_UINT32(index, WeaklyValidatedMigratedIndexState),
+    VMSTATE_UINT32(count, WeaklyValidatedMigratedIndexState),
+    VMSTATE_VALIDATE("index <= count + 1", migrated_index_one_past_count),
+    VMSTATE_END_OF_LIST(),
+};
+
+static void allocate_weakly_validated_migrated_index(
+    WeaklyValidatedMigratedIndexState *s) {
+  s->slots = malloc(s->count * sizeof(*s->slots));
+}
+
+static int migrated_weakly_validated_dynamic_index(
+    WeaklyValidatedMigratedIndexState *s) {
+  if (s->index == s->count) // expected-note {{Assuming field 'index' is not equal to field 'count'}} expected-note {{Taking false branch}}
+    return 0;
+  return s->slots[s->index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
+                              // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
 }
 
 static uint64_t mmio_index(void *opaque, uint64_t addr, unsigned size) { // expected-note {{MMIO callback parameter 'addr' is guest-controlled}}

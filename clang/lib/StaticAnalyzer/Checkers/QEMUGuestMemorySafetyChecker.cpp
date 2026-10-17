@@ -85,6 +85,11 @@ struct ShiftedBoundPredicate {
   uint64_t ExclusiveLimit;
 };
 
+struct ValidatedFieldBound {
+  const FieldDecl *LimitField;
+  bool Inclusive;
+};
+
 static const InitListExpr *semanticInitList(const Expr *E) {
   if (!E)
     return nullptr;
@@ -252,6 +257,8 @@ class QEMUGuestMemorySafetyChecker
       ShiftedBoundPredicates;
   mutable llvm::DenseMap<const FieldDecl *, InputClass> PersistentGuestFields;
   mutable llvm::DenseSet<const FieldDecl *> MigrationGuestFields;
+  mutable llvm::DenseMap<const FieldDecl *, ValidatedFieldBound>
+      MigrationValidatedFieldBounds;
   mutable llvm::DenseMap<const FieldDecl *, uint64_t>
       PersistentGuestFieldMaximums;
   mutable llvm::DenseSet<const FieldDecl *> UnboundedPersistentGuestFields;
@@ -522,7 +529,7 @@ class QEMUGuestMemorySafetyChecker
     return Visitor.Found;
   }
 
-  static const FieldDecl *destinationField(const Expr *E) {
+  static const MemberExpr *destinationMember(const Expr *E) {
     if (!E)
       return nullptr;
     E = E->IgnoreParenImpCasts();
@@ -531,7 +538,11 @@ class QEMUGuestMemorySafetyChecker
         break;
       E = UO->getSubExpr()->IgnoreParenImpCasts();
     }
-    const auto *Member = dyn_cast<MemberExpr>(E);
+    return dyn_cast<MemberExpr>(E);
+  }
+
+  static const FieldDecl *destinationField(const Expr *E) {
+    const MemberExpr *Member = destinationMember(E);
     const auto *Field =
         Member ? dyn_cast<FieldDecl>(Member->getMemberDecl()) : nullptr;
     return Field ? Field->getCanonicalDecl() : nullptr;
@@ -599,6 +610,75 @@ class QEMUGuestMemorySafetyChecker
     Visitor.TraverseStmt(const_cast<InitListExpr *>(ILE));
   }
 
+  void discoverVMStateValidation(const InitListExpr *ILE,
+                                 ASTContext &Context) const {
+    ILE = semanticInitList(ILE);
+    if (!ILE)
+      return;
+    const RecordDecl *RD = ILE->getType()->getAsRecordDecl();
+    if (!RD || RD->getName() != "VMStateField")
+      return;
+
+    const Expr *Flags = fieldInitializer(ILE, "flags");
+    Expr::EvalResult FlagsResult;
+    if (!Flags ||
+        !Flags->EvaluateAsInt(FlagsResult, Context, Expr::SE_NoSideEffects))
+      return;
+    const llvm::APSInt &FlagsValue = FlagsResult.Val.getInt();
+    // QEMU's VMSTATE_VALIDATE entries are the only VMState fields carrying
+    // both VMS_MUST_EXIST and VMS_NO_STATE.  Other field_exists predicates
+    // decide whether data is present and must not be treated as validators.
+    constexpr uint64_t ValidationFlags = 0x1000 | 0x080;
+    if (FlagsValue.isNegative() || FlagsValue.getActiveBits() > 64 ||
+        (FlagsValue.getZExtValue() & ValidationFlags) != ValidationFlags)
+      return;
+
+    const FunctionDecl *Predicate =
+        referencedFunction(fieldInitializer(ILE, "field_exists"));
+    if (!Predicate || !Predicate->doesThisDeclarationHaveABody())
+      return;
+    const auto *Body = dyn_cast<CompoundStmt>(Predicate->getBody());
+    if (!Body)
+      return;
+    const ReturnStmt *Return = nullptr;
+    for (const Stmt *Statement : Body->body()) {
+      if (const auto *Candidate = dyn_cast<ReturnStmt>(Statement)) {
+        if (Return)
+          return;
+        Return = Candidate;
+      } else if (!isa<DeclStmt>(Statement)) {
+        return;
+      }
+    }
+    const Expr *Value = Return ? Return->getRetValue() : nullptr;
+    Value = Value ? Value->IgnoreParenImpCasts() : nullptr;
+    const auto *Comparison = dyn_cast_or_null<BinaryOperator>(Value);
+    if (!Comparison || (Comparison->getOpcode() != BO_LE &&
+                        Comparison->getOpcode() != BO_LT))
+      return;
+
+    const MemberExpr *FieldMember =
+        destinationMember(Comparison->getLHS()->IgnoreParenImpCasts());
+    const MemberExpr *LimitMember =
+        destinationMember(Comparison->getRHS()->IgnoreParenImpCasts());
+    if (!FieldMember || !LimitMember ||
+        !sameSimpleExpression(FieldMember->getBase(), LimitMember->getBase()))
+      return;
+    const FieldDecl *Field = destinationField(FieldMember);
+    const FieldDecl *Limit = destinationField(LimitMember);
+    if (!Field || !Limit || Field == Limit)
+      return;
+    Field = Field->getCanonicalDecl();
+    Limit = Limit->getCanonicalDecl();
+
+    ValidatedFieldBound Bound{Limit, Comparison->getOpcode() == BO_LE};
+    auto [Found, Inserted] =
+        MigrationValidatedFieldBounds.try_emplace(Field, Bound);
+    if (!Inserted && (Found->second.LimitField != Bound.LimitField ||
+                      Found->second.Inclusive != Bound.Inclusive))
+      MigrationValidatedFieldBounds.erase(Field);
+  }
+
   struct PersistentFieldInfo {
     const FieldDecl *Field;
     InputClass Source;
@@ -653,6 +733,19 @@ class QEMUGuestMemorySafetyChecker
         return directReferencedField(VD->getInit(), Depth + 1);
     }
     return destinationField(E);
+  }
+
+  static const MemberExpr *directReferencedMember(const Expr *E,
+                                                  unsigned Depth = 0) {
+    if (!E || Depth > 8)
+      return nullptr;
+    E = E->IgnoreParenImpCasts();
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+      const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
+      if (VD && VD->isLocalVarDecl() && !isa<ParmVarDecl>(VD) && VD->hasInit())
+        return directReferencedMember(VD->getInit(), Depth + 1);
+    }
+    return destinationMember(E);
   }
 
   static const FieldDecl *addressedField(const Expr *E) {
@@ -2219,6 +2312,7 @@ public:
         if (Semantic && Seen.insert(Semantic).second) {
           Checker.discoverOperationTable(Semantic);
           Checker.discoverVMStateField(Semantic);
+          Checker.discoverVMStateValidation(Semantic, Context);
           if (isMemoryRegionOps(Semantic))
             MemoryRegionInitializers.insert(Semantic);
         }
@@ -2680,6 +2774,23 @@ public:
     QualType IndexType = UnpromotedIndex->getType();
     const llvm::APSInt *KnownCount =
         C.getSValBuilder().getKnownValue(State, Count);
+    const MemberExpr *IndexMember = directReferencedMember(ASE->getIdx());
+    if (Persistent && Member && IndexMember &&
+        sameSimpleExpression(Member->getBase(), IndexMember->getBase()) &&
+        DynamicCount != DynamicArrayCounts.end() &&
+        directReferencedField(ASE->getIdx()) == Persistent->Field) {
+      auto Validated =
+          MigrationValidatedFieldBounds.find(Persistent->Field);
+      if (Validated != MigrationValidatedFieldBounds.end() &&
+          Validated->second.LimitField == DynamicCount->second) {
+        if (!Validated->second.Inclusive)
+          return;
+        std::optional<BoundStates> NotAtLimit =
+            compare(State, Index, BO_NE, Count, C.getSValBuilder());
+        if (NotAtLimit && NotAtLimit->Safe && !NotAtLimit->Unsafe)
+          return;
+      }
+    }
     if (Persistent && KnownCount && !KnownCount->isNegative() &&
         KnownCount->getBitWidth() <= 64 &&
         directReferencedField(ASE->getIdx()) == Persistent->Field) {
