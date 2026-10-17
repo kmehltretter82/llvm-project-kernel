@@ -1427,6 +1427,18 @@ class QEMUGuestMemorySafetyChecker
     return std::nullopt;
   }
 
+  static std::optional<IntegerRange> unsignedTypeRange(QualType Type,
+                                                       ASTContext &Context) {
+    if (!Type->isUnsignedIntegerType())
+      return std::nullopt;
+    unsigned Width = Context.getIntWidth(Type);
+    if (!Width || Width > 64)
+      return std::nullopt;
+    uint64_t Maximum = Width == 64 ? std::numeric_limits<uint64_t>::max()
+                                   : (uint64_t(1) << Width) - 1;
+    return IntegerRange{0, Maximum};
+  }
+
   static std::optional<IntegerRange>
   integerRange(const Expr *E, CheckerContext &C, unsigned Depth = 0) {
     if (!E || Depth > 8)
@@ -1450,7 +1462,7 @@ class QEMUGuestMemorySafetyChecker
           C.getSValBuilder().getMaxValue(C.getState(), Value);
       if (!Minimum || !Maximum || Minimum->isNegative() ||
           Minimum->getBitWidth() > 64 || Maximum->getBitWidth() > 64)
-        return std::nullopt;
+        return unsignedTypeRange(E->getType(), C.getASTContext());
       uint64_t Low = Minimum->getZExtValue();
       uint64_t High = Maximum->getZExtValue();
       QualType Type = E->getType();

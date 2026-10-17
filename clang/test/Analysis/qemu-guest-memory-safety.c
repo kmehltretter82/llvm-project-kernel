@@ -228,6 +228,20 @@ static int persistent_bounded_field_in_unsafe_expression(
                                       // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
 }
 
+typedef struct PersistentMaskedState {
+  unsigned control;
+  int rates[4];
+} PersistentMaskedState;
+
+static const VMStateField migrated_masked_fields[] = {
+    VMSTATE_UINT32(control, PersistentMaskedState),
+    VMSTATE_END_OF_LIST(),
+};
+
+static int migrated_masked_shift_index(PersistentMaskedState *s) {
+  return s->rates[(s->control & 0x3000) >> 12];
+}
+
 typedef struct MigratedIndexState {
   unsigned index;
   unsigned char byte_index;
