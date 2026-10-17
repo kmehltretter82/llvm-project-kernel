@@ -7,6 +7,24 @@ typedef struct Foo Foo;
 typedef struct Object Object;
 typedef struct QObject QObject;
 typedef struct QDict QDict;
+typedef struct QEMUBH QEMUBH;
+typedef struct QEMUTimer QEMUTimer;
+typedef struct BlockAIOCB BlockAIOCB;
+typedef struct Coroutine Coroutine;
+typedef struct EventNotifier {
+  int fd;
+} EventNotifier;
+typedef struct QemuEvent {
+  int value;
+} QemuEvent;
+typedef struct QemuThread {
+  int value;
+} QemuThread;
+typedef void QEMUBHFunc(void *opaque);
+typedef void QEMUTimerCB(void *opaque);
+typedef void BlockCompletionFunc(void *opaque, int ret);
+typedef void CoroutineEntry(void *opaque);
+typedef void EventNotifierHandler(EventNotifier *notifier);
 
 void g_free(void *ptr);
 void qapi_free_Foo(Foo *foo);
@@ -27,6 +45,57 @@ void qobject_unref_impl(QObject *obj);
 int close(int fd);
 long read(int fd, void *buf, size_t count);
 int open_again(void);
+
+QEMUBH *qemu_bh_new_full(QEMUBHFunc *cb, void *opaque, const char *name,
+                         void *guard);
+void qemu_bh_schedule(QEMUBH *bh);
+void qemu_bh_cancel(QEMUBH *bh);
+void qemu_bh_delete(QEMUBH *bh);
+void aio_bh_schedule_oneshot_full(void *ctx, QEMUBHFunc *cb, void *opaque,
+                                  const char *name);
+int aio_poll(void *ctx, int blocking);
+void main_loop_wait(int blocking);
+int g_main_context_iteration(void *ctx, int blocking);
+void qemu_event_wait(QemuEvent *event);
+void qemu_thread_join(QemuThread *thread);
+
+QEMUTimer *timer_new_ns(int type, QEMUTimerCB *cb, void *opaque);
+void timer_mod_ns(QEMUTimer *timer, long expires);
+void timer_del(QEMUTimer *timer);
+void timer_free(QEMUTimer *timer);
+int timer_pending(QEMUTimer *timer);
+
+BlockAIOCB *blk_aio_preadv(void *blk, long offset, void *qiov,
+                           unsigned flags, BlockCompletionFunc *cb,
+                           void *opaque);
+void blk_aio_cancel(BlockAIOCB *acb);
+
+Coroutine *qemu_coroutine_create(CoroutineEntry *entry, void *opaque);
+void qemu_coroutine_enter(Coroutine *co);
+void aio_co_wake(Coroutine *co);
+void aio_co_schedule(void *ctx, Coroutine *co);
+void qemu_coroutine_yield(void);
+void qemu_co_sleep_ns_wakeable(void *state, int type, unsigned long timeout);
+
+void defer_call_begin(void);
+void defer_call(void (*fn)(void *), void *opaque);
+void defer_call_end(void);
+void aio_set_event_notifier(void *ctx, EventNotifier *notifier,
+                            EventNotifierHandler *io_read, void *io_poll,
+                            EventNotifierHandler *io_poll_ready);
+void event_notifier_set_handler(EventNotifier *notifier,
+                                EventNotifierHandler *handler);
+void aio_set_fd_handler(void *ctx, int fd, QEMUBHFunc *io_read,
+                        QEMUBHFunc *io_write, void *io_poll,
+                        QEMUBHFunc *io_poll_ready, void *opaque);
+void qemu_set_fd_handler(int fd, QEMUBHFunc *io_read,
+                         QEMUBHFunc *io_write, void *opaque);
+
+#define AIO_WAIT_WHILE(ctx, cond)                                          \
+  ({                                                                       \
+    if (cond)                                                              \
+      aio_poll(ctx, 1);                                                    \
+  })
 
 #define QOBJECT(obj) ((QObject *)(obj))
 #define FREE_BUFFER(ptr) g_free(ptr)
@@ -333,4 +402,357 @@ void annotated_double_close(int fd) {
     return;
   close_wrapper(fd); // expected-note {{File descriptor first closed here}}
   close_wrapper(fd); // expected-warning {{File descriptor is closed more than once}}
+}
+
+static void async_callback(void *opaque) {}
+static void block_callback(void *opaque, int ret) {}
+static void notifier_callback(EventNotifier *notifier) {}
+
+typedef struct NotifierOwner {
+  EventNotifier notifier;
+  int value;
+} NotifierOwner;
+
+void release_with_scheduled_bh(char *ptr) {
+  if (!ptr)
+    return;
+  QEMUBH *bh = qemu_bh_new_full(async_callback, ptr, "test", 0);
+  qemu_bh_schedule(bh); // expected-note {{Callback made pending here}}
+  g_free(ptr); // expected-warning {{Object is released while a pending bottom-half callback can still use it}}
+}
+
+void cancel_bh_before_release_is_safe(char *ptr) {
+  QEMUBH *bh = qemu_bh_new_full(async_callback, ptr, "test", 0);
+  qemu_bh_schedule(bh);
+  qemu_bh_cancel(bh);
+  g_free(ptr);
+}
+
+void delete_bh_before_release_is_safe(char *ptr) {
+  QEMUBH *bh = qemu_bh_new_full(async_callback, ptr, "test", 0);
+  qemu_bh_schedule(bh);
+  qemu_bh_delete(bh);
+  g_free(ptr);
+}
+
+void dormant_bh_does_not_retain_live_use(char *ptr) {
+  qemu_bh_new_full(async_callback, ptr, "test", 0);
+  g_free(ptr);
+}
+
+void release_with_oneshot_bh(char *ptr) {
+  aio_bh_schedule_oneshot_full(0, async_callback, ptr, "test"); // expected-note {{Callback made pending here}}
+  g_free(ptr); // expected-warning {{Object is released while a pending bottom-half callback can still use it}}
+}
+
+void oneshot_bh_poll_before_release_is_safe(char *ptr) {
+  aio_bh_schedule_oneshot_full(0, async_callback, ptr, "test");
+  aio_poll(0, 0);
+  g_free(ptr);
+}
+
+void oneshot_bh_single_glib_iteration_is_not_a_barrier(char *ptr) {
+  aio_bh_schedule_oneshot_full(0, async_callback, ptr, "test"); // expected-note {{Callback made pending here}}
+  g_main_context_iteration(0, 1);
+  g_free(ptr); // expected-warning {{Object is released while a pending bottom-half callback can still use it}}
+}
+
+typedef struct EventOwner {
+  QemuEvent event;
+  int result;
+} EventOwner;
+
+void stack_oneshot_event_wait_is_safe(void) {
+  EventOwner owner;
+  aio_bh_schedule_oneshot_full(0, async_callback, &owner, "test");
+  qemu_event_wait(&owner.event);
+}
+
+void unrelated_event_wait_keeps_pending_stack(QemuEvent *other) {
+  EventOwner owner;
+  aio_bh_schedule_oneshot_full(0, async_callback, &owner, "test");
+  qemu_event_wait(other);
+  return; // expected-warning {{Address of stack object is retained by a pending bottom-half callback}}
+}
+
+typedef struct ThreadOwner {
+  QemuThread thread;
+  int result;
+} ThreadOwner;
+
+void oneshot_thread_join_before_release_is_safe(ThreadOwner *owner) {
+  aio_bh_schedule_oneshot_full(0, async_callback, owner, "test");
+  qemu_thread_join(&owner->thread);
+  g_free(owner);
+}
+
+void unrelated_thread_join_keeps_pending_release(ThreadOwner *owner,
+                                                 QemuThread *other) {
+  aio_bh_schedule_oneshot_full(0, async_callback, owner, "test"); // expected-note {{Callback made pending here}}
+  qemu_thread_join(other);
+  g_free(owner); // expected-warning {{Object is released while a pending bottom-half callback can still use it}}
+}
+
+void stack_oneshot_escape(void) {
+  char buffer[8];
+  aio_bh_schedule_oneshot_full(0, async_callback, buffer, "test");
+  return; // expected-warning {{Address of stack object is retained by a pending bottom-half callback}}
+}
+
+void stack_oneshot_poll_is_safe(void) {
+  char buffer[8];
+  aio_bh_schedule_oneshot_full(0, async_callback, buffer, "test");
+  aio_poll(0, 0);
+}
+
+void stack_oneshot_aio_wait_is_safe(void) {
+  struct {
+    int done;
+    char buffer[8];
+  } data;
+  aio_bh_schedule_oneshot_full(0, async_callback, &data, "test");
+  AIO_WAIT_WHILE(0, !data.done);
+}
+
+void unrelated_aio_wait_does_not_complete_pending_stack(int wait) {
+  char buffer[8];
+  aio_bh_schedule_oneshot_full(0, async_callback, buffer, "test");
+  AIO_WAIT_WHILE(0, wait);
+  return; // expected-warning {{Address of stack object is retained by a pending bottom-half callback}}
+}
+
+void stack_oneshot_coroutine_yield_is_safe(void) {
+  char buffer[8];
+  aio_bh_schedule_oneshot_full(0, async_callback, buffer, "test");
+  qemu_coroutine_yield();
+}
+
+void release_with_armed_timer(char *ptr) {
+  QEMUTimer *timer = timer_new_ns(0, async_callback, ptr);
+  timer_mod_ns(timer, 1); // expected-note {{Callback made pending here}}
+  g_free(ptr); // expected-warning {{Object is released while a pending timer callback can still use it}}
+}
+
+void timer_delete_before_release_is_safe(char *ptr) {
+  QEMUTimer *timer = timer_new_ns(0, async_callback, ptr);
+  timer_mod_ns(timer, 1);
+  timer_del(timer);
+  g_free(ptr);
+}
+
+void timer_free_before_release_is_safe(char *ptr) {
+  QEMUTimer *timer = timer_new_ns(0, async_callback, ptr);
+  timer_mod_ns(timer, 1);
+  timer_free(timer);
+  g_free(ptr);
+}
+
+void use_timer_after_free(void) {
+  QEMUTimer *timer = timer_new_ns(0, async_callback, 0);
+  timer_free(timer); // expected-note {{Pointer released here}}
+  timer_pending(timer); // expected-warning {{Pointer is passed to 'timer_pending' after it was released by timer_free}}
+}
+
+typedef struct TimerOwner {
+  QEMUTimer *timer;
+} TimerOwner;
+
+void bdrv_test_detach_aio_context(TimerOwner *owner) {
+  timer_free(owner->timer); // expected-warning {{A persistent object field still points to a timer freed by timer_free}}
+}
+
+void bdrv_fixed_detach_aio_context(TimerOwner *owner) {
+  timer_free(owner->timer);
+  owner->timer = 0;
+}
+
+void release_with_block_aio(char *ptr) {
+  blk_aio_preadv(0, 0, 0, 0, block_callback, ptr); // expected-note {{Callback made pending here}}
+  g_free(ptr); // expected-warning {{Object is released while a pending block AIO callback can still use it}}
+}
+
+void block_aio_completion_loop_is_safe(void) {
+  int async_ret = 1;
+  blk_aio_preadv(0, 0, 0, 0, block_callback, &async_ret);
+  while (async_ret == 1) {
+    main_loop_wait(0);
+  }
+}
+
+void unrelated_completion_loop_keeps_block_aio(int wait) {
+  int async_ret = 1;
+  blk_aio_preadv(0, 0, 0, 0, block_callback, &async_ret);
+  while (wait) {
+    main_loop_wait(0);
+  }
+  return; // expected-warning {{Address of stack object is retained by a pending block AIO callback}}
+}
+
+void impure_completion_loop_is_not_a_barrier(void) {
+  int async_ret = 1;
+  blk_aio_preadv(0, 0, 0, 0, block_callback, &async_ret);
+  while (async_ret == 1) {
+    main_loop_wait(0);
+    break;
+  }
+  return; // expected-warning {{Address of stack object is retained by a pending block AIO callback}}
+}
+
+void cancel_block_aio_before_release_is_safe(char *ptr) {
+  BlockAIOCB *acb = blk_aio_preadv(0, 0, 0, 0, block_callback, ptr);
+  blk_aio_cancel(acb);
+  g_free(ptr);
+}
+
+void stack_block_aio_escape(void) {
+  int result;
+  blk_aio_preadv(0, 0, 0, 0, block_callback, &result);
+  return; // expected-warning {{Address of stack object is retained by a pending block AIO callback}}
+}
+
+void release_with_scheduled_coroutine(char *ptr) {
+  Coroutine *co = qemu_coroutine_create(async_callback, ptr);
+  aio_co_schedule(0, co); // expected-note {{Callback made pending here}}
+  g_free(ptr); // expected-warning {{Object is released while a pending coroutine callback can still use it}}
+}
+
+void direct_coroutine_completion_before_release_is_safe(char *ptr) {
+  Coroutine *co = qemu_coroutine_create(async_callback, ptr);
+  qemu_coroutine_enter(co);
+  g_free(ptr);
+}
+
+void coroutine_sleep_transfers_completion_ownership(char *ptr) {
+  Coroutine *co = qemu_coroutine_create(async_callback, ptr);
+  aio_co_schedule(0, co);
+  qemu_co_sleep_ns_wakeable(0, 0, 1);
+  g_free(ptr);
+}
+
+void release_inside_deferred_section(char *ptr) {
+  defer_call_begin();
+  defer_call(async_callback, ptr); // expected-note {{Callback made pending here}}
+  g_free(ptr); // expected-warning {{Object is released while a pending deferred callback can still use it}}
+  defer_call_end();
+}
+
+void end_deferred_section_before_release_is_safe(char *ptr) {
+  defer_call_begin();
+  defer_call(async_callback, ptr);
+  defer_call_end();
+  g_free(ptr);
+}
+
+void immediate_defer_call_before_release_is_safe(char *ptr) {
+  defer_call(async_callback, ptr);
+  g_free(ptr);
+}
+
+void release_with_registered_aio_notifier(NotifierOwner *owner) {
+  // expected-note@+1 {{Callback registered here}}
+  aio_set_event_notifier(0, &owner->notifier, notifier_callback, 0, 0);
+  g_free(owner); // expected-warning {{Object is released while a registered AIO event-notifier callback can still use it}}
+}
+
+void unregister_aio_notifier_before_release_is_safe(NotifierOwner *owner) {
+  aio_set_event_notifier(0, &owner->notifier, notifier_callback, 0, 0);
+  aio_set_event_notifier(0, &owner->notifier, 0, 0, 0);
+  g_free(owner);
+}
+
+void release_with_registered_main_loop_notifier(NotifierOwner *owner) {
+  // expected-note@+1 {{Callback registered here}}
+  event_notifier_set_handler(&owner->notifier, notifier_callback);
+  g_free(owner); // expected-warning {{Object is released while a registered AIO event-notifier callback can still use it}}
+}
+
+void unregister_main_loop_notifier_before_release_is_safe(
+    NotifierOwner *owner) {
+  event_notifier_set_handler(&owner->notifier, notifier_callback);
+  event_notifier_set_handler(&owner->notifier, 0);
+  g_free(owner);
+}
+
+void stack_registered_notifier_escape(void) {
+  EventNotifier notifier;
+  event_notifier_set_handler(&notifier, notifier_callback);
+  return; // expected-warning {{Address of stack object is retained by a registered AIO event-notifier callback}}
+}
+
+void stack_unregistered_notifier_is_safe(void) {
+  EventNotifier notifier;
+  event_notifier_set_handler(&notifier, notifier_callback);
+  event_notifier_set_handler(&notifier, 0);
+}
+
+void release_with_registered_fd_handler(int fd, char *ptr) {
+  // expected-note@+1 {{Callback registered here}}
+  qemu_set_fd_handler(fd, async_callback, 0, ptr);
+  g_free(ptr); // expected-warning {{Object is released while a registered AIO file-descriptor callback can still use it}}
+}
+
+void unregister_fd_handler_before_release_is_safe(int fd, char *ptr) {
+  qemu_set_fd_handler(fd, async_callback, 0, ptr);
+  qemu_set_fd_handler(fd, 0, 0, 0);
+  g_free(ptr);
+}
+
+void replace_fd_handler_before_old_release_is_safe(int fd, char *old_ptr,
+                                                   char *new_ptr) {
+  qemu_set_fd_handler(fd, async_callback, 0, old_ptr);
+  qemu_set_fd_handler(fd, async_callback, 0, new_ptr);
+  g_free(old_ptr);
+  qemu_set_fd_handler(fd, 0, 0, 0);
+}
+
+void unrelated_fd_unregister_keeps_registration(int fd, int other_fd,
+                                                 char *ptr) {
+  if (fd == other_fd)
+    return;
+  // expected-note@+1 {{Callback registered here}}
+  qemu_set_fd_handler(fd, async_callback, 0, ptr);
+  qemu_set_fd_handler(other_fd, 0, 0, 0);
+  g_free(ptr); // expected-warning {{Object is released while a registered AIO file-descriptor callback can still use it}}
+}
+
+void release_with_registered_aio_fd_handler(int fd, char *ptr) {
+  // expected-note@+1 {{Callback registered here}}
+  aio_set_fd_handler(0, fd, async_callback, 0, 0, 0, ptr);
+  g_free(ptr); // expected-warning {{Object is released while a registered AIO file-descriptor callback can still use it}}
+}
+
+void unregister_aio_fd_handler_before_release_is_safe(int fd, char *ptr) {
+  aio_set_fd_handler(0, fd, async_callback, 0, 0, 0, ptr);
+  aio_set_fd_handler(0, fd, 0, 0, 0, 0, 0);
+  g_free(ptr);
+}
+
+void stack_registered_fd_handler_escape(int fd) {
+  char buffer[8];
+  qemu_set_fd_handler(fd, async_callback, 0, buffer);
+  return; // expected-warning {{Address of stack object is retained by a registered AIO file-descriptor callback}}
+}
+
+typedef struct CoroutineResumeData {
+  Coroutine *co;
+  int fd;
+} CoroutineResumeData;
+
+static void self_unregistering_coroutine_resume(void *opaque) {
+  CoroutineResumeData *data = opaque;
+  qemu_set_fd_handler(data->fd, 0, 0, 0);
+  qemu_coroutine_enter(data->co);
+}
+
+void stack_coroutine_resume_handler_is_safe(int fd, Coroutine *co) {
+  CoroutineResumeData data = {co, fd};
+  qemu_set_fd_handler(fd, self_unregistering_coroutine_resume, 0, &data);
+  qemu_coroutine_yield();
+}
+
+void unref_with_scheduled_bh(void) {
+  Object *obj = object_new("test");
+  QEMUBH *bh = qemu_bh_new_full(async_callback, obj, "test", 0);
+  qemu_bh_schedule(bh); // expected-note {{Callback made pending here}}
+  object_unref(obj); // expected-warning {{Object is released while a pending bottom-half callback can still use it}}
 }
