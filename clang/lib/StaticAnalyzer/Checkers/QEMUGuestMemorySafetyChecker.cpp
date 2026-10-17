@@ -15,9 +15,11 @@
 //===----------------------------------------------------------------------===//
 
 #include "clang/AST/ASTContext.h"
+#include "clang/AST/ASTTypeTraits.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/DynamicRecursiveASTVisitor.h"
 #include "clang/AST/Expr.h"
+#include "clang/AST/ParentMapContext.h"
 #include "clang/StaticAnalyzer/Checkers/BuiltinCheckerRegistration.h"
 #include "clang/StaticAnalyzer/Checkers/Taint.h"
 #include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
@@ -49,7 +51,16 @@ REGISTER_MAP_WITH_PROGRAMSTATE(QEMUSavedTaintedScalars, const VarRegion *, SVal)
 
 namespace {
 
-enum class InputClass { MMIO, PIO, DMA, Migration, Network, DiskImage, Mixed };
+enum class InputClass {
+  MMIO,
+  PIO,
+  DMA,
+  Migration,
+  Network,
+  DiskImage,
+  Virtio,
+  Mixed
+};
 
 struct CallbackInfo {
   uint64_t ParameterMask = 0;
@@ -171,8 +182,10 @@ static StringRef inputClassName(InputClass Source) {
     return "network receive";
   case InputClass::DiskImage:
     return "disk-image read";
+  case InputClass::Virtio:
+    return "virtio configuration";
   case InputClass::Mixed:
-    return "MMIO/PIO";
+    return "mixed guest input";
   }
   llvm_unreachable("unknown QEMU input class");
 }
@@ -234,6 +247,11 @@ class QEMUGuestMemorySafetyChecker
   mutable llvm::DenseSet<const FieldDecl *> AmbiguousDynamicArrays;
   mutable llvm::DenseMap<const FunctionDecl *, ShiftedBoundPredicate>
       ShiftedBoundPredicates;
+  mutable llvm::DenseMap<const FieldDecl *, InputClass> PersistentGuestFields;
+  mutable llvm::DenseSet<const FieldDecl *> MigrationGuestFields;
+  mutable llvm::DenseMap<const FieldDecl *, uint64_t>
+      PersistentGuestFieldMaximums;
+  mutable llvm::DenseSet<const FieldDecl *> UnboundedPersistentGuestFields;
   mutable std::unique_ptr<BugType> LevelABug;
   mutable std::unique_ptr<BugType> LevelBBug;
 
@@ -269,6 +287,471 @@ class QEMUGuestMemorySafetyChecker
         Info.AccessSizeParameter.reset();
       }
     }
+  }
+
+  void discoverCallbackAssignment(const BinaryOperator *Assignment) const {
+    if (!Assignment || Assignment->getOpcode() != BO_Assign)
+      return;
+    const auto *Member =
+        dyn_cast<MemberExpr>(Assignment->getLHS()->IgnoreParenImpCasts());
+    const auto *Field =
+        Member ? dyn_cast<FieldDecl>(Member->getMemberDecl()) : nullptr;
+    const auto *Parent =
+        Field ? dyn_cast<RecordDecl>(Field->getDeclContext()) : nullptr;
+    if (!Field || !Parent || Parent->getName() != "VirtioDeviceClass" ||
+        Field->getName() != "set_config")
+      return;
+    addCallback(Assignment->getRHS(), InputClass::Virtio, {}, {1});
+  }
+
+  void addPersistentGuestField(const FieldDecl *Field,
+                               InputClass Source) const {
+    Field = Field->getCanonicalDecl();
+    auto [Found, Inserted] = PersistentGuestFields.try_emplace(Field, Source);
+    if (!Inserted && Found->second != Source)
+      Found->second = InputClass::Mixed;
+    if (Source == InputClass::Migration)
+      MigrationGuestFields.insert(Field);
+  }
+
+  static bool sameSimpleExpression(const Expr *Left, const Expr *Right) {
+    if (!Left || !Right)
+      return false;
+    Left = Left->IgnoreParenImpCasts();
+    Right = Right->IgnoreParenImpCasts();
+    if (Left == Right)
+      return true;
+    const auto *LeftRef = dyn_cast<DeclRefExpr>(Left);
+    const auto *RightRef = dyn_cast<DeclRefExpr>(Right);
+    return LeftRef && RightRef &&
+           LeftRef->getDecl()->getCanonicalDecl() ==
+               RightRef->getDecl()->getCanonicalDecl();
+  }
+
+  static std::optional<uint64_t> literalUpperBound(const Expr *E) {
+    if (!E)
+      return std::nullopt;
+    E = E->IgnoreParenImpCasts();
+    while (const auto *Constant = dyn_cast<ConstantExpr>(E))
+      E = Constant->getSubExpr()->IgnoreParenImpCasts();
+    if (const auto *Literal = dyn_cast<IntegerLiteral>(E)) {
+      if (Literal->getValue().getActiveBits() <= 64)
+        return Literal->getValue().getZExtValue();
+      return std::nullopt;
+    }
+    if (const auto *Cast = dyn_cast<CastExpr>(E))
+      return literalUpperBound(Cast->getSubExpr());
+    if (const auto *And = dyn_cast<BinaryOperator>(E))
+      if (And->getOpcode() == BO_And) {
+        std::optional<uint64_t> Left = literalUpperBound(And->getLHS());
+        std::optional<uint64_t> Right = literalUpperBound(And->getRHS());
+        if (Left && Right)
+          return std::min(*Left, *Right);
+        if (Left)
+          return Left;
+        if (Right)
+          return Right;
+      }
+    return std::nullopt;
+  }
+
+  static std::optional<uint64_t> persistentAssignmentMaximum(const Expr *E) {
+    if (!E)
+      return std::nullopt;
+    E = E->IgnoreParenImpCasts();
+    if (std::optional<uint64_t> Literal = literalUpperBound(E))
+      return Literal;
+    const auto *Conditional = dyn_cast<ConditionalOperator>(E);
+    if (!Conditional)
+      return std::nullopt;
+    const auto *Comparison =
+        dyn_cast<BinaryOperator>(Conditional->getCond()->IgnoreParenImpCasts());
+    if (!Comparison)
+      return std::nullopt;
+
+    std::optional<uint64_t> TrueMaximum;
+    if (sameSimpleExpression(Conditional->getTrueExpr(),
+                             Comparison->getLHS())) {
+      std::optional<uint64_t> Limit = literalUpperBound(Comparison->getRHS());
+      if (Limit && Comparison->getOpcode() == BO_LT && *Limit > 0)
+        TrueMaximum = *Limit - 1;
+      else if (Limit && Comparison->getOpcode() == BO_LE)
+        TrueMaximum = *Limit;
+    }
+    if (!TrueMaximum)
+      TrueMaximum = literalUpperBound(Conditional->getTrueExpr());
+    std::optional<uint64_t> FalseMaximum =
+        literalUpperBound(Conditional->getFalseExpr());
+    if (!TrueMaximum || !FalseMaximum)
+      return std::nullopt;
+    return std::max(*TrueMaximum, *FalseMaximum);
+  }
+
+  static std::optional<uint64_t> comparisonUpperBound(const Expr *Condition,
+                                                      const Expr *Value) {
+    if (!Condition || !Value)
+      return std::nullopt;
+    Condition = Condition->IgnoreParenImpCasts();
+    if (const auto *Logical = dyn_cast<BinaryOperator>(Condition)) {
+      if (Logical->getOpcode() == BO_LAnd) {
+        if (std::optional<uint64_t> Left =
+                comparisonUpperBound(Logical->getLHS(), Value))
+          return Left;
+        return comparisonUpperBound(Logical->getRHS(), Value);
+      }
+    }
+    const auto *Comparison = dyn_cast<BinaryOperator>(Condition);
+    if (!Comparison)
+      return std::nullopt;
+
+    const Expr *LimitExpression = nullptr;
+    bool Strict = false;
+    if (sameSimpleExpression(Value, Comparison->getLHS())) {
+      if (Comparison->getOpcode() == BO_LT) {
+        LimitExpression = Comparison->getRHS();
+        Strict = true;
+      } else if (Comparison->getOpcode() == BO_LE) {
+        LimitExpression = Comparison->getRHS();
+      }
+    } else if (sameSimpleExpression(Value, Comparison->getRHS())) {
+      if (Comparison->getOpcode() == BO_GT) {
+        LimitExpression = Comparison->getLHS();
+        Strict = true;
+      } else if (Comparison->getOpcode() == BO_GE) {
+        LimitExpression = Comparison->getLHS();
+      }
+    }
+    std::optional<uint64_t> Limit = literalUpperBound(LimitExpression);
+    if (!Limit || (Strict && *Limit == 0))
+      return std::nullopt;
+    return Strict ? *Limit - 1 : *Limit;
+  }
+
+  static std::optional<uint64_t>
+  enclosingGuardMaximum(const BinaryOperator *Assignment, ASTContext &Context) {
+    if (!Assignment)
+      return std::nullopt;
+    DynTypedNode Child = DynTypedNode::create(*Assignment);
+    for (unsigned Depth = 0; Depth < 16; ++Depth) {
+      auto Parents = Context.getParents(Child);
+      if (Parents.size() != 1)
+        return std::nullopt;
+      DynTypedNode Parent = Parents[0];
+      if (const auto *If = Parent.get<IfStmt>()) {
+        const Stmt *ChildStatement = Child.get<Stmt>();
+        if (ChildStatement && If->getThen() == ChildStatement)
+          if (std::optional<uint64_t> Maximum =
+                  comparisonUpperBound(If->getCond(), Assignment->getRHS()))
+            return Maximum;
+      }
+      Child = Parent;
+    }
+    return std::nullopt;
+  }
+
+  static std::optional<uint64_t> unsignedFieldMaximum(const FieldDecl *Field,
+                                                      ASTContext &Context) {
+    QualType Type = Field->getType();
+    if (!Type->isUnsignedIntegerType())
+      return std::nullopt;
+    unsigned Width = Context.getIntWidth(Type);
+    if (!Width || Width > 64)
+      return std::nullopt;
+    return Width == 64 ? std::numeric_limits<uint64_t>::max()
+                       : (uint64_t(1) << Width) - 1;
+  }
+
+  static std::optional<uint64_t>
+  storedAssignmentMaximum(const BinaryOperator *Assignment,
+                          const FieldDecl *Field, ASTContext &Context) {
+    if (!Assignment || Assignment->getOpcode() != BO_Assign)
+      return std::nullopt;
+    if (std::optional<uint64_t> Maximum =
+            persistentAssignmentMaximum(Assignment->getRHS()))
+      return Maximum;
+    if (std::optional<uint64_t> Maximum =
+            enclosingGuardMaximum(Assignment, Context))
+      return Maximum;
+    return unsignedFieldMaximum(Field, Context);
+  }
+
+  static bool expressionReferencesCallbackInput(const Expr *E,
+                                                const FunctionDecl *FD,
+                                                const CallbackInfo &Info) {
+    if (!E || !FD)
+      return false;
+    class InputReferenceVisitor : public DynamicRecursiveASTVisitor {
+      const FunctionDecl *FD;
+      uint64_t Mask;
+      llvm::DenseSet<const VarDecl *> ExpandedLocals;
+
+    public:
+      bool Found = false;
+
+      InputReferenceVisitor(const FunctionDecl *FD, uint64_t Mask)
+          : FD(FD), Mask(Mask) {}
+
+      bool VisitDeclRefExpr(DeclRefExpr *DRE) override {
+        const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
+        if (!VD)
+          return true;
+        if (const auto *Parameter = dyn_cast<ParmVarDecl>(VD)) {
+          for (unsigned I = 0; I < FD->getNumParams() && I < 64; ++I)
+            if ((Mask & (uint64_t(1) << I)) &&
+                FD->getParamDecl(I)->getCanonicalDecl() ==
+                    Parameter->getCanonicalDecl()) {
+              Found = true;
+              return false;
+            }
+          return true;
+        }
+        if (VD->isLocalVarDecl() && VD->hasInit() &&
+            ExpandedLocals.insert(VD->getCanonicalDecl()).second)
+          TraverseStmt(const_cast<Expr *>(VD->getInit()));
+        return !Found;
+      }
+    } Visitor(FD, Info.ParameterMask | Info.PointeeMask);
+    Visitor.TraverseStmt(const_cast<Expr *>(E));
+    return Visitor.Found;
+  }
+
+  static const FieldDecl *destinationField(const Expr *E) {
+    if (!E)
+      return nullptr;
+    E = E->IgnoreParenImpCasts();
+    while (const auto *UO = dyn_cast<UnaryOperator>(E)) {
+      if (UO->getOpcode() != UO_AddrOf)
+        break;
+      E = UO->getSubExpr()->IgnoreParenImpCasts();
+    }
+    const auto *Member = dyn_cast<MemberExpr>(E);
+    const auto *Field =
+        Member ? dyn_cast<FieldDecl>(Member->getMemberDecl()) : nullptr;
+    return Field ? Field->getCanonicalDecl() : nullptr;
+  }
+
+  void discoverPersistentGuestAssignment(const BinaryOperator *Assignment,
+                                         const FunctionDecl *FD) const {
+    if (!Assignment || !Assignment->isAssignmentOp() || !FD)
+      return;
+    auto Callback = Callbacks.find(FD->getCanonicalDecl());
+    if (Callback == Callbacks.end() ||
+        !expressionReferencesCallbackInput(Assignment->getRHS(), FD,
+                                           Callback->second))
+      return;
+    if (const FieldDecl *Field = destinationField(Assignment->getLHS()))
+      addPersistentGuestField(Field, Callback->second.Source);
+  }
+
+  void discoverPersistentGuestCopy(const CallExpr *Call,
+                                   const FunctionDecl *FD) const {
+    if (!Call || !FD || Call->getNumArgs() < 3)
+      return;
+    const FunctionDecl *Callee = Call->getDirectCallee();
+    if (!Callee || !Callee->getIdentifier() ||
+        (Callee->getName() != "memcpy" && Callee->getName() != "memmove" &&
+         Callee->getName() != "__builtin_memcpy" &&
+         Callee->getName() != "__builtin_memmove"))
+      return;
+    auto Callback = Callbacks.find(FD->getCanonicalDecl());
+    if (Callback == Callbacks.end() ||
+        !expressionReferencesCallbackInput(Call->getArg(1), FD,
+                                           Callback->second))
+      return;
+    if (const FieldDecl *Field = destinationField(Call->getArg(0)))
+      addPersistentGuestField(Field, Callback->second.Source);
+  }
+
+  void discoverVMStateField(const InitListExpr *ILE) const {
+    ILE = semanticInitList(ILE);
+    if (!ILE)
+      return;
+    const RecordDecl *RD = ILE->getType()->getAsRecordDecl();
+    if (!RD || RD->getName() != "VMStateField")
+      return;
+
+    class OffsetVisitor : public DynamicRecursiveASTVisitor {
+      const QEMUGuestMemorySafetyChecker &Checker;
+
+    public:
+      explicit OffsetVisitor(const QEMUGuestMemorySafetyChecker &Checker)
+          : Checker(Checker) {}
+
+      bool VisitOffsetOfExpr(OffsetOfExpr *Offset) override {
+        for (unsigned I = 0; I < Offset->getNumComponents(); ++I) {
+          const OffsetOfNode &Component = Offset->getComponent(I);
+          if (Component.getKind() != OffsetOfNode::Field)
+            continue;
+          const FieldDecl *Field = Component.getField();
+          if (Field->getType()->isIntegerType())
+            Checker.addPersistentGuestField(Field, InputClass::Migration);
+        }
+        return true;
+      }
+    } Visitor(*this);
+    Visitor.TraverseStmt(const_cast<InitListExpr *>(ILE));
+  }
+
+  struct PersistentFieldInfo {
+    const FieldDecl *Field;
+    InputClass Source;
+  };
+
+  std::optional<PersistentFieldInfo> persistentGuestField(const Expr *E) const {
+    if (!E || PersistentGuestFields.empty())
+      return std::nullopt;
+    class FieldVisitor : public DynamicRecursiveASTVisitor {
+      const llvm::DenseMap<const FieldDecl *, InputClass> &Fields;
+      llvm::DenseSet<const VarDecl *> ExpandedLocals;
+
+    public:
+      std::optional<PersistentFieldInfo> Result;
+
+      explicit FieldVisitor(
+          const llvm::DenseMap<const FieldDecl *, InputClass> &Fields)
+          : Fields(Fields) {}
+
+      bool VisitMemberExpr(MemberExpr *ME) override {
+        const auto *Field = dyn_cast<FieldDecl>(ME->getMemberDecl());
+        if (!Field)
+          return true;
+        auto Found = Fields.find(Field->getCanonicalDecl());
+        if (Found != Fields.end()) {
+          Result = PersistentFieldInfo{Found->first, Found->second};
+          return false;
+        }
+        return true;
+      }
+
+      bool VisitDeclRefExpr(DeclRefExpr *DRE) override {
+        const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
+        if (VD && VD->isLocalVarDecl() && VD->hasInit() &&
+            ExpandedLocals.insert(VD->getCanonicalDecl()).second)
+          TraverseStmt(const_cast<Expr *>(VD->getInit()));
+        return !Result.has_value();
+      }
+    } Visitor(PersistentGuestFields);
+    Visitor.TraverseStmt(const_cast<Expr *>(E));
+    return Visitor.Result;
+  }
+
+  static const FieldDecl *directReferencedField(const Expr *E,
+                                                unsigned Depth = 0) {
+    if (!E || Depth > 8)
+      return nullptr;
+    E = E->IgnoreParenImpCasts();
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+      const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
+      if (VD && VD->isLocalVarDecl() && !isa<ParmVarDecl>(VD) && VD->hasInit())
+        return directReferencedField(VD->getInit(), Depth + 1);
+    }
+    return destinationField(E);
+  }
+
+  static const FieldDecl *addressedField(const Expr *E) {
+    if (!E)
+      return nullptr;
+    E = E->IgnoreParenImpCasts();
+    const auto *Address = dyn_cast<UnaryOperator>(E);
+    if (!Address || Address->getOpcode() != UO_AddrOf)
+      return nullptr;
+    return destinationField(Address->getSubExpr());
+  }
+
+  void computePersistentGuestFieldMaximums(const TranslationUnitDecl *TU,
+                                           ASTContext &Context) const {
+    PersistentGuestFieldMaximums.clear();
+    UnboundedPersistentGuestFields.clear();
+    for (const FieldDecl *Field : MigrationGuestFields)
+      UnboundedPersistentGuestFields.insert(Field);
+    for (const auto &Entry : PersistentGuestFields)
+      if (!Context.getSourceManager().isWrittenInMainFile(
+              Entry.first->getLocation()))
+        UnboundedPersistentGuestFields.insert(Entry.first);
+
+    class FieldWriteVisitor : public DynamicRecursiveASTVisitor {
+      const QEMUGuestMemorySafetyChecker &Checker;
+      ASTContext &Context;
+
+      bool isPersistent(const FieldDecl *Field) const {
+        return Field && Checker.PersistentGuestFields.contains(
+                            Field->getCanonicalDecl());
+      }
+
+      void markUnbounded(const FieldDecl *Field) {
+        Field = Field->getCanonicalDecl();
+        Checker.PersistentGuestFieldMaximums.erase(Field);
+        Checker.UnboundedPersistentGuestFields.insert(Field);
+      }
+
+      void recordMaximum(const FieldDecl *Field,
+                         std::optional<uint64_t> Maximum) {
+        Field = Field->getCanonicalDecl();
+        if (Checker.UnboundedPersistentGuestFields.contains(Field))
+          return;
+        if (!Maximum) {
+          markUnbounded(Field);
+          return;
+        }
+        auto [Bound, Inserted] =
+            Checker.PersistentGuestFieldMaximums.try_emplace(Field, *Maximum);
+        if (!Inserted)
+          Bound->second = std::max(Bound->second, *Maximum);
+      }
+
+    public:
+      FieldWriteVisitor(const QEMUGuestMemorySafetyChecker &Checker,
+                        ASTContext &Context)
+          : Checker(Checker), Context(Context) {}
+
+      bool VisitBinaryOperator(BinaryOperator *Assignment) override {
+        if (!Assignment->isAssignmentOp())
+          return true;
+        const FieldDecl *Field = QEMUGuestMemorySafetyChecker::destinationField(
+            Assignment->getLHS());
+        if (!isPersistent(Field))
+          return true;
+        recordMaximum(Field,
+                      QEMUGuestMemorySafetyChecker::storedAssignmentMaximum(
+                          Assignment, Field, Context));
+        return true;
+      }
+
+      bool VisitUnaryOperator(UnaryOperator *Operation) override {
+        if (!Operation->isIncrementDecrementOp())
+          return true;
+        const FieldDecl *Field = QEMUGuestMemorySafetyChecker::destinationField(
+            Operation->getSubExpr());
+        if (isPersistent(Field))
+          markUnbounded(Field);
+        return true;
+      }
+
+      bool VisitCallExpr(CallExpr *Call) override {
+        const FunctionDecl *Callee = Call->getDirectCallee();
+        for (unsigned I = 0; I < Call->getNumArgs(); ++I) {
+          const FieldDecl *Field =
+              QEMUGuestMemorySafetyChecker::addressedField(Call->getArg(I));
+          if (!isPersistent(Field))
+            continue;
+          bool ReadOnly = false;
+          if (Callee && I < Callee->getNumParams()) {
+            QualType ParameterType = Callee->getParamDecl(I)->getType();
+            ReadOnly = ParameterType->isPointerType() &&
+                       ParameterType->getPointeeType().isConstQualified();
+          }
+          if (!ReadOnly)
+            markUnbounded(Field);
+        }
+        return true;
+      }
+    } Visitor(*this, Context);
+    Visitor.TraverseDecl(const_cast<TranslationUnitDecl *>(TU));
+
+    for (const FieldDecl *Field : UnboundedPersistentGuestFields)
+      if (std::optional<uint64_t> Maximum =
+              unsignedFieldMaximum(Field, Context))
+        PersistentGuestFieldMaximums[Field] = *Maximum;
   }
 
   void discoverOperationTable(const InitListExpr *ILE) const {
@@ -627,7 +1110,8 @@ class QEMUGuestMemorySafetyChecker
 
   void report(CheckerContext &C, ProgramStateRef Safe, ProgramStateRef Unsafe,
               SVal TaintedValue, const Expr *Where, StringRef Sink,
-              SVal ExtentOrCount, bool Elements) const {
+              SVal ExtentOrCount, bool Elements,
+              StringRef SourceDetail = {}) const {
     if (!Unsafe)
       return;
     bool Definite = !Safe;
@@ -646,7 +1130,10 @@ class QEMUGuestMemorySafetyChecker
             << " (value "
             << valueRange(Unsafe, TaintedValue, C.getSValBuilder()) << ", "
             << (Elements ? "elements " : "bytes ")
-            << valueRange(Unsafe, ExtentOrCount, C.getSValBuilder()) << ')';
+            << valueRange(Unsafe, ExtentOrCount, C.getSValBuilder());
+    if (!SourceDetail.empty())
+      Message << ", source " << SourceDetail;
+    Message << ')';
 
     auto Report = std::make_unique<PathSensitiveBugReport>(bugType(Definite),
                                                            Message.str(), Node);
@@ -657,12 +1144,20 @@ class QEMUGuestMemorySafetyChecker
     C.emitReport(std::move(Report));
   }
 
+  static std::string
+  persistentSourceDescription(const PersistentFieldInfo &Info) {
+    return inputClassName(Info.Source).str() + "-stored field '" +
+           Info.Field->getNameAsString() + "'";
+  }
+
   struct MemorySink {
-    unsigned DestinationArgument;
+    unsigned BufferArgument;
     unsigned LengthArgument;
+    StringRef Description;
   };
 
-  static std::optional<MemorySink> memorySink(const CallEvent &Call) {
+  static std::optional<MemorySink>
+  destinationMemorySink(const CallEvent &Call) {
     const auto *FD = dyn_cast_or_null<FunctionDecl>(Call.getDecl());
     if (!FD || !FD->getIdentifier())
       return std::nullopt;
@@ -671,25 +1166,54 @@ class QEMUGuestMemorySafetyChecker
          Name == "__builtin_memcpy" || Name == "__builtin_memmove" ||
          Name == "__builtin_memset") &&
         Call.getNumArgs() >= 3)
-      return MemorySink{0, 2};
+      return MemorySink{0, 2, "memory-operation length"};
     if (Name == "iov_to_buf" && Call.getNumArgs() >= 5)
-      return MemorySink{3, 4};
+      return MemorySink{3, 4, "memory-operation length"};
     if (Name == "qemu_iovec_to_buf" && Call.getNumArgs() >= 4)
-      return MemorySink{2, 3};
+      return MemorySink{2, 3, "memory-operation length"};
     if ((Name == "address_space_read" || Name == "address_space_read_full") &&
         Call.getNumArgs() >= 5)
-      return MemorySink{3, 4};
+      return MemorySink{3, 4, "memory-operation length"};
     if ((Name == "dma_memory_read" || Name == "pci_dma_read") &&
         Call.getNumArgs() >= 4)
-      return MemorySink{2, 3};
+      return MemorySink{2, 3, "memory-operation length"};
     if (Name == "cpu_physical_memory_read" && Call.getNumArgs() >= 3)
-      return MemorySink{1, 2};
+      return MemorySink{1, 2, "memory-operation length"};
     if (Name == "physical_memory_read" && Call.getNumArgs() >= 3)
-      return MemorySink{1, 2};
+      return MemorySink{1, 2, "memory-operation length"};
     if (Name == "qemu_get_buffer" && Call.getNumArgs() >= 3)
-      return MemorySink{1, 2};
+      return MemorySink{1, 2, "memory-operation length"};
     if (Name == "bdrv_pread" && Call.getNumArgs() >= 5)
-      return MemorySink{3, 2};
+      return MemorySink{3, 2, "memory-operation length"};
+    return std::nullopt;
+  }
+
+  static std::optional<MemorySink> sourceMemorySink(const CallEvent &Call) {
+    const auto *FD = dyn_cast_or_null<FunctionDecl>(Call.getDecl());
+    if (!FD || !FD->getIdentifier())
+      return std::nullopt;
+    StringRef Name = FD->getName();
+    if ((Name == "memcpy" || Name == "memmove" || Name == "__builtin_memcpy" ||
+         Name == "__builtin_memmove") &&
+        Call.getNumArgs() >= 3)
+      return MemorySink{1, 2, "memory-operation source length"};
+    if ((Name == "iov_from_buf" && Call.getNumArgs() >= 5))
+      return MemorySink{3, 4, "memory-operation source length"};
+    if (Name == "qemu_iovec_from_buf" && Call.getNumArgs() >= 4)
+      return MemorySink{2, 3, "memory-operation source length"};
+    if ((Name == "qemu_send_packet" || Name == "qemu_send_packet_raw" ||
+         Name == "qemu_send_packet_async") &&
+        Call.getNumArgs() >= 3)
+      return MemorySink{1, 2, "packet length"};
+    if ((Name == "dma_memory_write" || Name == "pci_dma_write") &&
+        Call.getNumArgs() >= 4)
+      return MemorySink{2, 3, "DMA source length"};
+    if (Name == "cpu_physical_memory_write" && Call.getNumArgs() >= 3)
+      return MemorySink{1, 2, "DMA source length"};
+    if (Name == "qemu_put_buffer" && Call.getNumArgs() >= 3)
+      return MemorySink{1, 2, "migration-output source length"};
+    if (Name == "bdrv_pwrite" && Call.getNumArgs() >= 5)
+      return MemorySink{3, 2, "block-write source length"};
     return std::nullopt;
   }
 
@@ -799,6 +1323,10 @@ class QEMUGuestMemorySafetyChecker
         return std::nullopt;
       return IntegerRange{Left.Minimum / Right.Maximum,
                           Left.Maximum / Right.Minimum};
+    case BO_Rem:
+      if (Right.Minimum == 0)
+        return std::nullopt;
+      return IntegerRange{0, std::min(Left.Maximum, Right.Maximum - 1)};
     case BO_Shr:
       if (Right.Maximum >= 64)
         return std::nullopt;
@@ -1371,6 +1899,135 @@ class QEMUGuestMemorySafetyChecker
     C.emitReport(std::move(Report));
   }
 
+  void checkMemorySink(const CallEvent &Call, const MemorySink &Sink,
+                       CheckerContext &C) const {
+    ProgramStateRef State = C.getState();
+    SVal Length = Call.getArgSVal(Sink.LengthArgument);
+    std::string SourceDetail;
+    if (!taint::isTainted(State, Length)) {
+      std::optional<PersistentFieldInfo> Persistent =
+          persistentGuestField(Call.getArgExpr(Sink.LengthArgument));
+      if (!Persistent)
+        return;
+      State = taint::addTaint(State, Length);
+      SourceDetail = persistentSourceDescription(*Persistent);
+    }
+
+    SVal Required = Length;
+    SVal BoundRequired =
+        expressionValue(Call.getArgExpr(Sink.LengthArgument), C);
+    if (BoundRequired.isUnknownOrUndef())
+      BoundRequired = Required;
+    SVal Extent =
+        getDynamicExtentWithOffset(State, Call.getArgSVal(Sink.BufferArgument));
+    StringRef SinkDescription = Sink.Description;
+
+    const Expr *Buffer =
+        Call.getArgExpr(Sink.BufferArgument)->IgnoreParenImpCasts();
+    auto StaticExtent = [&C](const Expr *E) -> std::optional<uint64_t> {
+      E = E ? E->IgnoreParenImpCasts() : nullptr;
+      if (!E)
+        return std::nullopt;
+      if (const ConstantArrayType *Array =
+              C.getASTContext().getAsConstantArrayType(E->getType())) {
+        if (Array->getSize().getActiveBits() > 64)
+          return std::nullopt;
+        uint64_t Elements = Array->getSize().getZExtValue();
+        uint64_t ElementBytes = C.getASTContext()
+                                    .getTypeSizeInChars(Array->getElementType())
+                                    .getQuantity();
+        if (ElementBytes &&
+            Elements > std::numeric_limits<uint64_t>::max() / ElementBytes)
+          return std::nullopt;
+        return Elements * ElementBytes;
+      }
+      const auto *Address = dyn_cast<UnaryOperator>(E);
+      if (!Address || Address->getOpcode() != UO_AddrOf)
+        return std::nullopt;
+      QualType ObjectType = Address->getSubExpr()->getType();
+      if (ObjectType->isIncompleteType())
+        return std::nullopt;
+      return C.getASTContext().getTypeSizeInChars(ObjectType).getQuantity();
+    };
+    if (!hasUsableExtent(State, Extent, C.getSValBuilder()))
+      if (std::optional<uint64_t> Bytes = StaticExtent(Buffer))
+        Extent = C.getSValBuilder().makeIntVal(*Bytes,
+                                               C.getASTContext().getSizeType());
+    if (const auto *Add = dyn_cast<BinaryOperator>(Buffer)) {
+      if (Add->getOpcode() == BO_Add) {
+        const Expr *Pointer = nullptr;
+        const Expr *Offset = nullptr;
+        if (Add->getLHS()->getType()->isPointerType()) {
+          Pointer = Add->getLHS();
+          Offset = Add->getRHS();
+        } else if (Add->getRHS()->getType()->isPointerType()) {
+          Pointer = Add->getRHS();
+          Offset = Add->getLHS();
+        }
+        if (Pointer) {
+          QualType Pointee = Pointer->getType()->getPointeeType();
+          if (!Pointee->isVoidType() && !Pointee->isIncompleteType()) {
+            SVal BaseExtent =
+                getDynamicExtentWithOffset(State, pointerValue(Pointer, C));
+            if (!hasUsableExtent(State, BaseExtent, C.getSValBuilder()))
+              if (std::optional<uint64_t> Bytes = StaticExtent(Pointer))
+                BaseExtent = C.getSValBuilder().makeIntVal(
+                    *Bytes, C.getASTContext().getSizeType());
+            SVal OffsetValue = expressionValue(Offset, C);
+            uint64_t ElementBytes =
+                C.getASTContext().getTypeSizeInChars(Pointee).getQuantity();
+            SVal Scale = C.getSValBuilder().makeIntVal(
+                ElementBytes, C.getASTContext().getSizeType());
+            SVal ByteOffset =
+                C.getSValBuilder().evalBinOp(State, BO_Mul, OffsetValue, Scale,
+                                             C.getASTContext().getSizeType());
+            SVal Total =
+                C.getSValBuilder().evalBinOp(State, BO_Add, Length, ByteOffset,
+                                             C.getASTContext().getSizeType());
+            if (!Total.isUnknown() &&
+                hasUsableExtent(State, BaseExtent, C.getSValBuilder())) {
+              Required = Total;
+              BoundRequired = Total;
+              Extent = BaseExtent;
+              SinkDescription = Sink.Description == "packet length"
+                                    ? "packet offset plus length"
+                                    : "memory-operation offset plus length";
+            }
+          }
+        }
+      }
+    }
+    if (!hasUsableExtent(State, Extent, C.getSValBuilder()))
+      return;
+    if (const llvm::APSInt *KnownExtent =
+            C.getSValBuilder().getKnownValue(State, Extent))
+      if (!KnownExtent->isNegative() && KnownExtent->getBitWidth() <= 64) {
+        QualType UnpromotedType = Call.getArgExpr(Sink.LengthArgument)
+                                      ->IgnoreParenImpCasts()
+                                      ->getType();
+        if (UnpromotedType->isUnsignedIntegerType()) {
+          llvm::APSInt Maximum =
+              C.getSValBuilder().getBasicValueFactory().getMaxValue(
+                  UnpromotedType);
+          unsigned Width =
+              std::max(Maximum.getBitWidth(), KnownExtent->getBitWidth());
+          if (Maximum.zextOrTrunc(Width).ule(KnownExtent->zextOrTrunc(Width)))
+            return;
+        }
+        if (std::optional<IntegerRange> Range =
+                integerRange(Call.getArgExpr(Sink.LengthArgument), C))
+          if (Range->Maximum <= KnownExtent->getZExtValue())
+            return;
+      }
+    std::optional<BoundStates> Bounds =
+        compare(State, BoundRequired, BO_LE, Extent, C.getSValBuilder());
+    if (!Bounds || !Bounds->Unsafe)
+      return;
+    report(C, Bounds->Safe, Bounds->Unsafe, Required,
+           Call.getArgExpr(Sink.LengthArgument), SinkDescription, Extent, false,
+           SourceDetail);
+  }
+
 public:
   void checkASTDecl(const TranslationUnitDecl *TU, AnalysisManager &Mgr,
                     BugReporter &BR) const {
@@ -1417,6 +2074,7 @@ public:
         const InitListExpr *Semantic = semanticInitList(ILE);
         if (Semantic && Seen.insert(Semantic).second) {
           Checker.discoverOperationTable(Semantic);
+          Checker.discoverVMStateField(Semantic);
           if (isMemoryRegionOps(Semantic))
             MemoryRegionInitializers.insert(Semantic);
         }
@@ -1424,6 +2082,7 @@ public:
       }
 
       bool VisitBinaryOperator(BinaryOperator *BO) override {
+        Checker.discoverCallbackAssignment(BO);
         Checker.discoverDynamicArrayAllocation(BO);
         return true;
       }
@@ -1516,6 +2175,36 @@ public:
     } Visitor(*this, Mgr.getASTContext());
     Visitor.TraverseDecl(const_cast<TranslationUnitDecl *>(TU));
     Visitor.applyAddressLimits();
+
+    class PersistentFieldVisitor : public DynamicRecursiveASTVisitor {
+      const QEMUGuestMemorySafetyChecker &Checker;
+      const FunctionDecl *CurrentFunction = nullptr;
+
+    public:
+      explicit PersistentFieldVisitor(
+          const QEMUGuestMemorySafetyChecker &Checker)
+          : Checker(Checker) {}
+
+      bool TraverseFunctionDecl(FunctionDecl *FD) override {
+        const FunctionDecl *Previous = CurrentFunction;
+        CurrentFunction = FD ? FD->getCanonicalDecl() : nullptr;
+        bool Result = DynamicRecursiveASTVisitor::TraverseFunctionDecl(FD);
+        CurrentFunction = Previous;
+        return Result;
+      }
+
+      bool VisitBinaryOperator(BinaryOperator *BO) override {
+        Checker.discoverPersistentGuestAssignment(BO, CurrentFunction);
+        return true;
+      }
+
+      bool VisitCallExpr(CallExpr *Call) override {
+        Checker.discoverPersistentGuestCopy(Call, CurrentFunction);
+        return true;
+      }
+    } PersistentVisitor(*this);
+    PersistentVisitor.TraverseDecl(const_cast<TranslationUnitDecl *>(TU));
+    computePersistentGuestFieldMaximums(TU, Mgr.getASTContext());
   }
 
   void checkBeginFunction(CheckerContext &C) const {
@@ -1647,65 +2336,10 @@ public:
       }
     }
     checkAllocationOverflow(Call, C);
-    std::optional<MemorySink> Sink = memorySink(Call);
-    if (!Sink)
-      return;
-    SVal Length = Call.getArgSVal(Sink->LengthArgument);
-    if (!taint::isTainted(State, Length))
-      return;
-    SVal Required = Length;
-    SVal Extent = getDynamicExtentWithOffset(
-        State, Call.getArgSVal(Sink->DestinationArgument));
-    StringRef SinkDescription = "memory-operation length";
-
-    const Expr *Destination =
-        Call.getArgExpr(Sink->DestinationArgument)->IgnoreParenImpCasts();
-    if (const auto *Add = dyn_cast<BinaryOperator>(Destination)) {
-      if (Add->getOpcode() == BO_Add) {
-        const Expr *Pointer = nullptr;
-        const Expr *Offset = nullptr;
-        if (Add->getLHS()->getType()->isPointerType()) {
-          Pointer = Add->getLHS();
-          Offset = Add->getRHS();
-        } else if (Add->getRHS()->getType()->isPointerType()) {
-          Pointer = Add->getRHS();
-          Offset = Add->getLHS();
-        }
-        if (Pointer) {
-          QualType Pointee = Pointer->getType()->getPointeeType();
-          if (!Pointee->isVoidType() && !Pointee->isIncompleteType()) {
-            SVal BaseExtent =
-                getDynamicExtentWithOffset(State, pointerValue(Pointer, C));
-            SVal OffsetValue = expressionValue(Offset, C);
-            uint64_t ElementBytes =
-                C.getASTContext().getTypeSizeInChars(Pointee).getQuantity();
-            SVal Scale = C.getSValBuilder().makeIntVal(
-                ElementBytes, C.getASTContext().getSizeType());
-            SVal ByteOffset =
-                C.getSValBuilder().evalBinOp(State, BO_Mul, OffsetValue, Scale,
-                                             C.getASTContext().getSizeType());
-            SVal Total =
-                C.getSValBuilder().evalBinOp(State, BO_Add, Length, ByteOffset,
-                                             C.getASTContext().getSizeType());
-            if (!Total.isUnknown() &&
-                hasUsableExtent(State, BaseExtent, C.getSValBuilder())) {
-              Required = Total;
-              Extent = BaseExtent;
-              SinkDescription = "memory-operation offset plus length";
-            }
-          }
-        }
-      }
-    }
-    if (!hasUsableExtent(State, Extent, C.getSValBuilder()))
-      return;
-    std::optional<BoundStates> Bounds =
-        compare(State, Required, BO_LE, Extent, C.getSValBuilder());
-    if (!Bounds || !Bounds->Unsafe)
-      return;
-    report(C, Bounds->Safe, Bounds->Unsafe, Required,
-           Call.getArgExpr(Sink->LengthArgument), SinkDescription, Extent,
-           false);
+    if (std::optional<MemorySink> Sink = destinationMemorySink(Call))
+      checkMemorySink(Call, *Sink, C);
+    if (std::optional<MemorySink> Sink = sourceMemorySink(Call))
+      checkMemorySink(Call, *Sink, C);
   }
 
   void checkPostCall(const CallEvent &Call, CheckerContext &C) const {
@@ -1819,8 +2453,15 @@ public:
     // usual integer promotion can otherwise turn a uint8_t index into an
     // unconstrained int and invent an impossible index >= 256 path.
     SVal Index = expressionValue(ASE->getIdx(), C);
-    if (!taint::isTainted(State, Index))
-      return;
+    std::string SourceDetail;
+    std::optional<PersistentFieldInfo> Persistent =
+        persistentGuestField(ASE->getIdx());
+    if (!taint::isTainted(State, Index)) {
+      if (!Persistent)
+        return;
+      State = taint::addTaint(State, Index);
+      SourceDetail = persistentSourceDescription(*Persistent);
+    }
     const Expr *Base = ASE->getBase()->IgnoreParenImpCasts();
     const auto *Member = dyn_cast<MemberExpr>(Base);
     const auto *PointerField =
@@ -1853,6 +2494,14 @@ public:
     QualType IndexType = UnpromotedIndex->getType();
     const llvm::APSInt *KnownCount =
         C.getSValBuilder().getKnownValue(State, Count);
+    if (Persistent && KnownCount && !KnownCount->isNegative() &&
+        KnownCount->getBitWidth() <= 64 &&
+        directReferencedField(ASE->getIdx()) == Persistent->Field) {
+      auto Maximum = PersistentGuestFieldMaximums.find(Persistent->Field);
+      if (Maximum != PersistentGuestFieldMaximums.end() &&
+          Maximum->second < KnownCount->getZExtValue())
+        return;
+    }
     if (DynamicCount != DynamicArrayCounts.end() &&
         scaledAddressIndexCoveredByGuard(ASE->getIdx(), DynamicCount->second,
                                          Count, C))
@@ -1883,7 +2532,7 @@ public:
       if (!Outside || !Outside->Safe)
         return;
       report(C, Outside->Unsafe, Outside->Safe, Index, ASE->getIdx(),
-             "array index", Count, true);
+             "array index", Count, true, SourceDetail);
       return;
     }
 
@@ -1892,7 +2541,7 @@ public:
     if (!Inside || !Inside->Unsafe)
       return;
     report(C, Inside->Safe, Inside->Unsafe, Index, ASE->getIdx(), "array index",
-           Count, true);
+           Count, true, SourceDetail);
   }
 };
 

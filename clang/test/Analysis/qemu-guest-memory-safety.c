@@ -12,6 +12,7 @@ int bdrv_pread(void *, long long, long long, void *, unsigned);
 unsigned qemu_get_byte(void *);
 size_t qemu_iovec_to_buf(void *, size_t, void *, size_t);
 int range_covers_byte(uint64_t, uint64_t, uint64_t);
+long qemu_send_packet(void *, const unsigned char *, int);
 
 typedef struct MemoryRegionOps {
   uint64_t (*read)(void *, uint64_t, unsigned);
@@ -49,6 +50,34 @@ typedef struct NetClientInfo {
   long (*receive_iov)(void *, const void *, int);
 } NetClientInfo;
 
+typedef struct VirtioDeviceClass {
+  void (*set_config)(void *, const unsigned char *);
+} VirtioDeviceClass;
+
+typedef struct VMStateField {
+  size_t offset;
+} VMStateField;
+
+#define VMSTATE_UINT32(_field, _state)                                     \
+  { .offset = __builtin_offsetof(_state, _field) }
+#define VMSTATE_UINT8(_field, _state)                                      \
+  { .offset = __builtin_offsetof(_state, _field) }
+#define VMSTATE_END_OF_LIST()                                              \
+  { .offset = (size_t)-1 }
+
+static unsigned virtio_config_result;
+
+static void virtio_config_index(void *device,
+                                const unsigned char *config) { // expected-note@-1 {{virtio configuration callback parameter 'config' is guest-controlled}}
+  int slots[4] = {0};
+  virtio_config_result = slots[config[0]]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
+                                            // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
+}
+
+static void register_virtio_config_callback(VirtioDeviceClass *vdc) {
+  vdc->set_config = virtio_config_index;
+}
+
 static void mmio_copy(void *opaque, uint64_t addr, uint64_t data, // expected-note {{MMIO callback parameter 'size' is guest-controlled}}
                       unsigned size) {
   char destination[8];
@@ -72,6 +101,153 @@ static void mmio_bounded_copy(void *opaque, uint64_t addr, uint64_t data,
   if (size > sizeof(destination))
     return;
   memcpy(destination, opaque, size);
+}
+
+static void mmio_source_overread(void *opaque, uint64_t addr, uint64_t data,
+                                 unsigned size) { // expected-note@-1 {{MMIO callback parameter 'size' is guest-controlled}}
+  unsigned char source[8] = {0};
+  unsigned char destination[16];
+  if (size > sizeof(destination)) // expected-note {{Assuming the condition is false}}
+                                  // expected-note@-1 {{Taking false branch}}
+    return;
+  memcpy(destination, source, size); // expected-warning {{Level B: guest-controlled memory-operation source length may exceed the host object extent}}
+                                     // expected-note@-1 {{Level B: guest-controlled memory-operation source length may exceed the host object extent}}
+}
+
+static void mmio_packet_overread(void *opaque, uint64_t addr, uint64_t data, // expected-note {{MMIO callback parameter 'data' is guest-controlled}}
+                                 unsigned size) {
+  unsigned char packet[8] = {0};
+  qemu_send_packet(opaque, packet, data); // expected-warning {{Level B: guest-controlled packet length may exceed the host object extent}}
+                                          // expected-note@-1 {{Level B: guest-controlled packet length may exceed the host object extent}}
+}
+
+typedef struct PersistentPacketState {
+  unsigned packet_length;
+  unsigned char packet[8];
+} PersistentPacketState;
+
+static void mmio_persistent_packet_overread(void *opaque, uint64_t addr,
+                                            uint64_t data, unsigned size) {
+  PersistentPacketState *s = opaque;
+  if (addr == 0) { // expected-note {{Assuming 'addr' is not equal to 0}}
+                   // expected-note@-1 {{Taking false branch}}
+    s->packet_length = data;
+  } else if (addr == 4) { // expected-note {{Assuming 'addr' is equal to 4}}
+                          // expected-note@-1 {{Taking true branch}}
+    qemu_send_packet(opaque, s->packet, s->packet_length); // expected-warning {{Level B: guest-controlled packet length may exceed the host object extent}}
+                                                           // expected-note@-1 {{Level B: guest-controlled packet length may exceed the host object extent}}
+  }
+}
+
+static void mmio_persistent_bounded_packet(void *opaque, uint64_t addr,
+                                           uint64_t data, unsigned size) {
+  PersistentPacketState *s = opaque;
+  if (addr == 0) {
+    s->packet_length = data;
+  } else if (addr == 4) {
+    if (s->packet_length > sizeof(s->packet))
+      return;
+    qemu_send_packet(opaque, s->packet, s->packet_length);
+  }
+}
+
+static const MemoryRegionOps mmio_overread_ops = {
+    .write = mmio_source_overread,
+};
+
+static const MemoryRegionOps mmio_packet_overread_ops = {
+    .write = mmio_packet_overread,
+};
+
+static const MemoryRegionOps mmio_persistent_packet_ops = {
+    .write = mmio_persistent_packet_overread,
+};
+
+static const MemoryRegionOps mmio_persistent_bounded_packet_ops = {
+    .write = mmio_persistent_bounded_packet,
+};
+
+typedef struct PersistentChannelState {
+  unsigned channel;
+  int channels[2];
+} PersistentChannelState;
+
+static void mmio_persistent_clamped_channel(void *opaque, uint64_t addr,
+                                            uint64_t data, unsigned size) {
+  PersistentChannelState *s = opaque;
+  if (addr == 0)
+    s->channel = data < 2 ? data : 0;
+  else if (addr == 4)
+    s->channels[s->channel] = 1;
+}
+
+typedef struct PersistentOffByOneChannelState {
+  unsigned channel;
+  int channels[2];
+} PersistentOffByOneChannelState;
+
+static void mmio_persistent_off_by_one_channel(void *opaque, uint64_t addr,
+                                               uint64_t data, unsigned size) {
+  PersistentOffByOneChannelState *s = opaque;
+  if (addr == 0) { // expected-note {{Assuming 'addr' is not equal to 0}}
+                  // expected-note@-1 {{Taking false branch}}
+    s->channel = data < 3 ? data : 0;
+  } else if (addr == 4) { // expected-note {{Assuming 'addr' is equal to 4}}
+                          // expected-note@-1 {{Taking true branch}}
+    s->channels[s->channel] = 1; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
+                                 // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
+  }
+}
+
+static const MemoryRegionOps mmio_persistent_clamped_channel_ops = {
+    .write = mmio_persistent_clamped_channel,
+};
+
+static const MemoryRegionOps mmio_persistent_off_by_one_channel_ops = {
+    .write = mmio_persistent_off_by_one_channel,
+};
+
+static void mmio_persistent_guarded_channel(void *opaque, uint64_t addr,
+                                            uint64_t data, unsigned size) {
+  PersistentChannelState *s = opaque;
+  if (addr == 0) {
+    if (data < 2)
+      s->channel = data;
+  } else if (addr == 4) {
+    s->channels[s->channel] = 1;
+  }
+}
+
+static const MemoryRegionOps mmio_persistent_guarded_channel_ops = {
+    .write = mmio_persistent_guarded_channel,
+};
+
+static int persistent_bounded_field_in_unsafe_expression(
+    PersistentChannelState *s) {
+  return s->channels[s->channel * 4]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
+                                      // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
+}
+
+typedef struct MigratedIndexState {
+  unsigned index;
+  unsigned char byte_index;
+  int slots[4];
+  int byte_slots[256];
+} MigratedIndexState;
+
+static const VMStateField migrated_index_fields[] = {
+    VMSTATE_UINT32(index, MigratedIndexState),
+    VMSTATE_UINT8(byte_index, MigratedIndexState),
+    VMSTATE_END_OF_LIST(),
+};
+
+static int migrated_persistent_index(MigratedIndexState *s) {
+  return s->slots[s->index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
+                             // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
+}
+
+static int migrated_bounded_byte_index(MigratedIndexState *s) {
+  return s->byte_slots[s->byte_index];
 }
 
 static uint64_t mmio_index(void *opaque, uint64_t addr, unsigned size) { // expected-note {{MMIO callback parameter 'addr' is guest-controlled}}
@@ -98,6 +274,31 @@ static uint64_t mmio_bounded_index(void *opaque, uint64_t addr,
     return 0;
   return registers[addr];
 }
+
+static uint64_t mmio_modulo_bounded_index(void *opaque, uint64_t addr,
+                                          unsigned size) {
+  int registers[12] = {0};
+  addr = addr % 0x30;
+  addr >>= 2;
+  return registers[addr];
+}
+
+static const MemoryRegionOps mmio_modulo_bounded_index_ops = {
+    .read = mmio_modulo_bounded_index,
+};
+
+static uint64_t mmio_modulo_off_by_one_index( // expected-note {{MMIO callback parameter 'addr' is guest-controlled}}
+    void *opaque, uint64_t addr, unsigned size) {
+  int registers[12] = {0};
+  addr = addr % 0x34;
+  addr >>= 2;
+  return registers[addr]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
+                          // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
+}
+
+static const MemoryRegionOps mmio_modulo_off_by_one_index_ops = {
+    .read = mmio_modulo_off_by_one_index,
+};
 
 static const MemoryRegionOps mmio_ops = {
     .read = mmio_index,
