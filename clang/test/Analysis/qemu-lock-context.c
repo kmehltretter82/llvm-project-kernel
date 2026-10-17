@@ -20,6 +20,7 @@ void bql_auto_unlock(BQLLockAuto *guard);
 void glib_autoptr_cleanup_BQLLockAuto(BQLLockAuto **guard);
 void qemu_cond_wait_bql(void *cond);
 void bdrv_graph_wrlock(void);
+int qemu_in_coroutine(void);
 
 #define RCU_GUARD()                                                          \
   RCUReadAuto *guard __attribute__((cleanup(                                \
@@ -94,6 +95,15 @@ void double_bql_unlock(void) {
 void inherited_bql_unlock_and_relock(void) {
   bql_unlock();
   bql_lock_impl(__FILE__, __LINE__);
+}
+
+void repeated_coroutine_queries_are_stable(void) {
+  if (qemu_in_coroutine()) {
+    if (!qemu_in_coroutine())
+      bql_unlock();
+    if (!qemu_in_coroutine())
+      bql_lock_impl(__FILE__, __LINE__);
+  }
 }
 
 void graph_lock_after_bql_release(void) {

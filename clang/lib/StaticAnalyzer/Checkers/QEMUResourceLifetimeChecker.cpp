@@ -20,6 +20,7 @@
 
 #include "clang/AST/Attr.h"
 #include "clang/AST/Decl.h"
+#include "clang/AST/ParentMapContext.h"
 #include "clang/AST/Stmt.h"
 #include "clang/Lex/Lexer.h"
 #include "clang/StaticAnalyzer/Checkers/BuiltinCheckerRegistration.h"
@@ -287,6 +288,19 @@ static const VarRegion *findLocalBinding(const Stmt *S, SymbolRef Sym,
   return nullptr;
 }
 
+static const VarRegion *findDirectLocalBinding(const Expr *E,
+                                               ProgramStateRef State,
+                                               CheckerContext &C) {
+  if (!E)
+    return nullptr;
+  const auto *DRE = dyn_cast<DeclRefExpr>(E->IgnoreParenImpCasts());
+  const auto *VD = DRE ? dyn_cast<VarDecl>(DRE->getDecl()) : nullptr;
+  if (!VD)
+    return nullptr;
+  const VarRegion *VR = State->getRegion(VD, C.getStackFrame());
+  return VR->hasMemorySpace<StackSpaceRegion>(State) ? VR : nullptr;
+}
+
 static bool isQEMUQueueMacro(const Expr *E, CheckerContext &C) {
   if (!E)
     return false;
@@ -301,6 +315,81 @@ static bool isQEMUQueueMacro(const Expr *E, CheckerContext &C) {
     Loc = SM.getImmediateMacroCallerLoc(Loc);
   }
   return false;
+}
+
+static bool isQEMUQueueRemovalMacro(const Expr *E, CheckerContext &C) {
+  if (!E)
+    return false;
+  SourceLocation Loc = E->getExprLoc();
+  const SourceManager &SM = C.getSourceManager();
+  while (Loc.isMacroID()) {
+    StringRef Name =
+        Lexer::getImmediateMacroName(Loc, SM, C.getASTContext().getLangOpts());
+    if (Name == "QLIST_REMOVE" || Name == "QLIST_SAFE_REMOVE" ||
+        Name == "QTAILQ_REMOVE" || Name == "QSLIST_REMOVE")
+      return true;
+    Loc = SM.getImmediateMacroCallerLoc(Loc);
+  }
+  return false;
+}
+
+static bool isQEMUQueueHeadMacro(const Expr *E, CheckerContext &C) {
+  if (!E)
+    return false;
+  SourceLocation Loc = E->getExprLoc();
+  const SourceManager &SM = C.getSourceManager();
+  while (Loc.isMacroID()) {
+    StringRef Name =
+        Lexer::getImmediateMacroName(Loc, SM, C.getASTContext().getLangOpts());
+    if (Name == "QLIST_FIRST" || Name == "QTAILQ_FIRST" ||
+        Name == "QSLIST_FIRST" || Name == "QSIMPLEQ_FIRST")
+      return true;
+    Loc = SM.getImmediateMacroCallerLoc(Loc);
+  }
+  return false;
+}
+
+static bool referencesLocalBinding(const Stmt *S, const MemRegion *Binding,
+                                   ProgramStateRef State, CheckerContext &C) {
+  if (!S || !Binding)
+    return false;
+  if (const auto *DRE = dyn_cast<DeclRefExpr>(S)) {
+    const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
+    if (VD && State->getRegion(VD, C.getStackFrame()) == Binding)
+      return true;
+  }
+  for (const Stmt *Child : S->children())
+    if (referencesLocalBinding(Child, Binding, State, C))
+      return true;
+  return false;
+}
+
+static const Stmt *getLoopBody(const Stmt *S) {
+  if (const auto *Loop = dyn_cast<ForStmt>(S))
+    return Loop->getBody();
+  if (const auto *Loop = dyn_cast<WhileStmt>(S))
+    return Loop->getBody();
+  if (const auto *Loop = dyn_cast<DoStmt>(S))
+    return Loop->getBody();
+  if (const auto *Loop = dyn_cast<CXXForRangeStmt>(S))
+    return Loop->getBody();
+  return nullptr;
+}
+
+static const Stmt *findEnclosingBodyLoop(DynTypedNode Node, ASTContext &Ctx) {
+  const Stmt *Child = Node.get<Stmt>();
+  for (;;) {
+    DynTypedNodeList Parents = Ctx.getParents(Node);
+    if (Parents.size() != 1)
+      return nullptr;
+    Node = Parents[0];
+    const Stmt *Parent = Node.get<Stmt>();
+    if (!Parent)
+      return nullptr;
+    if (const Stmt *Body = getLoopBody(Parent))
+      return Body == Child ? Parent : nullptr;
+    Child = Parent;
+  }
 }
 
 class QEMUResourceLifetimeChecker
@@ -324,6 +413,42 @@ class QEMUResourceLifetimeChecker
       return false;
     const VarRegion *UseBinding = findLocalBinding(At, Sym, State, C);
     return UseBinding == Binding || (!UseBinding && isQEMUQueueMacro(At, C));
+  }
+
+  static bool isLoopCarriedQueueRemoval(const MemRegion *Binding,
+                                        const Expr *At, const Expr *Origin,
+                                        ProgramStateRef State,
+                                        CheckerContext &C) {
+    if (!Binding || !At || !Origin || !isQEMUQueueRemovalMacro(At, C))
+      return false;
+
+    const auto *UseBinding = dyn_cast<VarRegion>(Binding);
+    if (!UseBinding || !referencesLocalBinding(At, Binding, State, C))
+      return false;
+    const auto *VD = dyn_cast<VarDecl>(UseBinding->getDecl());
+    if (!VD || !isQEMUQueueHeadMacro(VD->getInit(), C))
+      return false;
+
+    ASTContext &Ctx = C.getASTContext();
+    const Stmt *UseLoop = findEnclosingBodyLoop(DynTypedNode::create(*At), Ctx);
+    const Stmt *DeclLoop =
+        findEnclosingBodyLoop(DynTypedNode::create(*VD), Ctx);
+    if (!UseLoop || UseLoop != DeclLoop)
+      return false;
+
+    const SourceManager &SM = C.getSourceManager();
+    SourceLocation UseLoc = SM.getExpansionLoc(At->getExprLoc());
+    SourceLocation ReleaseLoc = SM.getExpansionLoc(Origin->getExprLoc());
+    if (UseLoc.isInvalid() || ReleaseLoc.isInvalid() ||
+        SM.getFileID(UseLoc) != SM.getFileID(ReleaseLoc))
+      return false;
+
+    // When a removal appears textually before its release, the only path on
+    // which the release can precede the removal is a loop backedge.  QEMU's
+    // intrusive queue contract makes the element selected on the next
+    // iteration a new logical object even when the core analyzer reuses the
+    // old symbolic value for the list head.
+    return SM.isBeforeInTranslationUnit(UseLoc, ReleaseLoc);
   }
 
   static const unsigned *getRefCount(ProgramStateRef State, RefKind Kind,
@@ -432,6 +557,8 @@ void QEMUResourceLifetimeChecker::handlePointerRelease(
 
   const Expr *ValueExpr = Call.getNumArgs() ? Call.getArgExpr(0) : nullptr;
   const VarRegion *Binding = findLocalBinding(ValueExpr, Sym, State, C);
+  if (!Binding)
+    Binding = findDirectLocalBinding(ValueExpr, State, C);
 
   if (const unsigned *Previous = State->get<QEMUReleasedPointers>(Sym)) {
     const MemRegion *PreviousBinding =
@@ -713,8 +840,27 @@ void QEMUResourceLifetimeChecker::checkLocation(SVal Loc, bool IsLoad,
   SymbolRef Sym = Loc.getLocSymbolInBase();
   if (!Sym)
     return;
-  reportReleasedPointerUse(Sym, dyn_cast_or_null<Expr>(S),
-                           "Pointer is dereferenced", C.getState(), C);
+  ProgramStateRef State = C.getState();
+  const Expr *At = dyn_cast_or_null<Expr>(S);
+  const MemRegion *Binding = State->get<QEMUReleasedPointerBindings>(Sym)
+                                 ? *State->get<QEMUReleasedPointerBindings>(Sym)
+                                 : nullptr;
+  const Expr *Origin = State->get<QEMUReleasedPointerOrigins>(Sym)
+                           ? *State->get<QEMUReleasedPointerOrigins>(Sym)
+                           : nullptr;
+
+  if (State->get<QEMUReleasedPointers>(Sym) &&
+      isLoopCarriedQueueRemoval(Binding, At, Origin, State, C)) {
+    State = State->remove<QEMUReleasedPointers>(Sym)
+                ->remove<QEMUReleasedPointerOrigins>(Sym)
+                ->remove<QEMUReleasedPointerBindings>(Sym);
+    if (Binding)
+      State = State->remove<QEMUReboundBindings>(Binding);
+    C.addTransition(State);
+    return;
+  }
+
+  reportReleasedPointerUse(Sym, At, "Pointer is dereferenced", State, C);
 }
 
 void QEMUResourceLifetimeChecker::checkBind(SVal Loc, SVal Val, const Stmt *S,

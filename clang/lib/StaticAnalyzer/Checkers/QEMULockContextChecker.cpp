@@ -124,11 +124,14 @@ REGISTER_TRAIT_WITH_PROGRAMSTATE(QEMUBQLOrigin, const Expr *)
 REGISTER_TRAIT_WITH_PROGRAMSTATE(QEMUBQLKnowledge, BQLKnowledge)
 REGISTER_TRAIT_WITH_PROGRAMSTATE(QEMURCUViolation, bool)
 REGISTER_TRAIT_WITH_PROGRAMSTATE(QEMUBQLViolation, bool)
+REGISTER_MAP_WITH_PROGRAMSTATE(QEMUInCoroutineResults, const StackFrame *,
+                               SymbolRef)
 
 namespace {
 
 class QEMULockContextChecker
-    : public Checker<check::PreCall, check::PostCall, check::EndFunction> {
+    : public Checker<check::PreCall, check::PostCall, check::EndFunction,
+                     check::LiveSymbols> {
   const BugType BalanceBug{this, "Unbalanced QEMU execution context",
                            "QEMU lock context"};
   const BugType ContextBug{this, "Invalid QEMU execution context",
@@ -218,16 +221,16 @@ class QEMULockContextChecker
     C.emitReport(std::move(R));
   }
 
-  void reportLeaks(const ReturnStmt *RS, CheckerContext &C, bool ReportRCU,
-                   bool ReportBQL) const {
-    ExplodedNode *N = C.generateNonFatalErrorNode();
+  void reportLeaks(const ReturnStmt *RS, ProgramStateRef State,
+                   CheckerContext &C, bool ReportRCU, bool ReportBQL) const {
+    ExplodedNode *N = C.generateNonFatalErrorNode(State);
     if (!N)
       return;
     auto Emit = [&](ContextKind Kind, StringRef Message) {
       auto R = std::make_unique<PathSensitiveBugReport>(BalanceBug, Message, N);
       if (RS)
         R->addRange(RS->getSourceRange());
-      if (const Expr *Origin = getOrigin(C.getState(), Kind)) {
+      if (const Expr *Origin = getOrigin(State, Kind)) {
         StringRef Note = Kind == ContextKind::RCU
                              ? "RCU read-side critical section entered here"
                              : "BQL acquired here";
@@ -247,6 +250,7 @@ public:
   void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
   void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
   void checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const;
+  void checkLiveSymbols(ProgramStateRef State, SymbolReaper &SymReaper) const;
 };
 
 void QEMULockContextChecker::checkPreCall(const CallEvent &Call,
@@ -337,8 +341,30 @@ void QEMULockContextChecker::checkPostCall(const CallEvent &Call,
   const FunctionDecl *FD = getCallee(Call);
   if (!FD)
     return;
-  CallRole Role = classify(FD->getName());
   ProgramStateRef State = C.getState();
+
+  // Whether a QEMU function is running in coroutine context cannot change
+  // during one invocation.  Treat repeated queries in the same stack frame
+  // as the same value instead of letting the analyzer independently choose a
+  // result for every call.
+  if (FD->getName() == "qemu_in_coroutine") {
+    SymbolRef Current = Call.getReturnValue().getAsSymbol();
+    if (!Current)
+      return;
+
+    const StackFrame *Frame = C.getStackFrame();
+    if (const SymbolRef *Previous = State->get<QEMUInCoroutineResults>(Frame)) {
+      DefinedOrUnknownSVal Equal = C.getSValBuilder().evalEQ(
+          State, nonloc::SymbolVal(*Previous), nonloc::SymbolVal(Current));
+      if (ProgramStateRef Consistent = State->assume(Equal, true))
+        C.addTransition(Consistent);
+    } else {
+      C.addTransition(State->set<QEMUInCoroutineResults>(Frame, Current));
+    }
+    return;
+  }
+
+  CallRole Role = classify(FD->getName());
   const Expr *At = Call.getOriginExpr();
 
   if (Role == CallRole::RCUEnter) {
@@ -374,6 +400,8 @@ void QEMULockContextChecker::checkPostCall(const CallEvent &Call,
 void QEMULockContextChecker::checkEndFunction(const ReturnStmt *RS,
                                               CheckerContext &C) const {
   ProgramStateRef State = C.getState();
+  ProgramStateRef ExitState =
+      State->remove<QEMUInCoroutineResults>(C.getStackFrame());
   int RCUBalance = getBalance(State, ContextKind::RCU);
   int BQLBalance = getBalance(State, ContextKind::BQL);
   bool ReportRCU = RCUBalance > 0;
@@ -387,7 +415,15 @@ void QEMULockContextChecker::checkEndFunction(const ReturnStmt *RS,
   if (BQLBalance == 1 && allowsContextEscape(FD, ContextKind::BQL))
     ReportBQL = false;
   if (ReportRCU || ReportBQL)
-    reportLeaks(RS, C, ReportRCU, ReportBQL);
+    reportLeaks(RS, ExitState, C, ReportRCU, ReportBQL);
+  else if (ExitState != State)
+    C.addTransition(ExitState);
+}
+
+void QEMULockContextChecker::checkLiveSymbols(ProgramStateRef State,
+                                              SymbolReaper &SymReaper) const {
+  for (const auto &Entry : State->get<QEMUInCoroutineResults>())
+    SymReaper.markLive(Entry.second);
 }
 
 } // namespace
