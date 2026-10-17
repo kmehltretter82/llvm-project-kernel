@@ -288,31 +288,57 @@ static int migrated_bounded_byte_index(MigratedIndexState *s) {
 typedef struct MigratedAliasState {
   unsigned short next_channel;
   unsigned packet_index;
+  unsigned packet_length;
   int packets[8];
   int registers[64];
+  unsigned char payload[8];
 } MigratedAliasState;
 
 static const VMStateField migrated_alias_fields[] = {
     VMSTATE_UINT16(next_channel, MigratedAliasState),
     VMSTATE_UINT32(packet_index, MigratedAliasState),
+    VMSTATE_UINT32(packet_length, MigratedAliasState),
     VMSTATE_END_OF_LIST(),
 };
 
 static int migrated_assignment_alias(MigratedAliasState *s) {
   unsigned channel;
   channel = s->next_channel; // expected-note {{migration stored field 'next_channel' is guest-controlled}}
-  return s->packets[channel]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
+  return s->packets[channel]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count (value [8, 65535], elements 8, source migration-stored field 'next_channel')}}
                               // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
 }
 
 static int migrated_index_helper(MigratedAliasState *s, unsigned index) {
-  return s->registers[index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
+  return s->registers[index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count (value [64, 4294967295], elements 64, source migration-stored field 'packet_index')}}
                               // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
 }
 
 static int migrated_argument_alias(MigratedAliasState *s) {
   return migrated_index_helper( // expected-note {{Calling 'migrated_index_helper'}}
       s, s->packet_index); // expected-note {{migration stored field 'packet_index' is guest-controlled}}
+}
+
+static void migrated_packet_length_alias(MigratedAliasState *s) {
+  unsigned length;
+  length = s->packet_length; // expected-note {{migration stored field 'packet_length' is guest-controlled}}
+  qemu_send_packet(s, s->payload, length); // expected-warning {{Level B: guest-controlled packet length may exceed the host object extent (value [9, 4294967295], bytes 8, source migration-stored field 'packet_length')}}
+                                           // expected-note@-1 {{Level B: guest-controlled packet length may exceed the host object extent}}
+}
+
+static int migrated_constant_compound_alias(MigratedAliasState *s) {
+  unsigned index;
+  index = s->packet_index; // expected-note {{migration stored field 'packet_index' is guest-controlled}}
+  index &= 255;
+  return s->registers[index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count (value [64, 255], elements 64, source migration-stored field 'packet_index')}}
+                              // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
+}
+
+static int migrated_mixed_compound_alias(MigratedAliasState *s) {
+  unsigned index;
+  index = s->packet_index; // expected-note {{migration stored field 'packet_index' is guest-controlled}}
+  index &= s->next_channel; // expected-note {{migration stored field 'next_channel' is guest-controlled}}
+  return s->registers[index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count (value [64, 65535], elements 64)}}
+                              // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
 }
 
 static int migrated_guarded_assignment_alias(MigratedAliasState *s) {

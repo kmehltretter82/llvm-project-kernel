@@ -48,6 +48,10 @@ using namespace ento;
 
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUPendingAllocationSizes, const Expr *, SVal)
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUSavedTaintedScalars, const VarRegion *, SVal)
+REGISTER_MAP_WITH_PROGRAMSTATE(QEMUPersistentFieldSources, SymbolRef,
+                               const FieldDecl *)
+REGISTER_MAP_WITH_PROGRAMSTATE(QEMUPersistentLocalSources, const VarRegion *,
+                               const FieldDecl *)
 
 namespace {
 
@@ -247,8 +251,9 @@ static bool hasUsableExtent(ProgramStateRef State, SVal Extent,
 
 class QEMUGuestMemorySafetyChecker
     : public Checker<check::ASTDecl<TranslationUnitDecl>, check::BeginFunction,
-                     check::PreCall, check::PostCall, check::Bind,
-                     check::DeadSymbols, check::PostStmt<ImplicitCastExpr>,
+                     check::EndFunction, check::PreCall, check::PostCall,
+                     check::Bind, check::DeadSymbols,
+                     check::PostStmt<ImplicitCastExpr>,
                      check::PreStmt<ArraySubscriptExpr>> {
   mutable llvm::DenseMap<const FunctionDecl *, CallbackInfo> Callbacks;
   mutable llvm::DenseMap<const FieldDecl *, const FieldDecl *>
@@ -658,8 +663,8 @@ class QEMUGuestMemorySafetyChecker
     const Expr *Value = Return ? Return->getRetValue() : nullptr;
     Value = Value ? Value->IgnoreParenImpCasts() : nullptr;
     const auto *Comparison = dyn_cast_or_null<BinaryOperator>(Value);
-    if (!Comparison || (Comparison->getOpcode() != BO_LE &&
-                        Comparison->getOpcode() != BO_LT))
+    if (!Comparison ||
+        (Comparison->getOpcode() != BO_LE && Comparison->getOpcode() != BO_LT))
       return;
 
     const MemberExpr *FieldMember =
@@ -888,6 +893,7 @@ class QEMUGuestMemorySafetyChecker
 
     public:
       std::optional<PersistentFieldInfo> Result;
+      bool Ambiguous = false;
 
       explicit FieldVisitor(
           const llvm::DenseMap<const FieldDecl *, InputClass> &Fields)
@@ -899,8 +905,12 @@ class QEMUGuestMemorySafetyChecker
           return true;
         auto Found = Fields.find(Field->getCanonicalDecl());
         if (Found != Fields.end()) {
+          if (Result && Result->Field != Found->first) {
+            Result.reset();
+            Ambiguous = true;
+            return false;
+          }
           Result = PersistentFieldInfo{Found->first, Found->second};
-          return false;
         }
         return true;
       }
@@ -910,10 +920,12 @@ class QEMUGuestMemorySafetyChecker
         if (VD && VD->isLocalVarDecl() && VD->hasInit() &&
             ExpandedLocals.insert(VD->getCanonicalDecl()).second)
           TraverseStmt(const_cast<Expr *>(VD->getInit()));
-        return !Result.has_value();
+        return !Ambiguous;
       }
     } Visitor(PersistentGuestFields);
     Visitor.TraverseStmt(const_cast<Expr *>(E));
+    if (Visitor.Ambiguous)
+      return std::nullopt;
     return Visitor.Result;
   }
 
@@ -1500,6 +1512,125 @@ class QEMUGuestMemorySafetyChecker
   persistentSourceDescription(const PersistentFieldInfo &Info) {
     return inputClassName(Info.Source).str() + "-stored field '" +
            Info.Field->getNameAsString() + "'";
+  }
+
+  std::optional<PersistentFieldInfo>
+  persistentGuestFieldFromTaint(ProgramStateRef State, SVal Value) const {
+    const FieldDecl *Field = nullptr;
+    bool Found = false;
+    for (SymbolRef Symbol : taint::getTaintedSymbols(State, Value)) {
+      const FieldDecl *const *Mapped =
+          State->get<QEMUPersistentFieldSources>(Symbol);
+      // Do not attribute a composite value to one field when any of its
+      // tainted roots has another or unknown origin.
+      if (!Mapped || !*Mapped)
+        return std::nullopt;
+      if (Found && Field != *Mapped)
+        return std::nullopt;
+      Field = *Mapped;
+      Found = true;
+    }
+    if (!Found)
+      return std::nullopt;
+    auto Source = PersistentGuestFields.find(Field);
+    if (Source == PersistentGuestFields.end())
+      return std::nullopt;
+    return PersistentFieldInfo{Field, Source->second};
+  }
+
+  static const Expr *bindingSourceExpression(const Stmt *S,
+                                             const VarDecl *Destination) {
+    if (!S)
+      return nullptr;
+    if (const auto *Assignment = dyn_cast<BinaryOperator>(S))
+      if (Assignment->isAssignmentOp()) {
+        if (Assignment->getOpcode() == BO_Assign)
+          return Assignment->getRHS();
+        return Assignment;
+      }
+    if (const auto *Declaration = dyn_cast<DeclStmt>(S))
+      for (const Decl *D : Declaration->decls())
+        if (const auto *Variable = dyn_cast<VarDecl>(D))
+          if (Variable->getCanonicalDecl() == Destination->getCanonicalDecl())
+            return Variable->getInit();
+    return dyn_cast<Expr>(S);
+  }
+
+  std::optional<PersistentFieldInfo>
+  persistentGuestFieldFromAliases(const Expr *E, ProgramStateRef State,
+                                  CheckerContext &C, SVal Value) const {
+    if (!E)
+      return std::nullopt;
+
+    class LocalSourceVisitor : public DynamicRecursiveASTVisitor {
+      ProgramStateRef State;
+      const StackFrameContext *Frame;
+      const llvm::DenseMap<const FieldDecl *, InputClass> &PersistentFields;
+
+      bool addField(const FieldDecl *Candidate) {
+        if (Found && Field != Candidate) {
+          Ambiguous = true;
+          return false;
+        }
+        Field = Candidate;
+        Found = true;
+        return true;
+      }
+
+    public:
+      const FieldDecl *Field = nullptr;
+      bool Found = false;
+      bool Ambiguous = false;
+      bool HasScalarParameter = false;
+
+      LocalSourceVisitor(
+          ProgramStateRef State, const StackFrameContext *Frame,
+          const llvm::DenseMap<const FieldDecl *, InputClass> &PersistentFields)
+          : State(State), Frame(Frame), PersistentFields(PersistentFields) {}
+
+      bool VisitMemberExpr(MemberExpr *ME) override {
+        const auto *Candidate = dyn_cast<FieldDecl>(ME->getMemberDecl());
+        if (!Candidate)
+          return true;
+        Candidate = Candidate->getCanonicalDecl();
+        if (!PersistentFields.contains(Candidate))
+          return true;
+        return addField(Candidate);
+      }
+
+      bool VisitDeclRefExpr(DeclRefExpr *DRE) override {
+        const auto *Variable = dyn_cast<VarDecl>(DRE->getDecl());
+        if (!Variable)
+          return true;
+        if (isa<ParmVarDecl>(Variable) && Variable->getType()->isIntegerType())
+          HasScalarParameter = true;
+        if (!Variable->isLocalVarDecl())
+          return true;
+        const VarRegion *Region = State->getRegion(Variable, Frame);
+        const FieldDecl *const *Mapped =
+            State->get<QEMUPersistentLocalSources>(Region);
+        if (!Mapped || !*Mapped)
+          return true;
+        return addField(*Mapped);
+      }
+    } Visitor(State, C.getStackFrame(), PersistentGuestFields);
+    Visitor.TraverseStmt(const_cast<Expr *>(E));
+    if (Visitor.Ambiguous)
+      return std::nullopt;
+    if (Visitor.Found) {
+      auto Source = PersistentGuestFields.find(Visitor.Field);
+      if (Source != PersistentGuestFields.end())
+        return PersistentFieldInfo{Visitor.Field, Source->second};
+      return std::nullopt;
+    }
+
+    // An inlined callee's scalar parameter keeps the caller's symbolic
+    // value, but has no ordinary assignment in the callee to record.  Use
+    // symbol provenance only for that narrow case.  This avoids attributing
+    // unrelated unknown local values to an earlier tainted field.
+    if (Visitor.HasScalarParameter)
+      return persistentGuestFieldFromTaint(State, Value);
+    return std::nullopt;
   }
 
   struct MemorySink {
@@ -2319,16 +2450,20 @@ class QEMUGuestMemorySafetyChecker
                        CheckerContext &C) const {
     ProgramStateRef State = C.getState();
     SVal Length = Call.getArgSVal(Sink.LengthArgument);
-    std::string SourceDetail;
+    const Expr *LengthExpression = Call.getArgExpr(Sink.LengthArgument);
     std::optional<PersistentFieldInfo> Persistent =
-        persistentGuestField(Call.getArgExpr(Sink.LengthArgument));
-    if (Persistent)
-      SourceDetail = persistentSourceDescription(*Persistent);
+        persistentGuestField(LengthExpression);
     if (!taint::isTainted(State, Length)) {
       if (!Persistent)
         return;
       State = taint::addTaint(State, Length);
     }
+    if (!Persistent)
+      Persistent =
+          persistentGuestFieldFromAliases(LengthExpression, State, C, Length);
+    std::string SourceDetail;
+    if (Persistent)
+      SourceDetail = persistentSourceDescription(*Persistent);
 
     SVal Required = Length;
     SVal BoundRequired =
@@ -2947,6 +3082,14 @@ public:
     if (Value.isUnknownOrUndef() || taint::isTainted(State, Value))
       return;
     State = taint::addTaint(State, Value);
+    for (SymbolRef Symbol : taint::getTaintedSymbols(State, Value)) {
+      const FieldDecl *const *Previous =
+          State->get<QEMUPersistentFieldSources>(Symbol);
+      const FieldDecl *Field = Persistent->Field;
+      if (Previous && *Previous != Field)
+        Field = nullptr;
+      State = State->set<QEMUPersistentFieldSources>(Symbol, Field);
+    }
     std::string Detail = "stored field '" +
                          Persistent->Field->getNameAsString() +
                          "' is guest-controlled";
@@ -2961,10 +3104,19 @@ public:
     if (!Region || !Region->getValueType()->isIntegerType())
       return;
     ProgramStateRef State = C.getState();
-    if (!Value.isUnknownOrUndef() && taint::isTainted(State, Value))
+    const Expr *SourceExpression =
+        bindingSourceExpression(S, Region->getDecl());
+    std::optional<PersistentFieldInfo> Source =
+        persistentGuestFieldFromAliases(SourceExpression, State, C, Value);
+    if (!Value.isUnknownOrUndef() && taint::isTainted(State, Value)) {
       State = State->set<QEMUSavedTaintedScalars>(Region, Value);
-    else
+    } else {
       State = State->remove<QEMUSavedTaintedScalars>(Region);
+    }
+    if (Source)
+      State = State->set<QEMUPersistentLocalSources>(Region, Source->Field);
+    else
+      State = State->remove<QEMUPersistentLocalSources>(Region);
     if (State != C.getState())
       C.addTransition(State);
   }
@@ -2975,6 +3127,21 @@ public:
     for (const auto &Entry : Saved)
       if (!SymReaper.isLiveRegion(Entry.first))
         State = State->remove<QEMUSavedTaintedScalars>(Entry.first);
+    auto Sources = State->get<QEMUPersistentFieldSources>();
+    for (const auto &Entry : Sources)
+      if (SymReaper.isDead(Entry.first))
+        State = State->remove<QEMUPersistentFieldSources>(Entry.first);
+    if (State != C.getState())
+      C.addTransition(State);
+  }
+
+  void checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const {
+    ProgramStateRef State = C.getState();
+    const StackFrameContext *Frame = C.getStackFrame();
+    auto LocalSources = State->get<QEMUPersistentLocalSources>();
+    for (const auto &Entry : LocalSources)
+      if (Entry.first->getStackFrame() == Frame)
+        State = State->remove<QEMUPersistentLocalSources>(Entry.first);
     if (State != C.getState())
       C.addTransition(State);
   }
@@ -2985,16 +3152,20 @@ public:
     // usual integer promotion can otherwise turn a uint8_t index into an
     // unconstrained int and invent an impossible index >= 256 path.
     SVal Index = expressionValue(ASE->getIdx(), C);
-    std::string SourceDetail;
+    const Expr *IndexExpression = ASE->getIdx();
     std::optional<PersistentFieldInfo> Persistent =
-        persistentGuestField(ASE->getIdx());
-    if (Persistent)
-      SourceDetail = persistentSourceDescription(*Persistent);
+        persistentGuestField(IndexExpression);
     if (!taint::isTainted(State, Index)) {
       if (!Persistent)
         return;
       State = taint::addTaint(State, Index);
     }
+    if (!Persistent)
+      Persistent =
+          persistentGuestFieldFromAliases(IndexExpression, State, C, Index);
+    std::string SourceDetail;
+    if (Persistent)
+      SourceDetail = persistentSourceDescription(*Persistent);
     const Expr *Base = ASE->getBase()->IgnoreParenImpCasts();
     const auto *Member = dyn_cast<MemberExpr>(Base);
     const auto *PointerField =
@@ -3057,8 +3228,7 @@ public:
         sameSimpleExpression(Member->getBase(), IndexMember->getBase()) &&
         DynamicCount != DynamicArrayCounts.end() &&
         directReferencedField(ASE->getIdx()) == Persistent->Field) {
-      auto Validated =
-          MigrationValidatedFieldBounds.find(Persistent->Field);
+      auto Validated = MigrationValidatedFieldBounds.find(Persistent->Field);
       if (Validated != MigrationValidatedFieldBounds.end() &&
           Validated->second.LimitField == DynamicCount->second) {
         if (!Validated->second.Inclusive)
