@@ -27,6 +27,11 @@ typedef struct MemoryRegionOps {
     _Bool unaligned;
     _Bool (*accepts)(void *, uint64_t, unsigned, _Bool, unsigned);
   } valid;
+  struct {
+    unsigned min_access_size;
+    unsigned max_access_size;
+    _Bool unaligned;
+  } impl;
 } MemoryRegionOps;
 
 typedef struct MemoryRegionPortio {
@@ -81,14 +86,14 @@ static void register_virtio_config_callback(VirtioDeviceClass *vdc) {
 
 static void mmio_copy(void *opaque, uint64_t addr, uint64_t data, // expected-note {{MMIO callback parameter 'size' is guest-controlled}}
                       unsigned size) {
-  char destination[8];
+  char destination[4];
   memcpy(destination, opaque, size); // expected-warning {{Level B: guest-controlled memory-operation length may exceed the host object extent}}
                                     // expected-note@-1 {{Level B: guest-controlled memory-operation length may exceed the host object extent}}
 }
 
 static void mmio_definite_copy(void *opaque, uint64_t addr, uint64_t data, // expected-note {{MMIO callback parameter 'size' is guest-controlled}}
                                unsigned size) {
-  char destination[8];
+  char destination[4];
   if (size <= sizeof(destination)) // expected-note {{Assuming the condition is false}}
                                    // expected-note@-1 {{Taking false branch}}
     return;
@@ -106,10 +111,9 @@ static void mmio_bounded_copy(void *opaque, uint64_t addr, uint64_t data,
 
 static void mmio_source_overread(void *opaque, uint64_t addr, uint64_t data,
                                  unsigned size) { // expected-note@-1 {{MMIO callback parameter 'size' is guest-controlled}}
-  unsigned char source[8] = {0};
+  unsigned char source[4] = {0};
   unsigned char destination[16];
-  if (size > sizeof(destination)) // expected-note {{Assuming the condition is false}}
-                                  // expected-note@-1 {{Taking false branch}}
+  if (size > sizeof(destination)) // expected-note {{Taking false branch}}
     return;
   memcpy(destination, source, size); // expected-warning {{Level B: guest-controlled memory-operation source length may exceed the host object extent}}
                                      // expected-note@-1 {{Level B: guest-controlled memory-operation source length may exceed the host object extent}}
@@ -567,7 +571,7 @@ static const MemoryRegionOps mmio_definite_allocation_ops = {
 
 static void mmio_heap_copy(void *opaque, uint64_t addr, uint64_t data, // expected-note {{MMIO callback parameter 'size' is guest-controlled}}
                            unsigned size) {
-  char *destination = malloc(8);
+  char *destination = malloc(4);
   if (!destination) // expected-note {{Assuming 'destination' is non-null}}
                     // expected-note@-1 {{Taking false branch}}
     return;
@@ -593,6 +597,25 @@ static const MemoryRegionOps mmio_offset_copy_ops = {
     .write = mmio_offset_copy,
 };
 
+static char framework_bounded_buffer[16];
+
+static void mmio_framework_bounded_copy(void *opaque, uint64_t addr,
+                                        uint64_t data, unsigned size) {
+  memcpy(&framework_bounded_buffer[addr], &data, size);
+}
+
+static const MemoryRegionOps mmio_framework_bounded_copy_ops = {
+    .write = mmio_framework_bounded_copy,
+};
+
+static MemoryRegion framework_bounded_region;
+
+static void register_framework_bounded_copy(void) {
+  memory_region_init_io(&framework_bounded_region, 0,
+                        &mmio_framework_bounded_copy_ops,
+                        framework_bounded_buffer, "bounded", 16);
+}
+
 static void mmio_bounded_tail_fill(void *opaque, uint64_t addr,
                                    uint64_t data, unsigned size) {
   char destination[16];
@@ -603,6 +626,43 @@ static void mmio_bounded_tail_fill(void *opaque, uint64_t addr,
 
 static const MemoryRegionOps mmio_bounded_tail_fill_ops = {
     .write = mmio_bounded_tail_fill,
+};
+
+static int byte_data_result;
+
+static void mmio_byte_data_index(void *opaque, uint64_t addr, uint64_t data,
+                                 unsigned size) {
+  int channels[3] = {0};
+  unsigned channel = data >> 6;
+  if (channel == 3)
+    return;
+  byte_data_result = channels[channel];
+}
+
+static const MemoryRegionOps mmio_byte_data_index_ops = {
+    .write = mmio_byte_data_index,
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 1,
+    },
+};
+
+static void mmio_word_data_index(void *opaque, uint64_t addr, uint64_t data, // expected-note {{MMIO callback parameter 'data' is guest-controlled}}
+                                 unsigned size) {
+  int channels[3] = {0};
+  unsigned channel = data >> 6;
+  if (channel == 3) // expected-note {{Taking false branch}} expected-note {{Assuming 'channel' is not equal to 3}}
+    return;
+  byte_data_result = channels[channel]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
+                                        // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
+}
+
+static const MemoryRegionOps mmio_word_data_index_ops = {
+    .write = mmio_word_data_index,
+    .impl = {
+        .min_access_size = 2,
+        .max_access_size = 2,
+    },
 };
 
 static void mmio_signed_length(void *opaque, uint64_t addr, uint64_t data, // expected-note {{MMIO callback parameter 'data' is guest-controlled}}

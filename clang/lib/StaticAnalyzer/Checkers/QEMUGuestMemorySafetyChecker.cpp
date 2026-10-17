@@ -69,6 +69,9 @@ struct CallbackInfo {
   std::optional<uint64_t> AddressLimit;
   std::optional<unsigned> AddressParameter;
   std::optional<unsigned> AccessSizeParameter;
+  std::optional<uint64_t> AccessSizeLimit;
+  std::optional<unsigned> DataParameter;
+  std::optional<uint64_t> DataMaximum;
 };
 
 struct BoundStates {
@@ -255,12 +258,13 @@ class QEMUGuestMemorySafetyChecker
   mutable std::unique_ptr<BugType> LevelABug;
   mutable std::unique_ptr<BugType> LevelBBug;
 
-  void addCallback(
-      const Expr *Initializer, InputClass Source,
-      std::initializer_list<unsigned> Parameters,
-      std::initializer_list<unsigned> Pointees = {},
-      std::optional<unsigned> AddressParameter = std::nullopt,
-      std::optional<unsigned> AccessSizeParameter = std::nullopt) const {
+  void
+  addCallback(const Expr *Initializer, InputClass Source,
+              std::initializer_list<unsigned> Parameters,
+              std::initializer_list<unsigned> Pointees = {},
+              std::optional<unsigned> AddressParameter = std::nullopt,
+              std::optional<unsigned> AccessSizeParameter = std::nullopt,
+              std::optional<uint64_t> AccessSizeLimit = std::nullopt) const {
     const FunctionDecl *FD = referencedFunction(Initializer);
     if (!FD)
       return;
@@ -287,6 +291,9 @@ class QEMUGuestMemorySafetyChecker
         Info.AccessSizeParameter.reset();
       }
     }
+    if (AccessSizeLimit)
+      Info.AccessSizeLimit =
+          std::max(Info.AccessSizeLimit.value_or(0), *AccessSizeLimit);
   }
 
   void discoverCallbackAssignment(const BinaryOperator *Assignment) const {
@@ -763,18 +770,50 @@ class QEMUGuestMemorySafetyChecker
       return;
     StringRef Name = RD->getName();
     if (Name == "MemoryRegionOps") {
+      std::optional<uint64_t> ExplicitAccessSize;
+      if (const InitListExpr *Impl =
+              semanticInitList(fieldInitializer(ILE, "impl"))) {
+        std::optional<uint64_t> Minimum =
+            literalUpperBound(fieldInitializer(Impl, "min_access_size"));
+        std::optional<uint64_t> Maximum =
+            literalUpperBound(fieldInitializer(Impl, "max_access_size"));
+        if (Minimum || Maximum)
+          ExplicitAccessSize =
+              std::max(Minimum.value_or(0), Maximum.value_or(0));
+      }
+      uint64_t AccessSizeLimit = ExplicitAccessSize.value_or(8);
       addCallback(fieldInitializer(ILE, "read"), InputClass::MMIO, {1, 2}, {},
-                  1, 2);
+                  1, 2, AccessSizeLimit);
       addCallback(fieldInitializer(ILE, "write"), InputClass::MMIO, {1, 2, 3},
-                  {}, 1, 3);
+                  {}, 1, 3, AccessSizeLimit);
       addCallback(fieldInitializer(ILE, "read_with_attrs"), InputClass::MMIO,
-                  {1, 3, 4}, {}, 1, 3);
+                  {1, 3, 4}, {}, 1, 3, AccessSizeLimit);
       addCallback(fieldInitializer(ILE, "write_with_attrs"), InputClass::MMIO,
-                  {1, 2, 3, 4}, {}, 1, 3);
+                  {1, 2, 3, 4}, {}, 1, 3, AccessSizeLimit);
       if (const InitListExpr *Valid =
               semanticInitList(fieldInitializer(ILE, "valid")))
         addCallback(fieldInitializer(Valid, "accepts"), InputClass::MMIO,
-                    {1, 2, 3, 4}, {}, 1, 2);
+                    {1, 2, 3, 4}, {}, 1, 2, 8);
+      if (ExplicitAccessSize && *ExplicitAccessSize > 0 &&
+          *ExplicitAccessSize < 8) {
+        uint64_t DataMaximum = (uint64_t(1) << (*ExplicitAccessSize * 8)) - 1;
+        auto SetDataMaximum = [&](const Expr *Initializer) {
+          const FunctionDecl *FD = referencedFunction(Initializer);
+          if (!FD)
+            return;
+          CallbackInfo &Info = Callbacks[FD->getCanonicalDecl()];
+          if (Info.DataParameter && *Info.DataParameter != 2) {
+            Info.DataParameter.reset();
+            Info.DataMaximum.reset();
+            return;
+          }
+          Info.DataParameter = 2;
+          Info.DataMaximum =
+              std::max(Info.DataMaximum.value_or(0), DataMaximum);
+        };
+        SetDataMaximum(fieldInitializer(ILE, "write"));
+        SetDataMaximum(fieldInitializer(ILE, "write_with_attrs"));
+      }
       return;
     }
     if (Name == "MemoryRegionPortio") {
@@ -1452,17 +1491,35 @@ class QEMUGuestMemorySafetyChecker
     }
     if (isa<DeclRefExpr>(E) || isa<ArraySubscriptExpr>(E) ||
         isa<MemberExpr>(E)) {
+      std::optional<IntegerRange> InitializerRange;
+      if (const auto *DRE = dyn_cast<DeclRefExpr>(E))
+        if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))
+          if (VD->isLocalVarDecl() && !isa<ParmVarDecl>(VD) && VD->hasInit())
+            InitializerRange = integerRange(VD->getInit(), C, Depth + 1);
+      auto IntersectInitializer = [&](IntegerRange Range) {
+        if (!InitializerRange)
+          return Range;
+        return IntegerRange{std::max(Range.Minimum, InitializerRange->Minimum),
+                            std::min(Range.Maximum, InitializerRange->Maximum)};
+      };
       SVal Value = expressionValue(E, C);
       if (std::optional<IntegerRange> Range =
               symbolicIntegerRange(Value, C.getState(), C.getSValBuilder()))
-        return constrainRangeToType(*Range, E->getType(), C.getASTContext());
+        if (std::optional<IntegerRange> Constrained =
+                constrainRangeToType(*Range, E->getType(), C.getASTContext()))
+          return IntersectInitializer(*Constrained);
       const llvm::APSInt *Minimum =
           C.getSValBuilder().getMinValue(C.getState(), Value);
       const llvm::APSInt *Maximum =
           C.getSValBuilder().getMaxValue(C.getState(), Value);
       if (!Minimum || !Maximum || Minimum->isNegative() ||
-          Minimum->getBitWidth() > 64 || Maximum->getBitWidth() > 64)
-        return unsignedTypeRange(E->getType(), C.getASTContext());
+          Minimum->getBitWidth() > 64 || Maximum->getBitWidth() > 64) {
+        if (std::optional<IntegerRange> TypeRange =
+                unsignedTypeRange(E->getType(), C.getASTContext()))
+          return IntersectInitializer(*TypeRange);
+        else
+          return InitializerRange;
+      }
       uint64_t Low = Minimum->getZExtValue();
       uint64_t High = Maximum->getZExtValue();
       QualType Type = E->getType();
@@ -1471,7 +1528,7 @@ class QEMUGuestMemorySafetyChecker
         if (Width < 64)
           High = std::min(High, (uint64_t(1) << Width) - 1);
       }
-      return IntegerRange{Low, High};
+      return IntersectInitializer(IntegerRange{Low, High});
     }
     if (const auto *Cast = dyn_cast<CastExpr>(E)) {
       std::optional<IntegerRange> Operand =
@@ -1811,6 +1868,40 @@ class QEMUGuestMemorySafetyChecker
     return BelowAccessSize && BelowAccessSize->Safe && !BelowAccessSize->Unsafe;
   }
 
+  bool memorySinkCoveredByCallbackAccess(const Expr *Offset, const Expr *Length,
+                                         SVal BaseExtent,
+                                         CheckerContext &C) const {
+    if (!C.inTopFrame())
+      return false;
+    const auto *FD = dyn_cast<FunctionDecl>(C.getStackFrame()->getDecl());
+    if (!FD)
+      return false;
+    auto Found = Callbacks.find(FD->getCanonicalDecl());
+    if (Found == Callbacks.end() || !Found->second.AddressLimit ||
+        !Found->second.AddressParameter || !Found->second.AccessSizeParameter)
+      return false;
+
+    const llvm::APSInt *KnownExtent =
+        C.getSValBuilder().getKnownValue(C.getState(), BaseExtent);
+    if (!KnownExtent || KnownExtent->isNegative() ||
+        KnownExtent->getBitWidth() > 64 ||
+        KnownExtent->getZExtValue() != *Found->second.AddressLimit)
+      return false;
+
+    unsigned AddressIndex = *Found->second.AddressParameter;
+    unsigned SizeIndex = *Found->second.AccessSizeParameter;
+    if (AddressIndex >= FD->getNumParams() || SizeIndex >= FD->getNumParams())
+      return false;
+    auto ReferencesParameter = [](const Expr *E, const ParmVarDecl *Parameter) {
+      E = E->IgnoreParenImpCasts();
+      const auto *DRE = dyn_cast<DeclRefExpr>(E);
+      return DRE && DRE->getDecl()->getCanonicalDecl() ==
+                        Parameter->getCanonicalDecl();
+    };
+    return ReferencesParameter(Offset, FD->getParamDecl(AddressIndex)) &&
+           ReferencesParameter(Length, FD->getParamDecl(SizeIndex));
+  }
+
   static SVal allocationSizeValue(const CallEvent &Call, unsigned SizeIndex,
                                   CheckerContext &C) {
     const Expr *Argument = Call.getArgExpr(SizeIndex);
@@ -1933,6 +2024,7 @@ class QEMUGuestMemorySafetyChecker
     SVal Extent =
         getDynamicExtentWithOffset(State, Call.getArgSVal(Sink.BufferArgument));
     StringRef SinkDescription = Sink.Description;
+    bool HasOffset = false;
 
     const Expr *Buffer =
         Call.getArgExpr(Sink.BufferArgument)->IgnoreParenImpCasts();
@@ -2003,6 +2095,10 @@ class QEMUGuestMemorySafetyChecker
         SVal OffsetValue = expressionValue(Offset, C);
         uint64_t ElementBytes =
             C.getASTContext().getTypeSizeInChars(Pointee).getQuantity();
+        if (ElementBytes == 1 &&
+            memorySinkCoveredByCallbackAccess(
+                Offset, Call.getArgExpr(Sink.LengthArgument), BaseExtent, C))
+          return;
         SVal Scale = C.getSValBuilder().makeIntVal(
             ElementBytes, C.getASTContext().getSizeType());
         SVal ByteOffset = C.getSValBuilder().evalBinOp(
@@ -2037,6 +2133,7 @@ class QEMUGuestMemorySafetyChecker
           Required = Total;
           BoundRequired = Total;
           Extent = BaseExtent;
+          HasOffset = true;
           SinkDescription = Sink.Description == "packet length"
                                 ? "packet offset plus length"
                                 : "memory-operation offset plus length";
@@ -2045,26 +2142,27 @@ class QEMUGuestMemorySafetyChecker
     }
     if (!hasUsableExtent(State, Extent, C.getSValBuilder()))
       return;
-    if (const llvm::APSInt *KnownExtent =
-            C.getSValBuilder().getKnownValue(State, Extent))
-      if (!KnownExtent->isNegative() && KnownExtent->getBitWidth() <= 64) {
-        QualType UnpromotedType = Call.getArgExpr(Sink.LengthArgument)
-                                      ->IgnoreParenImpCasts()
-                                      ->getType();
-        if (UnpromotedType->isUnsignedIntegerType()) {
-          llvm::APSInt Maximum =
-              C.getSValBuilder().getBasicValueFactory().getMaxValue(
-                  UnpromotedType);
-          unsigned Width =
-              std::max(Maximum.getBitWidth(), KnownExtent->getBitWidth());
-          if (Maximum.zextOrTrunc(Width).ule(KnownExtent->zextOrTrunc(Width)))
-            return;
+    if (!HasOffset)
+      if (const llvm::APSInt *KnownExtent =
+              C.getSValBuilder().getKnownValue(State, Extent))
+        if (!KnownExtent->isNegative() && KnownExtent->getBitWidth() <= 64) {
+          QualType UnpromotedType = Call.getArgExpr(Sink.LengthArgument)
+                                        ->IgnoreParenImpCasts()
+                                        ->getType();
+          if (UnpromotedType->isUnsignedIntegerType()) {
+            llvm::APSInt Maximum =
+                C.getSValBuilder().getBasicValueFactory().getMaxValue(
+                    UnpromotedType);
+            unsigned Width =
+                std::max(Maximum.getBitWidth(), KnownExtent->getBitWidth());
+            if (Maximum.zextOrTrunc(Width).ule(KnownExtent->zextOrTrunc(Width)))
+              return;
+          }
+          if (std::optional<IntegerRange> Range =
+                  integerRange(Call.getArgExpr(Sink.LengthArgument), C))
+            if (Range->Maximum <= KnownExtent->getZExtValue())
+              return;
         }
-        if (std::optional<IntegerRange> Range =
-                integerRange(Call.getArgExpr(Sink.LengthArgument), C))
-          if (Range->Maximum <= KnownExtent->getZExtValue())
-            return;
-      }
     std::optional<BoundStates> Bounds =
         compare(State, BoundRequired, BO_LE, Extent, C.getSValBuilder());
     if (!Bounds || !Bounds->Unsafe)
@@ -2264,6 +2362,48 @@ public:
       return;
 
     ProgramStateRef State = C.getState();
+    if (Found->second.DataParameter && Found->second.DataMaximum &&
+        *Found->second.DataParameter < FD->getNumParams()) {
+      const ParmVarDecl *DataParameter =
+          FD->getParamDecl(*Found->second.DataParameter);
+      const MemRegion *DataRegion =
+          State->getRegion(DataParameter, C.getStackFrame());
+      SVal Data = State->getSVal(DataRegion);
+      SVal Maximum = C.getSValBuilder().makeIntVal(*Found->second.DataMaximum,
+                                                   DataParameter->getType());
+      std::optional<BoundStates> WithinMaximum =
+          compare(State, Data, BO_LE, Maximum, C.getSValBuilder());
+      if (WithinMaximum) {
+        if (!WithinMaximum->Safe)
+          return;
+        State = WithinMaximum->Safe;
+      }
+    }
+    if (Found->second.AccessSizeLimit && Found->second.AccessSizeParameter &&
+        *Found->second.AccessSizeParameter < FD->getNumParams()) {
+      unsigned SizeIndex = *Found->second.AccessSizeParameter;
+      const ParmVarDecl *SizeParameter = FD->getParamDecl(SizeIndex);
+      const MemRegion *SizeRegion =
+          State->getRegion(SizeParameter, C.getStackFrame());
+      SVal Size = State->getSVal(SizeRegion);
+      SVal Zero = C.getSValBuilder().makeZeroVal(SizeParameter->getType());
+      SVal Limit = C.getSValBuilder().makeIntVal(*Found->second.AccessSizeLimit,
+                                                 SizeParameter->getType());
+      std::optional<BoundStates> Positive =
+          compare(State, Size, BO_GT, Zero, C.getSValBuilder());
+      if (Positive) {
+        if (!Positive->Safe)
+          return;
+        State = Positive->Safe;
+      }
+      std::optional<BoundStates> WithinLimit =
+          compare(State, Size, BO_LE, Limit, C.getSValBuilder());
+      if (WithinLimit) {
+        if (!WithinLimit->Safe)
+          return;
+        State = WithinLimit->Safe;
+      }
+    }
     if (Found->second.AddressLimit && Found->second.AddressParameter &&
         *Found->second.AddressParameter < FD->getNumParams()) {
       unsigned AddressIndex = *Found->second.AddressParameter;
@@ -2568,10 +2708,19 @@ public:
         return;
     }
     if (KnownCount && !KnownCount->isNegative() &&
-        KnownCount->getBitWidth() <= 64)
-      if (std::optional<IntegerRange> Range = integerRange(ASE->getIdx(), C))
-        if (Range->Maximum < KnownCount->getZExtValue())
+        KnownCount->getBitWidth() <= 64) {
+      if (std::optional<IntegerRange> Range = integerRange(ASE->getIdx(), C)) {
+        uint64_t ElementCount = KnownCount->getZExtValue();
+        if (Range->Maximum < ElementCount)
           return;
+        if (Range->Maximum == ElementCount) {
+          std::optional<BoundStates> NotEqual =
+              compare(State, Index, BO_NE, Count, C.getSValBuilder());
+          if (NotEqual && NotEqual->Safe && !NotEqual->Unsafe)
+            return;
+        }
+      }
+    }
     if (DynamicCount != DynamicArrayCounts.end()) {
       std::optional<BoundStates> Outside = compareSourceCondition(
           State, Index, BO_GE, Count, C.getSValBuilder());
