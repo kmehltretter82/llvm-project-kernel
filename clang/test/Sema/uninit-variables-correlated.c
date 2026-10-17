@@ -38,6 +38,37 @@ void loop_runs_at_least_once(void) {
   use(x); // corr-warning {{variable 'x' is uninitialized when used here only on paths that an earlier condition excludes}}
 }
 
+#define constant_max(a, b)                                                   \
+  ({                                                                         \
+    __typeof__(1 ? (a) : (b)) max_a = (a);                                  \
+    __typeof__(1 ? (a) : (b)) max_b = (b);                                  \
+    max_a > max_b ? max_a : max_b;                                           \
+  })
+
+void statement_expression_bound_runs(void) {
+  int i;
+  int x; // corr-note {{variable 'x' is declared here}}
+  for (i = 0; i < constant_max(4, 1); ++i)
+    x = f();
+  use(x); // corr-warning {{variable 'x' is uninitialized when used here only on paths that an earlier condition excludes}}
+}
+
+void zero_statement_expression_bound(void) {
+  int i;
+  int x; // maybe-note {{initialize the variable 'x' to silence this warning}}
+  for (i = 0; i < constant_max(0, 0); ++i)
+    x = f();
+  use(x); // maybe-warning {{variable 'x' may be uninitialized when used here}}
+}
+
+void unknown_statement_expression_bound(int count) {
+  int i;
+  int x; // maybe-note {{initialize the variable 'x' to silence this warning}}
+  for (i = 0; i < constant_max(count, 0); ++i)
+    x = f();
+  use(x); // maybe-warning {{variable 'x' may be uninitialized when used here}}
+}
+
 void status_set_with_value(int n) {
   int ret = -1;
   int x; // corr-note {{variable 'x' is declared here}}
@@ -102,6 +133,60 @@ void condition_reads_memory(int *p) {
     x = f();
   f(); // may change *p
   if (*p)
+    use(x); // maybe-warning {{variable 'x' may be uninitialized when used here}}
+}
+
+// A field of a local object remains stable across calls when the object does
+// not escape.  Writes to other fields do not invalidate that fact.
+struct local_options {
+  int enabled;
+  int other;
+};
+
+void stable_local_member(int flag, struct local_options opts) {
+  int x; // corr-note {{variable 'x' is declared here}}
+  if (opts.enabled)
+    return;
+  if (flag)
+    x = f();
+  opts.other = f();
+  f();
+  if (opts.enabled)
+    use(x); // corr-warning {{variable 'x' is uninitialized when used here only on paths that an earlier condition excludes}}
+}
+
+void changed_local_member(int flag, struct local_options opts) {
+  int x; // maybe-note {{initialize the variable 'x' to silence this warning}}
+  if (opts.enabled)
+    return;
+  if (flag)
+    x = f();
+  opts.enabled = f();
+  if (opts.enabled)
+    use(x); // maybe-warning {{variable 'x' may be uninitialized when used here}}
+}
+
+void pointer_member_may_change(int flag, struct local_options *opts) {
+  int x; // maybe-note {{initialize the variable 'x' to silence this warning}}
+  if (opts->enabled)
+    return;
+  if (flag)
+    x = f();
+  f();
+  if (opts->enabled)
+    use(x); // maybe-warning {{variable 'x' may be uninitialized when used here}}
+}
+
+void mutate_options(struct local_options *);
+
+void escaped_local_member(int flag, struct local_options opts) {
+  int x; // maybe-note {{initialize the variable 'x' to silence this warning}}
+  if (opts.enabled)
+    return;
+  if (flag)
+    x = f();
+  mutate_options(&opts);
+  if (opts.enabled)
     use(x); // maybe-warning {{variable 'x' may be uninitialized when used here}}
 }
 

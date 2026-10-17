@@ -15,6 +15,7 @@
 #include "clang/Sema/AnalysisBasedWarnings.h"
 #include "SemaLifetimeSafety.h"
 #include "SemaLinuxKernelWarnings.h"
+#include "SemaQEMUWarnings.h"
 #include "TypeLocBuilder.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclCXX.h"
@@ -1722,6 +1723,16 @@ public:
 
   bool wantsCorrelationPruning() const override { return PruneCorrelated; }
 
+  UninitOutputParamContract
+  getOutputParamContract(const CallExpr *Call,
+                         const VarDecl *VD) const override {
+    return sema::getQEMUOutputParamContract(Call, VD);
+  }
+
+  bool isKnownNonNullCall(const CallExpr *Call) const override {
+    return sema::isQEMUKnownNonNullCall(S, Call);
+  }
+
   MappedType &getUses(const VarDecl *vd) {
     MappedType &V = uses[vd];
     if (!V.getPointer())
@@ -3176,8 +3187,10 @@ void clang::sema::AnalysisBasedWarnings::IssueWarnings(
   const Stmt *Body = D->getBody();
   assert(Body);
 
-  if (const auto *FD = dyn_cast<FunctionDecl>(D))
+  if (const auto *FD = dyn_cast<FunctionDecl>(D)) {
     IssueLinuxKernelWarnings(S, FD);
+    IssueQEMUWarnings(S, FD);
+  }
 
   // Construct the analysis context with the specified CFG build options.
   AnalysisDeclContext AC(/* AnalysisDeclContextManager */ nullptr, D);
@@ -3278,8 +3291,10 @@ void clang::sema::AnalysisBasedWarnings::IssueWarnings(
     Analyzer.run(AC);
   }
 
-  if (const auto *FD = dyn_cast<FunctionDecl>(D))
+  if (const auto *FD = dyn_cast<FunctionDecl>(D)) {
     IssueLinuxKernelFlowWarnings(S, FD, AC);
+    IssueQEMUFlowWarnings(S, FD, AC);
+  }
 
   if (!Diags.isIgnored(diag::warn_uninit_var, D->getBeginLoc()) ||
       !Diags.isIgnored(diag::warn_sometimes_uninit_var, D->getBeginLoc()) ||

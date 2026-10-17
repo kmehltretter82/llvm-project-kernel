@@ -584,6 +584,39 @@ def warn_parameter_size: Warning<
 def warn_return_value_size: Warning<
   "return value of %0 is a large (%1 bytes) pass-by-value object; "
   "pass it by reference instead?">, InGroup<LargeByValueCopy>;
+def warn_qemu_noncoroutine_call : Warning<
+  "%select{ordinary|no-coroutine|mixed-context}0 function %1 directly calls "
+  "coroutine-only function %2">,
+  InGroup<QEMUCoroutineContext>, DefaultIgnore;
+def warn_qemu_coroutine_calls_no_coroutine : Warning<
+  "coroutine function %0 directly calls no-coroutine function %1">,
+  InGroup<QEMUCoroutineContext>, DefaultIgnore;
+def note_qemu_context_annotation : Note<
+  "%0 is annotated %select{coroutine-only|no-coroutine}1 here">;
+def warn_qemu_errp_dereference_without_guard : Warning<
+  "parameter %0 of type 'Error **' is dereferenced without ERRP_GUARD()">,
+  InGroup<QEMUErrorGuard>, DefaultIgnore;
+def warn_qemu_errp_helper_without_guard : Warning<
+  "%0 requires ERRP_GUARD() before passing parameter %1 of type 'Error **'">,
+  InGroup<QEMUErrorGuard>, DefaultIgnore;
+def warn_qemu_error_use_after_consume : Warning<
+  "%select{use|possible use}0 of Error pointer %1 after it was consumed">,
+  InGroup<QEMUErrorConsumed>, DefaultIgnore;
+def note_qemu_error_consumed_here : Note<
+  "error object was consumed by %0 here">;
+def warn_qemu_success_after_error_set : Warning<
+  "this return reports success after setting an error through parameter %0">,
+  InGroup<QEMUErrorPathSuccess>, DefaultIgnore;
+def note_qemu_error_set_here : Note<"error was set here">;
+def note_qemu_error_parameter_here : Note<"parameter of type 'Error **' declared here">;
+def warn_qemu_required_result_discarded : Warning<
+  "result of %0 is discarded despite its QEMU must-check contract; check the "
+  "result or explicitly cast the call to void">,
+  InGroup<QEMUResultCheck>, DefaultIgnore;
+def warn_qemu_memtx_result_discarded : Warning<
+  "result of memory transaction from %0 is discarded; check it or "
+  "explicitly cast the call to void">,
+  InGroup<QEMUMemTxResult>, DefaultIgnore;
 def warn_linux_kernel_bool_negative_return : Warning<
   "negative value returned from a boolean function evaluates to true">,
   InGroup<LinuxKernelBoolReturn>, DefaultIgnore;

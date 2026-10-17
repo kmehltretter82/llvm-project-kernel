@@ -101,6 +101,7 @@ def LLVM : Package<"llvm">;
 def LLVMAlpha : Package<"llvm">, ParentPackage<Alpha>;
 
 def LinuxAlpha : Package<"linux">, ParentPackage<Alpha>;
+def QEMUAlpha : Package<"qemu">, ParentPackage<Alpha>;
 
 // The APIModeling package is for checkers that model APIs and don't perform
 // any diagnostics. These checkers are always turned on; this package is
@@ -648,6 +649,26 @@ def LinuxAtomicSleepChecker : Checker<"AtomicSleep">,
   Documentation<NotDocumented>;
 
 } // end "alpha.linux"
+
+//===----------------------------------------------------------------------===//
+// QEMU checkers.
+//===----------------------------------------------------------------------===//
+
+let ParentPackage = QEMUAlpha in {
+
+def QEMUErrorOwnershipChecker : Checker<"ErrorOwnership">,
+  HelpText<"Check path-sensitive ownership of QEMU Error objects">,
+  Documentation<NotDocumented>;
+
+def QEMULockContextChecker : Checker<"LockContext">,
+  HelpText<"Check path-sensitive QEMU RCU and BQL context rules">,
+  Documentation<NotDocumented>;
+
+def QEMUResourceLifetimeChecker : Checker<"ResourceLifetime">,
+  HelpText<"Check path-sensitive QEMU resource lifetime rules">,
+  Documentation<NotDocumented>;
+
+} // end "alpha.qemu"
 
 //===----------------------------------------------------------------------===//
 // C++ checkers.

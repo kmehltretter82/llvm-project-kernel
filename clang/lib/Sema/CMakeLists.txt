@@ -65,6 +65,7 @@ add_clang_library(clangSema
   SemaInit.cpp
   SemaLambda.cpp
   SemaLinuxKernelWarnings.cpp
+  SemaQEMUWarnings.cpp
   SemaLookup.cpp
   SemaLoongArch.cpp
   SemaM68k.cpp
