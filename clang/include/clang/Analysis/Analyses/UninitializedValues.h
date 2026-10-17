@@ -20,11 +20,23 @@
 namespace clang {
 
 class AnalysisDeclContext;
+class CallExpr;
 class CFG;
 class DeclContext;
 class Expr;
 class Stmt;
 class VarDecl;
+
+/// Describes when a call initializes a particular output argument.  Clients
+/// can provide domain-specific contracts without teaching the generic
+/// uninitialized-value analysis API names.
+enum class UninitOutputParamContract {
+  None,
+  Always,
+  TrueOnSuccess,
+  ZeroOnSuccess,
+  NonnegativeOnSuccess,
+};
 
 /// A use of a variable, which might be uninitialized.
 class UninitUse {
@@ -127,6 +139,17 @@ public:
   /// Whether 'may be uninitialized' uses should be checked for correlated
   /// guarding conditions.  The check costs a path-sensitive replay per use.
   virtual bool wantsCorrelationPruning() const { return false; }
+
+  /// Return the contract of \p call for \p vd when the call takes the address
+  /// of the variable as an output argument.
+  virtual UninitOutputParamContract
+  getOutputParamContract(const CallExpr *call, const VarDecl *vd) const {
+    return UninitOutputParamContract::None;
+  }
+
+  /// Whether a direct call has a result known to be non-null.  This supports
+  /// scoped guard APIs whose expansion is a single-iteration pointer loop.
+  virtual bool isKnownNonNullCall(const CallExpr *call) const { return false; }
 
   /// Called when the uninitialized variable is used at the given expression.
   virtual void handleUseOfUninitVariable(const VarDecl *vd,

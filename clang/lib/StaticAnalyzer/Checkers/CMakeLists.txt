@@ -96,6 +96,11 @@ add_clang_library(clangStaticAnalyzerCheckers
   PointerSubChecker.cpp
   PthreadLockChecker.cpp
   PutenvStackArrayChecker.cpp
+  QEMUErrorOwnershipChecker.cpp
+  QEMUGuestInputChecker.cpp
+  QEMULockContextChecker.cpp
+  QEMUMigrationConsistencyChecker.cpp
+  QEMUResourceLifetimeChecker.cpp
   RetainCountChecker/RetainCountChecker.cpp
   RetainCountChecker/RetainCountDiagnostics.cpp
   ReturnPointerRangeChecker.cpp

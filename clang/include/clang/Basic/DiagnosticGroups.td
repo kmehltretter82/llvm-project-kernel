@@ -1192,6 +1192,22 @@ def Uninitialized  : DiagGroup<"uninitialized", [UninitializedSometimes,
                                                  UninitializedConstReference,
                                                  UninitializedConstPointer]>;
 
+// Diagnostics for QEMU execution-context and error API contracts.  Keep these
+// opt-in: the annotations and Error conventions are specific to QEMU.
+def QEMUCoroutineContext : DiagGroup<"qemu-coroutine-context">;
+def QEMUErrorGuard : DiagGroup<"qemu-error-guard">;
+def QEMUErrorConsumed : DiagGroup<"qemu-error-consumed">;
+def QEMUErrorContract : DiagGroup<"qemu-error-contract",
+                                        [QEMUErrorGuard,
+                                         QEMUErrorConsumed]>;
+def QEMUErrorPathSuccess : DiagGroup<"qemu-error-path-success">;
+def QEMUResultCheck : DiagGroup<"qemu-result-check">;
+def QEMUMemTxResult : DiagGroup<"qemu-memtx-result">;
+// Checks graduate into this umbrella only after demonstrating approximately
+// 90% actionable diagnostics on the validation matrix.  None has graduated
+// yet; the individual groups above remain available for experimentation.
+def QEMU : DiagGroup<"qemu">;
+
 // Diagnostics for Linux kernel API contracts and bug patterns. Keep these
 // opt-in: their semantics are not generally true for freestanding C programs.
 def LinuxKernelBoolReturn : DiagGroup<"linux-kernel-bool-return">;
