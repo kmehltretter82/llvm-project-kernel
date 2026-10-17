@@ -4,6 +4,7 @@ typedef __SIZE_TYPE__ size_t;
 typedef __UINT64_TYPE__ uint64_t;
 
 void *memcpy(void *, const void *, size_t);
+void *memset(void *, int, size_t);
 void *malloc(size_t);
 unsigned dma_memory_read(void *, uint64_t, void *, size_t, unsigned);
 void physical_memory_read(uint64_t, void *, uint64_t);
@@ -590,6 +591,18 @@ static void mmio_offset_copy(void *opaque, uint64_t addr, uint64_t data, // expe
 
 static const MemoryRegionOps mmio_offset_copy_ops = {
     .write = mmio_offset_copy,
+};
+
+static void mmio_bounded_tail_fill(void *opaque, uint64_t addr,
+                                   uint64_t data, unsigned size) {
+  char destination[16];
+  if (size >= sizeof(destination))
+    return;
+  memset(&destination[size], 0, sizeof(destination) - size);
+}
+
+static const MemoryRegionOps mmio_bounded_tail_fill_ops = {
+    .write = mmio_bounded_tail_fill,
 };
 
 static void mmio_signed_length(void *opaque, uint64_t addr, uint64_t data, // expected-note {{MMIO callback parameter 'data' is guest-controlled}}

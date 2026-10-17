@@ -1965,10 +1965,10 @@ class QEMUGuestMemorySafetyChecker
       if (std::optional<uint64_t> Bytes = StaticExtent(Buffer))
         Extent = C.getSValBuilder().makeIntVal(*Bytes,
                                                C.getASTContext().getSizeType());
+    const Expr *Pointer = nullptr;
+    const Expr *Offset = nullptr;
     if (const auto *Add = dyn_cast<BinaryOperator>(Buffer)) {
       if (Add->getOpcode() == BO_Add) {
-        const Expr *Pointer = nullptr;
-        const Expr *Offset = nullptr;
         if (Add->getLHS()->getType()->isPointerType()) {
           Pointer = Add->getLHS();
           Offset = Add->getRHS();
@@ -1976,36 +1976,70 @@ class QEMUGuestMemorySafetyChecker
           Pointer = Add->getRHS();
           Offset = Add->getLHS();
         }
-        if (Pointer) {
-          QualType Pointee = Pointer->getType()->getPointeeType();
-          if (!Pointee->isVoidType() && !Pointee->isIncompleteType()) {
-            SVal BaseExtent =
-                getDynamicExtentWithOffset(State, pointerValue(Pointer, C));
-            if (!hasUsableExtent(State, BaseExtent, C.getSValBuilder()))
-              if (std::optional<uint64_t> Bytes = StaticExtent(Pointer))
-                BaseExtent = C.getSValBuilder().makeIntVal(
-                    *Bytes, C.getASTContext().getSizeType());
-            SVal OffsetValue = expressionValue(Offset, C);
-            uint64_t ElementBytes =
-                C.getASTContext().getTypeSizeInChars(Pointee).getQuantity();
-            SVal Scale = C.getSValBuilder().makeIntVal(
-                ElementBytes, C.getASTContext().getSizeType());
-            SVal ByteOffset =
-                C.getSValBuilder().evalBinOp(State, BO_Mul, OffsetValue, Scale,
-                                             C.getASTContext().getSizeType());
-            SVal Total =
-                C.getSValBuilder().evalBinOp(State, BO_Add, Length, ByteOffset,
-                                             C.getASTContext().getSizeType());
-            if (!Total.isUnknown() &&
-                hasUsableExtent(State, BaseExtent, C.getSValBuilder())) {
-              Required = Total;
-              BoundRequired = Total;
-              Extent = BaseExtent;
-              SinkDescription = Sink.Description == "packet length"
-                                    ? "packet offset plus length"
-                                    : "memory-operation offset plus length";
-            }
-          }
+      }
+    } else if (const auto *Address = dyn_cast<UnaryOperator>(Buffer)) {
+      if (Address->getOpcode() == UO_AddrOf)
+        if (const auto *Subscript = dyn_cast<ArraySubscriptExpr>(
+                Address->getSubExpr()->IgnoreParenImpCasts())) {
+          Pointer = Subscript->getBase()->IgnoreParenImpCasts();
+          Offset = Subscript->getIdx();
+        }
+    }
+    if (Pointer) {
+      QualType Pointee;
+      if (Pointer->getType()->isPointerType())
+        Pointee = Pointer->getType()->getPointeeType();
+      else if (const ArrayType *Array =
+                   C.getASTContext().getAsArrayType(Pointer->getType()))
+        Pointee = Array->getElementType();
+      if (!Pointee.isNull() && !Pointee->isVoidType() &&
+          !Pointee->isIncompleteType()) {
+        SVal BaseExtent =
+            getDynamicExtentWithOffset(State, pointerValue(Pointer, C));
+        if (!hasUsableExtent(State, BaseExtent, C.getSValBuilder()))
+          if (std::optional<uint64_t> Bytes = StaticExtent(Pointer))
+            BaseExtent = C.getSValBuilder().makeIntVal(
+                *Bytes, C.getASTContext().getSizeType());
+        SVal OffsetValue = expressionValue(Offset, C);
+        uint64_t ElementBytes =
+            C.getASTContext().getTypeSizeInChars(Pointee).getQuantity();
+        SVal Scale = C.getSValBuilder().makeIntVal(
+            ElementBytes, C.getASTContext().getSizeType());
+        SVal ByteOffset = C.getSValBuilder().evalBinOp(
+            State, BO_Mul, OffsetValue, Scale, C.getASTContext().getSizeType());
+        SVal Total;
+        const Expr *LengthExpr =
+            Call.getArgExpr(Sink.LengthArgument)->IgnoreParenImpCasts();
+        const auto *Remaining = dyn_cast<BinaryOperator>(LengthExpr);
+        if (ElementBytes == 1 && Remaining &&
+            Remaining->getOpcode() == BO_Sub &&
+            sameSimpleExpression(Remaining->getRHS(), Offset)) {
+          std::optional<llvm::APSInt> StartingExtent =
+              Remaining->getLHS()->getIntegerConstantExpr(C.getASTContext());
+          const llvm::APSInt *KnownBaseExtent =
+              C.getSValBuilder().getKnownValue(State, BaseExtent);
+          std::optional<IntegerRange> OffsetRange = integerRange(Offset, C);
+          if (StartingExtent && KnownBaseExtent && OffsetRange &&
+              !StartingExtent->isNegative() && !KnownBaseExtent->isNegative() &&
+              StartingExtent->getBitWidth() <= 64 &&
+              KnownBaseExtent->getBitWidth() <= 64 &&
+              StartingExtent->getZExtValue() ==
+                  KnownBaseExtent->getZExtValue() &&
+              OffsetRange->Maximum <= KnownBaseExtent->getZExtValue())
+            Total = BaseExtent;
+        }
+        if (Total.isUnknownOrUndef())
+          Total =
+              C.getSValBuilder().evalBinOp(State, BO_Add, Length, ByteOffset,
+                                           C.getASTContext().getSizeType());
+        if (!Total.isUnknown() &&
+            hasUsableExtent(State, BaseExtent, C.getSValBuilder())) {
+          Required = Total;
+          BoundRequired = Total;
+          Extent = BaseExtent;
+          SinkDescription = Sink.Description == "packet length"
+                                ? "packet offset plus length"
+                                : "memory-operation offset plus length";
         }
       }
     }
