@@ -260,6 +260,10 @@ class QEMUGuestMemorySafetyChecker
   mutable llvm::DenseMap<const FieldDecl *, ValidatedFieldBound>
       MigrationValidatedFieldBounds;
   mutable llvm::DenseMap<const FieldDecl *, uint64_t>
+      MigrationPostLoadFieldMaximums;
+  mutable llvm::DenseSet<const FieldDecl *> MigrationPostLoadUnvalidatedFields;
+  mutable llvm::DenseSet<const FunctionDecl *> MigrationPostLoadFunctions;
+  mutable llvm::DenseMap<const FieldDecl *, uint64_t>
       PersistentGuestFieldMaximums;
   mutable llvm::DenseSet<const FieldDecl *> UnboundedPersistentGuestFields;
   mutable std::unique_ptr<BugType> LevelABug;
@@ -679,6 +683,196 @@ class QEMUGuestMemorySafetyChecker
       MigrationValidatedFieldBounds.erase(Field);
   }
 
+  static bool returnsNonZero(const Stmt *Statement, ASTContext &Context) {
+    const ReturnStmt *Return = dyn_cast_or_null<ReturnStmt>(Statement);
+    if (!Return)
+      if (const auto *Compound = dyn_cast_or_null<CompoundStmt>(Statement))
+        if (Compound->size() == 1)
+          Return = dyn_cast<ReturnStmt>(*Compound->body_begin());
+    const Expr *Value = Return ? Return->getRetValue() : nullptr;
+    if (!Value)
+      return false;
+    Expr::EvalResult Result;
+    return Value->EvaluateAsInt(Result, Context, Expr::SE_NoSideEffects) &&
+           Result.Val.getInt() != 0;
+  }
+
+  static void collectRejectedBounds(
+      const Expr *Condition, ASTContext &Context,
+      llvm::DenseMap<const FieldDecl *, uint64_t> &UpperBounds,
+      llvm::DenseSet<const FieldDecl *> &NonNegativeFields) {
+    if (!Condition)
+      return;
+    Condition = Condition->IgnoreParenImpCasts();
+    const auto *Operation = dyn_cast<BinaryOperator>(Condition);
+    if (!Operation)
+      return;
+    if (Operation->getOpcode() == BO_LOr) {
+      collectRejectedBounds(Operation->getLHS(), Context, UpperBounds,
+                            NonNegativeFields);
+      collectRejectedBounds(Operation->getRHS(), Context, UpperBounds,
+                            NonNegativeFields);
+      return;
+    }
+
+    auto IsConstant = [&](const Expr *Expression, int Value) {
+      Expr::EvalResult Result;
+      if (!Expression->EvaluateAsInt(Result, Context, Expr::SE_NoSideEffects))
+        return false;
+      const llvm::APSInt &Integer = Result.Val.getInt();
+      if (Value == 0)
+        return Integer.isZero();
+      return Value == -1 && Integer.isSigned() && Integer.isNegative() &&
+             Integer.isAllOnes();
+    };
+    const FieldDecl *NonNegativeField = nullptr;
+    switch (Operation->getOpcode()) {
+    case BO_LT:
+      if (IsConstant(Operation->getRHS(), 0))
+        NonNegativeField = destinationField(Operation->getLHS());
+      break;
+    case BO_LE:
+      if (IsConstant(Operation->getRHS(), -1))
+        NonNegativeField = destinationField(Operation->getLHS());
+      break;
+    case BO_GT:
+      if (IsConstant(Operation->getLHS(), 0))
+        NonNegativeField = destinationField(Operation->getRHS());
+      break;
+    case BO_GE:
+      if (IsConstant(Operation->getLHS(), -1))
+        NonNegativeField = destinationField(Operation->getRHS());
+      break;
+    default:
+      break;
+    }
+    if (NonNegativeField)
+      NonNegativeFields.insert(NonNegativeField->getCanonicalDecl());
+
+    const Expr *FieldExpression = nullptr;
+    const Expr *LimitExpression = nullptr;
+    bool InclusiveMaximum = true;
+    switch (Operation->getOpcode()) {
+    case BO_GT:
+      FieldExpression = Operation->getLHS();
+      LimitExpression = Operation->getRHS();
+      break;
+    case BO_GE:
+      FieldExpression = Operation->getLHS();
+      LimitExpression = Operation->getRHS();
+      InclusiveMaximum = false;
+      break;
+    case BO_LT:
+      FieldExpression = Operation->getRHS();
+      LimitExpression = Operation->getLHS();
+      break;
+    case BO_LE:
+      FieldExpression = Operation->getRHS();
+      LimitExpression = Operation->getLHS();
+      InclusiveMaximum = false;
+      break;
+    default:
+      return;
+    }
+
+    const FieldDecl *Field = destinationField(FieldExpression);
+    if (!Field)
+      return;
+    Expr::EvalResult LimitResult;
+    if (!LimitExpression->EvaluateAsInt(LimitResult, Context,
+                                        Expr::SE_NoSideEffects))
+      return;
+    const llvm::APSInt &Limit = LimitResult.Val.getInt();
+    if (Limit.isNegative() || Limit.getActiveBits() > 64)
+      return;
+    uint64_t Maximum = Limit.getZExtValue();
+    if (!InclusiveMaximum) {
+      if (Maximum == 0)
+        return;
+      --Maximum;
+    }
+    Field = Field->getCanonicalDecl();
+    auto [Found, Inserted] = UpperBounds.try_emplace(Field, Maximum);
+    if (!Inserted)
+      Found->second = std::min(Found->second, Maximum);
+  }
+
+  void discoverVMStatePostLoadBounds(const InitListExpr *ILE,
+                                     ASTContext &Context) const {
+    ILE = semanticInitList(ILE);
+    if (!ILE)
+      return;
+    const RecordDecl *RD = ILE->getType()->getAsRecordDecl();
+    if (!RD || RD->getName() != "VMStateDescription")
+      return;
+
+    llvm::DenseSet<const FieldDecl *> MigratedFields;
+    class OffsetVisitor : public DynamicRecursiveASTVisitor {
+      llvm::DenseSet<const FieldDecl *> &Fields;
+
+    public:
+      explicit OffsetVisitor(llvm::DenseSet<const FieldDecl *> &Fields)
+          : Fields(Fields) {}
+
+      bool VisitOffsetOfExpr(OffsetOfExpr *Offset) override {
+        for (unsigned I = 0; I < Offset->getNumComponents(); ++I) {
+          const OffsetOfNode &Component = Offset->getComponent(I);
+          if (Component.getKind() != OffsetOfNode::Field)
+            continue;
+          const FieldDecl *Field = Component.getField();
+          if (Field->getType()->isIntegerType())
+            Fields.insert(Field->getCanonicalDecl());
+        }
+        return true;
+      }
+    } FieldVisitor(MigratedFields);
+    if (const Expr *Fields = fieldInitializer(ILE, "fields"))
+      FieldVisitor.TraverseStmt(const_cast<Expr *>(Fields));
+    if (MigratedFields.empty())
+      return;
+
+    auto MarkUnvalidated = [&] {
+      for (const FieldDecl *Field : MigratedFields)
+        MigrationPostLoadUnvalidatedFields.insert(Field);
+    };
+    const FunctionDecl *PostLoad =
+        referencedFunction(fieldInitializer(ILE, "post_load"));
+    if (!PostLoad || !PostLoad->doesThisDeclarationHaveABody()) {
+      MarkUnvalidated();
+      return;
+    }
+    PostLoad = PostLoad->getCanonicalDecl();
+    MigrationPostLoadFunctions.insert(PostLoad);
+    const auto *Body = dyn_cast<CompoundStmt>(PostLoad->getBody());
+    if (!Body) {
+      MarkUnvalidated();
+      return;
+    }
+
+    llvm::DenseMap<const FieldDecl *, uint64_t> UpperBounds;
+    llvm::DenseSet<const FieldDecl *> NonNegativeFields;
+    for (const Stmt *Statement : Body->body()) {
+      const auto *If = dyn_cast<IfStmt>(Statement);
+      if (!If || !returnsNonZero(If->getThen(), Context))
+        continue;
+      collectRejectedBounds(If->getCond(), Context, UpperBounds,
+                            NonNegativeFields);
+    }
+    for (const FieldDecl *Field : MigratedFields) {
+      auto Bound = UpperBounds.find(Field);
+      bool HasLowerBound = Field->getType()->isUnsignedIntegerType() ||
+                           NonNegativeFields.contains(Field);
+      if (Bound == UpperBounds.end() || !HasLowerBound) {
+        MigrationPostLoadUnvalidatedFields.insert(Field);
+        continue;
+      }
+      auto [Found, Inserted] =
+          MigrationPostLoadFieldMaximums.try_emplace(Field, Bound->second);
+      if (!Inserted)
+        Found->second = std::max(Found->second, Bound->second);
+    }
+  }
+
   struct PersistentFieldInfo {
     const FieldDecl *Field;
     InputClass Source;
@@ -746,6 +940,31 @@ class QEMUGuestMemorySafetyChecker
         return directReferencedMember(VD->getInit(), Depth + 1);
     }
     return destinationMember(E);
+  }
+
+  static std::optional<uint64_t> indexMaximumFromField(const Expr *E,
+                                                       const FieldDecl *Field,
+                                                       uint64_t Maximum) {
+    if (!E)
+      return std::nullopt;
+    E = E->IgnoreParenImpCasts();
+    if (destinationField(E) == Field)
+      return Maximum;
+    const auto *Operation = dyn_cast<UnaryOperator>(E);
+    if (!Operation || destinationField(Operation->getSubExpr()) != Field)
+      return std::nullopt;
+    switch (Operation->getOpcode()) {
+    case UO_PreDec:
+      return Maximum == 0 ? 0 : Maximum - 1;
+    case UO_PostDec:
+    case UO_PostInc:
+      return Maximum;
+    case UO_PreInc:
+      return Maximum == std::numeric_limits<uint64_t>::max() ? Maximum
+                                                             : Maximum + 1;
+    default:
+      return std::nullopt;
+    }
   }
 
   static const FieldDecl *addressedField(const Expr *E) {
@@ -2313,6 +2532,7 @@ public:
           Checker.discoverOperationTable(Semantic);
           Checker.discoverVMStateField(Semantic);
           Checker.discoverVMStateValidation(Semantic, Context);
+          Checker.discoverVMStatePostLoadBounds(Semantic, Context);
           if (isMemoryRegionOps(Semantic))
             MemoryRegionInitializers.insert(Semantic);
         }
@@ -2774,6 +2994,31 @@ public:
     QualType IndexType = UnpromotedIndex->getType();
     const llvm::APSInt *KnownCount =
         C.getSValBuilder().getKnownValue(State, Count);
+    const auto *CurrentFunction =
+        dyn_cast<FunctionDecl>(C.getCurrentAnalysisDeclContext()->getDecl());
+    bool InPostLoad =
+        CurrentFunction && MigrationPostLoadFunctions.contains(
+                               CurrentFunction->getCanonicalDecl());
+    if (Persistent && Persistent->Source == InputClass::Migration &&
+        !InPostLoad &&
+        !MigrationPostLoadUnvalidatedFields.contains(Persistent->Field) &&
+        KnownCount && !KnownCount->isNegative() &&
+        KnownCount->getBitWidth() <= 64) {
+      auto Validated = MigrationPostLoadFieldMaximums.find(Persistent->Field);
+      if (Validated != MigrationPostLoadFieldMaximums.end())
+        if (std::optional<uint64_t> Maximum = indexMaximumFromField(
+                ASE->getIdx(), Persistent->Field, Validated->second)) {
+          uint64_t ElementCount = KnownCount->getZExtValue();
+          if (*Maximum < ElementCount)
+            return;
+          if (*Maximum == ElementCount) {
+            std::optional<BoundStates> NotAtLimit =
+                compare(State, Index, BO_NE, Count, C.getSValBuilder());
+            if (NotAtLimit && NotAtLimit->Safe && !NotAtLimit->Unsafe)
+              return;
+          }
+        }
+    }
     const MemberExpr *IndexMember = directReferencedMember(ASE->getIdx());
     if (Persistent && Member && IndexMember &&
         sameSimpleExpression(Member->getBase(), IndexMember->getBase()) &&

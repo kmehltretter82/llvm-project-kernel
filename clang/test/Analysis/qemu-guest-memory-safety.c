@@ -66,6 +66,11 @@ typedef struct VMStateField {
   _Bool (*field_exists)(void *, int);
 } VMStateField;
 
+typedef struct VMStateDescription {
+  int (*post_load)(void *, int);
+  const VMStateField *fields;
+} VMStateDescription;
+
 enum {
   VMS_NO_STATE = 0x080,
   VMS_MUST_EXIST = 0x1000,
@@ -347,6 +352,176 @@ static int migrated_weakly_validated_dynamic_index(
   return s->slots[s->index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
                               // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
 }
+
+typedef struct PostLoadBoundedIndexState {
+  int index;
+  int slots[4];
+} PostLoadBoundedIndexState;
+
+static int validate_post_load_index(void *opaque, int version) {
+  PostLoadBoundedIndexState *s = opaque;
+  if (s->index < 0 || s->index >= 4)
+    return -1;
+  return 0;
+}
+
+static const VMStateDescription post_load_bounded_index_vmsd = {
+    .post_load = validate_post_load_index,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(index, PostLoadBoundedIndexState),
+        VMSTATE_END_OF_LIST(),
+    },
+};
+
+static int migrated_post_load_bounded_index(PostLoadBoundedIndexState *s) {
+  return s->slots[s->index];
+}
+
+typedef struct PostLoadUpperOnlyState {
+  int index;
+  int slots[4];
+} PostLoadUpperOnlyState;
+
+static int validate_post_load_upper_only(void *opaque, int version) {
+  PostLoadUpperOnlyState *s = opaque;
+  if (s->index >= 4)
+    return -1;
+  return 0;
+}
+
+static const VMStateDescription post_load_upper_only_vmsd = {
+    .post_load = validate_post_load_upper_only,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(index, PostLoadUpperOnlyState),
+        VMSTATE_END_OF_LIST(),
+    },
+};
+
+static int migrated_post_load_upper_only_index(PostLoadUpperOnlyState *s) {
+  return s->slots[s->index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
+                              // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
+}
+
+typedef struct PostLoadOffByOneIndexState {
+  int index;
+  int slots[4];
+} PostLoadOffByOneIndexState;
+
+static int validate_post_load_off_by_one(void *opaque, int version) {
+  PostLoadOffByOneIndexState *s = opaque;
+  if (s->index < 0 || s->index > 4)
+    return -1;
+  return 0;
+}
+
+static const VMStateDescription post_load_off_by_one_vmsd = {
+    .post_load = validate_post_load_off_by_one,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(index, PostLoadOffByOneIndexState),
+        VMSTATE_END_OF_LIST(),
+    },
+};
+
+static int migrated_post_load_off_by_one_index(
+    PostLoadOffByOneIndexState *s) {
+  return s->slots[s->index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
+                              // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
+}
+
+static int migrated_post_load_excludes_limit(PostLoadOffByOneIndexState *s) {
+  if (s->index == 4)
+    return 0;
+  return s->slots[s->index];
+}
+
+typedef struct PostLoadEarlyAccessState {
+  int index;
+  int slots[4];
+} PostLoadEarlyAccessState;
+
+static int validate_post_load_after_access(void *opaque, int version) {
+  PostLoadEarlyAccessState *s = opaque;
+  int result = s->slots[s->index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
+                                    // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
+  if (s->index < 0 || s->index >= 4)
+    return -1;
+  return result;
+}
+
+static const VMStateDescription post_load_early_access_vmsd = {
+    .post_load = validate_post_load_after_access,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(index, PostLoadEarlyAccessState),
+        VMSTATE_END_OF_LIST(),
+    },
+};
+
+typedef struct AlternateUnvalidatedState {
+  int index;
+  int slots[4];
+} AlternateUnvalidatedState;
+
+static int validate_alternate_index(void *opaque, int version) {
+  AlternateUnvalidatedState *s = opaque;
+  if (s->index < 0 || s->index >= 4)
+    return -1;
+  return 0;
+}
+
+static const VMStateDescription validated_alternate_vmsd = {
+    .post_load = validate_alternate_index,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(index, AlternateUnvalidatedState),
+        VMSTATE_END_OF_LIST(),
+    },
+};
+
+static const VMStateDescription unvalidated_alternate_vmsd = {
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(index, AlternateUnvalidatedState),
+        VMSTATE_END_OF_LIST(),
+    },
+};
+
+static int migrated_alternate_unvalidated_index(AlternateUnvalidatedState *s) {
+  return s->slots[s->index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
+                              // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
+}
+
+typedef struct PostLoadMMIOOverrideState {
+  int index;
+  int slots[4];
+} PostLoadMMIOOverrideState;
+
+static int validate_post_load_mmio_override(void *opaque, int version) {
+  PostLoadMMIOOverrideState *s = opaque;
+  if (s->index < 0 || s->index >= 4)
+    return -1;
+  return 0;
+}
+
+static const VMStateDescription post_load_mmio_override_vmsd = {
+    .post_load = validate_post_load_mmio_override,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(index, PostLoadMMIOOverrideState),
+        VMSTATE_END_OF_LIST(),
+    },
+};
+
+static void mmio_overrides_post_load_index(void *opaque, uint64_t addr,
+                                           uint64_t data, unsigned size) {
+  PostLoadMMIOOverrideState *s = opaque;
+  if (addr == 0) { // expected-note {{Assuming 'addr' is not equal to 0}} expected-note {{Taking false branch}}
+    s->index = data;
+  } else if (addr == 4) { // expected-note {{Assuming 'addr' is equal to 4}} expected-note {{Taking true branch}}
+    s->slots[s->index] = 1; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
+                             // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
+  }
+}
+
+static const MemoryRegionOps mmio_overrides_post_load_index_ops = {
+    .write = mmio_overrides_post_load_index,
+};
 
 static uint64_t mmio_index(void *opaque, uint64_t addr, unsigned size) { // expected-note {{MMIO callback parameter 'addr' is guest-controlled}}
   int registers[4] = {0};
