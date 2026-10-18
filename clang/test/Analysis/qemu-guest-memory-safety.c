@@ -15,6 +15,7 @@ struct VirtIODevice {
 void *memcpy(void *, const void *, size_t);
 void *memmove(void *, const void *, size_t);
 void *memset(void *, int, size_t);
+int memcmp(const void *, const void *, size_t);
 void *malloc(size_t);
 unsigned dma_memory_read(void *, uint64_t, void *, size_t, unsigned);
 void physical_memory_read(uint64_t, void *, uint64_t);
@@ -1180,6 +1181,29 @@ static long network_index(NetClientState *client, const unsigned char *packet,
 
 static const NetClientInfo network_info = {
     .receive = network_index,
+};
+
+static long network_fixed_width_read( // expected-note {{network receive callback parameter 'length' is guest-controlled}}
+    NetClientState *client, const unsigned char *packet,
+    size_t length) {
+  return *(const unsigned *)packet; // expected-warning {{Level B: network receive callback buffer read may exceed the available guest-input bytes}}
+                                    // expected-note@-1 {{Level B: network receive callback buffer read may exceed the available guest-input bytes}}
+}
+
+static const NetClientInfo network_fixed_width_info = {
+    .receive = network_fixed_width_read,
+};
+
+static long network_fixed_memcmp( // expected-note {{network receive callback parameter 'length' is guest-controlled}}
+    NetClientState *client, const unsigned char *packet,
+    size_t length) {
+  static const unsigned char magic[4] = {0};
+  return memcmp(packet, magic, sizeof(magic)); // expected-warning {{Level B: network receive callback buffer read may exceed the available guest-input bytes}}
+                                               // expected-note@-1 {{Level B: network receive callback buffer read may exceed the available guest-input bytes}}
+}
+
+static const NetClientInfo network_fixed_memcmp_info = {
+    .receive = network_fixed_memcmp,
 };
 
 static void pio_index(void *opaque, unsigned address, unsigned data) { // expected-note {{PIO callback parameter 'address' is guest-controlled}}

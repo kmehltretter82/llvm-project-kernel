@@ -246,6 +246,8 @@ static int scsi_parse_cdb_guarded(SCSIDevice *dev, SCSICommand *command,
                                   uint8_t *cdb, size_t cdb_length,
                                   void *hba_private) {
   int handlers[4] = {0};
+  if (cdb_length == 0)
+    return 0;
   if (cdb[0] >= 4)
     return 0;
   return handlers[cdb[0]];

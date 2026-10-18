@@ -98,6 +98,34 @@ static long copied_iovec(NetClientState *client,
                        // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
 }
 
+static long zero_length_iov_copy_is_not_a_source(NetClientState *client,
+                                                  const struct iovec *iov,
+                                                  int iovcnt) {
+  struct iovec copy[1];
+  unsigned index = 0;
+  int slots[4] = {0};
+  (void)iov_copy(copy, 1, iov, (unsigned)iovcnt, 0, 0);
+  if (iov_to_buf_full(copy, 1, 0, &index, sizeof(index)) != sizeof(index))
+    return 0;
+  return slots[index];
+}
+
+static long zero_length_iov_copy_preserves_destination(
+    NetClientState *client, const struct iovec *iov, int iovcnt) {
+  struct iovec copy[4];
+  struct iovec trusted[1] = {{0}};
+  unsigned index;
+  int slots[4] = {0};
+  (void)iov_copy(copy, 4, iov, (unsigned)iovcnt, 0, sizeof(index));
+  (void)iov_copy(copy, 4, trusted, 1, 0, 0);
+  // expected-note@+2 {{network receive populated guest-controlled data here}}
+  // expected-note@+1 {{Taking false branch}}
+  if (iov_to_buf_full(copy, 4, 0, &index, sizeof(index)) != sizeof(index))
+    return 0;
+  return slots[index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
+                       // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
+}
+
 static long failed_iovec_copy_is_not_a_source(NetClientState *client,
                                                const struct iovec *iov,
                                                int iovcnt) {
@@ -147,6 +175,7 @@ static long sliced_and_cloned_qiov(NetClientState *client,
   int slots[4] = {0};
   qemu_iovec_init_external(&source, (struct iovec *)iov, iovcnt);
   qemu_iovec_init_slice(&slice, &source, 0, sizeof(index));
+  qemu_iovec_init(&clone, 1);
   qemu_iovec_clone(&clone, &slice, 0);
   // expected-note@+2 {{network receive populated guest-controlled data here}}
   // expected-note@+1 {{Taking false branch}}
@@ -185,6 +214,24 @@ static long zero_length_concatenation_is_not_a_source(
   qemu_iovec_init_external(&source, (struct iovec *)iov, iovcnt);
   qemu_iovec_init_external(&destination, &trusted, 1);
   qemu_iovec_concat(&destination, &source, 0, 0);
+  if (qemu_iovec_to_buf(&destination, 0, &index, sizeof(index)) !=
+      sizeof(index))
+    return 0;
+  return slots[index];
+}
+
+static long offset_past_source_is_not_a_source(NetClientState *client,
+                                                const struct iovec *iov,
+                                                int iovcnt) {
+  unsigned trusted_index = 0;
+  unsigned index = 0;
+  int slots[4] = {0};
+  struct iovec trusted = {&trusted_index, sizeof(trusted_index)};
+  QEMUIOVector source, destination;
+  qemu_iovec_init_external(&source, (struct iovec *)iov, iovcnt);
+  source.size = sizeof(index);
+  qemu_iovec_init_external(&destination, &trusted, 1);
+  qemu_iovec_concat(&destination, &source, sizeof(index), sizeof(index));
   if (qemu_iovec_to_buf(&destination, 0, &index, sizeof(index)) !=
       sizeof(index))
     return 0;
@@ -241,12 +288,15 @@ static const NetClientInfo iovec_callbacks[] = {
     {.receive_iov = raw_iovec_short_copy_is_not_a_source},
     {.receive_iov = raw_iovec_zero_length_is_not_a_source},
     {.receive_iov = copied_iovec},
+    {.receive_iov = zero_length_iov_copy_is_not_a_source},
+    {.receive_iov = zero_length_iov_copy_preserves_destination},
     {.receive_iov = failed_iovec_copy_is_not_a_source},
     {.receive_iov = duplicated_iovec},
     {.receive_iov = external_qiov},
     {.receive_iov = sliced_and_cloned_qiov},
     {.receive_iov = concatenated_qiov},
     {.receive_iov = zero_length_concatenation_is_not_a_source},
+    {.receive_iov = offset_past_source_is_not_a_source},
     {.receive_iov = concatenated_raw_iov},
     {.receive_iov = destroyed_qiov_is_not_a_source},
     {.receive_iov = reset_qiov_is_not_a_source},

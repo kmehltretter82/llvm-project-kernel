@@ -60,6 +60,7 @@ REGISTER_MAP_WITH_PROGRAMSTATE(QEMUPendingAllocationRelationRight, const Expr *,
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUAllocationRelationKinds, SymbolRef, unsigned)
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUAllocationRelationLeft, SymbolRef, SVal)
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUAllocationRelationRight, SymbolRef, SVal)
+REGISTER_MAP_WITH_PROGRAMSTATE(QEMUPendingIovecSourceSizes, const Expr *, SVal)
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUSavedTaintedScalars, const VarRegion *, SVal)
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUPersistentFieldSources, SymbolRef,
                                const FieldDecl *)
@@ -1828,11 +1829,16 @@ class QEMUGuestMemorySafetyChecker
   }
 
   struct IovecAlias {
+    enum class SourceExtentKind { None, NonEmpty, BytesAfterOffset, Range };
+
     unsigned DestinationArgument;
     unsigned SourceArgument;
     bool RequiresPositiveReturn;
     bool ReplacesDestination;
     std::optional<unsigned> RequiredPositiveArgument;
+    SourceExtentKind SourceExtent = SourceExtentKind::None;
+    std::optional<unsigned> SourceOffsetArgument;
+    std::optional<unsigned> SourceLengthArgument;
   };
 
   static std::optional<IovecAlias> iovecAlias(const CallEvent &Call) {
@@ -1893,16 +1899,35 @@ class QEMUGuestMemorySafetyChecker
         !isVoidPointer(FD->getParamDecl(2)->getType()))
       return std::nullopt;
     std::optional<unsigned> RequiredPositiveArgument;
-    if (Name == "qemu_iovec_init_external")
+    if (Name == "iov_copy")
+      RequiredPositiveArgument = 5;
+    else if (Name == "qemu_iovec_init_external")
       RequiredPositiveArgument = 2;
     else if (Name == "qemu_iovec_init_slice" || Name == "qemu_iovec_concat")
       RequiredPositiveArgument = 3;
-    return IovecAlias{
-        0, SourceArgument,
-        Name == "iov_copy" || Name == "qemu_iovec_concat_iov",
-        Name == "iov_copy" || Name == "qemu_iovec_init_external" ||
-            Name == "qemu_iovec_init_slice" || Name == "qemu_iovec_clone",
-        RequiredPositiveArgument};
+    IovecAlias::SourceExtentKind SourceExtent =
+        IovecAlias::SourceExtentKind::None;
+    std::optional<unsigned> SourceOffsetArgument;
+    std::optional<unsigned> SourceLengthArgument;
+    if (Name == "qemu_iovec_init_slice") {
+      SourceExtent = IovecAlias::SourceExtentKind::Range;
+      SourceOffsetArgument = 2;
+      SourceLengthArgument = 3;
+    } else if (Name == "qemu_iovec_concat") {
+      SourceExtent = IovecAlias::SourceExtentKind::BytesAfterOffset;
+      SourceOffsetArgument = 2;
+    } else if (Name == "qemu_iovec_clone") {
+      SourceExtent = IovecAlias::SourceExtentKind::NonEmpty;
+    }
+    return IovecAlias{0,
+                      SourceArgument,
+                      Name == "iov_copy" || Name == "qemu_iovec_concat_iov",
+                      Name == "qemu_iovec_init_external" ||
+                          Name == "qemu_iovec_init_slice",
+                      RequiredPositiveArgument,
+                      SourceExtent,
+                      SourceOffsetArgument,
+                      SourceLengthArgument};
   }
 
   static std::optional<BufferSource> bufferSource(const CallEvent &Call) {
@@ -2553,6 +2578,22 @@ class QEMUGuestMemorySafetyChecker
     return nullptr;
   }
 
+  static std::optional<SVal> qemuIovecSize(ProgramStateRef State, SVal Iovec,
+                                           QualType IovecType,
+                                           CheckerContext &C) {
+    const FieldDecl *Size = namedField(IovecType, "size");
+    if (!Size || !Size->getType()->isIntegerType())
+      return std::nullopt;
+    SVal Location = State->getLValue(Size, Iovec);
+    auto SizeLocation = Location.getAs<Loc>();
+    if (!SizeLocation)
+      return std::nullopt;
+    SVal Value = State->getSVal(*SizeLocation);
+    if (Value.isUnknownOrUndef())
+      return std::nullopt;
+    return Value;
+  }
+
   static std::optional<SVal>
   callbackFieldValue(const ParmVarDecl *Parameter,
                      std::initializer_list<StringRef> Path,
@@ -2691,6 +2732,113 @@ class QEMUGuestMemorySafetyChecker
     return std::make_pair(State, Offset);
   }
 
+  void reportCallbackBufferRead(CheckerContext &C, ProgramStateRef Safe,
+                                ProgramStateRef Unsafe, SVal AccessEnd,
+                                SVal Length, const Expr *Where,
+                                InputClass Source) const {
+    if (!Unsafe)
+      return;
+    bool Definite = !Safe;
+    ExplodedNode *Node = C.generateErrorNode(Unsafe);
+    if (!Node)
+      return;
+
+    llvm::SmallString<256> Buffer;
+    llvm::raw_svector_ostream Message(Buffer);
+    Message << (Definite ? "Level A: " : "Level B: ") << inputClassName(Source)
+            << " callback buffer read "
+            << (Definite ? "exceeds " : "may exceed ")
+            << "the available guest-input bytes (access end "
+            << valueRange(Unsafe, AccessEnd, C.getSValBuilder()) << ", bytes "
+            << valueRange(Unsafe, Length, C.getSValBuilder()) << ')';
+    auto Report = std::make_unique<PathSensitiveBugReport>(bugType(Definite),
+                                                           Message.str(), Node);
+    if (Where)
+      Report->addRange(Where->getSourceRange());
+    for (SymbolRef Symbol : AccessEnd.symbols())
+      Report->markInteresting(Symbol);
+    for (SymbolRef Symbol : Length.symbols())
+      Report->markInteresting(Symbol);
+    C.emitReport(std::move(Report));
+  }
+
+  bool checkCallbackBufferMemoryRead(const CallEvent &Call,
+                                     unsigned BufferArgument,
+                                     unsigned LengthArgument,
+                                     CheckerContext &C) const {
+    if (BufferArgument >= Call.getNumArgs() ||
+        LengthArgument >= Call.getNumArgs())
+      return false;
+    const MemRegion *Region = Call.getArgSVal(BufferArgument).getAsRegion();
+    if (!Region)
+      return false;
+    const MemRegion *Base = Region->getBaseRegion();
+    ProgramStateRef State = C.getState();
+    const SVal *StoredLength = State->get<QEMUInputBufferLengths>(Base);
+    const unsigned *StoredClass = State->get<QEMUInputBufferClasses>(Base);
+    if (!StoredLength || !StoredClass)
+      return false;
+
+    std::optional<std::pair<ProgramStateRef, SVal>> OffsetAndState =
+        callbackBufferOffset(Region, Base, State, C);
+    if (!OffsetAndState)
+      return true;
+    State = OffsetAndState->first;
+    SVal Offset = OffsetAndState->second;
+    SVal Length = *StoredLength;
+    SVal Access = Call.getArgSVal(LengthArgument);
+    ASTContext &Context = C.getASTContext();
+    SValBuilder &SVB = C.getSValBuilder();
+    QualType LengthType = Length.getType(Context);
+    QualType AccessType = Call.getArgExpr(LengthArgument)->getType();
+    QualType SizeType = Context.getSizeType();
+    if (LengthType.isNull() || !LengthType->isIntegerType() ||
+        !AccessType->isIntegerType())
+      return true;
+
+    auto Require = [&](SVal Left, BinaryOperatorKind Operation,
+                       SVal Right) -> bool {
+      std::optional<BoundStates> Bounds =
+          compare(State, Left, Operation, Right, SVB);
+      if (!Bounds)
+        return false;
+      if (Bounds->Unsafe)
+        C.addTransition(Bounds->Unsafe);
+      State = Bounds->Safe;
+      return State != nullptr;
+    };
+    if (!Require(Length, BO_GE, SVB.makeZeroVal(LengthType)) ||
+        !Require(Access, BO_GE, SVB.makeZeroVal(AccessType)))
+      return true;
+    Length = SVB.evalCast(Length, SizeType, LengthType);
+    Access = SVB.evalCast(Access, SizeType, AccessType);
+    if (Length.isUnknownOrUndef() || Access.isUnknownOrUndef())
+      return true;
+
+    llvm::APSInt Maximum = SVB.getBasicValueFactory().getMaxValue(SizeType);
+    SVal MaximumSVal = SVB.makeIntVal(Maximum);
+    SVal Remaining =
+        SVB.evalBinOp(State, BO_Sub, MaximumSVal, Offset, SizeType);
+    if (Remaining.isUnknownOrUndef() || !Require(Access, BO_LE, Remaining))
+      return true;
+    SVal AccessEnd = SVB.evalBinOp(State, BO_Add, Offset, Access, SizeType);
+    if (AccessEnd.isUnknownOrUndef())
+      return true;
+
+    std::optional<BoundStates> WithinBuffer =
+        compare(State, AccessEnd, BO_LE, Length, SVB);
+    if (!WithinBuffer)
+      return true;
+    InputClass Source = static_cast<InputClass>(*StoredClass);
+    if (WithinBuffer->Unsafe)
+      reportCallbackBufferRead(C, WithinBuffer->Safe, WithinBuffer->Unsafe,
+                               AccessEnd, Length,
+                               Call.getArgExpr(BufferArgument), Source);
+    if (WithinBuffer->Safe)
+      C.addTransition(WithinBuffer->Safe);
+    return true;
+  }
+
   bool modelCallbackBufferLoad(const ImplicitCastExpr *Cast,
                                CheckerContext &C) const {
     const MemRegion *Region = C.getSVal(Cast->getSubExpr()).getAsRegion();
@@ -2735,7 +2883,7 @@ class QEMUGuestMemorySafetyChecker
     if (!Require(Length, BO_GE, Zero))
       return true;
     Length = SVB.evalCast(Length, SizeType, LengthType);
-    if (Length.isUnknownOrUndef() || !Require(Offset, BO_LE, Length))
+    if (Length.isUnknownOrUndef())
       return true;
 
     QualType AccessType = Cast->getType();
@@ -2744,15 +2892,32 @@ class QEMUGuestMemorySafetyChecker
     uint64_t AccessBytes = Context.getTypeSizeInChars(AccessType).getQuantity();
     if (!AccessBytes)
       return true;
-    SVal Remaining = SVB.evalBinOp(State, BO_Sub, Length, Offset, SizeType);
+    llvm::APSInt Maximum = SVB.getBasicValueFactory().getMaxValue(SizeType);
+    if (Maximum.getBitWidth() > 64 || AccessBytes > Maximum.getZExtValue())
+      return true;
+    SVal LastOffset =
+        SVB.makeIntVal(Maximum.getZExtValue() - AccessBytes, SizeType);
+    if (!Require(Offset, BO_LE, LastOffset))
+      return true;
     SVal Access = SVB.makeIntVal(AccessBytes, SizeType);
-    if (Remaining.isUnknownOrUndef() || !Require(Access, BO_LE, Remaining))
+    SVal AccessEnd = SVB.evalBinOp(State, BO_Add, Offset, Access, SizeType);
+    if (AccessEnd.isUnknownOrUndef())
+      return true;
+    std::optional<BoundStates> WithinBuffer =
+        compare(State, AccessEnd, BO_LE, Length, SVB);
+    if (!WithinBuffer)
+      return true;
+    InputClass Source = static_cast<InputClass>(*StoredClass);
+    if (WithinBuffer->Unsafe)
+      reportCallbackBufferRead(C, WithinBuffer->Safe, WithinBuffer->Unsafe,
+                               AccessEnd, Length, Cast->getSubExpr(), Source);
+    State = WithinBuffer->Safe;
+    if (!State)
       return true;
 
     SVal Value = C.getSVal(Cast);
     if (Value.isUnknownOrUndef())
       return true;
-    InputClass Source = static_cast<InputClass>(*StoredClass);
     ProgramStateRef Tainted = addInputTaint(State, Value, Source);
     std::string Detail = "callback buffer is guest-controlled";
     if (const ParmVarDecl *const *Parameter =
@@ -4532,6 +4697,23 @@ public:
   }
 
   void checkPreCall(const CallEvent &Call, CheckerContext &C) const {
+    if (std::optional<IovecAlias> Alias = iovecAlias(Call)) {
+      if (Alias->SourceExtent != IovecAlias::SourceExtentKind::None) {
+        const auto *FD = dyn_cast_or_null<FunctionDecl>(Call.getDecl());
+        const Expr *Origin = Call.getOriginExpr();
+        if (FD && Origin) {
+          std::optional<SVal> Size = qemuIovecSize(
+              C.getState(), Call.getArgSVal(Alias->SourceArgument),
+              FD->getParamDecl(Alias->SourceArgument)->getType(), C);
+          if (Size) {
+            ProgramStateRef State =
+                C.getState()->set<QEMUPendingIovecSourceSizes>(Origin, *Size);
+            C.addTransition(State);
+            return;
+          }
+        }
+      }
+    }
     if (std::optional<AllocationExtentDescriptor> Descriptor =
             allocationExtentDescriptor(Call, C.getASTContext()))
       savePendingAllocationExtent(Call, *Descriptor, C);
@@ -4540,8 +4722,21 @@ public:
       checkBitmapBitSink(Call, C);
     if (std::optional<MemorySink> Sink = destinationMemorySink(Call))
       checkMemorySink(Call, *Sink, C);
-    if (std::optional<MemorySink> Sink = sourceMemorySink(Call))
+    if (const auto *FD = dyn_cast_or_null<FunctionDecl>(Call.getDecl()))
+      if (FD->getIdentifier() &&
+          (FD->getName() == "memcmp" || FD->getName() == "bcmp") &&
+          Call.getNumArgs() >= 3) {
+        bool ModeledLeft = checkCallbackBufferMemoryRead(Call, 0, 2, C);
+        bool ModeledRight = checkCallbackBufferMemoryRead(Call, 1, 2, C);
+        if (ModeledLeft || ModeledRight)
+          return;
+      }
+    if (std::optional<MemorySink> Sink = sourceMemorySink(Call)) {
+      if (checkCallbackBufferMemoryRead(Call, Sink->BufferArgument,
+                                        Sink->LengthArgument, C))
+        return;
       checkMemorySink(Call, *Sink, C);
+    }
   }
 
   void checkPostCall(const CallEvent &Call, CheckerContext &C) const {
@@ -4689,12 +4884,19 @@ public:
     }
     if (std::optional<IovecAlias> Alias = iovecAlias(Call)) {
       ProgramStateRef State = C.getState();
-      auto RemoveDestinationProvenance = [&]() {
+      std::optional<SVal> SourceSize;
+      if (const Expr *Origin = Call.getOriginExpr()) {
+        if (const SVal *Saved = State->get<QEMUPendingIovecSourceSizes>(Origin))
+          SourceSize = *Saved;
+        State = State->remove<QEMUPendingIovecSourceSizes>(Origin);
+      }
+      auto RemoveDestinationProvenance = [&](ProgramStateRef Input) {
         if (!Alias->ReplacesDestination)
-          return;
+          return Input;
         if (const MemRegion *Destination =
                 pointerBaseRegion(Call.getArgSVal(Alias->DestinationArgument)))
-          State = State->remove<QEMUInputIovecs>(Destination);
+          return Input->remove<QEMUInputIovecs>(Destination);
+        return Input;
       };
       if (Alias->RequiresPositiveReturn) {
         SVal Zero = C.getSValBuilder().makeZeroVal(FD->getReturnType());
@@ -4702,14 +4904,8 @@ public:
             State, Call.getReturnValue(), BO_GT, Zero, C.getSValBuilder());
         if (!Positive)
           return;
-        if (Positive->Unsafe) {
-          ProgramStateRef NonPositive = Positive->Unsafe;
-          if (Alias->ReplacesDestination)
-            if (const MemRegion *Destination = pointerBaseRegion(
-                    Call.getArgSVal(Alias->DestinationArgument)))
-              NonPositive = NonPositive->remove<QEMUInputIovecs>(Destination);
-          C.addTransition(NonPositive);
-        }
+        if (Positive->Unsafe)
+          C.addTransition(Positive->Unsafe);
         State = Positive->Safe;
       }
       if (!State)
@@ -4722,24 +4918,63 @@ public:
             State, Call.getArgSVal(Argument), BO_GT, Zero, C.getSValBuilder());
         if (!Positive)
           return;
-        if (Positive->Unsafe) {
-          ProgramStateRef NonPositive = Positive->Unsafe;
-          if (Alias->ReplacesDestination)
-            if (const MemRegion *Destination = pointerBaseRegion(
-                    Call.getArgSVal(Alias->DestinationArgument)))
-              NonPositive = NonPositive->remove<QEMUInputIovecs>(Destination);
-          C.addTransition(NonPositive);
-        }
+        if (Positive->Unsafe)
+          C.addTransition(RemoveDestinationProvenance(Positive->Unsafe));
         State = Positive->Safe;
       }
       if (!State)
         return;
+      if (Alias->SourceExtent != IovecAlias::SourceExtentKind::None) {
+        if (!SourceSize) {
+          C.addTransition(State);
+          return;
+        }
+        auto Require = [&](SVal Left, BinaryOperatorKind Operation,
+                           SVal Right) -> bool {
+          std::optional<BoundStates> Bounds =
+              compare(State, Left, Operation, Right, C.getSValBuilder());
+          if (!Bounds)
+            return false;
+          if (Bounds->Unsafe)
+            C.addTransition(Bounds->Unsafe);
+          State = Bounds->Safe;
+          return State != nullptr;
+        };
+        QualType SizeType = SourceSize->getType(C.getASTContext());
+        if (SizeType.isNull() || !SizeType->isIntegerType()) {
+          C.addTransition(State);
+          return;
+        }
+        if (Alias->SourceExtent == IovecAlias::SourceExtentKind::NonEmpty) {
+          SVal Zero = C.getSValBuilder().makeZeroVal(SizeType);
+          if (!Require(*SourceSize, BO_GT, Zero))
+            return;
+        } else if (Alias->SourceExtent ==
+                   IovecAlias::SourceExtentKind::BytesAfterOffset) {
+          if (!Alias->SourceOffsetArgument ||
+              !Require(Call.getArgSVal(*Alias->SourceOffsetArgument), BO_LT,
+                       *SourceSize))
+            return;
+        } else {
+          if (!Alias->SourceOffsetArgument || !Alias->SourceLengthArgument)
+            return;
+          SVal Length = Call.getArgSVal(*Alias->SourceLengthArgument);
+          if (!Require(Length, BO_LE, *SourceSize))
+            return;
+          SVal Remaining = C.getSValBuilder().evalBinOp(
+              State, BO_Sub, *SourceSize, Length, SizeType);
+          if (Remaining.isUnknownOrUndef() ||
+              !Require(Call.getArgSVal(*Alias->SourceOffsetArgument), BO_LE,
+                       Remaining))
+            return;
+        }
+      }
       if (std::optional<InputClass> Source =
               inputIovecSource(State, Call.getArgSVal(Alias->SourceArgument))) {
         State = addInputIovec(
             State, Call.getArgSVal(Alias->DestinationArgument), *Source);
       } else if (Alias->ReplacesDestination) {
-        RemoveDestinationProvenance();
+        State = RemoveDestinationProvenance(State);
       }
       C.addTransition(State);
       return;
@@ -4929,6 +5164,9 @@ public:
       for (SymbolRef Symbol : Entry.second.symbols())
         SymReaper.markLive(Symbol);
     }
+    for (const auto &Entry : State->get<QEMUPendingIovecSourceSizes>())
+      for (SymbolRef Symbol : Entry.second.symbols())
+        SymReaper.markLive(Symbol);
     for (const MemRegion *Region : State->get<QEMUVirtqueueElements>())
       SymReaper.markLive(Region);
     for (const MemRegion *Region : State->get<QEMUVirtqueueIovecs>())
