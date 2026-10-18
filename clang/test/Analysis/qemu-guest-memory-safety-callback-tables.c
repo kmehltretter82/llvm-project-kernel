@@ -14,6 +14,12 @@ typedef struct SCSICommand SCSICommand;
 typedef struct SCSIRequest SCSIRequest;
 typedef void NetPacketSent(NetClientState *, long);
 
+struct VirtIODevice {
+  size_t config_len;
+};
+
+void *memcpy(void *, const void *, size_t);
+
 struct SCSICommand {
   uint8_t buf[16];
   int len;
@@ -53,6 +59,32 @@ static void virtio_set_features_ex(VirtIODevice *vdev,
                                       // expected-note@-2 {{Level B: guest-controlled array index may exceed the host object element count}}
 }
 
+static void virtio_set_config_direct(VirtIODevice *vdev, const uint8_t *config) { // expected-note {{virtio configuration callback buffer parameter 'config' supplies guest-controlled bytes}}
+  callback_result = config[4]; // expected-warning {{Level B: virtio configuration callback buffer read may exceed the available guest-input bytes}}
+                               // expected-note@-1 {{Level B: virtio configuration callback buffer read may exceed the available guest-input bytes}}
+}
+
+static void virtio_set_config_copy(VirtIODevice *vdev, const uint8_t *config) { // expected-note {{virtio configuration callback buffer parameter 'config' supplies guest-controlled bytes}}
+  uint8_t destination[8];
+  memcpy(destination, config, sizeof(destination)); // expected-warning {{Level B: virtio configuration callback buffer read may exceed the available guest-input bytes}}
+                                                    // expected-note@-1 {{Level B: virtio configuration callback buffer read may exceed the available guest-input bytes}}
+}
+
+static void virtio_set_config_direct_guarded(VirtIODevice *vdev,
+                                             const uint8_t *config) {
+  if (vdev->config_len <= 4)
+    return;
+  callback_result = config[4];
+}
+
+static void virtio_set_config_copy_guarded(VirtIODevice *vdev,
+                                           const uint8_t *config) {
+  uint8_t destination[8];
+  if (vdev->config_len < sizeof(destination))
+    return;
+  memcpy(destination, config, sizeof(destination));
+}
+
 static int virtio_set_status(VirtIODevice *vdev, uint8_t status) { // expected-note {{virtio configuration callback parameter 'status' is guest-controlled}}
   int slots[4] = {0};
   return slots[status]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
@@ -89,6 +121,24 @@ static void register_virtio_callbacks(VirtioDeviceClass *vdc) {
   vdc->set_status = virtio_set_status;
   vdc->queue_reset = virtio_queue_reset;
   vdc->queue_enable = virtio_queue_enable;
+}
+
+static void register_virtio_config_direct_callback(VirtioDeviceClass *vdc) {
+  vdc->set_config = virtio_set_config_direct;
+}
+
+static void register_virtio_config_copy_callback(VirtioDeviceClass *vdc) {
+  vdc->set_config = virtio_set_config_copy;
+}
+
+static void
+register_virtio_config_direct_guarded_callback(VirtioDeviceClass *vdc) {
+  vdc->set_config = virtio_set_config_direct_guarded;
+}
+
+static void
+register_virtio_config_copy_guarded_callback(VirtioDeviceClass *vdc) {
+  vdc->set_config = virtio_set_config_copy_guarded;
 }
 
 static void register_guarded_virtio_callback(VirtioDeviceClass *vdc) {

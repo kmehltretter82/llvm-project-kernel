@@ -2650,6 +2650,18 @@ class QEMUGuestMemorySafetyChecker
     llvm_unreachable("unknown callback buffer length kind");
   }
 
+  static SVal callbackBufferParameterValue(const MemRegion *Base,
+                                           ProgramStateRef State,
+                                           CheckerContext &C) {
+    const ParmVarDecl *const *Parameter =
+        State->get<QEMUInputBufferParameters>(Base);
+    if (!Parameter || !*Parameter)
+      return UnknownVal();
+    const MemRegion *ParameterRegion =
+        State->getRegion(*Parameter, C.getStackFrame());
+    return State->getSVal(ParameterRegion);
+  }
+
   std::optional<std::pair<ProgramStateRef, SVal>>
   callbackBufferOffset(const MemRegion *Region, const MemRegion *Base,
                        ProgramStateRef State, CheckerContext &C) const {
@@ -2735,7 +2747,7 @@ class QEMUGuestMemorySafetyChecker
   void reportCallbackBufferRead(CheckerContext &C, ProgramStateRef Safe,
                                 ProgramStateRef Unsafe, SVal AccessEnd,
                                 SVal Length, const Expr *Where,
-                                InputClass Source) const {
+                                InputClass Source, SVal BufferPointer) const {
     if (!Unsafe)
       return;
     bool Definite = !Safe;
@@ -2759,6 +2771,7 @@ class QEMUGuestMemorySafetyChecker
       Report->markInteresting(Symbol);
     for (SymbolRef Symbol : Length.symbols())
       Report->markInteresting(Symbol);
+    Report->markInteresting(BufferPointer);
     C.emitReport(std::move(Report));
   }
 
@@ -2778,6 +2791,7 @@ class QEMUGuestMemorySafetyChecker
     const unsigned *StoredClass = State->get<QEMUInputBufferClasses>(Base);
     if (!StoredLength || !StoredClass)
       return false;
+    SVal BufferPointer = callbackBufferParameterValue(Base, State, C);
 
     std::optional<std::pair<ProgramStateRef, SVal>> OffsetAndState =
         callbackBufferOffset(Region, Base, State, C);
@@ -2831,9 +2845,9 @@ class QEMUGuestMemorySafetyChecker
       return true;
     InputClass Source = static_cast<InputClass>(*StoredClass);
     if (WithinBuffer->Unsafe)
-      reportCallbackBufferRead(C, WithinBuffer->Safe, WithinBuffer->Unsafe,
-                               AccessEnd, Length,
-                               Call.getArgExpr(BufferArgument), Source);
+      reportCallbackBufferRead(
+          C, WithinBuffer->Safe, WithinBuffer->Unsafe, AccessEnd, Length,
+          Call.getArgExpr(BufferArgument), Source, BufferPointer);
     if (WithinBuffer->Safe)
       C.addTransition(WithinBuffer->Safe);
     return true;
@@ -2852,6 +2866,7 @@ class QEMUGuestMemorySafetyChecker
     const unsigned *StoredClass = State->get<QEMUInputBufferClasses>(Base);
     if (!StoredClass)
       return true;
+    SVal BufferPointer = callbackBufferParameterValue(Base, State, C);
 
     std::optional<std::pair<ProgramStateRef, SVal>> OffsetAndState =
         callbackBufferOffset(Region, Base, State, C);
@@ -2910,7 +2925,8 @@ class QEMUGuestMemorySafetyChecker
     InputClass Source = static_cast<InputClass>(*StoredClass);
     if (WithinBuffer->Unsafe)
       reportCallbackBufferRead(C, WithinBuffer->Safe, WithinBuffer->Unsafe,
-                               AccessEnd, Length, Cast->getSubExpr(), Source);
+                               AccessEnd, Length, Cast->getSubExpr(), Source,
+                               BufferPointer);
     State = WithinBuffer->Safe;
     if (!State)
       return true;
@@ -4626,6 +4642,13 @@ public:
       }
     }
 
+    struct SourceValue {
+      SVal Value;
+      std::string Name;
+      bool IsBuffer;
+    };
+    std::vector<SourceValue> Sources;
+
     for (const CallbackBufferInfo &Buffer : Found->second.Buffers) {
       if (Buffer.BufferParameter >= FD->getNumParams())
         continue;
@@ -4645,13 +4668,9 @@ public:
           State->set<QEMUInputBufferLengths>(Base, *Length)
               ->set<QEMUInputBufferClasses>(Base, static_cast<unsigned>(Source))
               ->set<QEMUInputBufferParameters>(Base, Parameter);
+      Sources.push_back(
+          {Pointer, Parameter->getNameAsString(), /*IsBuffer=*/true});
     }
-
-    struct SourceValue {
-      SVal Value;
-      std::string Name;
-    };
-    std::vector<SourceValue> Sources;
     for (unsigned Index = 0; Index < FD->getNumParams() && Index < 64;
          ++Index) {
       uint64_t Bit = uint64_t(1) << Index;
@@ -4664,12 +4683,14 @@ public:
       SVal Value = State->getSVal(Region);
       if (Found->second.ParameterMask & Bit) {
         State = addInputTaint(State, Value, Found->second.Source);
-        Sources.push_back({Value, Parameter->getNameAsString()});
+        Sources.push_back(
+            {Value, Parameter->getNameAsString(), /*IsBuffer=*/false});
       }
       if (Found->second.PointeeMask & Bit)
         if (std::optional<SVal> Pointee = pointeeValue(State, Value)) {
           State = addInputTaint(State, *Pointee, Found->second.Source);
-          Sources.push_back({*Pointee, Parameter->getNameAsString()});
+          Sources.push_back(
+              {*Pointee, Parameter->getNameAsString(), /*IsBuffer=*/false});
         }
       if (Found->second.IovecMask & Bit)
         State = addInputIovec(State, Value, Found->second.Source);
@@ -4686,11 +4707,15 @@ public:
         C.getNoteTag([Sources = std::move(Sources), Class = std::move(Class)](
                          PathSensitiveBugReport &Report) -> std::string {
           for (const SourceValue &Source : Sources) {
-            if (!Report.isInteresting(Source.Value))
+            if (Source.IsBuffer || !Report.isInteresting(Source.Value))
               continue;
             return Class + " callback parameter '" + Source.Name +
                    "' is guest-controlled";
           }
+          for (const SourceValue &Source : Sources)
+            if (Source.IsBuffer && Report.isInteresting(Source.Value))
+              return Class + " callback buffer parameter '" + Source.Name +
+                     "' supplies guest-controlled bytes";
           return "";
         });
     C.addTransition(State, Tag);
