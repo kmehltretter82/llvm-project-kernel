@@ -897,8 +897,8 @@ static void mmio_definite_allocation(void *opaque, uint64_t addr, // expected-no
   if (data <= ((uint64_t)-1) / 2) // expected-note {{Assuming the condition is false}}
                                   // expected-note@-1 {{Taking false branch}}
     return;
-  malloc(data + data); // expected-warning {{Level A: guest-controlled allocation-size arithmetic overflows}}
-                       // expected-note@-1 {{Level A: guest-controlled allocation-size arithmetic overflows}}
+  malloc(data + data); // expected-warning {{Level B: guest-controlled allocation-size arithmetic overflows}}
+                       // expected-note@-1 {{Level B: guest-controlled allocation-size arithmetic overflows}}
 }
 
 static const MemoryRegionOps mmio_definite_allocation_ops = {
@@ -931,6 +931,36 @@ static void mmio_offset_copy(void *opaque, uint64_t addr, uint64_t data, // expe
 
 static const MemoryRegionOps mmio_offset_copy_ops = {
     .write = mmio_offset_copy,
+};
+
+typedef struct TailMemberArrayState {
+  unsigned char bytes[2048];
+} TailMemberArrayState;
+
+static void mmio_member_array_tail(void *opaque, uint64_t addr, uint64_t data,
+                                   unsigned size) {
+  TailMemberArrayState *s = opaque;
+  size_t frame_length = data & 63;
+  if (frame_length < 60)
+    memset(&s->bytes[frame_length + 2], 0, 60 - frame_length);
+}
+
+static const MemoryRegionOps mmio_member_array_tail_ops = {
+    .write = mmio_member_array_tail,
+};
+
+static void mmio_member_array_tail_oob(
+    void *opaque, uint64_t addr, uint64_t data, // expected-note {{MMIO callback parameter 'data' is guest-controlled}}
+    unsigned size) {
+  TailMemberArrayState *s = opaque;
+  size_t offset = 2040 + (data & 7);
+  size_t length = 9;
+  memset(&s->bytes[offset], 0, length); // expected-warning {{Level A: guest-controlled memory-operation offset plus length exceeds the host object extent}}
+                                       // expected-note@-1 {{Level A: guest-controlled memory-operation offset plus length exceeds the host object extent}}
+}
+
+static const MemoryRegionOps mmio_member_array_tail_oob_ops = {
+    .write = mmio_member_array_tail_oob,
 };
 
 static char framework_bounded_buffer[16];

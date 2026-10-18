@@ -3076,15 +3076,15 @@ class QEMUGuestMemorySafetyChecker
     llvm::SmallString<256> Buffer;
     llvm::raw_svector_ostream Message(Buffer);
     Message << (Result->MustOverflow
-                    ? "Level A: guest-controlled allocation-size arithmetic "
+                    ? "Level B: guest-controlled allocation-size arithmetic "
                       "overflows"
                     : "Level B: guest-controlled allocation-size arithmetic "
                       "may overflow")
             << " before the allocation (left "
             << valueRange(State, Left, C.getSValBuilder()) << ", right "
             << valueRange(State, Right, C.getSValBuilder()) << ')';
-    auto Report = std::make_unique<PathSensitiveBugReport>(
-        bugType(Result->MustOverflow), Message.str(), Node);
+    auto Report = std::make_unique<PathSensitiveBugReport>(bugType(false),
+                                                           Message.str(), Node);
     Report->addRange(Arithmetic->getSourceRange());
     for (SVal Value : {Left, Right, Size})
       for (SymbolRef Sym : taint::getTaintedSymbols(State, Value))
@@ -3308,6 +3308,7 @@ class QEMUGuestMemorySafetyChecker
       Extent = flexibleArrayMemberExtent(Buffer, State, C);
     const Expr *Pointer = nullptr;
     const Expr *Offset = nullptr;
+    bool SelectedArrayElement = false;
     if (const auto *Add = dyn_cast<BinaryOperator>(Buffer)) {
       if (Add->getOpcode() == BO_Add) {
         if (Add->getLHS()->getType()->isPointerType()) {
@@ -3324,9 +3325,16 @@ class QEMUGuestMemorySafetyChecker
                 Address->getSubExpr()->IgnoreParenImpCasts())) {
           Pointer = Subscript->getBase()->IgnoreParenImpCasts();
           Offset = Subscript->getIdx();
+          SelectedArrayElement = true;
         }
     }
     if (Pointer) {
+      // getDynamicExtentWithOffset() may describe only the selected array
+      // element for expressions such as &object->bytes[index].  That
+      // one-element extent is not the bound for the pointer passed to a byte
+      // operation; only diagnose after reconstructing the base-array tail.
+      if (SelectedArrayElement)
+        Extent = UnknownVal();
       QualType Pointee;
       if (Pointer->getType()->isPointerType())
         Pointee = Pointer->getType()->getPointeeType();
@@ -3353,8 +3361,12 @@ class QEMUGuestMemorySafetyChecker
           return false;
         SVal Scale = C.getSValBuilder().makeIntVal(
             ElementBytes, C.getASTContext().getSizeType());
-        SVal ByteOffset = C.getSValBuilder().evalBinOp(
-            State, BO_Mul, OffsetValue, Scale, C.getASTContext().getSizeType());
+        SVal ConvertedOffset = C.getSValBuilder().evalCast(
+            OffsetValue, C.getASTContext().getSizeType(),
+            Offset->IgnoreParenImpCasts()->getType());
+        SVal ByteOffset =
+            C.getSValBuilder().evalBinOp(State, BO_Mul, ConvertedOffset, Scale,
+                                         C.getASTContext().getSizeType());
         SVal Total;
         const Expr *LengthExpr =
             Call.getArgExpr(Sink.LengthArgument)->IgnoreParenImpCasts();
