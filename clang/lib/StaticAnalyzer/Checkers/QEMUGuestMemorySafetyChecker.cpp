@@ -11,7 +11,8 @@
 // byte-order helpers, and relates tainted indexes and memory-operation lengths
 // to host object extents. A Level A report has no feasible in-bounds state. A
 // Level B report has both in-bounds and out-of-bounds states and needs manual
-// review.
+// review. An optional Level C mode reports unbounded guest-controlled requests
+// to allocators that terminate QEMU on allocation failure.
 //
 //===----------------------------------------------------------------------===//
 
@@ -282,6 +283,8 @@ class QEMUGuestMemorySafetyChecker
   mutable llvm::DenseSet<const FieldDecl *> UnboundedPersistentGuestFields;
   mutable std::unique_ptr<BugType> LevelABug;
   mutable std::unique_ptr<BugType> LevelBBug;
+  mutable std::unique_ptr<BugType> LevelCBug;
+  bool ReportLevelC = false;
 
   void
   addCallback(const Expr *Initializer, InputClass Source,
@@ -1835,6 +1838,31 @@ class QEMUGuestMemorySafetyChecker
     return std::nullopt;
   }
 
+  struct AvailabilityAllocationSink {
+    unsigned CountArgument;
+    std::optional<unsigned> ElementSizeArgument;
+  };
+
+  static std::optional<AvailabilityAllocationSink>
+  availabilityAllocationSink(const CallEvent &Call) {
+    const auto *FD = dyn_cast_or_null<FunctionDecl>(Call.getDecl());
+    if (!FD || !FD->getIdentifier())
+      return std::nullopt;
+    StringRef Name = FD->getName();
+    if ((Name == "g_malloc" || Name == "g_malloc0") && Call.getNumArgs() >= 1)
+      return AvailabilityAllocationSink{0, std::nullopt};
+    if ((Name == "g_realloc" || Name == "qemu_memalign" ||
+         Name == "g_memdup2") &&
+        Call.getNumArgs() >= 2)
+      return AvailabilityAllocationSink{1, std::nullopt};
+    if ((Name == "g_malloc_n" || Name == "g_malloc0_n") &&
+        Call.getNumArgs() >= 2)
+      return AvailabilityAllocationSink{0, 1};
+    if (Name == "g_realloc_n" && Call.getNumArgs() >= 3)
+      return AvailabilityAllocationSink{1, 2};
+    return std::nullopt;
+  }
+
   static const BinaryOperator *sizeArithmetic(const Expr *E) {
     if (!E)
       return nullptr;
@@ -2599,6 +2627,116 @@ class QEMUGuestMemorySafetyChecker
     C.emitReport(std::move(Report));
   }
 
+  static bool isBoundedOnlyByUnsignedType(const Expr *Expression, SVal Value,
+                                          ProgramStateRef State,
+                                          CheckerContext &C) {
+    if (!Expression || Value.isUnknownOrUndef())
+      return false;
+    QualType Type = Expression->IgnoreParenImpCasts()->getType();
+    if (!Type->isUnsignedIntegerType())
+      return false;
+
+    llvm::APSInt TypeMaximum =
+        C.getSValBuilder().getBasicValueFactory().getMaxValue(Type);
+    const llvm::APSInt *DynamicMaximum =
+        C.getSValBuilder().getMaxValue(State, Value);
+    if (!DynamicMaximum || DynamicMaximum->isNegative())
+      return false;
+    unsigned Width =
+        std::max(TypeMaximum.getBitWidth(), DynamicMaximum->getBitWidth());
+    return TypeMaximum.zextOrTrunc(Width) == DynamicMaximum->zextOrTrunc(Width);
+  }
+
+  BugType &levelCBugType() const {
+    if (!LevelCBug)
+      LevelCBug = std::make_unique<BugType>(
+          this, "Level C guest-controlled allocation is unbounded",
+          "QEMU guest availability");
+    return *LevelCBug;
+  }
+
+  void checkAvailabilityAllocation(const CallEvent &Call,
+                                   CheckerContext &C) const {
+    if (!ReportLevelC)
+      return;
+    std::optional<AvailabilityAllocationSink> Sink =
+        availabilityAllocationSink(Call);
+    if (!Sink)
+      return;
+
+    const auto *FD = dyn_cast_or_null<FunctionDecl>(Call.getDecl());
+    if (!FD)
+      return;
+    unsigned Arguments[2] = {
+        Sink->CountArgument,
+        Sink->ElementSizeArgument.value_or(Sink->CountArgument)};
+    unsigned ArgumentCount = Sink->ElementSizeArgument ? 2 : 1;
+    for (unsigned I = 0; I < ArgumentCount; ++I) {
+      unsigned ArgumentIndex = Arguments[I];
+      const Expr *Expression = Call.getArgExpr(ArgumentIndex);
+      // The Level A/B arithmetic diagnostic owns explicit addition and
+      // multiplication. Keeping it out of Level C prevents duplicate reports.
+      if (sizeArithmetic(Expression))
+        continue;
+
+      SVal Value = expressionValue(Expression->IgnoreParenImpCasts(), C);
+      ProgramStateRef State = C.getState();
+      std::optional<PersistentFieldInfo> Persistent =
+          persistentGuestField(Expression);
+      if (!taint::isTainted(State, Value)) {
+        if (!Persistent)
+          continue;
+        State = addInputTaint(State, Value, Persistent->Source);
+      }
+      if (!Persistent)
+        Persistent =
+            persistentGuestFieldFromAliases(Expression, State, C, Value);
+      if (!isBoundedOnlyByUnsignedType(Expression, Value, State, C))
+        continue;
+
+      std::string SourceDetail;
+      if (Persistent)
+        SourceDetail = persistentSourceDescription(*Persistent);
+      else if (std::optional<InputClass> Source =
+                   inputClassForValue(State, Value))
+        SourceDetail = inputClassName(*Source).str();
+
+      ExplodedNode *Node = C.generateNonFatalErrorNode(State);
+      if (!Node)
+        return;
+      bool IsElementSize = Sink->ElementSizeArgument && I == 1;
+      StringRef Quantity = IsElementSize               ? "element size"
+                           : Sink->ElementSizeArgument ? "count"
+                                                       : "size";
+      llvm::SmallString<320> Buffer;
+      llvm::raw_svector_ostream Message(Buffer);
+      Message << "Level C: guest-controlled allocation " << Quantity << " in "
+              << FD->getName()
+              << " has no proven upper bound below its integer type maximum "
+                 "(value "
+              << valueRange(State, Value, C.getSValBuilder());
+      if (Sink->ElementSizeArgument) {
+        unsigned OtherIndex =
+            IsElementSize ? Sink->CountArgument : *Sink->ElementSizeArgument;
+        SVal Other = expressionValue(
+            Call.getArgExpr(OtherIndex)->IgnoreParenImpCasts(), C);
+        Message << (IsElementSize ? ", count " : ", element bytes ")
+                << valueRange(State, Other, C.getSValBuilder());
+      }
+      if (!SourceDetail.empty())
+        Message << ", source " << SourceDetail;
+      Message << "); allocation failure can terminate QEMU";
+
+      auto Report = std::make_unique<PathSensitiveBugReport>(
+          levelCBugType(), Message.str(), Node);
+      Report->addRange(Expression->getSourceRange());
+      for (SymbolRef Symbol : taint::getTaintedSymbols(State, Value))
+        Report->markInteresting(Symbol);
+      C.emitReport(std::move(Report));
+      return;
+    }
+  }
+
   void checkMemorySink(const CallEvent &Call, const MemorySink &Sink,
                        CheckerContext &C) const {
     ProgramStateRef State = C.getState();
@@ -2775,6 +2913,8 @@ class QEMUGuestMemorySafetyChecker
   }
 
 public:
+  void setReportLevelC(bool Enable) { ReportLevelC = Enable; }
+
   void checkASTDecl(const TranslationUnitDecl *TU, AnalysisManager &Mgr,
                     BugReporter &BR) const {
     class OperationTableVisitor : public DynamicRecursiveASTVisitor {
@@ -3126,6 +3266,7 @@ public:
       }
     }
     checkAllocationOverflow(Call, C);
+    checkAvailabilityAllocation(Call, C);
     if (std::optional<MemorySink> Sink = destinationMemorySink(Call))
       checkMemorySink(Call, *Sink, C);
     if (std::optional<MemorySink> Sink = sourceMemorySink(Call))
@@ -3573,7 +3714,9 @@ public:
 } // namespace
 
 void ento::registerQEMUGuestMemorySafetyChecker(CheckerManager &Mgr) {
-  Mgr.registerChecker<QEMUGuestMemorySafetyChecker>();
+  auto *Checker = Mgr.registerChecker<QEMUGuestMemorySafetyChecker>();
+  Checker->setReportLevelC(Mgr.getAnalyzerOptions().getCheckerBooleanOption(
+      Checker, "ReportLevelC"));
 }
 
 bool ento::shouldRegisterQEMUGuestMemorySafetyChecker(

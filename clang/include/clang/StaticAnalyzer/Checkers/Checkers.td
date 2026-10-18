@@ -1758,6 +1758,14 @@ def QEMUGuestInputChecker : Checker<"GuestInput">,
 def QEMUGuestMemorySafetyChecker : Checker<"GuestMemorySafety">,
   HelpText<"Check guest-controlled QEMU host-memory accesses">,
   Dependencies<[DynamicMemoryModeling, TaintPropagationChecker]>,
+  CheckerOptions<[
+    CmdLineOption<Boolean,
+                  "ReportLevelC",
+                  "Report unbounded guest-controlled allocations as "
+                  "availability risks",
+                  "false",
+                  InAlpha>
+  ]>,
   Documentation<NotDocumented>;
 
 } // end "alpha.qemu"
