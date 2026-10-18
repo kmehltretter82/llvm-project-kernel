@@ -33,8 +33,8 @@
 #include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
 #include "llvm/ADT/FoldingSet.h"
-#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringSwitch.h"
 #include <algorithm>
 #include <cstdint>
@@ -1095,9 +1095,10 @@ static bool directCalleeNamed(const CallExpr *Call,
   return llvm::is_contained(Names, FD->getName());
 }
 
-static const CallExpr *getQEMUMacroCall(
-    const Stmt *S, StringRef MacroName,
-    std::initializer_list<StringRef> DirectNames, ASTContext &Ctx) {
+static const CallExpr *
+getQEMUMacroCall(const Stmt *S, StringRef MacroName,
+                 std::initializer_list<StringRef> DirectNames,
+                 ASTContext &Ctx) {
   if (const auto *Call = dyn_cast_or_null<CallExpr>(S))
     return directCalleeNamed(Call, DirectNames) ? Call : nullptr;
 
@@ -1177,12 +1178,12 @@ static bool isMatchingMutexCall(const Stmt *S, bool Lock,
   const CallExpr *Call =
       Lock ? getQEMUMacroCall(S, "qemu_mutex_lock",
                               {"qemu_mutex_lock", "qemu_mutex_lock_impl"}, Ctx)
-           : getQEMUMacroCall(
-                 S, "qemu_mutex_unlock",
-                 {"qemu_mutex_unlock", "qemu_mutex_unlock_impl"}, Ctx);
-  const MemberExpr *Mutex =
-      Call && Call->getNumArgs() >= 1 ? getAddressedField(Call->getArg(0))
-                                     : nullptr;
+           : getQEMUMacroCall(S, "qemu_mutex_unlock",
+                              {"qemu_mutex_unlock", "qemu_mutex_unlock_impl"},
+                              Ctx);
+  const MemberExpr *Mutex = Call && Call->getNumArgs() >= 1
+                                ? getAddressedField(Call->getArg(0))
+                                : nullptr;
   return Mutex && Mutex->getMemberDecl() == Proof.MutexField &&
          refersToScheduledOpaque(Mutex->getBase(), ScheduledOpaque);
 }
