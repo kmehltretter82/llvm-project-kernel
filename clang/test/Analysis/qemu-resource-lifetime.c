@@ -2,6 +2,7 @@
 // RUN:   -analyzer-config ipa=none -verify %s
 
 typedef __SIZE_TYPE__ size_t;
+typedef __PTRDIFF_TYPE__ ssize_t;
 
 typedef struct Foo Foo;
 typedef struct Object Object;
@@ -10,7 +11,16 @@ typedef struct QDict QDict;
 typedef struct QEMUBH QEMUBH;
 typedef struct QEMUTimer QEMUTimer;
 typedef struct BlockAIOCB BlockAIOCB;
+typedef struct BlockBackend BlockBackend;
 typedef struct Coroutine Coroutine;
+typedef struct NetQueue NetQueue;
+typedef struct iovec {
+  void *iov_base;
+  size_t iov_len;
+} iovec;
+typedef struct NetClientState {
+  int value;
+} NetClientState;
 typedef struct EventNotifier {
   int fd;
 } EventNotifier;
@@ -34,6 +44,7 @@ typedef void QEMUTimerCB(void *opaque);
 typedef void BlockCompletionFunc(void *opaque, int ret);
 typedef void CoroutineEntry(void *opaque);
 typedef void EventNotifierHandler(EventNotifier *notifier);
+typedef void NetPacketSent(NetClientState *sender, ssize_t ret);
 
 void g_free(void *ptr);
 void qapi_free_Foo(Foo *foo);
@@ -98,10 +109,31 @@ void timer_del(QEMUTimer *timer);
 void timer_free(QEMUTimer *timer);
 int timer_pending(QEMUTimer *timer);
 
-BlockAIOCB *blk_aio_preadv(void *blk, long offset, void *qiov,
+BlockAIOCB *blk_aio_preadv(BlockBackend *blk, long offset, void *qiov,
                            unsigned flags, BlockCompletionFunc *cb,
                            void *opaque);
 void blk_aio_cancel(BlockAIOCB *acb);
+void blk_drain(BlockBackend *blk);
+void blk_drain_all(void);
+void bdrv_drain_all(void);
+void bdrv_drain_all_begin(void);
+void bdrv_drain_all_begin_nopoll(void);
+
+ssize_t qemu_send_packet_async(NetClientState *sender,
+                               const unsigned char *buf, int size,
+                               NetPacketSent *sent_cb);
+ssize_t qemu_sendv_packet_async(NetClientState *sender, const struct iovec *iov,
+                                int iovcnt, NetPacketSent *sent_cb);
+ssize_t qemu_net_queue_send(NetQueue *queue, NetClientState *sender,
+                            unsigned flags, const unsigned char *data,
+                            size_t size, NetPacketSent *sent_cb);
+ssize_t qemu_net_queue_send_iov(NetQueue *queue, NetClientState *sender,
+                                unsigned flags, const struct iovec *iov,
+                                int iovcnt, NetPacketSent *sent_cb);
+void qemu_purge_queued_packets(NetClientState *sender);
+void qemu_net_queue_purge(NetQueue *queue, NetClientState *sender);
+_Bool qemu_net_queue_flush(NetQueue *queue);
+void qemu_del_net_queue(NetQueue *queue);
 
 Coroutine *qemu_coroutine_create(CoroutineEntry *entry, void *opaque);
 void qemu_coroutine_enter(Coroutine *co);
@@ -462,6 +494,7 @@ void annotated_double_close(int fd) {
 static void async_callback(void *opaque) {}
 static void block_callback(void *opaque, int ret) {}
 static void notifier_callback(EventNotifier *notifier) {}
+static void packet_sent(NetClientState *sender, ssize_t ret) {}
 
 typedef struct NotifierOwner {
   EventNotifier notifier;
@@ -873,6 +906,19 @@ void bdrv_fixed_detach_aio_context(TimerOwner *owner) {
   owner->timer = 0;
 }
 
+void unplug_with_timer_cancel_is_safe(TimerOwner *owner) {
+  QEMUTimer *timer = timer_new_ns(0, async_callback, owner);
+  timer_mod_ns(timer, 1);
+  timer_del(timer);
+  g_free(owner);
+}
+
+void unplug_without_timer_cancel_is_unsafe(TimerOwner *owner) {
+  QEMUTimer *timer = timer_new_ns(0, async_callback, owner);
+  timer_mod_ns(timer, 1); // expected-note {{Callback made pending here}}
+  g_free(owner); // expected-warning {{Object is released while a pending timer callback can still use it}}
+}
+
 void release_with_block_aio(char *ptr) {
   blk_aio_preadv(0, 0, 0, 0, block_callback, ptr); // expected-note {{Callback made pending here}}
   g_free(ptr); // expected-warning {{Object is released while a pending block AIO callback can still use it}}
@@ -915,6 +961,218 @@ void stack_block_aio_escape(void) {
   int result;
   blk_aio_preadv(0, 0, 0, 0, block_callback, &result);
   return; // expected-warning {{Address of stack object is retained by a pending block AIO callback}}
+}
+
+void migration_teardown_with_blk_drain_is_safe(BlockBackend *blk, char *ptr) {
+  blk_aio_preadv(blk, 0, 0, 0, block_callback, ptr);
+  blk_drain(blk);
+  g_free(ptr);
+}
+
+void migration_teardown_without_drain_is_unsafe(BlockBackend *blk, char *ptr) {
+  // expected-note@+1 {{Callback made pending here}}
+  blk_aio_preadv(blk, 0, 0, 0, block_callback, ptr);
+  g_free(ptr); // expected-warning {{Object is released while a pending block AIO callback can still use it}}
+}
+
+void unrelated_blk_drain_keeps_request_pending(BlockBackend *blk,
+                                               BlockBackend *other, char *ptr) {
+  if (blk == other)
+    return;
+  // expected-note@+1 {{Callback made pending here}}
+  blk_aio_preadv(blk, 0, 0, 0, block_callback, ptr);
+  blk_drain(other);
+  g_free(ptr); // expected-warning {{Object is released while a pending block AIO callback can still use it}}
+}
+
+void migration_teardown_with_global_drain_is_safe(BlockBackend *blk,
+                                                  char *ptr) {
+  blk_aio_preadv(blk, 0, 0, 0, block_callback, ptr);
+  blk_drain_all();
+  g_free(ptr);
+}
+
+void bdrv_global_drain_is_not_a_blk_completion_barrier(BlockBackend *blk,
+                                                       char *ptr) {
+  // expected-note@+1 {{Callback made pending here}}
+  blk_aio_preadv(blk, 0, 0, 0, block_callback, ptr);
+  bdrv_drain_all();
+  g_free(ptr); // expected-warning {{Object is released while a pending block AIO callback can still use it}}
+}
+
+void bdrv_global_drain_begin_is_not_a_blk_completion_barrier(
+    BlockBackend *blk, char *ptr) {
+  // expected-note@+1 {{Callback made pending here}}
+  blk_aio_preadv(blk, 0, 0, 0, block_callback, ptr);
+  bdrv_drain_all_begin();
+  g_free(ptr); // expected-warning {{Object is released while a pending block AIO callback can still use it}}
+}
+
+void bdrv_nopoll_is_not_a_completion_barrier(BlockBackend *blk, char *ptr) {
+  // expected-note@+1 {{Callback made pending here}}
+  blk_aio_preadv(blk, 0, 0, 0, block_callback, ptr);
+  bdrv_drain_all_begin_nopoll();
+  g_free(ptr); // expected-warning {{Object is released while a pending block AIO callback can still use it}}
+}
+
+void ownerless_block_request_is_not_matched_by_opaque(char *ptr) {
+  // expected-note@+1 {{Callback made pending here}}
+  blk_aio_preadv(0, 0, 0, 0, block_callback, ptr);
+  blk_drain((BlockBackend *)ptr);
+  g_free(ptr); // expected-warning {{Object is released while a pending block AIO callback can still use it}}
+}
+
+void release_after_queued_network_packet(NetClientState *sender,
+                                         const unsigned char *buf) {
+  // expected-note@+1 {{Packet queued here}}
+  if (qemu_send_packet_async(sender, buf, 8, packet_sent) == 0)
+    g_free(sender); // expected-warning {{Object is released while a queued network packet can still use it}}
+}
+
+void immediate_network_send_is_safe(NetClientState *sender,
+                                    const unsigned char *buf) {
+  if (qemu_send_packet_async(sender, buf, 8, packet_sent) != 0)
+    g_free(sender);
+}
+
+void null_network_completion_still_retains_sender(NetClientState *sender,
+                                                  const unsigned char *buf) {
+  // expected-note@+1 {{Packet queued here}}
+  if (qemu_send_packet_async(sender, buf, 8, 0) == 0)
+    g_free(sender); // expected-warning {{Object is released while a queued network packet can still use it}}
+}
+
+void reset_purges_queued_network_packet(NetClientState *sender,
+                                        const unsigned char *buf) {
+  if (qemu_send_packet_async(sender, buf, 8, packet_sent) == 0) {
+    qemu_purge_queued_packets(sender);
+    g_free(sender);
+  }
+}
+
+void reset_without_network_purge_is_unsafe(NetClientState *sender,
+                                           const unsigned char *buf) {
+  // expected-note@+1 {{Packet queued here}}
+  if (qemu_send_packet_async(sender, buf, 8, packet_sent) == 0)
+    g_free(sender); // expected-warning {{Object is released while a queued network packet can still use it}}
+}
+
+void unrelated_network_purge_keeps_packet_pending(
+    NetClientState *sender, NetClientState *other,
+    const unsigned char *buf) {
+  if (sender == other)
+    return;
+  // expected-note@+1 {{Packet queued here}}
+  if (qemu_send_packet_async(sender, buf, 8, packet_sent) == 0) {
+    qemu_purge_queued_packets(other);
+    g_free(sender); // expected-warning {{Object is released while a queued network packet can still use it}}
+  }
+}
+
+void direct_queue_purge_is_safe(NetQueue *queue, NetClientState *sender,
+                                const unsigned char *buf) {
+  if (qemu_net_queue_send(queue, sender, 0, buf, 8, packet_sent) == 0) {
+    qemu_net_queue_purge(queue, sender);
+    g_free(sender);
+  }
+}
+
+void direct_iov_queue_release_is_unsafe(NetQueue *queue,
+                                        NetClientState *sender,
+                                        const struct iovec *iov) {
+  // expected-note@+1 {{Packet queued here}}
+  if (qemu_net_queue_send_iov(queue, sender, 0, iov, 1, packet_sent) == 0)
+    g_free(sender); // expected-warning {{Object is released while a queued network packet can still use it}}
+}
+
+void sendv_release_is_unsafe(NetClientState *sender,
+                             const struct iovec *iov) {
+  // expected-note@+1 {{Packet queued here}}
+  if (qemu_sendv_packet_async(sender, iov, 1, packet_sent) == 0)
+    g_free(sender); // expected-warning {{Object is released while a queued network packet can still use it}}
+}
+
+void stack_network_sender_escape(const unsigned char *buf) {
+  NetClientState sender;
+  if (qemu_send_packet_async(&sender, buf, 8, packet_sent) == 0)
+    return; // expected-warning {{Address of stack object is retained by a queued network packet}}
+}
+
+void purge_only_matches_exact_queue(NetQueue *first, NetQueue *second,
+                                    NetClientState *sender,
+                                    const unsigned char *buf) {
+  if (first == second)
+    return;
+  if (qemu_net_queue_send(first, sender, 0, buf, 8, packet_sent) == 0 &&
+      qemu_net_queue_send(second, sender, 0, buf, 8, packet_sent) == 0) {
+    // expected-note@-1 {{Packet queued here}}
+    qemu_net_queue_purge(first, sender);
+    g_free(sender); // expected-warning {{Object is released while a queued network packet can still use it}}
+  }
+}
+
+void direct_purge_does_not_clear_peer_queue(NetQueue *queue,
+                                            NetClientState *sender,
+                                            const unsigned char *buf) {
+  // expected-note@+1 {{Packet queued here}}
+  if (qemu_send_packet_async(sender, buf, 8, packet_sent) == 0) {
+    qemu_net_queue_purge(queue, sender);
+    g_free(sender); // expected-warning {{Object is released while a queued network packet can still use it}}
+  }
+}
+
+void peer_purge_does_not_clear_direct_queue(NetQueue *queue,
+                                            NetClientState *sender,
+                                            const unsigned char *buf) {
+  // expected-note@+1 {{Packet queued here}}
+  if (qemu_net_queue_send(queue, sender, 0, buf, 8, packet_sent) == 0) {
+    qemu_purge_queued_packets(sender);
+    g_free(sender); // expected-warning {{Object is released while a queued network packet can still use it}}
+  }
+}
+
+void successful_queue_flush_is_safe(NetQueue *queue,
+                                    NetClientState *sender,
+                                    const unsigned char *buf) {
+  if (qemu_net_queue_send(queue, sender, 0, buf, 8, packet_sent) == 0 &&
+      qemu_net_queue_flush(queue))
+    g_free(sender);
+}
+
+void blocked_queue_flush_keeps_packet_pending(NetQueue *queue,
+                                              NetClientState *sender,
+                                              const unsigned char *buf) {
+  // expected-note@+1 {{Packet queued here}}
+  if (qemu_net_queue_send(queue, sender, 0, buf, 8, packet_sent) == 0 &&
+      !qemu_net_queue_flush(queue))
+    g_free(sender); // expected-warning {{Object is released while a queued network packet can still use it}}
+}
+
+void deleting_queue_releases_sender(NetQueue *queue, NetClientState *sender,
+                                    const unsigned char *buf) {
+  if (qemu_net_queue_send(queue, sender, 0, buf, 8, packet_sent) == 0) {
+    qemu_del_net_queue(queue);
+    g_free(sender);
+  }
+}
+
+void deleting_other_queue_keeps_packet_pending(NetQueue *queue,
+                                               NetQueue *other,
+                                               NetClientState *sender,
+                                               const unsigned char *buf) {
+  if (queue == other)
+    return;
+  // expected-note@+1 {{Packet queued here}}
+  if (qemu_net_queue_send(queue, sender, 0, buf, 8, packet_sent) == 0) {
+    qemu_del_net_queue(other);
+    g_free(sender); // expected-warning {{Object is released while a queued network packet can still use it}}
+  }
+}
+
+void queued_network_payload_is_copied(NetClientState *sender) {
+  unsigned char payload[8];
+  qemu_send_packet_async(sender, payload, 8, packet_sent);
+  qemu_purge_queued_packets(sender);
 }
 
 void release_with_scheduled_coroutine(char *ptr) {
