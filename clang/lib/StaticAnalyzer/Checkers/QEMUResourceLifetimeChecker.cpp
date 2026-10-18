@@ -756,6 +756,48 @@ static const Stmt *findEnclosingBodyLoop(DynTypedNode Node, ASTContext &Ctx) {
   }
 }
 
+static bool containsQueueRemoval(const Stmt *S, const MemRegion *Binding,
+                                 SourceLocation ReleaseLoc,
+                                 ProgramStateRef State, CheckerContext &C) {
+  if (!S)
+    return false;
+
+  if (const auto *E = dyn_cast<Expr>(S)) {
+    const SourceManager &SM = C.getSourceManager();
+    SourceLocation RemovalLoc = SM.getExpansionLoc(E->getExprLoc());
+    if (isQEMUQueueRemovalMacro(E, C) &&
+        referencesLocalBinding(E, Binding, State, C) && RemovalLoc.isValid() &&
+        ReleaseLoc.isValid() &&
+        SM.getFileID(RemovalLoc) == SM.getFileID(ReleaseLoc) &&
+        SM.isBeforeInTranslationUnit(RemovalLoc, ReleaseLoc))
+      return true;
+  }
+
+  for (const Stmt *Child : S->children())
+    if (containsQueueRemoval(Child, Binding, ReleaseLoc, State, C))
+      return true;
+  return false;
+}
+
+static bool hasPriorTopLevelQueueRemoval(const Stmt *LoopBody,
+                                         const MemRegion *Binding,
+                                         SourceLocation ReleaseLoc,
+                                         ProgramStateRef State,
+                                         CheckerContext &C) {
+  const auto *Body = dyn_cast_or_null<CompoundStmt>(LoopBody);
+  if (!Body)
+    return false;
+
+  // Queue-removal macros expand to a top-level do/while statement in QEMU.
+  // Requiring that shape avoids treating a conditional removal as proof that
+  // every path reaching the later release unlinked the element.
+  for (const Stmt *Child : Body->body())
+    if (isa<DoStmt>(Child) &&
+        containsQueueRemoval(Child, Binding, ReleaseLoc, State, C))
+      return true;
+  return false;
+}
+
 static bool isAIOWaitMacro(const StmtExpr *S, CheckerContext &C) {
   SourceLocation Loc = S->getBeginLoc();
   const SourceManager &SM = C.getSourceManager();
@@ -952,6 +994,37 @@ class QEMUResourceLifetimeChecker
     // iteration a new logical object even when the core analyzer reuses the
     // old symbolic value for the list head.
     return SM.isBeforeInTranslationUnit(UseLoc, ReleaseLoc);
+  }
+
+  static bool isLoopCarriedQueueRelease(const MemRegion *Binding,
+                                        const Expr *At, const Expr *Origin,
+                                        ProgramStateRef State,
+                                        CheckerContext &C) {
+    // A repeated visit to the same release expression can represent a new
+    // intrusive-list element even when RegionStore reuses the QLIST_FIRST()
+    // symbol across the loop backedge.  Only recognize QEMU's canonical
+    // remove-before-free idiom; a missing or later removal remains unsafe.
+    if (!Binding || !At || At != Origin)
+      return false;
+
+    const auto *UseBinding = dyn_cast<VarRegion>(Binding);
+    const auto *VD =
+        UseBinding ? dyn_cast<VarDecl>(UseBinding->getDecl()) : nullptr;
+    if (!VD || !isQEMUQueueHeadMacro(VD->getInit(), C))
+      return false;
+
+    ASTContext &Ctx = C.getASTContext();
+    const Stmt *ReleaseLoop =
+        findEnclosingBodyLoop(DynTypedNode::create(*At), Ctx);
+    const Stmt *DeclLoop =
+        findEnclosingBodyLoop(DynTypedNode::create(*VD), Ctx);
+    if (!ReleaseLoop || ReleaseLoop != DeclLoop)
+      return false;
+
+    SourceLocation ReleaseLoc =
+        C.getSourceManager().getExpansionLoc(At->getExprLoc());
+    return hasPriorTopLevelQueueRemoval(getLoopBody(ReleaseLoop), Binding,
+                                        ReleaseLoc, State, C);
   }
 
   static const unsigned *getRefCount(ProgramStateRef State, RefKind Kind,
@@ -1384,7 +1457,13 @@ void QEMUResourceLifetimeChecker::handlePointerRelease(
         State->get<QEMUReleasedPointerBindings>(Sym)
             ? *State->get<QEMUReleasedPointerBindings>(Sym)
             : nullptr;
-    if (isReboundThrough(PreviousBinding, ValueExpr, Sym, State, C)) {
+    const Expr *PreviousOrigin =
+        State->get<QEMUReleasedPointerOrigins>(Sym)
+            ? *State->get<QEMUReleasedPointerOrigins>(Sym)
+            : nullptr;
+    if (isReboundThrough(PreviousBinding, ValueExpr, Sym, State, C) ||
+        isLoopCarriedQueueRelease(PreviousBinding, Call.getOriginExpr(),
+                                  PreviousOrigin, State, C)) {
       State = State
                   ->set<QEMUReleasedPointers>(
                       Sym, static_cast<unsigned>(Classified.Role))
@@ -1397,13 +1476,10 @@ void QEMUResourceLifetimeChecker::handlePointerRelease(
       C.addTransition(State);
       return;
     }
-    const Expr *Origin = State->get<QEMUReleasedPointerOrigins>(Sym)
-                             ? *State->get<QEMUReleasedPointerOrigins>(Sym)
-                             : nullptr;
     std::string Message = ("Pointer released by " +
                            pointerReleaseName(*Previous) + " is released again")
                               .str();
-    report(PointerBug, Message, Sym, Call.getOriginExpr(), Origin,
+    report(PointerBug, Message, Sym, Call.getOriginExpr(), PreviousOrigin,
            "Pointer first released here", State, C);
     return;
   }

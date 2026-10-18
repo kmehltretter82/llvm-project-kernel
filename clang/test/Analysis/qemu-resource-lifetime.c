@@ -122,8 +122,13 @@ struct QueueNode {
        (item) && (((next_item) = (item)->next), 1); (item) = (next_item))
 #define QLIST_FIRST(head) ((head)->lh_first)
 #define QLIST_EMPTY(head) (QLIST_FIRST(head) == 0)
-#define QLIST_REMOVE(item, field)                                            \
-  (*(item)->field.le_prev = (item)->field.le_next)
+#define QLIST_REMOVE(item, field) do {                                       \
+  if ((item)->field.le_next != 0)                                            \
+    (item)->field.le_next->field.le_prev = (item)->field.le_prev;             \
+  *(item)->field.le_prev = (item)->field.le_next;                            \
+  (item)->field.le_next = 0;                                                 \
+  (item)->field.le_prev = 0;                                                 \
+} while (0)
 
 static inline void g_autoptr_cleanup_generic_gfree(void *slot) {
   void **ptr = slot;
@@ -228,11 +233,28 @@ void remove_queue_head_loop_is_safe(QueueHead *head) {
   }
 }
 
+void queue_head_loop_without_remove_is_unsafe(QueueHead *head) {
+  while (!QLIST_EMPTY(head)) {
+    QueueNode *item = QLIST_FIRST(head);
+    g_free(item); // expected-note {{Pointer first released here}}
+                  // expected-warning@-1 {{Pointer released by g_free is released again}}
+  }
+}
+
+void queue_head_loop_remove_after_free_is_unsafe(QueueHead *head) {
+  while (!QLIST_EMPTY(head)) {
+    QueueNode *item = QLIST_FIRST(head);
+    g_free(item); // expected-note 7 {{Pointer released here}}
+    // expected-warning@+1 7 {{Pointer is dereferenced after it was released by g_free}}
+    QLIST_REMOVE(item, next);
+  }
+}
+
 void free_before_queue_remove_is_unsafe(QueueNode *item) {
   if (!item->next.le_prev)
     return;
-  g_free(item); // expected-note 2 {{Pointer released here}}
-  // expected-warning@+1 2 {{Pointer is dereferenced after it was released by g_free}}
+  g_free(item); // expected-note 7 {{Pointer released here}}
+  // expected-warning@+1 7 {{Pointer is dereferenced after it was released by g_free}}
   QLIST_REMOVE(item, next);
 }
 
@@ -241,10 +263,10 @@ void queue_loop_without_rebind_is_unsafe(QueueHead *head) {
   if (!item->next.le_prev)
     return;
   for (int i = 0; i < 2; i++) {
-    // expected-warning@+1 2 {{Pointer is dereferenced after it was released by g_free}}
+    // expected-warning@+1 7 {{Pointer is dereferenced after it was released by g_free}}
     QLIST_REMOVE(item, next);
     if (i == 0)
-      g_free(item); // expected-note 2 {{Pointer released here}}
+      g_free(item); // expected-note 7 {{Pointer released here}}
   }
 }
 
