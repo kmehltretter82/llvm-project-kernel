@@ -59,6 +59,7 @@ REGISTER_MAP_WITH_PROGRAMSTATE(QEMUPersistentLocalSources, const VarRegion *,
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUInputClasses, SymbolRef, unsigned)
 REGISTER_SET_WITH_PROGRAMSTATE(QEMUVirtqueueElements, const MemRegion *)
 REGISTER_SET_WITH_PROGRAMSTATE(QEMUVirtqueueIovecs, const MemRegion *)
+REGISTER_MAP_WITH_PROGRAMSTATE(QEMUInputIovecs, const MemRegion *, unsigned)
 
 namespace {
 
@@ -71,6 +72,8 @@ enum class InputClass {
   DiskImage,
   Virtio,
   Virtqueue,
+  PCIConfig,
+  DeviceRequest,
   Mixed
 };
 
@@ -84,6 +87,34 @@ struct CallbackInfo {
   std::optional<uint64_t> AccessSizeLimit;
   std::optional<unsigned> DataParameter;
   std::optional<uint64_t> DataMaximum;
+  uint64_t IovecMask = 0;
+};
+
+enum class CallbackSignature {
+  VirtioSetFeaturesEx,
+  VirtioSetFeatures,
+  VirtioSetConfig,
+  VirtioSetStatus,
+  VirtioQueueIndex,
+  PCIConfigWrite,
+  NetReceive,
+  NetReceiveIovec,
+  NetFilterReceiveIovec,
+  SCSIParseCDB,
+  SCSISendCommand,
+};
+
+struct CallbackFieldSpec {
+  const char *RecordName;
+  const char *FieldName;
+  InputClass Source;
+  uint64_t ParameterMask;
+  uint64_t PointeeMask;
+  uint64_t IovecMask;
+  CallbackSignature Signature;
+  int AddressParameter = -1;
+  int AccessSizeParameter = -1;
+  uint64_t AccessSizeLimit = 0;
 };
 
 struct BoundStates {
@@ -208,6 +239,10 @@ static StringRef inputClassName(InputClass Source) {
     return "virtio configuration";
   case InputClass::Virtqueue:
     return "virtqueue request";
+  case InputClass::PCIConfig:
+    return "PCI configuration";
+  case InputClass::DeviceRequest:
+    return "device request";
   case InputClass::Mixed:
     return "mixed guest input";
   }
@@ -289,27 +324,167 @@ class QEMUGuestMemorySafetyChecker
   mutable std::unique_ptr<BugType> LevelCBug;
   bool ReportLevelC = false;
 
+  static bool isNamedRecordPointer(QualType Type, StringRef Name) {
+    if (!Type->isPointerType())
+      return false;
+    const RecordDecl *Record =
+        Type->getPointeeType().getUnqualifiedType()->getAsRecordDecl();
+    return Record && Record->getName() == Name;
+  }
+
+  static bool isBytePointer(QualType Type, ASTContext &Context) {
+    if (!Type->isPointerType())
+      return false;
+    QualType Pointee = Type->getPointeeType().getUnqualifiedType();
+    return Pointee->isIntegerType() && Context.getIntWidth(Pointee) == 8;
+  }
+
+  static bool isVoidPointer(QualType Type) {
+    return Type->isPointerType() &&
+           Type->getPointeeType().getUnqualifiedType()->isVoidType();
+  }
+
+  static bool isIntegerWidth(QualType Type, unsigned Width,
+                             ASTContext &Context) {
+    return Type->isIntegralOrEnumerationType() &&
+           Context.getIntWidth(Type) == Width;
+  }
+
+  static bool isInteger(QualType Type) {
+    return Type->isIntegralOrEnumerationType();
+  }
+
+  static bool callbackSignatureMatches(const FunctionDecl *FD,
+                                       CallbackSignature Signature) {
+    if (!FD || FD->isVariadic())
+      return false;
+    ASTContext &Context = FD->getASTContext();
+    auto HasParameters = [&](unsigned Count) {
+      return FD->getNumParams() == Count;
+    };
+    auto Parameter = [&](unsigned Index) {
+      return FD->getParamDecl(Index)->getType();
+    };
+    auto ReturnsVoid = [&] { return FD->getReturnType()->isVoidType(); };
+    auto ReturnsInteger = [&] { return isInteger(FD->getReturnType()); };
+
+    switch (Signature) {
+    case CallbackSignature::VirtioSetFeaturesEx:
+      return HasParameters(2) && ReturnsVoid() &&
+             isNamedRecordPointer(Parameter(0), "VirtIODevice") &&
+             Parameter(1)->isPointerType() &&
+             isIntegerWidth(Parameter(1)->getPointeeType(), 64, Context);
+    case CallbackSignature::VirtioSetFeatures:
+      return HasParameters(2) && ReturnsVoid() &&
+             isNamedRecordPointer(Parameter(0), "VirtIODevice") &&
+             isIntegerWidth(Parameter(1), 64, Context);
+    case CallbackSignature::VirtioSetConfig:
+      return HasParameters(2) && ReturnsVoid() &&
+             isNamedRecordPointer(Parameter(0), "VirtIODevice") &&
+             isBytePointer(Parameter(1), Context);
+    case CallbackSignature::VirtioSetStatus:
+      return HasParameters(2) && ReturnsInteger() &&
+             isNamedRecordPointer(Parameter(0), "VirtIODevice") &&
+             isIntegerWidth(Parameter(1), 8, Context);
+    case CallbackSignature::VirtioQueueIndex:
+      return HasParameters(2) && ReturnsVoid() &&
+             isNamedRecordPointer(Parameter(0), "VirtIODevice") &&
+             isIntegerWidth(Parameter(1), 32, Context);
+    case CallbackSignature::PCIConfigWrite:
+      return HasParameters(4) && ReturnsVoid() &&
+             isNamedRecordPointer(Parameter(0), "PCIDevice") &&
+             isIntegerWidth(Parameter(1), 32, Context) &&
+             isIntegerWidth(Parameter(2), 32, Context) &&
+             isInteger(Parameter(3));
+    case CallbackSignature::NetReceive:
+      return HasParameters(3) && ReturnsInteger() &&
+             isNamedRecordPointer(Parameter(0), "NetClientState") &&
+             isBytePointer(Parameter(1), Context) && isInteger(Parameter(2));
+    case CallbackSignature::NetReceiveIovec:
+      return HasParameters(3) && ReturnsInteger() &&
+             isNamedRecordPointer(Parameter(0), "NetClientState") &&
+             isNamedRecordPointer(Parameter(1), "iovec") &&
+             isInteger(Parameter(2));
+    case CallbackSignature::NetFilterReceiveIovec:
+      return HasParameters(6) && ReturnsInteger() &&
+             isNamedRecordPointer(Parameter(0), "NetFilterState") &&
+             isNamedRecordPointer(Parameter(1), "NetClientState") &&
+             isInteger(Parameter(2)) &&
+             isNamedRecordPointer(Parameter(3), "iovec") &&
+             isInteger(Parameter(4)) && Parameter(5)->isPointerType() &&
+             Parameter(5)->getPointeeType()->isFunctionProtoType();
+    case CallbackSignature::SCSIParseCDB:
+      return HasParameters(5) && ReturnsInteger() &&
+             isNamedRecordPointer(Parameter(0), "SCSIDevice") &&
+             isNamedRecordPointer(Parameter(1), "SCSICommand") &&
+             isBytePointer(Parameter(2), Context) && isInteger(Parameter(3)) &&
+             isVoidPointer(Parameter(4));
+    case CallbackSignature::SCSISendCommand:
+      return HasParameters(2) && ReturnsInteger() &&
+             isNamedRecordPointer(Parameter(0), "SCSIRequest") &&
+             isBytePointer(Parameter(1), Context);
+    }
+    llvm_unreachable("unknown QEMU callback signature");
+  }
+
+  static const CallbackFieldSpec *callbackFieldSpec(StringRef RecordName,
+                                                    StringRef FieldName) {
+    static constexpr CallbackFieldSpec Specs[] = {
+        {"VirtioDeviceClass", "set_features_ex", InputClass::Virtio, 0,
+         uint64_t(1) << 1, 0, CallbackSignature::VirtioSetFeaturesEx},
+        {"VirtioDeviceClass", "set_features", InputClass::Virtio,
+         uint64_t(1) << 1, 0, 0, CallbackSignature::VirtioSetFeatures},
+        {"VirtioDeviceClass", "set_config", InputClass::Virtio, 0,
+         uint64_t(1) << 1, 0, CallbackSignature::VirtioSetConfig},
+        {"VirtioDeviceClass", "set_status", InputClass::Virtio,
+         uint64_t(1) << 1, 0, 0, CallbackSignature::VirtioSetStatus},
+        {"VirtioDeviceClass", "queue_reset", InputClass::Virtio,
+         uint64_t(1) << 1, 0, 0, CallbackSignature::VirtioQueueIndex},
+        {"VirtioDeviceClass", "queue_enable", InputClass::Virtio,
+         uint64_t(1) << 1, 0, 0, CallbackSignature::VirtioQueueIndex},
+        {"PCIDeviceClass", "config_write", InputClass::PCIConfig,
+         (uint64_t(1) << 1) | (uint64_t(1) << 2) | (uint64_t(1) << 3), 0, 0,
+         CallbackSignature::PCIConfigWrite, 1, 3, 4},
+        {"NetClientInfo", "receive", InputClass::Network, uint64_t(1) << 2,
+         uint64_t(1) << 1, 0, CallbackSignature::NetReceive},
+        {"NetClientInfo", "receive_iov", InputClass::Network, uint64_t(1) << 2,
+         0, uint64_t(1) << 1, CallbackSignature::NetReceiveIovec},
+        {"NetFilterClass", "receive_iov", InputClass::Network,
+         (uint64_t(1) << 2) | (uint64_t(1) << 4), 0, uint64_t(1) << 3,
+         CallbackSignature::NetFilterReceiveIovec},
+        {"SCSIBusInfo", "parse_cdb", InputClass::DeviceRequest,
+         uint64_t(1) << 3, uint64_t(1) << 2, 0,
+         CallbackSignature::SCSIParseCDB},
+        {"SCSIDeviceClass", "parse_cdb", InputClass::DeviceRequest,
+         uint64_t(1) << 3, uint64_t(1) << 2, 0,
+         CallbackSignature::SCSIParseCDB},
+        {"SCSIReqOps", "send_command", InputClass::DeviceRequest, 0,
+         uint64_t(1) << 1, 0, CallbackSignature::SCSISendCommand},
+    };
+    for (const CallbackFieldSpec &Spec : Specs)
+      if (RecordName == Spec.RecordName && FieldName == Spec.FieldName)
+        return &Spec;
+    return nullptr;
+  }
+
   void
-  addCallback(const Expr *Initializer, InputClass Source,
-              std::initializer_list<unsigned> Parameters,
-              std::initializer_list<unsigned> Pointees = {},
+  addCallback(const FunctionDecl *FD, InputClass Source, uint64_t ParameterMask,
+              uint64_t PointeeMask = 0, uint64_t IovecMask = 0,
               std::optional<unsigned> AddressParameter = std::nullopt,
               std::optional<unsigned> AccessSizeParameter = std::nullopt,
               std::optional<uint64_t> AccessSizeLimit = std::nullopt) const {
-    const FunctionDecl *FD = referencedFunction(Initializer);
     if (!FD)
       return;
+    FD = FD->getCanonicalDecl();
     CallbackInfo &Info = Callbacks[FD];
-    if (Info.ParameterMask && Info.Source != Source)
+    if ((Info.ParameterMask || Info.PointeeMask || Info.IovecMask) &&
+        Info.Source != Source)
       Info.Source = InputClass::Mixed;
     else
       Info.Source = Source;
-    for (unsigned Parameter : Parameters)
-      if (Parameter < 64)
-        Info.ParameterMask |= uint64_t(1) << Parameter;
-    for (unsigned Parameter : Pointees)
-      if (Parameter < 64)
-        Info.PointeeMask |= uint64_t(1) << Parameter;
+    Info.ParameterMask |= ParameterMask;
+    Info.PointeeMask |= PointeeMask;
+    Info.IovecMask |= IovecMask;
     if (AddressParameter && AccessSizeParameter) {
       if ((!Info.AddressParameter ||
            *Info.AddressParameter == *AddressParameter) &&
@@ -327,6 +502,45 @@ class QEMUGuestMemorySafetyChecker
           std::max(Info.AccessSizeLimit.value_or(0), *AccessSizeLimit);
   }
 
+  void
+  addCallback(const Expr *Initializer, InputClass Source,
+              std::initializer_list<unsigned> Parameters,
+              std::initializer_list<unsigned> Pointees = {},
+              std::optional<unsigned> AddressParameter = std::nullopt,
+              std::optional<unsigned> AccessSizeParameter = std::nullopt,
+              std::optional<uint64_t> AccessSizeLimit = std::nullopt) const {
+    uint64_t ParameterMask = 0;
+    for (unsigned Parameter : Parameters)
+      if (Parameter < 64)
+        ParameterMask |= uint64_t(1) << Parameter;
+    uint64_t PointeeMask = 0;
+    for (unsigned Parameter : Pointees)
+      if (Parameter < 64)
+        PointeeMask |= uint64_t(1) << Parameter;
+    addCallback(referencedFunction(Initializer), Source, ParameterMask,
+                PointeeMask, 0, AddressParameter, AccessSizeParameter,
+                AccessSizeLimit);
+  }
+
+  void addCallback(const Expr *Initializer,
+                   const CallbackFieldSpec &Spec) const {
+    const FunctionDecl *FD = referencedFunction(Initializer);
+    if (!callbackSignatureMatches(FD, Spec.Signature))
+      return;
+    std::optional<unsigned> AddressParameter;
+    std::optional<unsigned> AccessSizeParameter;
+    std::optional<uint64_t> AccessSizeLimit;
+    if (Spec.AddressParameter >= 0)
+      AddressParameter = static_cast<unsigned>(Spec.AddressParameter);
+    if (Spec.AccessSizeParameter >= 0)
+      AccessSizeParameter = static_cast<unsigned>(Spec.AccessSizeParameter);
+    if (Spec.AccessSizeLimit)
+      AccessSizeLimit = Spec.AccessSizeLimit;
+    addCallback(FD, Spec.Source, Spec.ParameterMask, Spec.PointeeMask,
+                Spec.IovecMask, AddressParameter, AccessSizeParameter,
+                AccessSizeLimit);
+  }
+
   void discoverCallbackAssignment(const BinaryOperator *Assignment) const {
     if (!Assignment || Assignment->getOpcode() != BO_Assign)
       return;
@@ -336,10 +550,12 @@ class QEMUGuestMemorySafetyChecker
         Member ? dyn_cast<FieldDecl>(Member->getMemberDecl()) : nullptr;
     const auto *Parent =
         Field ? dyn_cast<RecordDecl>(Field->getDeclContext()) : nullptr;
-    if (!Field || !Parent || Parent->getName() != "VirtioDeviceClass" ||
-        Field->getName() != "set_config")
+    if (!Field || !Parent)
       return;
-    addCallback(Assignment->getRHS(), InputClass::Virtio, {}, {1});
+    const CallbackFieldSpec *Spec =
+        callbackFieldSpec(Parent->getName(), Field->getName());
+    if (Spec)
+      addCallback(Assignment->getRHS(), *Spec);
   }
 
   void addPersistentGuestField(const FieldDecl *Field,
@@ -1108,6 +1324,10 @@ class QEMUGuestMemorySafetyChecker
     if (!RD)
       return;
     StringRef Name = RD->getName();
+    for (const FieldDecl *Field : RD->fields())
+      if (const CallbackFieldSpec *Spec =
+              callbackFieldSpec(Name, Field->getName()))
+        addCallback(fieldInitializer(ILE, Field->getName()), *Spec);
     if (Name == "MemoryRegionOps") {
       std::optional<uint64_t> ExplicitAccessSize;
       if (const InitListExpr *Impl =
@@ -1159,10 +1379,6 @@ class QEMUGuestMemorySafetyChecker
       addCallback(fieldInitializer(ILE, "read"), InputClass::PIO, {1});
       addCallback(fieldInitializer(ILE, "write"), InputClass::PIO, {1, 2});
       return;
-    }
-    if (Name == "NetClientInfo") {
-      addCallback(fieldInitializer(ILE, "receive"), InputClass::Network, {2},
-                  {1});
     }
   }
 
@@ -2045,6 +2261,29 @@ class QEMUGuestMemorySafetyChecker
     return Argument < Call.getNumArgs() &&
            (isTrackedVirtqueueIovec(State, Call.getArgSVal(Argument)) ||
             isVirtqueueOutIovecValue(State, Call.getArgSVal(Argument)));
+  }
+
+  static std::optional<InputClass> inputIovecSource(ProgramStateRef State,
+                                                    SVal Value) {
+    const MemRegion *Region = pointerBaseRegion(Value);
+    if (Region)
+      if (const unsigned *Stored = State->get<QEMUInputIovecs>(Region))
+        return static_cast<InputClass>(*Stored);
+    if (isTrackedVirtqueueIovec(State, Value) ||
+        isVirtqueueOutIovecValue(State, Value))
+      return InputClass::Virtqueue;
+    return std::nullopt;
+  }
+
+  static ProgramStateRef addInputIovec(ProgramStateRef State, SVal Value,
+                                       InputClass Source) {
+    const MemRegion *Region = pointerBaseRegion(Value);
+    if (!Region)
+      return State;
+    if (const unsigned *Stored = State->get<QEMUInputIovecs>(Region))
+      if (static_cast<InputClass>(*Stored) != Source)
+        Source = InputClass::Mixed;
+    return State->set<QEMUInputIovecs>(Region, static_cast<unsigned>(Source));
   }
 
   struct IntegerRange {
@@ -3365,7 +3604,8 @@ public:
          ++Index) {
       uint64_t Bit = uint64_t(1) << Index;
       if (!(Found->second.ParameterMask & Bit) &&
-          !(Found->second.PointeeMask & Bit))
+          !(Found->second.PointeeMask & Bit) &&
+          !(Found->second.IovecMask & Bit))
         continue;
       const ParmVarDecl *Parameter = FD->getParamDecl(Index);
       const MemRegion *Region = State->getRegion(Parameter, C.getStackFrame());
@@ -3379,6 +3619,8 @@ public:
           State = addInputTaint(State, *Pointee, Found->second.Source);
           Sources.push_back({*Pointee, Parameter->getNameAsString()});
         }
+      if (Found->second.IovecMask & Bit)
+        State = addInputIovec(State, Value, Found->second.Source);
     }
     if (State == C.getState())
       return;
@@ -3675,6 +3917,10 @@ public:
     for (const MemRegion *Region : State->get<QEMUVirtqueueIovecs>())
       if (!SymReaper.isLiveRegion(Region))
         State = State->remove<QEMUVirtqueueIovecs>(Region);
+    auto InputIovecs = State->get<QEMUInputIovecs>();
+    for (const auto &Entry : InputIovecs)
+      if (!SymReaper.isLiveRegion(Entry.first))
+        State = State->remove<QEMUInputIovecs>(Entry.first);
     if (State != C.getState())
       C.addTransition(State);
   }
@@ -3684,6 +3930,8 @@ public:
       SymReaper.markLive(Region);
     for (const MemRegion *Region : State->get<QEMUVirtqueueIovecs>())
       SymReaper.markLive(Region);
+    for (const auto &Entry : State->get<QEMUInputIovecs>())
+      SymReaper.markLive(Entry.first);
   }
 
   void checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const {

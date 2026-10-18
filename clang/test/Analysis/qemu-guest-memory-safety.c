@@ -3,15 +3,20 @@
 typedef __SIZE_TYPE__ size_t;
 typedef __UINT64_TYPE__ uint64_t;
 
+typedef struct BdrvChild BdrvChild;
+typedef struct NetClientState NetClientState;
+typedef struct VirtIODevice VirtIODevice;
+typedef struct QEMUIOVector QEMUIOVector;
+
 void *memcpy(void *, const void *, size_t);
 void *memset(void *, int, size_t);
 void *malloc(size_t);
 unsigned dma_memory_read(void *, uint64_t, void *, size_t, unsigned);
 void physical_memory_read(uint64_t, void *, uint64_t);
 size_t qemu_get_buffer(void *, unsigned char *, size_t);
-int bdrv_pread(void *, long long, long long, void *, unsigned);
+int bdrv_pread(BdrvChild *, long long, long long, void *, unsigned);
 unsigned qemu_get_byte(void *);
-size_t qemu_iovec_to_buf(void *, size_t, void *, size_t);
+size_t qemu_iovec_to_buf(QEMUIOVector *, size_t, void *, size_t);
 int range_covers_byte(uint64_t, uint64_t, uint64_t);
 long qemu_send_packet(void *, const unsigned char *, int);
 int test_bit(long, const unsigned long *);
@@ -55,12 +60,12 @@ void memory_region_init_io(MemoryRegion *, void *, const MemoryRegionOps *,
 typedef struct NetClientInfo {
   unsigned type;
   size_t size;
-  long (*receive)(void *, const unsigned char *, size_t);
+  long (*receive)(NetClientState *, const unsigned char *, size_t);
   long (*receive_iov)(void *, const void *, int);
 } NetClientInfo;
 
 typedef struct VirtioDeviceClass {
-  void (*set_config)(void *, const unsigned char *);
+  void (*set_config)(VirtIODevice *, const unsigned char *);
 } VirtioDeviceClass;
 
 typedef struct VMStateField {
@@ -92,7 +97,7 @@ enum {
 
 static unsigned virtio_config_result;
 
-static void virtio_config_index(void *device,
+static void virtio_config_index(VirtIODevice *device,
                                 const unsigned char *config) { // expected-note@-1 {{virtio configuration callback parameter 'config' is guest-controlled}}
   int slots[4] = {0};
   virtio_config_result = slots[config[0]]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
@@ -1102,7 +1107,7 @@ static unsigned disk_image_index(void *child) {
                        // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
 }
 
-static long network_index(void *client, const unsigned char *packet, // expected-note {{network receive callback parameter 'packet' is guest-controlled}}
+static long network_index(NetClientState *client, const unsigned char *packet, // expected-note {{network receive callback parameter 'packet' is guest-controlled}}
                           size_t length) {
   int slots[4] = {0};
   if (length == 0) // expected-note {{Assuming 'length' is not equal to 0}}
