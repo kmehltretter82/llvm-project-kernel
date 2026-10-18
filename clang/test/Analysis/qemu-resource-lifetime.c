@@ -20,6 +20,15 @@ typedef struct QemuEvent {
 typedef struct QemuThread {
   int value;
 } QemuThread;
+typedef struct QemuCond {
+  int value;
+} QemuCond;
+typedef struct QemuMutex {
+  int value;
+} QemuMutex;
+typedef struct QemuLockable {
+  int value;
+} QemuLockable;
 typedef void QEMUBHFunc(void *opaque);
 typedef void QEMUTimerCB(void *opaque);
 typedef void BlockCompletionFunc(void *opaque, int ret);
@@ -58,6 +67,30 @@ void main_loop_wait(int blocking);
 int g_main_context_iteration(void *ctx, int blocking);
 void qemu_event_wait(QemuEvent *event);
 void qemu_thread_join(QemuThread *thread);
+void qemu_cond_signal(QemuCond *cond);
+typedef void (*QemuMutexLockFunc)(QemuMutex *mutex);
+extern QemuMutexLockFunc qemu_mutex_lock_func;
+#define qemu_mutex_lock(mutex)                                                \
+  ({                                                                          \
+    QemuMutexLockFunc _f = qemu_mutex_lock_func;                              \
+    _f((mutex));                                                               \
+  })
+void qemu_mutex_unlock_impl(QemuMutex *mutex);
+#define qemu_mutex_unlock(mutex) qemu_mutex_unlock_impl(mutex)
+typedef void (*QemuCondWaitFunc)(QemuCond *cond, QemuMutex *mutex);
+extern QemuCondWaitFunc qemu_cond_wait_func;
+#define qemu_cond_wait(cond, mutex)                                            \
+  ({                                                                           \
+    QemuCondWaitFunc _f = qemu_cond_wait_func;                                 \
+    _f((cond), (mutex));                                                       \
+  })
+QemuLockable *qemu_lockable_auto_lock(QemuLockable *lockable);
+void glib_autoptr_cleanup_QemuLockable(QemuLockable **lockable);
+
+#define QEMU_LOCK_GUARD(lock)                                                   \
+  QemuLockable *qemu_lockable_auto_guard                                       \
+      __attribute__((cleanup(glib_autoptr_cleanup_QemuLockable))) =             \
+          qemu_lockable_auto_lock((QemuLockable *)(lock))
 
 QEMUTimer *timer_new_ns(int type, QEMUTimerCB *cb, void *opaque);
 void timer_mod_ns(QEMUTimer *timer, long expires);
@@ -465,6 +498,258 @@ void dormant_bh_does_not_retain_live_use(char *ptr) {
 void release_with_oneshot_bh(char *ptr) {
   aio_bh_schedule_oneshot_full(0, async_callback, ptr, "test"); // expected-note {{Callback made pending here}}
   g_free(ptr); // expected-warning {{Object is released while a pending bottom-half callback can still use it}}
+}
+
+enum {
+  HANDSHAKE_CLOSING = 1,
+  HANDSHAKE_CLOSED = 2,
+};
+
+typedef struct HandshakeOwner {
+  int state;
+  QemuCond close_cv;
+  QemuMutex lock;
+  QemuMutex other_lock;
+} HandshakeOwner;
+
+static void handshake_close_callback(void *opaque) {
+  HandshakeOwner *owner = opaque;
+  QEMU_LOCK_GUARD(&owner->lock);
+  owner->state = HANDSHAKE_CLOSED;
+  qemu_cond_signal(&owner->close_cv);
+}
+
+void oneshot_bh_state_condition_handshake_is_safe(HandshakeOwner *owner) {
+  qemu_mutex_lock(&owner->lock);
+  aio_bh_schedule_oneshot_full(0, handshake_close_callback, owner, "close");
+  while (owner->state != HANDSHAKE_CLOSED) {
+    qemu_cond_wait(&owner->close_cv, &owner->lock);
+  }
+  qemu_mutex_unlock(&owner->lock);
+  g_free(owner);
+}
+
+void oneshot_bh_wait_before_schedule_is_unsafe(HandshakeOwner *owner) {
+  qemu_mutex_lock(&owner->lock);
+  while (owner->state != HANDSHAKE_CLOSED) {
+    qemu_cond_wait(&owner->close_cv, &owner->lock);
+  }
+  // expected-note@+1 {{Callback made pending here}}
+  aio_bh_schedule_oneshot_full(0, handshake_close_callback, owner, "close");
+  qemu_mutex_unlock(&owner->lock);
+  g_free(owner); // expected-warning {{Object is released while a pending bottom-half callback can still use it}}
+}
+
+void oneshot_bh_missing_caller_lock_is_unsafe(HandshakeOwner *owner) {
+  // expected-note@+1 {{Callback made pending here}}
+  aio_bh_schedule_oneshot_full(0, handshake_close_callback, owner, "close");
+  while (owner->state != HANDSHAKE_CLOSED) {
+    qemu_cond_wait(&owner->close_cv, &owner->lock);
+  }
+  g_free(owner); // expected-warning {{Object is released while a pending bottom-half callback can still use it}}
+}
+
+void oneshot_bh_wrong_caller_lock_is_unsafe(HandshakeOwner *owner) {
+  qemu_mutex_lock(&owner->other_lock);
+  // expected-note@+1 {{Callback made pending here}}
+  aio_bh_schedule_oneshot_full(0, handshake_close_callback, owner, "close");
+  while (owner->state != HANDSHAKE_CLOSED) {
+    qemu_cond_wait(&owner->close_cv, &owner->lock);
+  }
+  qemu_mutex_unlock(&owner->other_lock);
+  g_free(owner); // expected-warning {{Object is released while a pending bottom-half callback can still use it}}
+}
+
+void oneshot_bh_unlock_before_wait_is_unsafe(HandshakeOwner *owner) {
+  qemu_mutex_lock(&owner->lock);
+  // expected-note@+1 {{Callback made pending here}}
+  aio_bh_schedule_oneshot_full(0, handshake_close_callback, owner, "close");
+  qemu_mutex_unlock(&owner->lock);
+  while (owner->state != HANDSHAKE_CLOSED) {
+    qemu_cond_wait(&owner->close_cv, &owner->lock);
+  }
+  g_free(owner); // expected-warning {{Object is released while a pending bottom-half callback can still use it}}
+}
+
+void oneshot_bh_wait_loop_with_break_is_unsafe(HandshakeOwner *owner) {
+  qemu_mutex_lock(&owner->lock);
+  // expected-note@+1 {{Callback made pending here}}
+  aio_bh_schedule_oneshot_full(0, handshake_close_callback, owner, "close");
+  while (owner->state != HANDSHAKE_CLOSED) {
+    qemu_cond_wait(&owner->close_cv, &owner->lock);
+    break;
+  }
+  qemu_mutex_unlock(&owner->lock);
+  g_free(owner); // expected-warning {{Object is released while a pending bottom-half callback can still use it}}
+}
+
+void oneshot_bh_wrong_mutex_is_unsafe(HandshakeOwner *owner) {
+  qemu_mutex_lock(&owner->lock);
+  // expected-note@+1 {{Callback made pending here}}
+  aio_bh_schedule_oneshot_full(0, handshake_close_callback, owner, "close");
+  while (owner->state != HANDSHAKE_CLOSED) {
+    qemu_cond_wait(&owner->close_cv, &owner->other_lock);
+  }
+  qemu_mutex_unlock(&owner->lock);
+  g_free(owner); // expected-warning {{Object is released while a pending bottom-half callback can still use it}}
+}
+
+typedef struct DifferentConditionOwner {
+  int state;
+  QemuCond close_cv;
+  QemuCond ready_cv;
+  QemuMutex lock;
+} DifferentConditionOwner;
+
+static void different_condition_close_callback(void *opaque) {
+  DifferentConditionOwner *owner = opaque;
+  QEMU_LOCK_GUARD(&owner->lock);
+  owner->state = HANDSHAKE_CLOSED;
+  qemu_cond_signal(&owner->ready_cv);
+}
+
+void oneshot_bh_different_condition_is_unsafe(DifferentConditionOwner *owner) {
+  qemu_mutex_lock(&owner->lock);
+  // expected-note@+1 {{Callback made pending here}}
+  aio_bh_schedule_oneshot_full(0, different_condition_close_callback, owner,
+                               "close");
+  while (owner->state != HANDSHAKE_CLOSED) {
+    qemu_cond_wait(&owner->close_cv, &owner->lock);
+  }
+  qemu_mutex_unlock(&owner->lock);
+  g_free(owner); // expected-warning {{Object is released while a pending bottom-half callback can still use it}}
+}
+
+typedef struct DifferentTerminalOwner {
+  int state;
+  QemuCond close_cv;
+  QemuMutex lock;
+} DifferentTerminalOwner;
+
+static void different_terminal_close_callback(void *opaque) {
+  DifferentTerminalOwner *owner = opaque;
+  QEMU_LOCK_GUARD(&owner->lock);
+  owner->state = HANDSHAKE_CLOSING;
+  qemu_cond_signal(&owner->close_cv);
+}
+
+void oneshot_bh_different_terminal_is_unsafe(DifferentTerminalOwner *owner) {
+  qemu_mutex_lock(&owner->lock);
+  // expected-note@+1 {{Callback made pending here}}
+  aio_bh_schedule_oneshot_full(0, different_terminal_close_callback, owner,
+                               "close");
+  while (owner->state != HANDSHAKE_CLOSED) {
+    qemu_cond_wait(&owner->close_cv, &owner->lock);
+  }
+  qemu_mutex_unlock(&owner->lock);
+  g_free(owner); // expected-warning {{Object is released while a pending bottom-half callback can still use it}}
+}
+
+typedef struct ConditionalTerminalOwner {
+  int state;
+  int complete;
+  QemuCond close_cv;
+  QemuMutex lock;
+} ConditionalTerminalOwner;
+
+static void conditional_terminal_close_callback(void *opaque) {
+  ConditionalTerminalOwner *owner = opaque;
+  QEMU_LOCK_GUARD(&owner->lock);
+  if (owner->complete)
+    owner->state = HANDSHAKE_CLOSED;
+  qemu_cond_signal(&owner->close_cv);
+}
+
+void oneshot_bh_conditional_terminal_is_unsafe(ConditionalTerminalOwner *owner) {
+  qemu_mutex_lock(&owner->lock);
+  // expected-note@+1 {{Callback made pending here}}
+  aio_bh_schedule_oneshot_full(0, conditional_terminal_close_callback, owner,
+                               "close");
+  while (owner->state != HANDSHAKE_CLOSED) {
+    qemu_cond_wait(&owner->close_cv, &owner->lock);
+  }
+  qemu_mutex_unlock(&owner->lock);
+  g_free(owner); // expected-warning {{Object is released while a pending bottom-half callback can still use it}}
+}
+
+typedef struct DifferentOpaqueOwner {
+  int state;
+  QemuCond close_cv;
+  QemuMutex lock;
+} DifferentOpaqueOwner;
+
+static DifferentOpaqueOwner *different_opaque_target;
+
+static void different_opaque_close_callback(void *opaque) {
+  QEMU_LOCK_GUARD(&different_opaque_target->lock);
+  different_opaque_target->state = HANDSHAKE_CLOSED;
+  qemu_cond_signal(&different_opaque_target->close_cv);
+}
+
+void oneshot_bh_different_opaque_is_unsafe(DifferentOpaqueOwner *owner) {
+  qemu_mutex_lock(&owner->lock);
+  // expected-note@+1 {{Callback made pending here}}
+  aio_bh_schedule_oneshot_full(0, different_opaque_close_callback, owner,
+                               "close");
+  while (owner->state != HANDSHAKE_CLOSED) {
+    qemu_cond_wait(&owner->close_cv, &owner->lock);
+  }
+  qemu_mutex_unlock(&owner->lock);
+  g_free(owner); // expected-warning {{Object is released while a pending bottom-half callback can still use it}}
+}
+
+typedef struct WrongOrderOwner {
+  int state;
+  QemuCond close_cv;
+  QemuMutex lock;
+} WrongOrderOwner;
+
+static void wrong_order_close_callback(void *opaque) {
+  WrongOrderOwner *owner = opaque;
+  QEMU_LOCK_GUARD(&owner->lock);
+  qemu_cond_signal(&owner->close_cv);
+  owner->state = HANDSHAKE_CLOSED;
+}
+
+void oneshot_bh_wrong_callback_order_is_unsafe(WrongOrderOwner *owner) {
+  qemu_mutex_lock(&owner->lock);
+  // expected-note@+1 {{Callback made pending here}}
+  aio_bh_schedule_oneshot_full(0, wrong_order_close_callback, owner, "close");
+  while (owner->state != HANDSHAKE_CLOSED) {
+    qemu_cond_wait(&owner->close_cv, &owner->lock);
+  }
+  qemu_mutex_unlock(&owner->lock);
+  g_free(owner); // expected-warning {{Object is released while a pending bottom-half callback can still use it}}
+}
+
+typedef struct MultipleWriterOwner {
+  int state;
+  QemuCond close_cv;
+  QemuMutex lock;
+} MultipleWriterOwner;
+
+static void multiple_writer_close_callback(void *opaque) {
+  MultipleWriterOwner *owner = opaque;
+  QEMU_LOCK_GUARD(&owner->lock);
+  owner->state = HANDSHAKE_CLOSED;
+  qemu_cond_signal(&owner->close_cv);
+}
+
+static void another_terminal_writer(MultipleWriterOwner *owner) {
+  owner->state = HANDSHAKE_CLOSED;
+}
+
+void oneshot_bh_multiple_terminal_writers_is_unsafe(
+    MultipleWriterOwner *owner) {
+  qemu_mutex_lock(&owner->lock);
+  // expected-note@+1 {{Callback made pending here}}
+  aio_bh_schedule_oneshot_full(0, multiple_writer_close_callback, owner,
+                               "close");
+  while (owner->state != HANDSHAKE_CLOSED) {
+    qemu_cond_wait(&owner->close_cv, &owner->lock);
+  }
+  qemu_mutex_unlock(&owner->lock);
+  g_free(owner); // expected-warning {{Object is released while a pending bottom-half callback can still use it}}
 }
 
 void oneshot_bh_poll_before_release_is_safe(char *ptr) {

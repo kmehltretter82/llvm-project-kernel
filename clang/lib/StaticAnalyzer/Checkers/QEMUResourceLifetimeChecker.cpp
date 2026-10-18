@@ -22,6 +22,7 @@
 #include "clang/AST/Attr.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/ParentMapContext.h"
+#include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/AST/Stmt.h"
 #include "clang/Lex/Lexer.h"
 #include "clang/StaticAnalyzer/Checkers/BuiltinCheckerRegistration.h"
@@ -33,6 +34,7 @@
 #include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
 #include "llvm/ADT/FoldingSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSwitch.h"
 #include <algorithm>
 #include <cstdint>
@@ -827,6 +829,440 @@ static const StmtExpr *findEnclosingAIOWaitMacro(const Stmt *S,
   return nullptr;
 }
 
+static const MemberExpr *getAddressedField(const Expr *E) {
+  if (!E)
+    return nullptr;
+  E = E->IgnoreParenImpCasts();
+  if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
+    if (UO->getOpcode() != UO_AddrOf)
+      return nullptr;
+    E = UO->getSubExpr()->IgnoreParenImpCasts();
+  }
+  const auto *ME = dyn_cast<MemberExpr>(E);
+  return ME && ME->isArrow() && isa<FieldDecl>(ME->getMemberDecl()) ? ME
+                                                                    : nullptr;
+}
+
+static bool derivesFromParameter(const Expr *E, const ParmVarDecl *Parameter,
+                                 llvm::SmallPtrSetImpl<const VarDecl *> &Seen) {
+  if (!E)
+    return false;
+  E = E->IgnoreParenImpCasts();
+  const auto *DRE = dyn_cast<DeclRefExpr>(E);
+  const auto *VD = DRE ? dyn_cast<VarDecl>(DRE->getDecl()) : nullptr;
+  if (!VD)
+    return false;
+  if (VD == Parameter)
+    return true;
+  return VD->hasLocalStorage() && VD->hasInit() && Seen.insert(VD).second &&
+         derivesFromParameter(VD->getInit(), Parameter, Seen);
+}
+
+static bool derivesFromParameter(const Expr *E, const ParmVarDecl *Parameter) {
+  llvm::SmallPtrSet<const VarDecl *, 4> Seen;
+  return derivesFromParameter(E, Parameter, Seen);
+}
+
+struct AsyncCompletionHandshake {
+  const FieldDecl *StateField;
+  int64_t TerminalValue;
+  const FieldDecl *ConditionField;
+  const FieldDecl *MutexField;
+  const BinaryOperator *TerminalWrite;
+};
+
+class DerivedFieldFinder : public RecursiveASTVisitor<DerivedFieldFinder> {
+  const ParmVarDecl *Parameter;
+
+public:
+  const FieldDecl *Field = nullptr;
+  bool Ambiguous = false;
+
+  explicit DerivedFieldFinder(const ParmVarDecl *Parameter)
+      : Parameter(Parameter) {}
+
+  bool VisitMemberExpr(MemberExpr *ME) {
+    const auto *FD =
+        ME->isArrow() ? dyn_cast<FieldDecl>(ME->getMemberDecl()) : nullptr;
+    if (!FD || !derivesFromParameter(ME->getBase(), Parameter))
+      return true;
+    if (Field && Field != FD)
+      Ambiguous = true;
+    else
+      Field = FD;
+    return true;
+  }
+};
+
+class NamedCallFinder : public RecursiveASTVisitor<NamedCallFinder> {
+  StringRef Name;
+
+public:
+  unsigned Count = 0;
+
+  explicit NamedCallFinder(StringRef Name) : Name(Name) {}
+
+  bool VisitCallExpr(CallExpr *Call) {
+    const FunctionDecl *FD = Call->getDirectCallee();
+    if (FD && FD->getIdentifier() && FD->getName() == Name)
+      ++Count;
+    return true;
+  }
+};
+
+static const FieldDecl *getQEMULockGuardField(const DeclStmt *DS,
+                                              const ParmVarDecl *Opaque) {
+  if (!DS || !DS->isSingleDecl())
+    return nullptr;
+  const auto *VD = dyn_cast<VarDecl>(DS->getSingleDecl());
+  if (!VD || !VD->hasInit() || !VD->hasAttr<CleanupAttr>())
+    return nullptr;
+
+  NamedCallFinder LockCall("qemu_lockable_auto_lock");
+  LockCall.TraverseStmt(const_cast<Expr *>(VD->getInit()));
+  if (LockCall.Count != 1)
+    return nullptr;
+
+  const auto *Cleanup = VD->getAttr<CleanupAttr>();
+  const FunctionDecl *CleanupFunction = Cleanup->getFunctionDecl();
+  if (!CleanupFunction || !CleanupFunction->getIdentifier() ||
+      CleanupFunction->getName() != "glib_autoptr_cleanup_QemuLockable")
+    return nullptr;
+
+  DerivedFieldFinder Field(Opaque);
+  Field.TraverseStmt(const_cast<Expr *>(VD->getInit()));
+  return !Field.Ambiguous ? Field.Field : nullptr;
+}
+
+static bool isOpaqueAliasDeclaration(const DeclStmt *DS,
+                                     const ParmVarDecl *Opaque) {
+  if (!DS || !DS->isSingleDecl())
+    return false;
+  const auto *VD = dyn_cast<VarDecl>(DS->getSingleDecl());
+  return VD && VD->hasLocalStorage() && VD->hasInit() &&
+         derivesFromParameter(VD->getInit(), Opaque);
+}
+
+class TerminalFieldWriterCounter
+    : public RecursiveASTVisitor<TerminalFieldWriterCounter> {
+  const FieldDecl *Field;
+  int64_t Value;
+  ASTContext &Ctx;
+
+public:
+  unsigned Count = 0;
+  const BinaryOperator *Writer = nullptr;
+
+  TerminalFieldWriterCounter(const FieldDecl *Field, int64_t Value,
+                             ASTContext &Ctx)
+      : Field(Field), Value(Value), Ctx(Ctx) {}
+
+  bool VisitBinaryOperator(BinaryOperator *BO) {
+    if (BO->getOpcode() != BO_Assign)
+      return true;
+    const auto *ME = dyn_cast<MemberExpr>(BO->getLHS()->IgnoreParenImpCasts());
+    if (!ME || ME->getMemberDecl() != Field)
+      return true;
+    std::optional<llvm::APSInt> Assigned =
+        BO->getRHS()->getIntegerConstantExpr(Ctx);
+    if (!Assigned || Assigned->getSExtValue() != Value)
+      return true;
+    ++Count;
+    Writer = BO;
+    return true;
+  }
+};
+
+static std::optional<AsyncCompletionHandshake>
+findAsyncCompletionHandshake(const FunctionDecl *Callback, ASTContext &Ctx) {
+  if (!Callback || Callback->param_empty() || !Callback->hasBody())
+    return std::nullopt;
+  const auto *Body = dyn_cast<CompoundStmt>(Callback->getBody());
+  if (!Body)
+    return std::nullopt;
+
+  const ParmVarDecl *Opaque = Callback->getParamDecl(0);
+  const BinaryOperator *TerminalWrite = nullptr;
+  const FieldDecl *StateField = nullptr;
+  std::optional<int64_t> TerminalValue;
+  const CallExpr *Signal = nullptr;
+  const FieldDecl *ConditionField = nullptr;
+  const FieldDecl *MutexField = nullptr;
+  bool SawGuard = false;
+
+  for (const Stmt *Child : Body->body()) {
+    if (isa<NullStmt>(Child))
+      continue;
+    if (const auto *DS = dyn_cast<DeclStmt>(Child)) {
+      if (SawGuard || TerminalWrite || Signal)
+        return std::nullopt;
+      if (const FieldDecl *Field = getQEMULockGuardField(DS, Opaque)) {
+        MutexField = Field;
+        SawGuard = true;
+      } else if (!isOpaqueAliasDeclaration(DS, Opaque)) {
+        return std::nullopt;
+      }
+      continue;
+    }
+
+    if (!SawGuard)
+      return std::nullopt;
+
+    if (!TerminalWrite) {
+      const auto *BO = dyn_cast<BinaryOperator>(Child);
+      const auto *ME =
+          BO && BO->getOpcode() == BO_Assign
+              ? dyn_cast<MemberExpr>(BO->getLHS()->IgnoreParenImpCasts())
+              : nullptr;
+      std::optional<llvm::APSInt> Value =
+          BO ? BO->getRHS()->getIntegerConstantExpr(Ctx) : std::nullopt;
+      if (!ME || !ME->isArrow() || !isa<FieldDecl>(ME->getMemberDecl()) ||
+          !derivesFromParameter(ME->getBase(), Opaque) || !Value)
+        return std::nullopt;
+      TerminalWrite = BO;
+      StateField = cast<FieldDecl>(ME->getMemberDecl());
+      TerminalValue = Value->getSExtValue();
+      continue;
+    }
+
+    if (!Signal) {
+      const auto *Call = dyn_cast<CallExpr>(Child);
+      const FunctionDecl *FD = Call ? Call->getDirectCallee() : nullptr;
+      if (!FD || !FD->getIdentifier() || Call->getNumArgs() < 1 ||
+          (FD->getName() != "qemu_cond_signal" &&
+           FD->getName() != "qemu_cond_broadcast"))
+        return std::nullopt;
+      const MemberExpr *Condition = getAddressedField(Call->getArg(0));
+      if (!Condition || !derivesFromParameter(Condition->getBase(), Opaque))
+        return std::nullopt;
+      Signal = Call;
+      ConditionField = cast<FieldDecl>(Condition->getMemberDecl());
+      continue;
+    }
+
+    // The signal must be the callback's final executable statement.  This
+    // keeps the proof independent of callback code that could use the opaque
+    // object after waking the waiter.
+    return std::nullopt;
+  }
+
+  if (!MutexField || !TerminalWrite || !TerminalValue || !Signal ||
+      !ConditionField)
+    return std::nullopt;
+
+  TerminalFieldWriterCounter Counter(StateField, *TerminalValue, Ctx);
+  Counter.TraverseDecl(Ctx.getTranslationUnitDecl());
+  if (Counter.Count != 1 || Counter.Writer != TerminalWrite)
+    return std::nullopt;
+
+  return AsyncCompletionHandshake{StateField, *TerminalValue, ConditionField,
+                                  MutexField, TerminalWrite};
+}
+
+static const ValueDecl *directObject(const Expr *E) {
+  if (!E)
+    return nullptr;
+  E = E->IgnoreParenImpCasts();
+  const auto *DRE = dyn_cast<DeclRefExpr>(E);
+  return DRE ? DRE->getDecl() : nullptr;
+}
+
+static bool refersToScheduledOpaque(const Expr *E,
+                                    const ValueDecl *ScheduledOpaque) {
+  return ScheduledOpaque && directObject(E) == ScheduledOpaque;
+}
+
+static bool isMacroExpansionNamed(const Stmt *S, StringRef Expected,
+                                  ASTContext &Ctx) {
+  if (!S)
+    return false;
+  SourceLocation Loc = S->getBeginLoc();
+  const SourceManager &SM = Ctx.getSourceManager();
+  while (Loc.isMacroID()) {
+    StringRef Name = Lexer::getImmediateMacroName(Loc, SM, Ctx.getLangOpts());
+    if (Name == Expected)
+      return true;
+    Loc = SM.getImmediateMacroCallerLoc(Loc);
+  }
+  return false;
+}
+
+static bool directCalleeNamed(const CallExpr *Call,
+                              std::initializer_list<StringRef> Names) {
+  const FunctionDecl *FD = Call ? Call->getDirectCallee() : nullptr;
+  if (!FD || !FD->getIdentifier())
+    return false;
+  return llvm::is_contained(Names, FD->getName());
+}
+
+static const CallExpr *getQEMUMacroCall(
+    const Stmt *S, StringRef MacroName,
+    std::initializer_list<StringRef> DirectNames, ASTContext &Ctx) {
+  if (const auto *Call = dyn_cast_or_null<CallExpr>(S))
+    return directCalleeNamed(Call, DirectNames) ? Call : nullptr;
+
+  const auto *MacroCall = dyn_cast_or_null<StmtExpr>(S);
+  if (!MacroCall || !isMacroExpansionNamed(MacroCall, MacroName, Ctx))
+    return nullptr;
+  const auto *MacroBody = dyn_cast<CompoundStmt>(MacroCall->getSubStmt());
+  if (!MacroBody || MacroBody->body_empty())
+    return nullptr;
+  const auto *Call = dyn_cast<CallExpr>(MacroBody->body_back());
+  if (!Call)
+    return nullptr;
+  return !Call->getDirectCallee() || directCalleeNamed(Call, DirectNames)
+             ? Call
+             : nullptr;
+}
+
+static const CallExpr *singleConditionWait(const Stmt *LoopBody,
+                                           ASTContext &Ctx) {
+  const auto *Body = dyn_cast_or_null<CompoundStmt>(LoopBody);
+  if (!Body)
+    return nullptr;
+  const Stmt *Only = nullptr;
+  for (const Stmt *Child : Body->body()) {
+    if (isa<NullStmt>(Child))
+      continue;
+    if (Only)
+      return nullptr;
+    Only = Child;
+  }
+  const CallExpr *Wait = getQEMUMacroCall(
+      Only, "qemu_cond_wait", {"qemu_cond_wait", "qemu_cond_wait_impl"}, Ctx);
+  return Wait && Wait->getNumArgs() >= 2 ? Wait : nullptr;
+}
+
+static bool completionConditionMatches(const Expr *Condition,
+                                       const AsyncCompletionHandshake &Proof,
+                                       const ValueDecl *ScheduledOpaque,
+                                       ASTContext &Ctx) {
+  Condition = Condition ? Condition->IgnoreParenImpCasts() : nullptr;
+  const auto *BO = dyn_cast_or_null<BinaryOperator>(Condition);
+  if (!BO || BO->getOpcode() != BO_NE)
+    return false;
+
+  auto Matches = [&](const Expr *FieldExpression, const Expr *ValueExpression) {
+    const auto *ME =
+        dyn_cast<MemberExpr>(FieldExpression->IgnoreParenImpCasts());
+    std::optional<llvm::APSInt> Value =
+        ValueExpression->getIntegerConstantExpr(Ctx);
+    return ME && ME->isArrow() && ME->getMemberDecl() == Proof.StateField &&
+           refersToScheduledOpaque(ME->getBase(), ScheduledOpaque) && Value &&
+           Value->getSExtValue() == Proof.TerminalValue;
+  };
+  return Matches(BO->getLHS(), BO->getRHS()) ||
+         Matches(BO->getRHS(), BO->getLHS());
+}
+
+static bool loopWaitMatches(const WhileStmt *Loop,
+                            const AsyncCompletionHandshake &Proof,
+                            const ValueDecl *ScheduledOpaque, ASTContext &Ctx) {
+  if (!completionConditionMatches(Loop->getCond(), Proof, ScheduledOpaque, Ctx))
+    return false;
+  const CallExpr *Wait = singleConditionWait(Loop->getBody(), Ctx);
+  const MemberExpr *Condition =
+      Wait ? getAddressedField(Wait->getArg(0)) : nullptr;
+  const MemberExpr *Mutex = Wait ? getAddressedField(Wait->getArg(1)) : nullptr;
+  return Condition && Condition->getMemberDecl() == Proof.ConditionField &&
+         refersToScheduledOpaque(Condition->getBase(), ScheduledOpaque) &&
+         Mutex && Mutex->getMemberDecl() == Proof.MutexField &&
+         refersToScheduledOpaque(Mutex->getBase(), ScheduledOpaque);
+}
+
+static bool isMatchingMutexCall(const Stmt *S, bool Lock,
+                                const AsyncCompletionHandshake &Proof,
+                                const ValueDecl *ScheduledOpaque,
+                                ASTContext &Ctx) {
+  const CallExpr *Call =
+      Lock ? getQEMUMacroCall(S, "qemu_mutex_lock",
+                              {"qemu_mutex_lock", "qemu_mutex_lock_impl"}, Ctx)
+           : getQEMUMacroCall(
+                 S, "qemu_mutex_unlock",
+                 {"qemu_mutex_unlock", "qemu_mutex_unlock_impl"}, Ctx);
+  const MemberExpr *Mutex =
+      Call && Call->getNumArgs() >= 1 ? getAddressedField(Call->getArg(0))
+                                     : nullptr;
+  return Mutex && Mutex->getMemberDecl() == Proof.MutexField &&
+         refersToScheduledOpaque(Mutex->getBase(), ScheduledOpaque);
+}
+
+static bool containsGoto(const Stmt *S) {
+  if (!S)
+    return false;
+  if (isa<GotoStmt, IndirectGotoStmt>(S))
+    return true;
+  for (const Stmt *Child : S->children())
+    if (containsGoto(Child))
+      return true;
+  return false;
+}
+
+static bool isSynchronizedOneShotCompletion(const MemRegion *Opaque,
+                                            const Expr *Release,
+                                            const Expr *Origin,
+                                            CheckerContext &C) {
+  const auto *Schedule =
+      Origin ? dyn_cast<CallExpr>(Origin->IgnoreParenImpCasts()) : nullptr;
+  if (!Opaque || !Schedule || Schedule->getNumArgs() < 3)
+    return false;
+  const FunctionDecl *Callback = directFunctionArgument(Schedule->getArg(1));
+  const ValueDecl *ScheduledOpaque = directObject(Schedule->getArg(2));
+  if (!ScheduledOpaque)
+    return false;
+  std::optional<AsyncCompletionHandshake> Proof =
+      findAsyncCompletionHandshake(Callback, C.getASTContext());
+  if (!Proof)
+    return false;
+
+  DynTypedNode Node = DynTypedNode::create(*Release);
+  const Stmt *Child = Release;
+  const CompoundStmt *Body = nullptr;
+  for (;;) {
+    DynTypedNodeList Parents = C.getASTContext().getParents(Node);
+    if (Parents.size() != 1)
+      return false;
+    Node = Parents[0];
+    const Stmt *Parent = Node.get<Stmt>();
+    if (!Parent)
+      return false;
+    if (const auto *Compound = dyn_cast<CompoundStmt>(Parent)) {
+      Body = Compound;
+      break;
+    }
+    Child = Parent;
+  }
+
+  if (containsGoto(Body))
+    return false;
+
+  bool MutexHeld = false;
+  bool ScheduledWhileLocked = false;
+  bool UnlockedBeforeWait = false;
+  for (const Stmt *Statement : Body->body()) {
+    if (Statement == Child)
+      break;
+    if (isMatchingMutexCall(Statement, true, *Proof, ScheduledOpaque,
+                            C.getASTContext()))
+      MutexHeld = true;
+    if (isMatchingMutexCall(Statement, false, *Proof, ScheduledOpaque,
+                            C.getASTContext())) {
+      if (ScheduledWhileLocked)
+        UnlockedBeforeWait = true;
+      MutexHeld = false;
+    }
+    if (Statement == Schedule) {
+      ScheduledWhileLocked = MutexHeld;
+      continue;
+    }
+    const auto *Loop = dyn_cast<WhileStmt>(Statement);
+    if (ScheduledWhileLocked && !UnlockedBeforeWait && MutexHeld && Loop &&
+        loopWaitMatches(Loop, *Proof, ScheduledOpaque, C.getASTContext()))
+      return true;
+  }
+  return false;
+}
+
 static bool referencesAsyncOpaque(const Stmt *S, const MemRegion *Opaque,
                                   ProgramStateRef State, CheckerContext &C) {
   if (!S || !Opaque)
@@ -1185,6 +1621,9 @@ bool QEMUResourceLifetimeChecker::reportPendingAsyncRelease(
     const Expr *Origin = State->get<QEMUAsyncOneShotOrigins>(Opaque)
                              ? *State->get<QEMUAsyncOneShotOrigins>(Opaque)
                              : nullptr;
+    if (Kind == AsyncBottomHalf &&
+        isSynchronizedOneShotCompletion(Opaque, At, Origin, C))
+      return false;
     std::string Message = ("Object is released while a pending " +
                            asyncKindName(Kind) + " callback can still use it")
                               .str();
