@@ -42,13 +42,14 @@ static const MemoryRegionOps max_range_is_unsafe_ops = {
     .write = max_range_is_unsafe,
 };
 
-static void side_effecting_min_is_unknown(void *opaque, uint64_t addr,
-                                          uint64_t data, unsigned size) {
+static void side_effecting_min_remains_unbounded(void *opaque, uint64_t addr,
+                                                 uint64_t data,
+                                                 unsigned size) {
   unsigned char buffer[4];
   size_t length = data;
-  memset(buffer, 0, TEST_MIN(length++, sizeof(buffer))); // expected-warning {{Level B: guest-controlled memory-operation length may exceed the host object extent}}
+  memset(buffer, 0, TEST_MIN(length++, data)); // expected-warning {{Level B: guest-controlled memory-operation length may exceed the host object extent}}
 }
 
-static const MemoryRegionOps side_effecting_min_is_unknown_ops = {
-    .write = side_effecting_min_is_unknown,
+static const MemoryRegionOps side_effecting_min_remains_unbounded_ops = {
+    .write = side_effecting_min_remains_unbounded,
 };

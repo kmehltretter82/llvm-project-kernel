@@ -2358,8 +2358,6 @@ class QEMUGuestMemorySafetyChecker
         const VarRegion *Region =
             C.getState()->getRegion(VD, C.getStackFrame());
         SVal Value = C.getState()->getSVal(Region);
-        if (!Value.isUnknownOrUndef())
-          return Value;
         if (const SVal *Saved =
                 C.getState()->get<QEMUSavedTaintedScalars>(Region))
           return *Saved;
@@ -2379,6 +2377,40 @@ class QEMUGuestMemorySafetyChecker
             return C.getState()->getSVal(*Location);
         }
     return expressionValue(E, C);
+  }
+
+  std::optional<InputClass>
+  inputClassInScalarExpression(const Expr *E, ProgramStateRef State,
+                               CheckerContext &C) const {
+    if (!E)
+      return std::nullopt;
+
+    class SourceVisitor : public DynamicRecursiveASTVisitor {
+      const QEMUGuestMemorySafetyChecker &Checker;
+      ProgramStateRef State;
+      CheckerContext &C;
+
+    public:
+      std::optional<InputClass> Source;
+
+      SourceVisitor(const QEMUGuestMemorySafetyChecker &Checker,
+                    ProgramStateRef State, CheckerContext &C)
+          : Checker(Checker), State(State), C(C) {}
+
+      bool VisitDeclRefExpr(DeclRefExpr *DRE) override {
+        std::optional<InputClass> Candidate = Checker.inputClassForValue(
+            State, QEMUGuestMemorySafetyChecker::expressionValue(DRE, C));
+        if (!Candidate)
+          return true;
+        if (Source && *Source != *Candidate)
+          Source = InputClass::Mixed;
+        else
+          Source = Candidate;
+        return true;
+      }
+    } Visitor(*this, State, C);
+    Visitor.TraverseStmt(const_cast<Expr *>(E));
+    return Visitor.Source;
   }
 
   static SVal pointerValue(const Expr *E, CheckerContext &C) {
@@ -4633,8 +4665,20 @@ public:
     }
     std::optional<PersistentFieldInfo> Source =
         persistentGuestFieldFromAliases(SourceExpression, State, C, Value);
-    if (!Value.isUnknownOrUndef() && taint::isTainted(State, Value)) {
-      State = State->set<QEMUSavedTaintedScalars>(Region, Value);
+    SVal BoundValue = Value;
+    if (SourceExpression) {
+      SVal SourceValue = C.getSVal(SourceExpression);
+      if (!SourceValue.isUnknownOrUndef() &&
+          taint::isTainted(State, SourceValue))
+        BoundValue = SourceValue;
+    }
+    std::optional<InputClass> BoundInput =
+        inputClassInScalarExpression(SourceExpression, State, C);
+    if (!BoundValue.isUnknownOrUndef() && BoundInput)
+      State = addInputTaint(State, BoundValue, *BoundInput);
+    if (!BoundValue.isUnknownOrUndef() &&
+        taint::isTainted(State, BoundValue)) {
+      State = State->set<QEMUSavedTaintedScalars>(Region, BoundValue);
     } else {
       State = State->remove<QEMUSavedTaintedScalars>(Region);
     }
@@ -4677,6 +4721,11 @@ public:
   }
 
   void checkLiveSymbols(ProgramStateRef State, SymbolReaper &SymReaper) const {
+    for (const auto &Entry : State->get<QEMUSavedTaintedScalars>()) {
+      SymReaper.markLive(Entry.first);
+      for (SymbolRef Symbol : Entry.second.symbols())
+        SymReaper.markLive(Symbol);
+    }
     for (const MemRegion *Region : State->get<QEMUVirtqueueElements>())
       SymReaper.markLive(Region);
     for (const MemRegion *Region : State->get<QEMUVirtqueueIovecs>())
@@ -4693,6 +4742,10 @@ public:
   void checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const {
     ProgramStateRef State = C.getState();
     const StackFrame *Frame = C.getStackFrame();
+    auto SavedScalars = State->get<QEMUSavedTaintedScalars>();
+    for (const auto &Entry : SavedScalars)
+      if (Entry.first->getStackFrame() == Frame)
+        State = State->remove<QEMUSavedTaintedScalars>(Entry.first);
     auto LocalSources = State->get<QEMUPersistentLocalSources>();
     for (const auto &Entry : LocalSources)
       if (Entry.first->getStackFrame() == Frame)

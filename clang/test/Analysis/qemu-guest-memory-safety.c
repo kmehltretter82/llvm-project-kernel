@@ -1277,6 +1277,25 @@ static void mmio_bitmap_guarded(void *opaque, uint64_t addr, uint64_t data,
   clear_bit(bit, bitmap);
 }
 
+static void mmio_bitmap_overwritten_with_trusted(
+    void *opaque, uint64_t addr, uint64_t data, unsigned size) {
+  unsigned long bitmap[1] = {0};
+  long bit = (long)(sizeof(bitmap) * 8 + (data & 7));
+  bit = 0;
+  (void)test_bit(bit, bitmap);
+}
+
+static void mmio_bitmap_shadowed_local(void *opaque, uint64_t addr,
+                                       uint64_t data, unsigned size) {
+  unsigned long bitmap[1] = {0};
+  long bit = (long)(sizeof(bitmap) * 8 + (data & 7));
+  {
+    long bit = 0;
+    (void)test_bit(bit, bitmap);
+  }
+  (void)bit;
+}
+
 static const MemoryRegionOps mmio_test_bit_oob_ops = {
     .write = mmio_test_bit_oob,
 };
@@ -1291,4 +1310,12 @@ static const MemoryRegionOps mmio_clear_bit_oob_ops = {
 
 static const MemoryRegionOps mmio_bitmap_guarded_ops = {
     .write = mmio_bitmap_guarded,
+};
+
+static const MemoryRegionOps mmio_bitmap_overwritten_with_trusted_ops = {
+    .write = mmio_bitmap_overwritten_with_trusted,
+};
+
+static const MemoryRegionOps mmio_bitmap_shadowed_local_ops = {
+    .write = mmio_bitmap_shadowed_local,
 };
