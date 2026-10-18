@@ -8,6 +8,10 @@ typedef struct NetClientState NetClientState;
 typedef struct VirtIODevice VirtIODevice;
 typedef struct QEMUIOVector QEMUIOVector;
 
+struct VirtIODevice {
+  size_t config_len;
+};
+
 void *memcpy(void *, const void *, size_t);
 void *memset(void *, int, size_t);
 void *malloc(size_t);
@@ -98,10 +102,14 @@ enum {
 static unsigned virtio_config_result;
 
 static void virtio_config_index(VirtIODevice *device,
-                                const unsigned char *config) { // expected-note@-1 {{virtio configuration callback parameter 'config' is guest-controlled}}
+                                const unsigned char *config) {
   int slots[4] = {0};
-  virtio_config_result = slots[config[0]]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
-                                            // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
+  if (device->config_len < 2) // expected-note {{Assuming field 'config_len' is >= 2}}
+                               // expected-note@-1 {{Taking false branch}}
+    return;
+  virtio_config_result = slots[config[1]]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
+                                            // expected-note@-1 {{virtio configuration callback parameter 'config' is guest-controlled}}
+                                            // expected-note@-2 {{Level B: guest-controlled array index may exceed the host object element count}}
 }
 
 static void register_virtio_config_callback(VirtioDeviceClass *vdc) {
@@ -1137,14 +1145,15 @@ static unsigned disk_image_index(void *child) {
                        // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
 }
 
-static long network_index(NetClientState *client, const unsigned char *packet, // expected-note {{network receive callback parameter 'packet' is guest-controlled}}
+static long network_index(NetClientState *client, const unsigned char *packet,
                           size_t length) {
   int slots[4] = {0};
-  if (length == 0) // expected-note {{Assuming 'length' is not equal to 0}}
+  if (length < 2) // expected-note {{Assuming 'length' is >= 2}}
                    // expected-note@-1 {{Taking false branch}}
     return 0;
-  return slots[packet[0]]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
-                           // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
+  return slots[packet[1]]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
+                           // expected-note@-1 {{network receive callback parameter 'packet' is guest-controlled}}
+                           // expected-note@-2 {{Level B: guest-controlled array index may exceed the host object element count}}
 }
 
 static const NetClientInfo network_info = {

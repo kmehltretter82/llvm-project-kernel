@@ -60,6 +60,11 @@ REGISTER_MAP_WITH_PROGRAMSTATE(QEMUInputClasses, SymbolRef, unsigned)
 REGISTER_SET_WITH_PROGRAMSTATE(QEMUVirtqueueElements, const MemRegion *)
 REGISTER_SET_WITH_PROGRAMSTATE(QEMUVirtqueueIovecs, const MemRegion *)
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUInputIovecs, const MemRegion *, unsigned)
+REGISTER_MAP_WITH_PROGRAMSTATE(QEMUInputBufferLengths, const MemRegion *, SVal)
+REGISTER_MAP_WITH_PROGRAMSTATE(QEMUInputBufferClasses, const MemRegion *,
+                               unsigned)
+REGISTER_MAP_WITH_PROGRAMSTATE(QEMUInputBufferParameters, const MemRegion *,
+                               const ParmVarDecl *)
 
 namespace {
 
@@ -77,6 +82,20 @@ enum class InputClass {
   Mixed
 };
 
+enum class CallbackBufferLengthKind {
+  Parameter,
+  Fixed,
+  VirtioConfigLength,
+  SCSICommandLength,
+};
+
+struct CallbackBufferInfo {
+  unsigned BufferParameter;
+  CallbackBufferLengthKind LengthKind;
+  unsigned LengthParameter = 0;
+  uint64_t FixedLength = 0;
+};
+
 struct CallbackInfo {
   uint64_t ParameterMask = 0;
   uint64_t PointeeMask = 0;
@@ -88,6 +107,7 @@ struct CallbackInfo {
   std::optional<unsigned> DataParameter;
   std::optional<uint64_t> DataMaximum;
   uint64_t IovecMask = 0;
+  llvm::SmallVector<CallbackBufferInfo, 1> Buffers;
 };
 
 enum class CallbackSignature {
@@ -430,12 +450,12 @@ class QEMUGuestMemorySafetyChecker
   static const CallbackFieldSpec *callbackFieldSpec(StringRef RecordName,
                                                     StringRef FieldName) {
     static constexpr CallbackFieldSpec Specs[] = {
-        {"VirtioDeviceClass", "set_features_ex", InputClass::Virtio, 0,
-         uint64_t(1) << 1, 0, CallbackSignature::VirtioSetFeaturesEx},
+        {"VirtioDeviceClass", "set_features_ex", InputClass::Virtio, 0, 0, 0,
+         CallbackSignature::VirtioSetFeaturesEx},
         {"VirtioDeviceClass", "set_features", InputClass::Virtio,
          uint64_t(1) << 1, 0, 0, CallbackSignature::VirtioSetFeatures},
-        {"VirtioDeviceClass", "set_config", InputClass::Virtio, 0,
-         uint64_t(1) << 1, 0, CallbackSignature::VirtioSetConfig},
+        {"VirtioDeviceClass", "set_config", InputClass::Virtio, 0, 0, 0,
+         CallbackSignature::VirtioSetConfig},
         {"VirtioDeviceClass", "set_status", InputClass::Virtio,
          uint64_t(1) << 1, 0, 0, CallbackSignature::VirtioSetStatus},
         {"VirtioDeviceClass", "queue_reset", InputClass::Virtio,
@@ -445,26 +465,50 @@ class QEMUGuestMemorySafetyChecker
         {"PCIDeviceClass", "config_write", InputClass::PCIConfig,
          (uint64_t(1) << 1) | (uint64_t(1) << 2) | (uint64_t(1) << 3), 0, 0,
          CallbackSignature::PCIConfigWrite, 1, 3, 4},
-        {"NetClientInfo", "receive", InputClass::Network, uint64_t(1) << 2,
-         uint64_t(1) << 1, 0, CallbackSignature::NetReceive},
+        {"NetClientInfo", "receive", InputClass::Network, uint64_t(1) << 2, 0,
+         0, CallbackSignature::NetReceive},
         {"NetClientInfo", "receive_iov", InputClass::Network, uint64_t(1) << 2,
          0, uint64_t(1) << 1, CallbackSignature::NetReceiveIovec},
         {"NetFilterClass", "receive_iov", InputClass::Network,
          (uint64_t(1) << 2) | (uint64_t(1) << 4), 0, uint64_t(1) << 3,
          CallbackSignature::NetFilterReceiveIovec},
         {"SCSIBusInfo", "parse_cdb", InputClass::DeviceRequest,
-         uint64_t(1) << 3, uint64_t(1) << 2, 0,
-         CallbackSignature::SCSIParseCDB},
+         uint64_t(1) << 3, 0, 0, CallbackSignature::SCSIParseCDB},
         {"SCSIDeviceClass", "parse_cdb", InputClass::DeviceRequest,
-         uint64_t(1) << 3, uint64_t(1) << 2, 0,
-         CallbackSignature::SCSIParseCDB},
-        {"SCSIReqOps", "send_command", InputClass::DeviceRequest, 0,
-         uint64_t(1) << 1, 0, CallbackSignature::SCSISendCommand},
+         uint64_t(1) << 3, 0, 0, CallbackSignature::SCSIParseCDB},
+        {"SCSIReqOps", "send_command", InputClass::DeviceRequest, 0, 0, 0,
+         CallbackSignature::SCSISendCommand},
     };
     for (const CallbackFieldSpec &Spec : Specs)
       if (RecordName == Spec.RecordName && FieldName == Spec.FieldName)
         return &Spec;
     return nullptr;
+  }
+
+  static std::optional<CallbackBufferInfo>
+  callbackBufferInfo(CallbackSignature Signature) {
+    switch (Signature) {
+    case CallbackSignature::VirtioSetFeaturesEx:
+      // QEMU's VIRTIO_FEATURES_NU64S is asserted to be two in virtio.c.
+      return CallbackBufferInfo{1, CallbackBufferLengthKind::Fixed, 0, 16};
+    case CallbackSignature::VirtioSetConfig:
+      return CallbackBufferInfo{1,
+                                CallbackBufferLengthKind::VirtioConfigLength};
+    case CallbackSignature::NetReceive:
+      return CallbackBufferInfo{1, CallbackBufferLengthKind::Parameter, 2};
+    case CallbackSignature::SCSIParseCDB:
+      return CallbackBufferInfo{2, CallbackBufferLengthKind::Parameter, 3};
+    case CallbackSignature::SCSISendCommand:
+      return CallbackBufferInfo{1, CallbackBufferLengthKind::SCSICommandLength};
+    case CallbackSignature::VirtioSetFeatures:
+    case CallbackSignature::VirtioSetStatus:
+    case CallbackSignature::VirtioQueueIndex:
+    case CallbackSignature::PCIConfigWrite:
+    case CallbackSignature::NetReceiveIovec:
+    case CallbackSignature::NetFilterReceiveIovec:
+      return std::nullopt;
+    }
+    llvm_unreachable("unknown QEMU callback signature");
   }
 
   void
@@ -539,6 +583,18 @@ class QEMUGuestMemorySafetyChecker
     addCallback(FD, Spec.Source, Spec.ParameterMask, Spec.PointeeMask,
                 Spec.IovecMask, AddressParameter, AccessSizeParameter,
                 AccessSizeLimit);
+    if (std::optional<CallbackBufferInfo> Buffer =
+            callbackBufferInfo(Spec.Signature)) {
+      CallbackInfo &Info = Callbacks[FD->getCanonicalDecl()];
+      bool Duplicate = llvm::any_of(Info.Buffers, [&](const auto &Existing) {
+        return Existing.BufferParameter == Buffer->BufferParameter &&
+               Existing.LengthKind == Buffer->LengthKind &&
+               Existing.LengthParameter == Buffer->LengthParameter &&
+               Existing.FixedLength == Buffer->FixedLength;
+      });
+      if (!Duplicate)
+        Info.Buffers.push_back(*Buffer);
+    }
   }
 
   void discoverCallbackAssignment(const BinaryOperator *Assignment) const {
@@ -1752,6 +1808,7 @@ class QEMUGuestMemorySafetyChecker
     unsigned SourceArgument;
     bool RequiresPositiveReturn;
     bool ReplacesDestination;
+    std::optional<unsigned> RequiredPositiveArgument;
   };
 
   static std::optional<IovecAlias> iovecAlias(const CallEvent &Call) {
@@ -1811,11 +1868,17 @@ class QEMUGuestMemorySafetyChecker
     if (Name == "qemu_iovec_clone" &&
         !isVoidPointer(FD->getParamDecl(2)->getType()))
       return std::nullopt;
+    std::optional<unsigned> RequiredPositiveArgument;
+    if (Name == "qemu_iovec_init_external")
+      RequiredPositiveArgument = 2;
+    else if (Name == "qemu_iovec_init_slice" || Name == "qemu_iovec_concat")
+      RequiredPositiveArgument = 3;
     return IovecAlias{
         0, SourceArgument,
         Name == "iov_copy" || Name == "qemu_iovec_concat_iov",
         Name == "iov_copy" || Name == "qemu_iovec_init_external" ||
-            Name == "qemu_iovec_init_slice" || Name == "qemu_iovec_clone"};
+            Name == "qemu_iovec_init_slice" || Name == "qemu_iovec_clone",
+        RequiredPositiveArgument};
   }
 
   static std::optional<BufferSource> bufferSource(const CallEvent &Call) {
@@ -2389,6 +2452,231 @@ class QEMUGuestMemorySafetyChecker
   static const MemRegion *pointerBaseRegion(SVal Value) {
     const MemRegion *Region = Value.getAsRegion();
     return Region ? Region->getBaseRegion() : nullptr;
+  }
+
+  static const FieldDecl *namedField(QualType Type, StringRef Name) {
+    if (Type->isPointerType())
+      Type = Type->getPointeeType();
+    const RecordDecl *Record = Type.getUnqualifiedType()->getAsRecordDecl();
+    if (!Record)
+      return nullptr;
+    if (const RecordDecl *Definition = Record->getDefinition())
+      Record = Definition;
+    for (const FieldDecl *Field : Record->fields())
+      if (Field->getName() == Name)
+        return Field;
+    return nullptr;
+  }
+
+  static std::optional<SVal>
+  callbackFieldValue(const ParmVarDecl *Parameter,
+                     std::initializer_list<StringRef> Path,
+                     ProgramStateRef State, CheckerContext &C) {
+    const MemRegion *ParameterRegion =
+        State->getRegion(Parameter, C.getStackFrame());
+    SVal Object = State->getSVal(ParameterRegion);
+    QualType ObjectType = Parameter->getType();
+    for (StringRef Name : Path) {
+      const FieldDecl *Field = namedField(ObjectType, Name);
+      if (!Field)
+        return std::nullopt;
+      SVal FieldLocation = State->getLValue(Field, Object);
+      if (!FieldLocation.getAs<Loc>())
+        return std::nullopt;
+      Object = FieldLocation;
+      ObjectType = Field->getType();
+    }
+    auto Location = Object.getAs<Loc>();
+    if (!Location)
+      return std::nullopt;
+    SVal Value = State->getSVal(*Location);
+    if (Value.isUnknownOrUndef())
+      return std::nullopt;
+    return Value;
+  }
+
+  static std::optional<SVal>
+  callbackBufferLength(const CallbackBufferInfo &Buffer, const FunctionDecl *FD,
+                       ProgramStateRef State, CheckerContext &C) {
+    switch (Buffer.LengthKind) {
+    case CallbackBufferLengthKind::Parameter: {
+      if (Buffer.LengthParameter >= FD->getNumParams())
+        return std::nullopt;
+      const ParmVarDecl *Length = FD->getParamDecl(Buffer.LengthParameter);
+      const MemRegion *Region = State->getRegion(Length, C.getStackFrame());
+      SVal Value = State->getSVal(Region);
+      if (Value.isUnknownOrUndef())
+        return std::nullopt;
+      return Value;
+    }
+    case CallbackBufferLengthKind::Fixed:
+      return C.getSValBuilder().makeIntVal(Buffer.FixedLength,
+                                           C.getASTContext().getSizeType());
+    case CallbackBufferLengthKind::VirtioConfigLength:
+      if (FD->getNumParams() < 1)
+        return std::nullopt;
+      return callbackFieldValue(FD->getParamDecl(0), {"config_len"}, State, C);
+    case CallbackBufferLengthKind::SCSICommandLength:
+      if (FD->getNumParams() < 1)
+        return std::nullopt;
+      return callbackFieldValue(FD->getParamDecl(0), {"cmd", "len"}, State, C);
+    }
+    llvm_unreachable("unknown callback buffer length kind");
+  }
+
+  std::optional<std::pair<ProgramStateRef, SVal>>
+  callbackBufferOffset(const MemRegion *Region, const MemRegion *Base,
+                       ProgramStateRef State, CheckerContext &C) const {
+    ASTContext &Context = C.getASTContext();
+    SValBuilder &SVB = C.getSValBuilder();
+    QualType SizeType = Context.getSizeType();
+    SVal Offset = SVB.makeZeroVal(SizeType);
+    llvm::APSInt Maximum = SVB.getBasicValueFactory().getMaxValue(SizeType);
+    if (Maximum.getBitWidth() > 64)
+      return std::nullopt;
+    uint64_t MaximumValue = Maximum.getZExtValue();
+    SVal MaximumSVal = SVB.makeIntVal(Maximum);
+
+    auto Require = [&](SVal Left, BinaryOperatorKind Operation,
+                       SVal Right) -> bool {
+      std::optional<BoundStates> Bounds =
+          compare(State, Left, Operation, Right, SVB);
+      if (!Bounds)
+        return false;
+      if (Bounds->Unsafe)
+        C.addTransition(Bounds->Unsafe);
+      State = Bounds->Safe;
+      return State != nullptr;
+    };
+
+    while (Region != Base) {
+      const auto *Sub = dyn_cast<SubRegion>(Region);
+      if (!Sub)
+        return std::nullopt;
+      SVal Delta;
+      if (const auto *Element = dyn_cast<ElementRegion>(Region)) {
+        QualType IndexType = Element->getIndex().getType(Context);
+        if (IndexType.isNull() || !IndexType->isIntegerType())
+          return std::nullopt;
+        SVal Zero = SVB.makeZeroVal(IndexType);
+        if (!Require(Element->getIndex(), BO_GE, Zero))
+          return std::nullopt;
+        SVal Index = SVB.evalCast(Element->getIndex(), SizeType, IndexType);
+        if (Index.isUnknownOrUndef())
+          return std::nullopt;
+        QualType ElementType = Element->getElementType();
+        if (ElementType->isIncompleteType())
+          return std::nullopt;
+        uint64_t ElementBytes =
+            Context.getTypeSizeInChars(ElementType).getQuantity();
+        if (!ElementBytes || ElementBytes > MaximumValue)
+          return std::nullopt;
+        if (ElementBytes > 1) {
+          SVal Limit = SVB.makeIntVal(MaximumValue / ElementBytes, SizeType);
+          if (!Require(Index, BO_LE, Limit))
+            return std::nullopt;
+        }
+        SVal Scale = SVB.makeIntVal(ElementBytes, SizeType);
+        Delta = SVB.evalBinOp(State, BO_Mul, Index, Scale, SizeType);
+      } else if (const auto *Field = dyn_cast<FieldRegion>(Region)) {
+        const RecordDecl *Record = Field->getDecl()->getParent();
+        uint64_t OffsetBits = Context.getASTRecordLayout(Record).getFieldOffset(
+            Field->getDecl()->getFieldIndex());
+        unsigned CharWidth = Context.getCharWidth();
+        if (!CharWidth || OffsetBits % CharWidth)
+          return std::nullopt;
+        uint64_t FieldBytes = OffsetBits / CharWidth;
+        if (FieldBytes > MaximumValue)
+          return std::nullopt;
+        Delta = SVB.makeIntVal(FieldBytes, SizeType);
+      } else {
+        return std::nullopt;
+      }
+      if (Delta.isUnknownOrUndef())
+        return std::nullopt;
+      SVal Remaining =
+          SVB.evalBinOp(State, BO_Sub, MaximumSVal, Offset, SizeType);
+      if (Remaining.isUnknownOrUndef() || !Require(Delta, BO_LE, Remaining))
+        return std::nullopt;
+      Offset = SVB.evalBinOp(State, BO_Add, Offset, Delta, SizeType);
+      if (Offset.isUnknownOrUndef())
+        return std::nullopt;
+      Region = Sub->getSuperRegion();
+    }
+    return std::make_pair(State, Offset);
+  }
+
+  bool modelCallbackBufferLoad(const ImplicitCastExpr *Cast,
+                               CheckerContext &C) const {
+    const MemRegion *Region = C.getSVal(Cast->getSubExpr()).getAsRegion();
+    if (!Region)
+      return false;
+    const MemRegion *Base = Region->getBaseRegion();
+    ProgramStateRef State = C.getState();
+    const SVal *StoredLength = State->get<QEMUInputBufferLengths>(Base);
+    if (!StoredLength)
+      return false;
+    const unsigned *StoredClass = State->get<QEMUInputBufferClasses>(Base);
+    if (!StoredClass)
+      return true;
+
+    std::optional<std::pair<ProgramStateRef, SVal>> OffsetAndState =
+        callbackBufferOffset(Region, Base, State, C);
+    if (!OffsetAndState)
+      return true;
+    State = OffsetAndState->first;
+    SVal Offset = OffsetAndState->second;
+    SVal Length = *StoredLength;
+    ASTContext &Context = C.getASTContext();
+    SValBuilder &SVB = C.getSValBuilder();
+    QualType LengthType = Length.getType(Context);
+    QualType SizeType = Context.getSizeType();
+    if (LengthType.isNull() || !LengthType->isIntegerType())
+      return true;
+
+    auto Require = [&](SVal Left, BinaryOperatorKind Operation,
+                       SVal Right) -> bool {
+      std::optional<BoundStates> Bounds =
+          compare(State, Left, Operation, Right, SVB);
+      if (!Bounds)
+        return false;
+      if (Bounds->Unsafe)
+        C.addTransition(Bounds->Unsafe);
+      State = Bounds->Safe;
+      return State != nullptr;
+    };
+
+    SVal Zero = SVB.makeZeroVal(LengthType);
+    if (!Require(Length, BO_GE, Zero))
+      return true;
+    Length = SVB.evalCast(Length, SizeType, LengthType);
+    if (Length.isUnknownOrUndef() || !Require(Offset, BO_LE, Length))
+      return true;
+
+    QualType AccessType = Cast->getType();
+    if (AccessType->isIncompleteType())
+      return true;
+    uint64_t AccessBytes = Context.getTypeSizeInChars(AccessType).getQuantity();
+    if (!AccessBytes)
+      return true;
+    SVal Remaining = SVB.evalBinOp(State, BO_Sub, Length, Offset, SizeType);
+    SVal Access = SVB.makeIntVal(AccessBytes, SizeType);
+    if (Remaining.isUnknownOrUndef() || !Require(Access, BO_LE, Remaining))
+      return true;
+
+    SVal Value = C.getSVal(Cast);
+    if (Value.isUnknownOrUndef())
+      return true;
+    InputClass Source = static_cast<InputClass>(*StoredClass);
+    ProgramStateRef Tainted = addInputTaint(State, Value, Source);
+    std::string Detail = "callback buffer is guest-controlled";
+    if (const ParmVarDecl *const *Parameter =
+            State->get<QEMUInputBufferParameters>(Base))
+      Detail = "callback parameter '" + (*Parameter)->getNameAsString() +
+               "' is guest-controlled";
+    const NoteTag *Tag = sourceNote(C, Tainted, Value, Source, Detail);
+    C.addTransition(Tainted, Tag);
+    return true;
   }
 
   static bool isTrackedVirtqueueIovec(ProgramStateRef State, SVal Value) {
@@ -3638,6 +3926,19 @@ class QEMUGuestMemorySafetyChecker
       return;
 
     ProgramStateRef Success = FullCopy->Safe;
+    SVal Zero = C.getSValBuilder().makeZeroVal(
+        Call.getArgExpr(Copy.LengthArgument)->getType());
+    std::optional<BoundStates> Positive =
+        compare(Success, Call.getArgSVal(Copy.LengthArgument), BO_GT, Zero,
+                C.getSValBuilder());
+    if (!Positive)
+      return;
+    if (Positive->Unsafe)
+      C.addTransition(Positive->Unsafe);
+    if (!Positive->Safe)
+      return;
+    Success = Positive->Safe;
+
     const NoteTag *Tag = nullptr;
     if (Copy.ToBuffer)
       if (std::optional<InputClass> Source =
@@ -3957,6 +4258,27 @@ public:
       }
     }
 
+    for (const CallbackBufferInfo &Buffer : Found->second.Buffers) {
+      if (Buffer.BufferParameter >= FD->getNumParams())
+        continue;
+      const ParmVarDecl *Parameter = FD->getParamDecl(Buffer.BufferParameter);
+      const MemRegion *ParameterRegion =
+          State->getRegion(Parameter, C.getStackFrame());
+      SVal Pointer = State->getSVal(ParameterRegion);
+      const MemRegion *Base = pointerBaseRegion(Pointer);
+      std::optional<SVal> Length = callbackBufferLength(Buffer, FD, State, C);
+      if (!Base || !Length || Length->isUnknownOrUndef())
+        continue;
+      InputClass Source = Found->second.Source;
+      if (const unsigned *Previous = State->get<QEMUInputBufferClasses>(Base))
+        if (static_cast<InputClass>(*Previous) != Source)
+          Source = InputClass::Mixed;
+      State =
+          State->set<QEMUInputBufferLengths>(Base, *Length)
+              ->set<QEMUInputBufferClasses>(Base, static_cast<unsigned>(Source))
+              ->set<QEMUInputBufferParameters>(Base, Parameter);
+    }
+
     struct SourceValue {
       SVal Value;
       std::string Name;
@@ -3986,6 +4308,10 @@ public:
     }
     if (State == C.getState())
       return;
+    if (Sources.empty()) {
+      C.addTransition(State);
+      return;
+    }
 
     std::string Class = inputClassName(Found->second.Source).str();
     const NoteTag *Tag =
@@ -4135,14 +4461,47 @@ public:
     }
     if (std::optional<IovecAlias> Alias = iovecAlias(Call)) {
       ProgramStateRef State = C.getState();
+      auto RemoveDestinationProvenance = [&]() {
+        if (!Alias->ReplacesDestination)
+          return;
+        if (const MemRegion *Destination =
+                pointerBaseRegion(Call.getArgSVal(Alias->DestinationArgument)))
+          State = State->remove<QEMUInputIovecs>(Destination);
+      };
       if (Alias->RequiresPositiveReturn) {
         SVal Zero = C.getSValBuilder().makeZeroVal(FD->getReturnType());
         std::optional<BoundStates> Positive = compare(
             State, Call.getReturnValue(), BO_GT, Zero, C.getSValBuilder());
         if (!Positive)
           return;
-        if (Positive->Unsafe)
-          C.addTransition(Positive->Unsafe);
+        if (Positive->Unsafe) {
+          ProgramStateRef NonPositive = Positive->Unsafe;
+          if (Alias->ReplacesDestination)
+            if (const MemRegion *Destination = pointerBaseRegion(
+                    Call.getArgSVal(Alias->DestinationArgument)))
+              NonPositive = NonPositive->remove<QEMUInputIovecs>(Destination);
+          C.addTransition(NonPositive);
+        }
+        State = Positive->Safe;
+      }
+      if (!State)
+        return;
+      if (Alias->RequiredPositiveArgument) {
+        unsigned Argument = *Alias->RequiredPositiveArgument;
+        QualType Type = Call.getArgExpr(Argument)->getType();
+        SVal Zero = C.getSValBuilder().makeZeroVal(Type);
+        std::optional<BoundStates> Positive = compare(
+            State, Call.getArgSVal(Argument), BO_GT, Zero, C.getSValBuilder());
+        if (!Positive)
+          return;
+        if (Positive->Unsafe) {
+          ProgramStateRef NonPositive = Positive->Unsafe;
+          if (Alias->ReplacesDestination)
+            if (const MemRegion *Destination = pointerBaseRegion(
+                    Call.getArgSVal(Alias->DestinationArgument)))
+              NonPositive = NonPositive->remove<QEMUInputIovecs>(Destination);
+          C.addTransition(NonPositive);
+        }
         State = Positive->Safe;
       }
       if (!State)
@@ -4152,9 +4511,7 @@ public:
         State = addInputIovec(
             State, Call.getArgSVal(Alias->DestinationArgument), *Source);
       } else if (Alias->ReplacesDestination) {
-        if (const MemRegion *Destination =
-                pointerBaseRegion(Call.getArgSVal(Alias->DestinationArgument)))
-          State = State->remove<QEMUInputIovecs>(Destination);
+        RemoveDestinationProvenance();
       }
       C.addTransition(State);
       return;
@@ -4219,6 +4576,8 @@ public:
 
   void checkPostStmt(const ImplicitCastExpr *Cast, CheckerContext &C) const {
     if (Cast->getCastKind() != CK_LValueToRValue)
+      return;
+    if (modelCallbackBufferLoad(Cast, C))
       return;
     std::optional<PersistentFieldInfo> Persistent =
         persistentGuestField(Cast->getSubExpr());
@@ -4307,6 +4666,12 @@ public:
     for (const auto &Entry : InputIovecs)
       if (!SymReaper.isLiveRegion(Entry.first))
         State = State->remove<QEMUInputIovecs>(Entry.first);
+    auto InputBuffers = State->get<QEMUInputBufferLengths>();
+    for (const auto &Entry : InputBuffers)
+      if (!SymReaper.isLiveRegion(Entry.first))
+        State = State->remove<QEMUInputBufferLengths>(Entry.first)
+                    ->remove<QEMUInputBufferClasses>(Entry.first)
+                    ->remove<QEMUInputBufferParameters>(Entry.first);
     if (State != C.getState())
       C.addTransition(State);
   }
@@ -4318,6 +4683,11 @@ public:
       SymReaper.markLive(Region);
     for (const auto &Entry : State->get<QEMUInputIovecs>())
       SymReaper.markLive(Entry.first);
+    for (const auto &Entry : State->get<QEMUInputBufferLengths>()) {
+      SymReaper.markLive(Entry.first);
+      for (SymbolRef Symbol : Entry.second.symbols())
+        SymReaper.markLive(Symbol);
+    }
   }
 
   void checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const {
@@ -4327,6 +4697,15 @@ public:
     for (const auto &Entry : LocalSources)
       if (Entry.first->getStackFrame() == Frame)
         State = State->remove<QEMUPersistentLocalSources>(Entry.first);
+    const auto *FD = dyn_cast<FunctionDecl>(Frame->getDecl());
+    if (FD) {
+      auto BufferParameters = State->get<QEMUInputBufferParameters>();
+      for (const auto &Entry : BufferParameters)
+        if (Entry.second->getDeclContext() == FD)
+          State = State->remove<QEMUInputBufferLengths>(Entry.first)
+                      ->remove<QEMUInputBufferClasses>(Entry.first)
+                      ->remove<QEMUInputBufferParameters>(Entry.first);
+    }
     if (State != C.getState())
       C.addTransition(State);
   }

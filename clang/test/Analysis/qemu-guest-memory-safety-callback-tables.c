@@ -14,6 +14,15 @@ typedef struct SCSICommand SCSICommand;
 typedef struct SCSIRequest SCSIRequest;
 typedef void NetPacketSent(NetClientState *, long);
 
+struct SCSICommand {
+  uint8_t buf[16];
+  int len;
+};
+
+struct SCSIRequest {
+  SCSICommand cmd;
+};
+
 struct iovec {
   void *iov_base;
   size_t iov_len;
@@ -36,11 +45,12 @@ static void virtio_set_features(VirtIODevice *vdev, uint64_t features) { // expe
                                       // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
 }
 
-static void virtio_set_features_ex(VirtIODevice *vdev, // expected-note {{virtio configuration callback parameter 'value' is guest-controlled}}
+static void virtio_set_features_ex(VirtIODevice *vdev,
                                    const uint64_t *value) {
   int slots[4] = {0};
-  callback_result = slots[*value]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
-                                    // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
+  callback_result = slots[value[1]]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
+                                      // expected-note@-1 {{virtio configuration callback parameter 'value' is guest-controlled}}
+                                      // expected-note@-2 {{Level B: guest-controlled array index may exceed the host object element count}}
 }
 
 static int virtio_set_status(VirtIODevice *vdev, uint8_t status) { // expected-note {{virtio configuration callback parameter 'status' is guest-controlled}}
@@ -198,26 +208,38 @@ typedef struct SCSIReqOps {
   int (*send_command)(SCSIRequest *, uint8_t *);
 } SCSIReqOps;
 
-static int scsi_parse_cdb(SCSIDevice *dev, SCSICommand *command, // expected-note {{device request callback parameter 'cdb' is guest-controlled}}
+static int scsi_parse_cdb(SCSIDevice *dev, SCSICommand *command,
                           uint8_t *cdb, size_t cdb_length,
                           void *hba_private) {
   int handlers[4] = {0};
-  return handlers[cdb[0]]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
-                           // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
+  if (cdb_length < 2) // expected-note {{Assuming 'cdb_length' is >= 2}}
+                       // expected-note@-1 {{Taking false branch}}
+    return 0;
+  return handlers[cdb[1]]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
+                           // expected-note@-1 {{device request callback parameter 'cdb' is guest-controlled}}
+                           // expected-note@-2 {{Level B: guest-controlled array index may exceed the host object element count}}
 }
 
-static int scsi_device_parse_cdb(SCSIDevice *dev, SCSICommand *command, // expected-note {{device request callback parameter 'cdb' is guest-controlled}}
+static int scsi_device_parse_cdb(SCSIDevice *dev, SCSICommand *command,
                                  uint8_t *cdb, size_t cdb_length,
                                  void *hba_private) {
   int handlers[4] = {0};
-  return handlers[cdb[0]]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
-                           // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
+  if (cdb_length < 2) // expected-note {{Assuming 'cdb_length' is >= 2}}
+                       // expected-note@-1 {{Taking false branch}}
+    return 0;
+  return handlers[cdb[1]]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
+                           // expected-note@-1 {{device request callback parameter 'cdb' is guest-controlled}}
+                           // expected-note@-2 {{Level B: guest-controlled array index may exceed the host object element count}}
 }
 
-static int scsi_send_command(SCSIRequest *request, uint8_t *cdb) { // expected-note {{device request callback parameter 'cdb' is guest-controlled}}
+static int scsi_send_command(SCSIRequest *request, uint8_t *cdb) {
   int handlers[4] = {0};
-  return handlers[cdb[0]]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
-                           // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
+  if (request->cmd.len < 2) // expected-note {{Assuming field 'len' is >= 2}}
+                             // expected-note@-1 {{Taking false branch}}
+    return 0;
+  return handlers[cdb[1]]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
+                           // expected-note@-1 {{device request callback parameter 'cdb' is guest-controlled}}
+                           // expected-note@-2 {{Level B: guest-controlled array index may exceed the host object element count}}
 }
 
 static int scsi_parse_cdb_guarded(SCSIDevice *dev, SCSICommand *command,

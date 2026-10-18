@@ -73,6 +73,16 @@ static long raw_iovec_short_copy_is_not_a_source(NetClientState *client,
   return slots[index];
 }
 
+static long raw_iovec_zero_length_is_not_a_source(NetClientState *client,
+                                                   const struct iovec *iov,
+                                                   int iovcnt) {
+  unsigned index = 0;
+  int slots[4] = {0};
+  if (iov_to_buf_full(iov, (unsigned)iovcnt, 0, &index, 0) != 0)
+    return 0;
+  return slots[index];
+}
+
 static long copied_iovec(NetClientState *client,
                          const struct iovec *iov, int iovcnt) {
   struct iovec copy[4];
@@ -165,6 +175,22 @@ static long concatenated_qiov(NetClientState *client,
                        // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
 }
 
+static long zero_length_concatenation_is_not_a_source(
+    NetClientState *client, const struct iovec *iov, int iovcnt) {
+  unsigned trusted_index = 0;
+  unsigned index = 0;
+  int slots[4] = {0};
+  struct iovec trusted = {&trusted_index, sizeof(trusted_index)};
+  QEMUIOVector source, destination;
+  qemu_iovec_init_external(&source, (struct iovec *)iov, iovcnt);
+  qemu_iovec_init_external(&destination, &trusted, 1);
+  qemu_iovec_concat(&destination, &source, 0, 0);
+  if (qemu_iovec_to_buf(&destination, 0, &index, sizeof(index)) !=
+      sizeof(index))
+    return 0;
+  return slots[index];
+}
+
 static long concatenated_raw_iov(NetClientState *client,
                                  const struct iovec *iov, int iovcnt) {
   QEMUIOVector destination;
@@ -213,12 +239,14 @@ static long reset_qiov_is_not_a_source(NetClientState *client,
 static const NetClientInfo iovec_callbacks[] = {
     {.receive_iov = raw_iovec_full_copy},
     {.receive_iov = raw_iovec_short_copy_is_not_a_source},
+    {.receive_iov = raw_iovec_zero_length_is_not_a_source},
     {.receive_iov = copied_iovec},
     {.receive_iov = failed_iovec_copy_is_not_a_source},
     {.receive_iov = duplicated_iovec},
     {.receive_iov = external_qiov},
     {.receive_iov = sliced_and_cloned_qiov},
     {.receive_iov = concatenated_qiov},
+    {.receive_iov = zero_length_concatenation_is_not_a_source},
     {.receive_iov = concatenated_raw_iov},
     {.receive_iov = destroyed_qiov_is_not_a_source},
     {.receive_iov = reset_qiov_is_not_a_source},
