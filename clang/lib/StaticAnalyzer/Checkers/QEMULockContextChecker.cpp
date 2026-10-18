@@ -126,12 +126,14 @@ REGISTER_TRAIT_WITH_PROGRAMSTATE(QEMURCUViolation, bool)
 REGISTER_TRAIT_WITH_PROGRAMSTATE(QEMUBQLViolation, bool)
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUInCoroutineResults, const StackFrame *,
                                SymbolRef)
+REGISTER_MAP_WITH_PROGRAMSTATE(QEMUStableKVMIRQChipResults, const StackFrame *,
+                               SymbolRef)
 
 namespace {
 
 class QEMULockContextChecker
-    : public Checker<check::PreCall, check::PostCall, check::EndFunction,
-                     check::LiveSymbols> {
+    : public Checker<check::PreCall, check::PostCall, check::Location,
+                     check::Bind, check::EndFunction, check::LiveSymbols> {
   const BugType BalanceBug{this, "Unbalanced QEMU execution context",
                            "QEMU lock context"};
   const BugType ContextBug{this, "Invalid QEMU execution context",
@@ -249,9 +251,21 @@ class QEMULockContextChecker
 public:
   void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
   void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
+  void checkLocation(SVal Loc, bool IsLoad, const Stmt *S,
+                     CheckerContext &C) const;
+  void checkBind(SVal Loc, SVal Val, const Stmt *S, bool AtDeclInit,
+                 CheckerContext &C) const;
   void checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const;
   void checkLiveSymbols(ProgramStateRef State, SymbolReaper &SymReaper) const;
 };
+
+static bool isKVMKernelIRQChipRegion(const MemRegion *Region) {
+  const auto *VR = dyn_cast_or_null<VarRegion>(Region);
+  const auto *VD = VR ? dyn_cast<VarDecl>(VR->getDecl()) : nullptr;
+  return VD && VD->getIdentifier() && VD->hasGlobalStorage() &&
+         VD->getDeclContext()->isFileContext() &&
+         VD->getName() == "kvm_kernel_irqchip";
+}
 
 void QEMULockContextChecker::checkPreCall(const CallEvent &Call,
                                           CheckerContext &C) const {
@@ -397,11 +411,53 @@ void QEMULockContextChecker::checkPostCall(const CallEvent &Call,
   }
 }
 
+void QEMULockContextChecker::checkLocation(SVal Loc, bool IsLoad, const Stmt *S,
+                                           CheckerContext &C) const {
+  if (!IsLoad || !isKVMKernelIRQChipRegion(Loc.getAsRegion()))
+    return;
+
+  ProgramStateRef State = C.getState();
+  SymbolRef Current = State->getSVal(Loc.getAsRegion()).getAsSymbol();
+  if (!Current)
+    return;
+
+  // kvm_kernel_irqchip is configuration established during KVM
+  // initialization.  Calls made while handling a vCPU exit cannot change it,
+  // but the generic RegionStore invalidates globals across those calls.  Keep
+  // repeated reads in one stack frame consistent while still forgetting the
+  // value on an explicit write (see checkBind).
+  const StackFrame *Frame = C.getStackFrame();
+  if (const SymbolRef *Previous =
+          State->get<QEMUStableKVMIRQChipResults>(Frame)) {
+    DefinedOrUnknownSVal Equal = C.getSValBuilder().evalEQ(
+        State, nonloc::SymbolVal(*Previous), nonloc::SymbolVal(Current));
+    if (ProgramStateRef Consistent = State->assume(Equal, true))
+      C.addTransition(Consistent);
+    return;
+  }
+
+  C.addTransition(State->set<QEMUStableKVMIRQChipResults>(Frame, Current));
+}
+
+void QEMULockContextChecker::checkBind(SVal Loc, SVal Val, const Stmt *S,
+                                       bool AtDeclInit,
+                                       CheckerContext &C) const {
+  if (!isKVMKernelIRQChipRegion(Loc.getAsRegion()))
+    return;
+
+  ProgramStateRef State = C.getState();
+  ProgramStateRef Updated =
+      State->remove<QEMUStableKVMIRQChipResults>(C.getStackFrame());
+  if (Updated != State)
+    C.addTransition(Updated);
+}
+
 void QEMULockContextChecker::checkEndFunction(const ReturnStmt *RS,
                                               CheckerContext &C) const {
   ProgramStateRef State = C.getState();
   ProgramStateRef ExitState =
       State->remove<QEMUInCoroutineResults>(C.getStackFrame());
+  ExitState = ExitState->remove<QEMUStableKVMIRQChipResults>(C.getStackFrame());
   int RCUBalance = getBalance(State, ContextKind::RCU);
   int BQLBalance = getBalance(State, ContextKind::BQL);
   bool ReportRCU = RCUBalance > 0;
@@ -423,6 +479,8 @@ void QEMULockContextChecker::checkEndFunction(const ReturnStmt *RS,
 void QEMULockContextChecker::checkLiveSymbols(ProgramStateRef State,
                                               SymbolReaper &SymReaper) const {
   for (const auto &Entry : State->get<QEMUInCoroutineResults>())
+    SymReaper.markLive(Entry.second);
+  for (const auto &Entry : State->get<QEMUStableKVMIRQChipResults>())
     SymReaper.markLive(Entry.second);
 }
 

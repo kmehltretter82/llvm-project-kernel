@@ -21,6 +21,9 @@ void glib_autoptr_cleanup_BQLLockAuto(BQLLockAuto **guard);
 void qemu_cond_wait_bql(void *cond);
 void bdrv_graph_wrlock(void);
 int qemu_in_coroutine(void);
+extern _Bool kvm_kernel_irqchip;
+extern _Bool other_qemu_configuration;
+void opaque_call(void);
 
 #define RCU_GUARD()                                                          \
   RCUReadAuto *guard __attribute__((cleanup(                                \
@@ -104,6 +107,40 @@ void repeated_coroutine_queries_are_stable(void) {
     if (!qemu_in_coroutine())
       bql_lock_impl(__FILE__, __LINE__);
   }
+}
+
+void repeated_kvm_irqchip_reads_are_stable(void) {
+  if (!kvm_kernel_irqchip)
+    bql_lock_impl(__FILE__, __LINE__);
+  opaque_call();
+  opaque_call();
+  if (!kvm_kernel_irqchip)
+    bql_unlock();
+}
+
+void different_config_globals_are_not_correlated(void) {
+  if (!kvm_kernel_irqchip) // expected-note {{Assuming 'kvm_kernel_irqchip' is false}}
+                           // expected-note@-1 {{Taking true branch}}
+    bql_lock_impl(__FILE__, __LINE__); // expected-note {{BQL acquired here}}
+  opaque_call();
+  if (!other_qemu_configuration) // expected-warning {{BQL acquired in this function is not released on this path}}
+                                 // expected-note@-1 {{Assuming 'other_qemu_configuration' is true}}
+                                 // expected-note@-2 {{Taking false branch}}
+                                 // expected-note@-3 {{BQL acquired in this function is not released on this path}}
+    bql_unlock();
+}
+
+void explicit_kvm_irqchip_change_is_not_stable(void) {
+  if (!kvm_kernel_irqchip) // expected-note {{Assuming 'kvm_kernel_irqchip' is false}}
+                           // expected-note@-1 {{Taking true branch}}
+    bql_lock_impl(__FILE__, __LINE__); // expected-note {{BQL acquired here}}
+  kvm_kernel_irqchip = other_qemu_configuration;
+  opaque_call();
+  if (!kvm_kernel_irqchip) // expected-warning {{BQL acquired in this function is not released on this path}}
+                           // expected-note@-1 {{Assuming 'kvm_kernel_irqchip' is true}}
+                           // expected-note@-2 {{Taking false branch}}
+                           // expected-note@-3 {{BQL acquired in this function is not released on this path}}
+    bql_unlock();
 }
 
 void graph_lock_after_bql_release(void) {
