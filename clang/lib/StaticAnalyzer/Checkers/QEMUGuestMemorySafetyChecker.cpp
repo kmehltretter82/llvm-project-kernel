@@ -2602,6 +2602,60 @@ class QEMUGuestMemorySafetyChecker
     if (!E || Depth > 8)
       return std::nullopt;
     E = E->IgnoreParenImpCasts();
+    if (const auto *StatementExpression = dyn_cast<StmtExpr>(E)) {
+      if (StatementExpression->HasSideEffects(C.getASTContext()))
+        return std::nullopt;
+      const CompoundStmt *Body = StatementExpression->getSubStmt();
+      if (!Body || Body->body_empty())
+        return std::nullopt;
+      const auto *Result = dyn_cast<Expr>(Body->body_back());
+      return Result ? integerRange(Result, C, Depth + 1) : std::nullopt;
+    }
+    if (const auto *Conditional = dyn_cast<ConditionalOperator>(E)) {
+      if (Conditional->HasSideEffects(C.getASTContext()))
+        return std::nullopt;
+      std::optional<IntegerRange> True =
+          integerRange(Conditional->getTrueExpr(), C, Depth + 1);
+      std::optional<IntegerRange> False =
+          integerRange(Conditional->getFalseExpr(), C, Depth + 1);
+      if (!True || !False)
+        return std::nullopt;
+
+      enum class Selection {
+        Unknown,
+        Minimum,
+        Maximum
+      } Choice = Selection::Unknown;
+      if (const auto *Comparison = dyn_cast<BinaryOperator>(
+              Conditional->getCond()->IgnoreParenImpCasts())) {
+        bool Direct = sameSimpleExpression(Comparison->getLHS(),
+                                           Conditional->getTrueExpr()) &&
+                      sameSimpleExpression(Comparison->getRHS(),
+                                           Conditional->getFalseExpr());
+        bool Reversed = sameSimpleExpression(Comparison->getLHS(),
+                                             Conditional->getFalseExpr()) &&
+                        sameSimpleExpression(Comparison->getRHS(),
+                                             Conditional->getTrueExpr());
+        if (Direct || Reversed) {
+          bool Less = Comparison->getOpcode() == BO_LT ||
+                      Comparison->getOpcode() == BO_LE;
+          bool Greater = Comparison->getOpcode() == BO_GT ||
+                         Comparison->getOpcode() == BO_GE;
+          if ((Direct && Less) || (Reversed && Greater))
+            Choice = Selection::Minimum;
+          else if ((Direct && Greater) || (Reversed && Less))
+            Choice = Selection::Maximum;
+        }
+      }
+      if (Choice == Selection::Minimum)
+        return IntegerRange{std::min(True->Minimum, False->Minimum),
+                            std::min(True->Maximum, False->Maximum)};
+      if (Choice == Selection::Maximum)
+        return IntegerRange{std::max(True->Minimum, False->Minimum),
+                            std::max(True->Maximum, False->Maximum)};
+      return IntegerRange{std::min(True->Minimum, False->Minimum),
+                          std::max(True->Maximum, False->Maximum)};
+    }
     if (const auto *Literal = dyn_cast<IntegerLiteral>(E)) {
       if (Literal->getValue().getActiveBits() > 64)
         return std::nullopt;
