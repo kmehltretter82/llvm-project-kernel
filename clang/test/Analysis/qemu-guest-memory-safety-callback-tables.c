@@ -138,8 +138,8 @@ typedef struct NetFilterClass {
                       const struct iovec *, int, NetPacketSent *);
 } NetFilterClass;
 
-static long network_iov_count(NetClientState *client, const struct iovec *iov,
-                              int iovcnt) { // expected-note {{network receive callback parameter 'iovcnt' is guest-controlled}}
+static long network_iov_count(NetClientState *client, // expected-note {{network receive callback parameter 'iovcnt' is guest-controlled}}
+                              const struct iovec *iov, int iovcnt) {
   int slots[4] = {0};
   return slots[(unsigned)iovcnt]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
                                   // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
@@ -159,10 +159,10 @@ static long network_iov_signature_spoof(NetClientState *client,
   return slots[(unsigned)iovcnt];
 }
 
-static long netfilter_iov_count(NetFilterState *filter,
+static long netfilter_iov_count(NetFilterState *filter, // expected-note {{network receive callback parameter 'iovcnt' is guest-controlled}}
                                 NetClientState *sender, unsigned flags,
                                 const struct iovec *iov, int iovcnt,
-                                NetPacketSent *sent_cb) { // expected-note {{network receive callback parameter 'iovcnt' is guest-controlled}}
+                                NetPacketSent *sent_cb) {
   int slots[4] = {0};
   return slots[(unsigned)iovcnt]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
                                   // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}

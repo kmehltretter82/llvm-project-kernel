@@ -49,12 +49,14 @@ typedef struct VirtioDeviceClass {
   void (*set_features)(VirtIODevice *, uint64_t);
 } VirtioDeviceClass;
 
-static long raw_iovec_full_copy(NetClientState *client, // expected-note {{network receive populated guest-controlled data here}}
+static long raw_iovec_full_copy(NetClientState *client,
                                 const struct iovec *iov, int iovcnt) {
   unsigned index;
   int slots[4] = {0};
+  // expected-note@+2 {{network receive populated guest-controlled data here}}
+  // expected-note@+1 {{Taking false branch}}
   if (iov_to_buf_full(iov, (unsigned)iovcnt, 0, &index, sizeof(index)) !=
-      sizeof(index)) // expected-note {{Taking false branch}}
+      sizeof(index))
     return 0;
   return slots[index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
                        // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
@@ -71,14 +73,16 @@ static long raw_iovec_short_copy_is_not_a_source(NetClientState *client,
   return slots[index];
 }
 
-static long copied_iovec(NetClientState *client, // expected-note {{network receive populated guest-controlled data here}}
+static long copied_iovec(NetClientState *client,
                          const struct iovec *iov, int iovcnt) {
   struct iovec copy[4];
   unsigned index;
   int slots[4] = {0};
   (void)iov_copy(copy, 4, iov, (unsigned)iovcnt, 0, sizeof(index));
+  // expected-note@+2 {{network receive populated guest-controlled data here}}
+  // expected-note@+1 {{Taking false branch}}
   if (iov_to_buf_full(copy, 4, 0, &index, sizeof(index)) !=
-      sizeof(index)) // expected-note {{Taking false branch}}
+      sizeof(index))
     return 0;
   return slots[index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
                        // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
@@ -97,32 +101,36 @@ static long failed_iovec_copy_is_not_a_source(NetClientState *client,
   return slots[index];
 }
 
-static long duplicated_iovec(NetClientState *client, // expected-note {{network receive populated guest-controlled data here}}
+static long duplicated_iovec(NetClientState *client,
                              const struct iovec *iov, int iovcnt) {
   struct iovec *copy = g_memdup2(iov, (size_t)iovcnt * sizeof(*iov));
   unsigned index;
   int slots[4] = {0};
+  // expected-note@+2 {{network receive populated guest-controlled data here}}
+  // expected-note@+1 {{Taking false branch}}
   if (iov_to_buf_full(copy, (unsigned)iovcnt, 0, &index, sizeof(index)) !=
-      sizeof(index)) // expected-note {{Taking false branch}}
+      sizeof(index))
     return 0;
   return slots[index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
                        // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
 }
 
-static long external_qiov(NetClientState *client, // expected-note {{network receive populated guest-controlled data here}}
+static long external_qiov(NetClientState *client,
                           const struct iovec *iov, int iovcnt) {
   QEMUIOVector qiov;
   unsigned index;
   int slots[4] = {0};
   qemu_iovec_init_external(&qiov, (struct iovec *)iov, iovcnt);
+  // expected-note@+2 {{network receive populated guest-controlled data here}}
+  // expected-note@+1 {{Taking false branch}}
   if (qemu_iovec_to_buf(&qiov, 0, &index, sizeof(index)) !=
-      sizeof(index)) // expected-note {{Taking false branch}}
+      sizeof(index))
     return 0;
   return slots[index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
                        // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
 }
 
-static long sliced_and_cloned_qiov(NetClientState *client, // expected-note {{network receive populated guest-controlled data here}}
+static long sliced_and_cloned_qiov(NetClientState *client,
                                    const struct iovec *iov, int iovcnt) {
   QEMUIOVector source, slice, clone;
   unsigned index;
@@ -130,14 +138,16 @@ static long sliced_and_cloned_qiov(NetClientState *client, // expected-note {{ne
   qemu_iovec_init_external(&source, (struct iovec *)iov, iovcnt);
   qemu_iovec_init_slice(&slice, &source, 0, sizeof(index));
   qemu_iovec_clone(&clone, &slice, 0);
+  // expected-note@+2 {{network receive populated guest-controlled data here}}
+  // expected-note@+1 {{Taking false branch}}
   if (qemu_iovec_to_buf(&clone, 0, &index, sizeof(index)) !=
-      sizeof(index)) // expected-note {{Taking false branch}}
+      sizeof(index))
     return 0;
   return slots[index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
                        // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
 }
 
-static long concatenated_qiov(NetClientState *client, // expected-note {{network receive populated guest-controlled data here}}
+static long concatenated_qiov(NetClientState *client,
                               const struct iovec *iov, int iovcnt) {
   struct iovec trusted = {0};
   QEMUIOVector source, destination;
@@ -146,14 +156,16 @@ static long concatenated_qiov(NetClientState *client, // expected-note {{network
   qemu_iovec_init_external(&source, (struct iovec *)iov, iovcnt);
   qemu_iovec_init_external(&destination, &trusted, 1);
   qemu_iovec_concat(&destination, &source, 0, sizeof(index));
+  // expected-note@+2 {{network receive populated guest-controlled data here}}
+  // expected-note@+1 {{Taking false branch}}
   if (qemu_iovec_to_buf(&destination, 0, &index, sizeof(index)) !=
-      sizeof(index)) // expected-note {{Taking false branch}}
+      sizeof(index))
     return 0;
   return slots[index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
                        // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
 }
 
-static long concatenated_raw_iov(NetClientState *client, // expected-note {{network receive populated guest-controlled data here}}
+static long concatenated_raw_iov(NetClientState *client,
                                  const struct iovec *iov, int iovcnt) {
   QEMUIOVector destination;
   unsigned index;
@@ -161,8 +173,10 @@ static long concatenated_raw_iov(NetClientState *client, // expected-note {{netw
   qemu_iovec_init(&destination, 1);
   (void)qemu_iovec_concat_iov(&destination, (struct iovec *)iov,
                               (unsigned)iovcnt, 0, sizeof(index));
+  // expected-note@+2 {{network receive populated guest-controlled data here}}
+  // expected-note@+1 {{Taking false branch}}
   if (qemu_iovec_to_buf(&destination, 0, &index, sizeof(index)) !=
-      sizeof(index)) // expected-note {{Taking false branch}}
+      sizeof(index))
     return 0;
   return slots[index]; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
                        // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
