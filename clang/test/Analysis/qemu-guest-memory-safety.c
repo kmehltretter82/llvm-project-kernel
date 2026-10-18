@@ -13,6 +13,7 @@ struct VirtIODevice {
 };
 
 void *memcpy(void *, const void *, size_t);
+void *memmove(void *, const void *, size_t);
 void *memset(void *, int, size_t);
 void *malloc(size_t);
 unsigned dma_memory_read(void *, uint64_t, void *, size_t, unsigned);
@@ -927,6 +928,27 @@ static const MemoryRegionOps mmio_heap_copy_ops = {
     .write = mmio_heap_copy,
 };
 
+static void mmio_memmove_length( // expected-note {{MMIO callback parameter 'size' is guest-controlled}}
+    void *opaque, uint64_t addr, uint64_t data, unsigned size) {
+  char destination[4];
+  memmove(destination, opaque, size); // expected-warning {{Level B: guest-controlled memory-operation length may exceed the host object extent}}
+                                      // expected-note@-1 {{Level B: guest-controlled memory-operation length may exceed the host object extent}}
+}
+
+static const MemoryRegionOps mmio_memmove_length_ops = {
+    .write = mmio_memmove_length,
+};
+
+static void mmio_guest_physical_address_only(void *opaque, uint64_t addr,
+                                             uint64_t data, unsigned size) {
+  char destination[4];
+  dma_memory_read(opaque, addr, destination, sizeof(destination), 0);
+}
+
+static const MemoryRegionOps mmio_guest_physical_address_only_ops = {
+    .write = mmio_guest_physical_address_only,
+};
+
 static void mmio_offset_copy(void *opaque, uint64_t addr, uint64_t data, // expected-note {{MMIO callback parameter 'addr' is guest-controlled}}
                              unsigned size) {
   char destination[16];
@@ -957,8 +979,8 @@ static const MemoryRegionOps mmio_member_array_tail_ops = {
     .write = mmio_member_array_tail,
 };
 
-static void mmio_member_array_tail_oob(
-    void *opaque, uint64_t addr, uint64_t data, // expected-note {{MMIO callback parameter 'data' is guest-controlled}}
+static void mmio_member_array_tail_oob( // expected-note {{MMIO callback parameter 'data' is guest-controlled}}
+    void *opaque, uint64_t addr, uint64_t data,
     unsigned size) {
   TailMemberArrayState *s = opaque;
   size_t offset = 2040 + (data & 7);

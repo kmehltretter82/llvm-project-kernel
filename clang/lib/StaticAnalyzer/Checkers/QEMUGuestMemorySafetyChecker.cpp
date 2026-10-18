@@ -3782,10 +3782,10 @@ class QEMUGuestMemorySafetyChecker
     const Expr *LengthExpression = Call.getArgExpr(Sink.LengthArgument);
     std::optional<PersistentFieldInfo> Persistent =
         persistentGuestField(LengthExpression);
-    if (!taint::isTainted(State, Length)) {
-      if (!Persistent)
-        return false;
+    bool GuestControlled = taint::isTainted(State, Length);
+    if (!GuestControlled && Persistent) {
       State = addInputTaint(State, Length, Persistent->Source);
+      GuestControlled = taint::isTainted(State, Length);
     }
     if (!Persistent)
       Persistent =
@@ -3860,6 +3860,19 @@ class QEMUGuestMemorySafetyChecker
         if (!hasUsableExtent(State, BaseExtent, C.getSValBuilder()))
           BaseExtent = flexibleArrayMemberExtent(Pointer, State, C);
         SVal OffsetValue = expressionValue(Offset, C);
+        std::optional<PersistentFieldInfo> OffsetPersistent =
+            persistentGuestField(Offset);
+        if (!taint::isTainted(State, OffsetValue) && OffsetPersistent)
+          State =
+              addInputTaint(State, OffsetValue, OffsetPersistent->Source);
+        if (!OffsetPersistent)
+          OffsetPersistent =
+              persistentGuestFieldFromAliases(Offset, State, C, OffsetValue);
+        if (taint::isTainted(State, OffsetValue)) {
+          GuestControlled = true;
+          if (SourceDetail.empty() && OffsetPersistent)
+            SourceDetail = persistentSourceDescription(*OffsetPersistent);
+        }
         uint64_t ElementBytes =
             C.getASTContext().getTypeSizeInChars(Pointee).getQuantity();
         if (ElementBytes == 1 &&
@@ -3911,6 +3924,8 @@ class QEMUGuestMemorySafetyChecker
         }
       }
     }
+    if (!GuestControlled)
+      return false;
     if (!hasUsableExtent(State, Extent, C.getSValBuilder()))
       return false;
     if (!HasOffset)
