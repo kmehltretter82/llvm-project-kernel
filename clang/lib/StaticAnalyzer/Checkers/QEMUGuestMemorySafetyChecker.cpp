@@ -22,6 +22,7 @@
 #include "clang/AST/DynamicRecursiveASTVisitor.h"
 #include "clang/AST/Expr.h"
 #include "clang/AST/ParentMapContext.h"
+#include "clang/AST/RecordLayout.h"
 #include "clang/StaticAnalyzer/Checkers/BuiltinCheckerRegistration.h"
 #include "clang/StaticAnalyzer/Checkers/Taint.h"
 #include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
@@ -89,6 +90,8 @@ struct BoundStates {
   ProgramStateRef Safe;
   ProgramStateRef Unsafe;
 };
+
+enum class BoundUnit { Bytes, Elements, Bits };
 
 struct ShiftedBoundPredicate {
   unsigned Parameter;
@@ -1596,7 +1599,7 @@ class QEMUGuestMemorySafetyChecker
 
   void report(CheckerContext &C, ProgramStateRef Safe, ProgramStateRef Unsafe,
               SVal TaintedValue, const Expr *Where, StringRef Sink,
-              SVal ExtentOrCount, bool Elements,
+              SVal ExtentOrCount, BoundUnit Unit,
               StringRef SourceDetail = {}) const {
     if (!Unsafe)
       return;
@@ -1609,14 +1612,28 @@ class QEMUGuestMemorySafetyChecker
 
     llvm::SmallString<256> Buffer;
     llvm::raw_svector_ostream Message(Buffer);
+    StringRef BoundDescription;
+    StringRef Units;
+    switch (Unit) {
+    case BoundUnit::Bytes:
+      BoundDescription = "extent";
+      Units = "bytes ";
+      break;
+    case BoundUnit::Elements:
+      BoundDescription = "element count";
+      Units = "elements ";
+      break;
+    case BoundUnit::Bits:
+      BoundDescription = "bit capacity";
+      Units = "bits ";
+      break;
+    }
     Message << (Definite ? "Level A: guest-controlled "
                          : "Level B: guest-controlled ")
             << Sink << (Definite ? " exceeds " : " may exceed ")
-            << "the host object " << (Elements ? "element count" : "extent")
-            << " (value "
+            << "the host object " << BoundDescription << " (value "
             << valueRange(Unsafe, TaintedValue, C.getSValBuilder()) << ", "
-            << (Elements ? "elements " : "bytes ")
-            << valueRange(Unsafe, ExtentOrCount, C.getSValBuilder());
+            << Units << valueRange(Unsafe, ExtentOrCount, C.getSValBuilder());
     if (!SourceDetail.empty())
       Message << ", source " << SourceDetail;
     Message << ')';
@@ -1760,6 +1777,28 @@ class QEMUGuestMemorySafetyChecker
     unsigned LengthArgument;
     StringRef Description;
   };
+
+  static bool isBitmapBitSink(const CallEvent &Call, ASTContext &Context) {
+    const auto *FD = dyn_cast_or_null<FunctionDecl>(Call.getDecl());
+    if (!FD || !FD->getIdentifier() || FD->getNumParams() != 2 ||
+        Call.getNumArgs() != 2)
+      return false;
+    StringRef Name = FD->getName();
+    if (Name != "test_bit" && Name != "set_bit" && Name != "clear_bit")
+      return false;
+    if (!Context.hasSameUnqualifiedType(FD->getParamDecl(0)->getType(),
+                                        Context.LongTy))
+      return false;
+    QualType AddressType = FD->getParamDecl(1)->getType();
+    if (!AddressType->isPointerType() ||
+        !Context.hasSameUnqualifiedType(AddressType->getPointeeType(),
+                                        Context.UnsignedLongTy))
+      return false;
+    QualType ReturnType = FD->getReturnType();
+    return Name == "test_bit"
+               ? Context.hasSameUnqualifiedType(ReturnType, Context.IntTy)
+               : ReturnType->isVoidType();
+  }
 
   static std::optional<MemorySink>
   destinationMemorySink(const CallEvent &Call) {
@@ -1913,6 +1952,65 @@ class QEMUGuestMemorySafetyChecker
         if (VD->getType()->isArrayType())
           return C.getState()->getLValue(VD, C.getStackFrame());
     return C.getSVal(E);
+  }
+
+  static std::optional<uint64_t> staticObjectExtent(const Expr *E,
+                                                    ASTContext &Context) {
+    E = E ? E->IgnoreParenImpCasts() : nullptr;
+    if (!E)
+      return std::nullopt;
+    if (const ConstantArrayType *Array =
+            Context.getAsConstantArrayType(E->getType())) {
+      if (Array->getSize().getActiveBits() > 64)
+        return std::nullopt;
+      uint64_t Elements = Array->getSize().getZExtValue();
+      uint64_t ElementBytes =
+          Context.getTypeSizeInChars(Array->getElementType()).getQuantity();
+      if (ElementBytes &&
+          Elements > std::numeric_limits<uint64_t>::max() / ElementBytes)
+        return std::nullopt;
+      return Elements * ElementBytes;
+    }
+    const auto *Address = dyn_cast<UnaryOperator>(E);
+    if (!Address || Address->getOpcode() != UO_AddrOf)
+      return std::nullopt;
+    QualType ObjectType = Address->getSubExpr()->getType();
+    if (ObjectType->isIncompleteType())
+      return std::nullopt;
+    return Context.getTypeSizeInChars(ObjectType).getQuantity();
+  }
+
+  static SVal flexibleArrayMemberExtent(const Expr *E, ProgramStateRef State,
+                                        CheckerContext &C) {
+    E = E ? E->IgnoreParenImpCasts() : nullptr;
+    if (const auto *Address = dyn_cast_or_null<UnaryOperator>(E))
+      if (Address->getOpcode() == UO_AddrOf)
+        E = Address->getSubExpr()->IgnoreParenImpCasts();
+    const auto *Member = dyn_cast_or_null<MemberExpr>(E);
+    const auto *Field =
+        Member ? dyn_cast<FieldDecl>(Member->getMemberDecl()) : nullptr;
+    if (!Member || !Member->isArrow() || !Field)
+      return UnknownVal();
+
+    ASTContext &Context = C.getASTContext();
+    const RecordDecl *Record = Field->getParent();
+    if (!Context.getAsIncompleteArrayType(Field->getType()) || !Record ||
+        !Record->hasFlexibleArrayMember())
+      return UnknownVal();
+
+    uint64_t OffsetBits = Context.getASTRecordLayout(Record).getFieldOffset(
+        Field->getFieldIndex());
+    unsigned CharWidth = Context.getCharWidth();
+    if (!CharWidth || OffsetBits % CharWidth)
+      return UnknownVal();
+
+    SVal BaseExtent =
+        getDynamicExtentWithOffset(State, pointerValue(Member->getBase(), C));
+    if (!hasUsableExtent(State, BaseExtent, C.getSValBuilder()))
+      return UnknownVal();
+    SVal Offset = C.getSValBuilder().makeArrayIndex(OffsetBits / CharWidth);
+    return C.getSValBuilder().evalBinOp(State, BO_Sub, BaseExtent, Offset,
+                                        C.getSValBuilder().getArrayIndexType());
   }
 
   static const MemRegion *pointerBaseRegion(SVal Value) {
@@ -2737,6 +2835,70 @@ class QEMUGuestMemorySafetyChecker
     }
   }
 
+  void checkBitmapBitSink(const CallEvent &Call, CheckerContext &C) const {
+    ProgramStateRef State = C.getState();
+    const Expr *IndexExpression = Call.getArgExpr(0);
+    SVal Index = expressionValue(IndexExpression, C);
+    std::optional<PersistentFieldInfo> Persistent =
+        persistentGuestField(IndexExpression);
+    if (!taint::isTainted(State, Index)) {
+      if (!Persistent)
+        return;
+      State = addInputTaint(State, Index, Persistent->Source);
+    }
+    if (!Persistent)
+      Persistent =
+          persistentGuestFieldFromAliases(IndexExpression, State, C, Index);
+
+    const Expr *BitmapExpression = Call.getArgExpr(1)->IgnoreParenImpCasts();
+    SVal Extent = UnknownVal();
+    if (C.getASTContext().getAsConstantArrayType(BitmapExpression->getType()))
+      if (std::optional<uint64_t> Bytes =
+              staticObjectExtent(BitmapExpression, C.getASTContext()))
+        Extent = C.getSValBuilder().makeArrayIndex(*Bytes);
+    if (!hasUsableExtent(State, Extent, C.getSValBuilder()))
+      Extent = getDynamicExtentWithOffset(State, Call.getArgSVal(1));
+    if (!hasUsableExtent(State, Extent, C.getSValBuilder()))
+      if (std::optional<uint64_t> Bytes =
+              staticObjectExtent(BitmapExpression, C.getASTContext()))
+        Extent = C.getSValBuilder().makeArrayIndex(*Bytes);
+    if (!hasUsableExtent(State, Extent, C.getSValBuilder()))
+      Extent = flexibleArrayMemberExtent(BitmapExpression, State, C);
+
+    const llvm::APSInt *KnownExtent =
+        C.getSValBuilder().getKnownValue(State, Extent);
+    if (!KnownExtent || KnownExtent->isNegative() ||
+        KnownExtent->getActiveBits() > 64)
+      return;
+    uint64_t LongBytes =
+        C.getASTContext()
+            .getTypeSizeInChars(C.getASTContext().UnsignedLongTy)
+            .getQuantity();
+    uint64_t LongBits =
+        C.getASTContext().getTypeSize(C.getASTContext().UnsignedLongTy);
+    if (!LongBytes || !LongBits)
+      return;
+    uint64_t Words = KnownExtent->getZExtValue() / LongBytes;
+    if (Words > std::numeric_limits<uint64_t>::max() / LongBits)
+      return;
+    SVal Capacity = C.getSValBuilder().makeIntVal(
+        Words * LongBits, C.getASTContext().getSizeType());
+    SVal UnsignedIndex = C.getSValBuilder().evalCast(
+        Index, C.getASTContext().getSizeType(), IndexExpression->getType());
+    if (UnsignedIndex.isUnknownOrUndef())
+      return;
+    std::optional<BoundStates> Inside =
+        compare(State, UnsignedIndex, BO_LT, Capacity, C.getSValBuilder());
+    if (!Inside || !Inside->Unsafe)
+      return;
+
+    std::string SourceDetail;
+    if (Persistent)
+      SourceDetail = persistentSourceDescription(*Persistent);
+    report(C, Inside->Safe, Inside->Unsafe, Index, IndexExpression,
+           "bitmap bit index", Capacity, BoundUnit::Bits, SourceDetail);
+  }
+
   void checkMemorySink(const CallEvent &Call, const MemorySink &Sink,
                        CheckerContext &C) const {
     ProgramStateRef State = C.getState();
@@ -2768,35 +2930,13 @@ class QEMUGuestMemorySafetyChecker
 
     const Expr *Buffer =
         Call.getArgExpr(Sink.BufferArgument)->IgnoreParenImpCasts();
-    auto StaticExtent = [&C](const Expr *E) -> std::optional<uint64_t> {
-      E = E ? E->IgnoreParenImpCasts() : nullptr;
-      if (!E)
-        return std::nullopt;
-      if (const ConstantArrayType *Array =
-              C.getASTContext().getAsConstantArrayType(E->getType())) {
-        if (Array->getSize().getActiveBits() > 64)
-          return std::nullopt;
-        uint64_t Elements = Array->getSize().getZExtValue();
-        uint64_t ElementBytes = C.getASTContext()
-                                    .getTypeSizeInChars(Array->getElementType())
-                                    .getQuantity();
-        if (ElementBytes &&
-            Elements > std::numeric_limits<uint64_t>::max() / ElementBytes)
-          return std::nullopt;
-        return Elements * ElementBytes;
-      }
-      const auto *Address = dyn_cast<UnaryOperator>(E);
-      if (!Address || Address->getOpcode() != UO_AddrOf)
-        return std::nullopt;
-      QualType ObjectType = Address->getSubExpr()->getType();
-      if (ObjectType->isIncompleteType())
-        return std::nullopt;
-      return C.getASTContext().getTypeSizeInChars(ObjectType).getQuantity();
-    };
     if (!hasUsableExtent(State, Extent, C.getSValBuilder()))
-      if (std::optional<uint64_t> Bytes = StaticExtent(Buffer))
+      if (std::optional<uint64_t> Bytes =
+              staticObjectExtent(Buffer, C.getASTContext()))
         Extent = C.getSValBuilder().makeIntVal(*Bytes,
                                                C.getASTContext().getSizeType());
+    if (!hasUsableExtent(State, Extent, C.getSValBuilder()))
+      Extent = flexibleArrayMemberExtent(Buffer, State, C);
     const Expr *Pointer = nullptr;
     const Expr *Offset = nullptr;
     if (const auto *Add = dyn_cast<BinaryOperator>(Buffer)) {
@@ -2829,9 +2969,12 @@ class QEMUGuestMemorySafetyChecker
         SVal BaseExtent =
             getDynamicExtentWithOffset(State, pointerValue(Pointer, C));
         if (!hasUsableExtent(State, BaseExtent, C.getSValBuilder()))
-          if (std::optional<uint64_t> Bytes = StaticExtent(Pointer))
+          if (std::optional<uint64_t> Bytes =
+                  staticObjectExtent(Pointer, C.getASTContext()))
             BaseExtent = C.getSValBuilder().makeIntVal(
                 *Bytes, C.getASTContext().getSizeType());
+        if (!hasUsableExtent(State, BaseExtent, C.getSValBuilder()))
+          BaseExtent = flexibleArrayMemberExtent(Pointer, State, C);
         SVal OffsetValue = expressionValue(Offset, C);
         uint64_t ElementBytes =
             C.getASTContext().getTypeSizeInChars(Pointee).getQuantity();
@@ -2908,8 +3051,8 @@ class QEMUGuestMemorySafetyChecker
     if (!Bounds || !Bounds->Unsafe)
       return;
     report(C, Bounds->Safe, Bounds->Unsafe, Required,
-           Call.getArgExpr(Sink.LengthArgument), SinkDescription, Extent, false,
-           SourceDetail);
+           Call.getArgExpr(Sink.LengthArgument), SinkDescription, Extent,
+           BoundUnit::Bytes, SourceDetail);
   }
 
 public:
@@ -3267,6 +3410,8 @@ public:
     }
     checkAllocationOverflow(Call, C);
     checkAvailabilityAllocation(Call, C);
+    if (isBitmapBitSink(Call, C.getASTContext()))
+      checkBitmapBitSink(Call, C);
     if (std::optional<MemorySink> Sink = destinationMemorySink(Call))
       checkMemorySink(Call, *Sink, C);
     if (std::optional<MemorySink> Sink = sourceMemorySink(Call))
@@ -3581,6 +3726,16 @@ public:
     SVal Count = getDynamicElementCountWithOffset(
         State, C.getSVal(ASE->getBase()), ASE->getType());
     if (!hasUsableExtent(State, Count, C.getSValBuilder())) {
+      SVal Extent = flexibleArrayMemberExtent(Base, State, C);
+      if (hasUsableExtent(State, Extent, C.getSValBuilder())) {
+        SVal ElementExtent =
+            getElementExtent(ASE->getType(), C.getSValBuilder());
+        Count = C.getSValBuilder().evalBinOp(
+            State, BO_Div, Extent, ElementExtent,
+            C.getSValBuilder().getArrayIndexType());
+      }
+    }
+    if (!hasUsableExtent(State, Count, C.getSValBuilder())) {
       const ConstantArrayType *Array =
           C.getASTContext().getAsConstantArrayType(Base->getType());
       if (Array && Array->getSize().getActiveBits() <= 64) {
@@ -3698,7 +3853,7 @@ public:
       if (!Outside || !Outside->Safe)
         return;
       report(C, Outside->Unsafe, Outside->Safe, Index, ASE->getIdx(),
-             "array index", Count, true, SourceDetail);
+             "array index", Count, BoundUnit::Elements, SourceDetail);
       return;
     }
 
@@ -3707,7 +3862,7 @@ public:
     if (!Inside || !Inside->Unsafe)
       return;
     report(C, Inside->Safe, Inside->Unsafe, Index, ASE->getIdx(), "array index",
-           Count, true, SourceDetail);
+           Count, BoundUnit::Elements, SourceDetail);
   }
 };
 

@@ -14,6 +14,9 @@ unsigned qemu_get_byte(void *);
 size_t qemu_iovec_to_buf(void *, size_t, void *, size_t);
 int range_covers_byte(uint64_t, uint64_t, uint64_t);
 long qemu_send_packet(void *, const unsigned char *, int);
+int test_bit(long, const unsigned long *);
+void set_bit(long, unsigned long *);
+void clear_bit(long, unsigned long *);
 
 typedef struct MemoryRegionOps {
   uint64_t (*read)(void *, uint64_t, unsigned);
@@ -1129,3 +1132,119 @@ static void same_signature_but_not_registered(void *opaque, uint64_t addr,
   char destination[8];
   memcpy(destination, opaque, size);
 }
+
+typedef struct FlexiblePacket {
+  unsigned tag;
+  unsigned char data[];
+} FlexiblePacket;
+
+static void mmio_flexible_array_oob(void *opaque, uint64_t addr, // expected-note {{MMIO callback parameter 'data' is guest-controlled}}
+                                    uint64_t data, unsigned size) {
+  FlexiblePacket *packet = malloc(sizeof(*packet) + 4);
+  if (!packet) // expected-note {{Assuming 'packet' is non-null}}
+               // expected-note@-1 {{Taking false branch}}
+    return;
+  unsigned index = 4 + (data & 3);
+  packet->data[index] = 1; // expected-warning {{Level A: guest-controlled array index exceeds the host object element count}}
+                           // expected-note@-1 {{Level A: guest-controlled array index exceeds the host object element count}}
+}
+
+static void mmio_flexible_array_guarded(void *opaque, uint64_t addr,
+                                        uint64_t data, unsigned size) {
+  FlexiblePacket *packet = malloc(sizeof(*packet) + 4);
+  if (!packet)
+    return;
+  unsigned index = data & 255;
+  if (index >= 4)
+    return;
+  packet->data[index] = 1;
+}
+
+static void mmio_flexible_array_copy_oob(void *opaque, uint64_t addr, // expected-note {{MMIO callback parameter 'data' is guest-controlled}}
+                                         uint64_t data, unsigned size) {
+  FlexiblePacket *packet = malloc(sizeof(*packet) + 4);
+  if (!packet) // expected-note {{Assuming 'packet' is non-null}}
+               // expected-note@-1 {{Taking false branch}}
+    return;
+  size_t length = 5 + (data & 3);
+  memset(packet->data, 0, length); // expected-warning {{Level A: guest-controlled memory-operation length exceeds the host object extent}}
+                                   // expected-note@-1 {{Level A: guest-controlled memory-operation length exceeds the host object extent}}
+}
+
+static void mmio_flexible_array_copy_guarded(void *opaque, uint64_t addr,
+                                             uint64_t data, unsigned size) {
+  FlexiblePacket *packet = malloc(sizeof(*packet) + 4);
+  if (!packet)
+    return;
+  size_t length = data & 255;
+  if (length > 4)
+    return;
+  memset(packet->data, 0, length);
+}
+
+static const MemoryRegionOps mmio_flexible_array_oob_ops = {
+    .write = mmio_flexible_array_oob,
+};
+
+static const MemoryRegionOps mmio_flexible_array_guarded_ops = {
+    .write = mmio_flexible_array_guarded,
+};
+
+static const MemoryRegionOps mmio_flexible_array_copy_oob_ops = {
+    .write = mmio_flexible_array_copy_oob,
+};
+
+static const MemoryRegionOps mmio_flexible_array_copy_guarded_ops = {
+    .write = mmio_flexible_array_copy_guarded,
+};
+
+static void mmio_test_bit_oob(void *opaque, uint64_t addr, uint64_t data, // expected-note {{MMIO callback parameter 'data' is guest-controlled}}
+                              unsigned size) {
+  unsigned long bitmap[1] = {0};
+  long bit = (long)(sizeof(bitmap) * 8 + (data & 7));
+  (void)test_bit(bit, bitmap); // expected-warning {{Level A: guest-controlled bitmap bit index exceeds the host object bit capacity}}
+                               // expected-note@-1 {{Level A: guest-controlled bitmap bit index exceeds the host object bit capacity}}
+}
+
+static void mmio_set_bit_oob(void *opaque, uint64_t addr, uint64_t data, // expected-note {{MMIO callback parameter 'data' is guest-controlled}}
+                             unsigned size) {
+  unsigned long bitmap[1] = {0};
+  long bit = (long)(sizeof(bitmap) * 8 + (data & 7));
+  set_bit(bit, bitmap); // expected-warning {{Level A: guest-controlled bitmap bit index exceeds the host object bit capacity}}
+                        // expected-note@-1 {{Level A: guest-controlled bitmap bit index exceeds the host object bit capacity}}
+}
+
+static void mmio_clear_bit_oob(void *opaque, uint64_t addr, uint64_t data, // expected-note {{MMIO callback parameter 'data' is guest-controlled}}
+                               unsigned size) {
+  unsigned long bitmap[1] = {0};
+  long bit = (long)(sizeof(bitmap) * 8 + (data & 7));
+  clear_bit(bit, bitmap); // expected-warning {{Level A: guest-controlled bitmap bit index exceeds the host object bit capacity}}
+                          // expected-note@-1 {{Level A: guest-controlled bitmap bit index exceeds the host object bit capacity}}
+}
+
+static void mmio_bitmap_guarded(void *opaque, uint64_t addr, uint64_t data,
+                                unsigned size) {
+  unsigned long bitmap[1] = {0};
+  long bit = (long)(data & 255);
+  if ((unsigned long)bit >= sizeof(bitmap) * 8)
+    return;
+  (void)test_bit(bit, bitmap);
+  set_bit(bit, bitmap);
+  clear_bit(bit, bitmap);
+}
+
+static const MemoryRegionOps mmio_test_bit_oob_ops = {
+    .write = mmio_test_bit_oob,
+};
+
+static const MemoryRegionOps mmio_set_bit_oob_ops = {
+    .write = mmio_set_bit_oob,
+};
+
+static const MemoryRegionOps mmio_clear_bit_oob_ops = {
+    .write = mmio_clear_bit_oob,
+};
+
+static const MemoryRegionOps mmio_bitmap_guarded_ops = {
+    .write = mmio_bitmap_guarded,
+};
