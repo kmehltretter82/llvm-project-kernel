@@ -133,6 +133,30 @@ static const MemoryRegionOps checked_product_safe_ops = {
     .write = checked_product_safe,
 };
 
+static void checked_product_changed_operand(void *opaque, uint64_t addr,
+                                            uint64_t data, unsigned size) {
+  size_t count = data & 3;
+  unsigned char *buffer = g_malloc_n(count, 4);
+  count++;
+  memset(buffer, 0, count * 4); // expected-warning {{guest-controlled memory-operation length}}
+}
+
+static const MemoryRegionOps checked_product_changed_operand_ops = {
+    .write = checked_product_changed_operand,
+};
+
+static void checked_product_independent_same_range(
+    void *opaque, uint64_t addr, uint64_t data, unsigned size) {
+  size_t count = data & 3;
+  size_t independent = addr & 3;
+  unsigned char *buffer = g_malloc_n(count, 4);
+  memset(buffer, 0, independent * 4); // expected-warning {{Level B: guest-controlled memory-operation length may exceed the host object extent}}
+}
+
+static const MemoryRegionOps checked_product_independent_same_range_ops = {
+    .write = checked_product_independent_same_range,
+};
+
 static void local_wrapped_allocation(
     void *opaque, uint64_t addr, uint64_t data, unsigned size) {
   if (data <= ((uint64_t)-1) / 2)

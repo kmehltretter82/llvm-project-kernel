@@ -51,6 +51,15 @@ using namespace clang;
 using namespace ento;
 
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUPendingAllocationSizes, const Expr *, SVal)
+REGISTER_MAP_WITH_PROGRAMSTATE(QEMUPendingAllocationRelationKinds, const Expr *,
+                               unsigned)
+REGISTER_MAP_WITH_PROGRAMSTATE(QEMUPendingAllocationRelationLeft, const Expr *,
+                               SVal)
+REGISTER_MAP_WITH_PROGRAMSTATE(QEMUPendingAllocationRelationRight, const Expr *,
+                               SVal)
+REGISTER_MAP_WITH_PROGRAMSTATE(QEMUAllocationRelationKinds, SymbolRef, unsigned)
+REGISTER_MAP_WITH_PROGRAMSTATE(QEMUAllocationRelationLeft, SymbolRef, SVal)
+REGISTER_MAP_WITH_PROGRAMSTATE(QEMUAllocationRelationRight, SymbolRef, SVal)
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUSavedTaintedScalars, const VarRegion *, SVal)
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUPersistentFieldSources, SymbolRef,
                                const FieldDecl *)
@@ -143,6 +152,14 @@ struct BoundStates {
 };
 
 enum class BoundUnit { Bytes, Elements, Bits };
+
+enum class AllocationRelationKind : unsigned {
+  NonOverflowingAdd,
+  WrappedAdd,
+  CheckedMultiply,
+};
+
+enum class AllocationAccessRelation { Unknown, Covered, Exceeds };
 
 struct ShiftedBoundPredicate {
   unsigned Parameter;
@@ -294,6 +311,13 @@ static std::optional<BoundStates> compare(ProgramStateRef State, SVal Left,
     return std::nullopt;
   auto [TrueState, FalseState] = State->assume(*Defined);
   return BoundStates{TrueState, FalseState};
+}
+
+static bool isDefinitelyTrue(ProgramStateRef State, SVal Left,
+                             BinaryOperatorKind Op, SVal Right,
+                             SValBuilder &SVB) {
+  std::optional<BoundStates> Result = compare(State, Left, Op, Right, SVB);
+  return Result && Result->Safe && !Result->Unsafe;
 }
 
 static std::optional<BoundStates>
@@ -2366,6 +2390,35 @@ class QEMUGuestMemorySafetyChecker
     return C.getSVal(E);
   }
 
+  static SVal currentOperandValue(const Expr *Operand, CheckerContext &C) {
+    const Expr *Core = Operand->IgnoreParenImpCasts();
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(Core))
+      if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
+        const VarRegion *Region =
+            C.getState()->getRegion(VD, C.getStackFrame());
+        SVal Current = C.getState()->getSVal(Region);
+        if (!Current.isUnknownOrUndef())
+          return Current;
+      }
+    SVal Value = expressionValue(Operand, C);
+    if (!Value.isUnknownOrUndef())
+      return Value;
+    if (std::optional<llvm::APSInt> Constant =
+            Operand->getIntegerConstantExpr(C.getASTContext()))
+      return C.getSValBuilder().makeIntVal(*Constant);
+    return UnknownVal();
+  }
+
+  static SVal currentArithmeticValue(const BinaryOperator *Arithmetic,
+                                     CheckerContext &C) {
+    SVal Left = currentOperandValue(Arithmetic->getLHS(), C);
+    SVal Right = currentOperandValue(Arithmetic->getRHS(), C);
+    if (Left.isUnknownOrUndef() || Right.isUnknownOrUndef())
+      return UnknownVal();
+    return C.getSValBuilder().evalBinOp(C.getState(), Arithmetic->getOpcode(),
+                                        Left, Right, Arithmetic->getType());
+  }
+
   static SVal storedExpressionValue(const Expr *E, CheckerContext &C) {
     const Expr *Core = E->IgnoreParenImpCasts();
     if (const auto *ME = dyn_cast<MemberExpr>(Core))
@@ -3501,9 +3554,36 @@ class QEMUGuestMemorySafetyChecker
       return;
 
     if (!Descriptor.ElementSizeArgument) {
-      State =
-          State->set<QEMUPendingAllocationSizes>(Call.getOriginExpr(), Count);
-      C.addTransition(State);
+      const Expr *Origin = Call.getOriginExpr();
+      State = State->set<QEMUPendingAllocationSizes>(Origin, Count);
+      const BinaryOperator *Arithmetic =
+          sizeArithmetic(Call.getArgExpr(Descriptor.CountArgument));
+      if (Arithmetic && Arithmetic->getOpcode() == BO_Add) {
+        SVal Left = currentOperandValue(Arithmetic->getLHS(), C);
+        SVal Right = currentOperandValue(Arithmetic->getRHS(), C);
+        SVal ArithmeticValue = currentArithmeticValue(Arithmetic, C);
+        if (!Left.isUnknownOrUndef() && !Right.isUnknownOrUndef() &&
+            isDefinitelyTrue(State, Count, BO_EQ, ArithmeticValue,
+                             C.getSValBuilder())) {
+          unsigned Width = C.getASTContext().getIntWidth(Arithmetic->getType());
+          std::optional<OverflowResult> Overflow = overflowRange(
+              State, Left, Right, BO_Add, Width, C.getSValBuilder());
+          std::optional<AllocationRelationKind> Kind;
+          if (Overflow && !Overflow->MayOverflow)
+            Kind = AllocationRelationKind::NonOverflowingAdd;
+          else if (Overflow && Overflow->MustOverflow)
+            Kind = AllocationRelationKind::WrappedAdd;
+          if (Kind)
+            State =
+                State
+                    ->set<QEMUPendingAllocationRelationKinds>(
+                        Origin, static_cast<unsigned>(*Kind))
+                    ->set<QEMUPendingAllocationRelationLeft>(Origin, Left)
+                    ->set<QEMUPendingAllocationRelationRight>(Origin, Right);
+        }
+      }
+      if (!checkAllocationOverflow(Call, C, State))
+        C.addTransition(State);
       return;
     }
 
@@ -3537,49 +3617,58 @@ class QEMUGuestMemorySafetyChecker
     SVal Size = SVB.evalBinOp(Multiplication->Safe, BO_Mul, ConvertedCount,
                               ConvertedElementSize, ProductType);
     if (auto DefinedSize = Size.getAs<DefinedOrUnknownSVal>()) {
+      const Expr *Origin = Call.getOriginExpr();
       ProgramStateRef Sized =
-          Multiplication->Safe->set<QEMUPendingAllocationSizes>(
-              Call.getOriginExpr(), *DefinedSize);
+          Multiplication->Safe->set<QEMUPendingAllocationSizes>(Origin,
+                                                                *DefinedSize);
+      Sized =
+          Sized
+              ->set<QEMUPendingAllocationRelationKinds>(
+                  Origin, static_cast<unsigned>(
+                              AllocationRelationKind::CheckedMultiply))
+              ->set<QEMUPendingAllocationRelationLeft>(Origin, ConvertedCount)
+              ->set<QEMUPendingAllocationRelationRight>(Origin,
+                                                        ConvertedElementSize);
       C.addTransition(Sized);
     }
   }
 
-  void checkAllocationOverflow(const CallEvent &Call, CheckerContext &C) const {
+  bool checkAllocationOverflow(const CallEvent &Call, CheckerContext &C,
+                               ProgramStateRef State) const {
     std::optional<AllocationExtentDescriptor> Descriptor =
         allocationExtentDescriptor(Call, C.getASTContext());
     if (!Descriptor || Descriptor->ElementSizeArgument)
-      return;
+      return false;
     const BinaryOperator *Arithmetic =
         sizeArithmetic(Call.getArgExpr(Descriptor->CountArgument));
     if (!Arithmetic)
-      return;
+      return false;
 
-    ProgramStateRef State = C.getState();
-    SVal Left = expressionValue(Arithmetic->getLHS(), C);
-    SVal Right = expressionValue(Arithmetic->getRHS(), C);
+    SVal Left = currentOperandValue(Arithmetic->getLHS(), C);
+    SVal Right = currentOperandValue(Arithmetic->getRHS(), C);
     SVal Size = allocationArgumentValue(Call, Descriptor->CountArgument, C);
-    SVal ArithmeticValue = expressionValue(Arithmetic, C);
+    SVal ArithmeticValue = currentArithmeticValue(Arithmetic, C);
     std::optional<BoundStates> StillCurrent =
         compare(State, Size, BO_EQ, ArithmeticValue, C.getSValBuilder());
     // A local initializer is useful only while its value still equals the
     // allocation argument.  Do not diagnose stale initializer arithmetic
     // after the local (or one of its operands) has been reassigned.
     if (!StillCurrent || !StillCurrent->Safe || StillCurrent->Unsafe)
-      return;
+      return false;
     State = StillCurrent->Safe;
     if (!taint::isTainted(State, Left) && !taint::isTainted(State, Right) &&
         !taint::isTainted(State, Size))
-      return;
+      return false;
 
     unsigned Width = C.getASTContext().getIntWidth(Arithmetic->getType());
     std::optional<OverflowResult> Result = overflowRange(
         State, Left, Right, Arithmetic->getOpcode(), Width, C.getSValBuilder());
     if (!Result || !Result->MayOverflow)
-      return;
+      return false;
 
-    ExplodedNode *Node = C.generateNonFatalErrorNode();
+    ExplodedNode *Node = C.generateNonFatalErrorNode(State);
     if (!Node)
-      return;
+      return false;
     llvm::SmallString<256> Buffer;
     llvm::raw_svector_ostream Message(Buffer);
     Message << (Result->MustOverflow
@@ -3597,6 +3686,7 @@ class QEMUGuestMemorySafetyChecker
       for (SymbolRef Sym : taint::getTaintedSymbols(State, Value))
         Report->markInteresting(Sym);
     C.emitReport(std::move(Report));
+    return true;
   }
 
   static bool isBoundedOnlyByUnsignedType(const Expr *Expression, SVal Value,
@@ -3773,6 +3863,62 @@ class QEMUGuestMemorySafetyChecker
            "bitmap bit index", Capacity, BoundUnit::Bits, SourceDetail);
   }
 
+  AllocationAccessRelation
+  allocationAccessRelation(SVal Buffer, SVal Length,
+                           const Expr *LengthExpression, ProgramStateRef State,
+                           CheckerContext &C) const {
+    SymbolRef Allocation = Buffer.getLocSymbolInBase();
+    if (!Allocation)
+      return AllocationAccessRelation::Unknown;
+    const unsigned *StoredKind =
+        State->get<QEMUAllocationRelationKinds>(Allocation);
+    const SVal *Left = State->get<QEMUAllocationRelationLeft>(Allocation);
+    const SVal *Right = State->get<QEMUAllocationRelationRight>(Allocation);
+    if (!StoredKind || !Left || !Right)
+      return AllocationAccessRelation::Unknown;
+
+    AllocationRelationKind Kind =
+        static_cast<AllocationRelationKind>(*StoredKind);
+    SValBuilder &SVB = C.getSValBuilder();
+    if (Kind == AllocationRelationKind::NonOverflowingAdd) {
+      if (isDefinitelyTrue(State, Length, BO_LE, *Left, SVB) ||
+          isDefinitelyTrue(State, Length, BO_LE, *Right, SVB))
+        return AllocationAccessRelation::Covered;
+      return AllocationAccessRelation::Unknown;
+    }
+    if (Kind == AllocationRelationKind::WrappedAdd) {
+      if (isDefinitelyTrue(State, Length, BO_GE, *Left, SVB) ||
+          isDefinitelyTrue(State, Length, BO_GE, *Right, SVB))
+        return AllocationAccessRelation::Exceeds;
+      return AllocationAccessRelation::Unknown;
+    }
+
+    const Expr *Core = LengthExpression->IgnoreParenImpCasts();
+    while (const auto *Cast = dyn_cast<CastExpr>(Core))
+      Core = Cast->getSubExpr()->IgnoreParenImpCasts();
+    const auto *Multiply = dyn_cast<BinaryOperator>(Core);
+    if (!Multiply || Multiply->getOpcode() != BO_Mul ||
+        !Multiply->getType()->isUnsignedIntegerType() ||
+        !C.getASTContext().hasSameUnqualifiedType(
+            Multiply->getType(), C.getASTContext().getSizeType()))
+      return AllocationAccessRelation::Unknown;
+
+    SVal CurrentLeft = currentOperandValue(Multiply->getLHS(), C);
+    SVal CurrentRight = currentOperandValue(Multiply->getRHS(), C);
+    if (CurrentLeft.isUnknownOrUndef() || CurrentRight.isUnknownOrUndef())
+      return AllocationAccessRelation::Unknown;
+    CurrentLeft = SVB.evalCast(CurrentLeft, C.getASTContext().getSizeType(),
+                               Multiply->getLHS()->getType());
+    CurrentRight = SVB.evalCast(CurrentRight, C.getASTContext().getSizeType(),
+                                Multiply->getRHS()->getType());
+    bool Direct = isDefinitelyTrue(State, CurrentLeft, BO_EQ, *Left, SVB) &&
+                  isDefinitelyTrue(State, CurrentRight, BO_EQ, *Right, SVB);
+    bool Reversed = isDefinitelyTrue(State, CurrentLeft, BO_EQ, *Right, SVB) &&
+                    isDefinitelyTrue(State, CurrentRight, BO_EQ, *Left, SVB);
+    return Direct || Reversed ? AllocationAccessRelation::Covered
+                              : AllocationAccessRelation::Unknown;
+  }
+
   bool checkMemorySink(const CallEvent &Call, const MemorySink &Sink,
                        CheckerContext &C,
                        ProgramStateRef State = nullptr) const {
@@ -3926,6 +4072,16 @@ class QEMUGuestMemorySafetyChecker
     }
     if (!GuestControlled)
       return false;
+    AllocationAccessRelation AllocationRelation =
+        allocationAccessRelation(Call.getArgSVal(Sink.BufferArgument), Length,
+                                 LengthExpression, State, C);
+    if (!HasOffset && AllocationRelation == AllocationAccessRelation::Covered)
+      return false;
+    if (AllocationRelation == AllocationAccessRelation::Exceeds) {
+      report(C, nullptr, State, Required, LengthExpression, SinkDescription,
+             Extent, BoundUnit::Bytes, SourceDetail);
+      return true;
+    }
     if (!hasUsableExtent(State, Extent, C.getSValBuilder()))
       return false;
     if (!HasOffset)
@@ -4379,7 +4535,6 @@ public:
     if (std::optional<AllocationExtentDescriptor> Descriptor =
             allocationExtentDescriptor(Call, C.getASTContext()))
       savePendingAllocationExtent(Call, *Descriptor, C);
-    checkAllocationOverflow(Call, C);
     checkAvailabilityAllocation(Call, C);
     if (isBitmapBitSink(Call, C.getASTContext()))
       checkBitmapBitSink(Call, C);
@@ -4393,9 +4548,26 @@ public:
     if (std::optional<AllocationExtentDescriptor> Descriptor =
             allocationExtentDescriptor(Call, C.getASTContext())) {
       ProgramStateRef State = C.getState();
-      const SVal *SavedSize =
-          State->get<QEMUPendingAllocationSizes>(Call.getOriginExpr());
-      State = State->remove<QEMUPendingAllocationSizes>(Call.getOriginExpr());
+      const Expr *Origin = Call.getOriginExpr();
+      const SVal *SavedSize = State->get<QEMUPendingAllocationSizes>(Origin);
+      const unsigned *SavedRelationKind =
+          State->get<QEMUPendingAllocationRelationKinds>(Origin);
+      const SVal *SavedRelationLeft =
+          State->get<QEMUPendingAllocationRelationLeft>(Origin);
+      const SVal *SavedRelationRight =
+          State->get<QEMUPendingAllocationRelationRight>(Origin);
+      std::optional<unsigned> RelationKind;
+      std::optional<SVal> RelationLeft;
+      std::optional<SVal> RelationRight;
+      if (SavedRelationKind && SavedRelationLeft && SavedRelationRight) {
+        RelationKind = *SavedRelationKind;
+        RelationLeft = *SavedRelationLeft;
+        RelationRight = *SavedRelationRight;
+      }
+      State = State->remove<QEMUPendingAllocationSizes>(Origin)
+                  ->remove<QEMUPendingAllocationRelationKinds>(Origin)
+                  ->remove<QEMUPendingAllocationRelationLeft>(Origin)
+                  ->remove<QEMUPendingAllocationRelationRight>(Origin);
       SVal Size = SavedSize ? *SavedSize : UnknownVal();
       // Direct-size allocators cannot fail their size calculation, so recover
       // it if another checker dropped our pre-call bookkeeping.  For checked
@@ -4406,6 +4578,15 @@ public:
       if (const MemRegion *Region = Call.getReturnValue().getAsRegion()) {
         if (auto DefinedSize = Size.getAs<DefinedOrUnknownSVal>())
           State = setDynamicExtent(State, Region, *DefinedSize);
+        if (SymbolRef Allocation = Call.getReturnValue().getLocSymbolInBase())
+          if (RelationKind && RelationLeft && RelationRight)
+            State =
+                State
+                    ->set<QEMUAllocationRelationKinds>(Allocation,
+                                                       *RelationKind)
+                    ->set<QEMUAllocationRelationLeft>(Allocation, *RelationLeft)
+                    ->set<QEMUAllocationRelationRight>(Allocation,
+                                                       *RelationRight);
         const auto *FD = dyn_cast_or_null<FunctionDecl>(Call.getDecl());
         if (FD && FD->getIdentifier() && FD->getName() == "g_memdup2") {
           if (std::optional<InputClass> Source =
@@ -4731,6 +4912,13 @@ public:
         State = State->remove<QEMUInputBufferLengths>(Entry.first)
                     ->remove<QEMUInputBufferClasses>(Entry.first)
                     ->remove<QEMUInputBufferParameters>(Entry.first);
+    auto AllocationRelations = State->get<QEMUAllocationRelationKinds>();
+    for (const auto &Entry : AllocationRelations)
+      if (SymReaper.isDead(Entry.first)) {
+        State = State->remove<QEMUAllocationRelationKinds>(Entry.first)
+                    ->remove<QEMUAllocationRelationLeft>(Entry.first)
+                    ->remove<QEMUAllocationRelationRight>(Entry.first);
+      }
     if (State != C.getState())
       C.addTransition(State);
   }
@@ -4752,6 +4940,12 @@ public:
       for (SymbolRef Symbol : Entry.second.symbols())
         SymReaper.markLive(Symbol);
     }
+    for (const auto &Entry : State->get<QEMUAllocationRelationLeft>())
+      for (SymbolRef Symbol : Entry.second.symbols())
+        SymReaper.markLive(Symbol);
+    for (const auto &Entry : State->get<QEMUAllocationRelationRight>())
+      for (SymbolRef Symbol : Entry.second.symbols())
+        SymReaper.markLive(Symbol);
   }
 
   void checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const {
