@@ -660,7 +660,7 @@ static bool isAIOContextDetach(CheckerContext &C) {
   // conventional detach callback name instead of requiring every timer_free
   // caller to clear its source expression.
   const auto *FD =
-      dyn_cast_or_null<FunctionDecl>(C.getLocationContext()->getDecl());
+      dyn_cast_or_null<FunctionDecl>(C.getStackFrame()->getDecl());
   return FD && FD->getIdentifier() &&
          FD->getName().contains("detach_aio_context");
 }
@@ -877,7 +877,7 @@ static ProgramStateRef clearAsyncForBarrier(ProgramStateRef State, SVal Barrier,
 
 static ProgramStateRef
 clearSelfUnregisteringFDHandlers(ProgramStateRef State,
-                                 const StackFrameContext *CurrentFrame) {
+                                 const StackFrame *CurrentFrame) {
   ProgramStateRef Updated = State;
   for (const AsyncFDKey &FD : State->get<QEMUAsyncFDResumeHandlers>()) {
     const MemRegion *const *Opaque = State->get<QEMUAsyncOpaqueByFD>(FD);

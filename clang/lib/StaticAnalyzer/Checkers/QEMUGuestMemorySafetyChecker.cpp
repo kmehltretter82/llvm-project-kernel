@@ -1686,7 +1686,7 @@ class QEMUGuestMemorySafetyChecker
 
     class LocalSourceVisitor : public DynamicRecursiveASTVisitor {
       ProgramStateRef State;
-      const StackFrameContext *Frame;
+      const StackFrame *Frame;
       const llvm::DenseMap<const FieldDecl *, InputClass> &PersistentFields;
 
       bool addField(const FieldDecl *Candidate) {
@@ -1706,7 +1706,7 @@ class QEMUGuestMemorySafetyChecker
       bool HasScalarParameter = false;
 
       LocalSourceVisitor(
-          ProgramStateRef State, const StackFrameContext *Frame,
+          ProgramStateRef State, const StackFrame *Frame,
           const llvm::DenseMap<const FieldDecl *, InputClass> &PersistentFields)
           : State(State), Frame(Frame), PersistentFields(PersistentFields) {}
 
@@ -3543,7 +3543,7 @@ public:
 
   void checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const {
     ProgramStateRef State = C.getState();
-    const StackFrameContext *Frame = C.getStackFrame();
+    const StackFrame *Frame = C.getStackFrame();
     auto LocalSources = State->get<QEMUPersistentLocalSources>();
     for (const auto &Entry : LocalSources)
       if (Entry.first->getStackFrame() == Frame)
