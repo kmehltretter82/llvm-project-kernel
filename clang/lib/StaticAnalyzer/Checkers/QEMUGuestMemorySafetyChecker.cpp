@@ -2205,19 +2205,48 @@ class QEMUGuestMemorySafetyChecker
     return std::nullopt;
   }
 
-  static std::optional<unsigned> allocationSizeArgument(const CallEvent &Call) {
+  struct AllocationExtentDescriptor {
+    unsigned CountArgument;
+    std::optional<unsigned> ElementSizeArgument;
+  };
+
+  static std::optional<AllocationExtentDescriptor>
+  allocationExtentDescriptor(const CallEvent &Call, ASTContext &Context) {
     const auto *FD = dyn_cast_or_null<FunctionDecl>(Call.getDecl());
-    if (!FD || !FD->getIdentifier())
+    if (!FD || !FD->getIdentifier() || !FD->getReturnType()->isPointerType())
       return std::nullopt;
+
+    auto HasSignature = [&](unsigned ParameterCount,
+                            std::initializer_list<unsigned> SizeParameters) {
+      if (FD->getNumParams() != ParameterCount ||
+          Call.getNumArgs() != ParameterCount)
+        return false;
+      for (unsigned Parameter : SizeParameters)
+        if (Parameter >= ParameterCount ||
+            !Context.hasSameUnqualifiedType(
+                FD->getParamDecl(Parameter)->getType(), Context.getSizeType()))
+          return false;
+      return true;
+    };
+
     StringRef Name = FD->getName();
     if ((Name == "malloc" || Name == "g_malloc" || Name == "g_malloc0" ||
          Name == "g_try_malloc" || Name == "g_try_malloc0") &&
-        Call.getNumArgs() >= 1)
-      return 0;
+        HasSignature(1, {0}))
+      return AllocationExtentDescriptor{0, std::nullopt};
     if ((Name == "realloc" || Name == "g_realloc" || Name == "g_try_realloc" ||
-         Name == "qemu_memalign") &&
-        Call.getNumArgs() >= 2)
-      return 1;
+         Name == "qemu_memalign" || Name == "qemu_try_memalign" ||
+         Name == "g_memdup2") &&
+        HasSignature(2, {1}))
+      return AllocationExtentDescriptor{1, std::nullopt};
+    if ((Name == "g_malloc_n" || Name == "g_malloc0_n" ||
+         Name == "g_try_malloc_n" || Name == "g_try_malloc0_n" ||
+         Name == "calloc") &&
+        HasSignature(2, {0, 1}))
+      return AllocationExtentDescriptor{0, 1};
+    if ((Name == "g_realloc_n" || Name == "g_try_realloc_n") &&
+        HasSignature(3, {1, 2}))
+      return AllocationExtentDescriptor{1, 2};
     return std::nullopt;
   }
 
@@ -2249,7 +2278,7 @@ class QEMUGuestMemorySafetyChecker
   static const BinaryOperator *sizeArithmetic(const Expr *E) {
     if (!E)
       return nullptr;
-    E = E->IgnoreParenImpCasts();
+    E = resolveLocalInitializer(E)->IgnoreParenImpCasts();
     while (const auto *Cast = dyn_cast<CastExpr>(E))
       E = Cast->getSubExpr()->IgnoreParenImpCasts();
     const auto *BO = dyn_cast<BinaryOperator>(E);
@@ -2992,10 +3021,16 @@ class QEMUGuestMemorySafetyChecker
            ReferencesParameter(Length, FD->getParamDecl(SizeIndex));
   }
 
-  static SVal allocationSizeValue(const CallEvent &Call, unsigned SizeIndex,
-                                  CheckerContext &C) {
-    const Expr *Argument = Call.getArgExpr(SizeIndex);
+  static SVal allocationArgumentValue(const CallEvent &Call,
+                                      unsigned ArgumentIndex,
+                                      CheckerContext &C) {
+    const Expr *Argument = Call.getArgExpr(ArgumentIndex);
     SVal Value = expressionValue(Argument, C);
+    if (Value.isUnknownOrUndef()) {
+      const Expr *Resolved = resolveLocalInitializer(Argument);
+      if (Resolved != Argument->IgnoreParenImpCasts())
+        Value = expressionValue(Resolved, C);
+    }
     QualType UnpromotedType = Argument->IgnoreParenImpCasts()->getType();
     if (!UnpromotedType->isUnsignedIntegerType())
       return Value;
@@ -3047,19 +3082,117 @@ class QEMUGuestMemorySafetyChecker
     return OverflowResult{May, Must};
   }
 
+  static std::optional<BoundStates>
+  checkedMultiplicationStates(ProgramStateRef State, SVal Left, SVal Right,
+                              QualType ProductType, SValBuilder &SVB) {
+    unsigned Width = SVB.getContext().getIntWidth(ProductType);
+    std::optional<OverflowResult> Range =
+        overflowRange(State, Left, Right, BO_Mul, Width, SVB);
+    if (!Range)
+      return std::nullopt;
+    if (!Range->MayOverflow)
+      return BoundStates{State, nullptr};
+    if (Range->MustOverflow)
+      return BoundStates{nullptr, State};
+
+    const llvm::APSInt *LeftValue = SVB.getKnownValue(State, Left);
+    const llvm::APSInt *RightValue = SVB.getKnownValue(State, Right);
+    SVal Variable;
+    const llvm::APSInt *Factor = nullptr;
+    if (LeftValue && !LeftValue->isNegative()) {
+      Factor = LeftValue;
+      Variable = Right;
+    } else if (RightValue && !RightValue->isNegative()) {
+      Factor = RightValue;
+      Variable = Left;
+    }
+    if (!Factor || Width == 0 || Width > 64 || Factor->getActiveBits() > 64)
+      return std::nullopt;
+    uint64_t FactorValue = Factor->getZExtValue();
+    if (FactorValue == 0)
+      return BoundStates{State, nullptr};
+
+    llvm::APSInt Maximum = SVB.getBasicValueFactory().getMaxValue(ProductType);
+    uint64_t Limit = Maximum.getZExtValue() / FactorValue;
+    SVal LimitValue = SVB.makeIntVal(Limit, ProductType);
+    return compare(State, Variable, BO_LE, LimitValue, SVB);
+  }
+
+  void savePendingAllocationExtent(const CallEvent &Call,
+                                   const AllocationExtentDescriptor &Descriptor,
+                                   CheckerContext &C) const {
+    ProgramStateRef State = C.getState();
+    SVal Count = allocationArgumentValue(Call, Descriptor.CountArgument, C);
+    if (Count.isUnknownOrUndef())
+      return;
+
+    if (!Descriptor.ElementSizeArgument) {
+      State =
+          State->set<QEMUPendingAllocationSizes>(Call.getOriginExpr(), Count);
+      C.addTransition(State);
+      return;
+    }
+
+    SVal ElementSize =
+        allocationArgumentValue(Call, *Descriptor.ElementSizeArgument, C);
+    if (ElementSize.isUnknownOrUndef())
+      return;
+    QualType ProductType = cast<FunctionDecl>(Call.getDecl())
+                               ->getParamDecl(Descriptor.CountArgument)
+                               ->getType();
+    SValBuilder &SVB = C.getSValBuilder();
+    SVal ConvertedCount =
+        SVB.evalCast(Count, ProductType,
+                     Call.getArgExpr(Descriptor.CountArgument)->getType());
+    SVal ConvertedElementSize = SVB.evalCast(
+        ElementSize, ProductType,
+        Call.getArgExpr(*Descriptor.ElementSizeArgument)->getType());
+    if (ConvertedCount.isUnknownOrUndef() ||
+        ConvertedElementSize.isUnknownOrUndef())
+      return;
+
+    std::optional<BoundStates> Multiplication = checkedMultiplicationStates(
+        State, ConvertedCount, ConvertedElementSize, ProductType, SVB);
+    if (!Multiplication)
+      return;
+    if (Multiplication->Unsafe)
+      C.addTransition(Multiplication->Unsafe);
+    if (!Multiplication->Safe)
+      return;
+
+    SVal Size = SVB.evalBinOp(Multiplication->Safe, BO_Mul, ConvertedCount,
+                              ConvertedElementSize, ProductType);
+    if (auto DefinedSize = Size.getAs<DefinedOrUnknownSVal>()) {
+      ProgramStateRef Sized =
+          Multiplication->Safe->set<QEMUPendingAllocationSizes>(
+              Call.getOriginExpr(), *DefinedSize);
+      C.addTransition(Sized);
+    }
+  }
+
   void checkAllocationOverflow(const CallEvent &Call, CheckerContext &C) const {
-    std::optional<unsigned> SizeIndex = allocationSizeArgument(Call);
-    if (!SizeIndex)
+    std::optional<AllocationExtentDescriptor> Descriptor =
+        allocationExtentDescriptor(Call, C.getASTContext());
+    if (!Descriptor || Descriptor->ElementSizeArgument)
       return;
     const BinaryOperator *Arithmetic =
-        sizeArithmetic(Call.getArgExpr(*SizeIndex));
+        sizeArithmetic(Call.getArgExpr(Descriptor->CountArgument));
     if (!Arithmetic)
       return;
 
     ProgramStateRef State = C.getState();
     SVal Left = expressionValue(Arithmetic->getLHS(), C);
     SVal Right = expressionValue(Arithmetic->getRHS(), C);
-    SVal Size = Call.getArgSVal(*SizeIndex);
+    SVal Size = allocationArgumentValue(Call, Descriptor->CountArgument, C);
+    SVal ArithmeticValue = expressionValue(Arithmetic, C);
+    std::optional<BoundStates> StillCurrent =
+        compare(State, Size, BO_EQ, ArithmeticValue, C.getSValBuilder());
+    // A local initializer is useful only while its value still equals the
+    // allocation argument.  Do not diagnose stale initializer arithmetic
+    // after the local (or one of its operands) has been reassigned.
+    if (!StillCurrent || !StillCurrent->Safe || StillCurrent->Unsafe)
+      return;
+    State = StillCurrent->Safe;
     if (!taint::isTainted(State, Left) && !taint::isTainted(State, Right) &&
         !taint::isTainted(State, Size))
       return;
@@ -3816,15 +3949,9 @@ public:
   }
 
   void checkPreCall(const CallEvent &Call, CheckerContext &C) const {
-    ProgramStateRef State = C.getState();
-    if (std::optional<unsigned> SizeIndex = allocationSizeArgument(Call)) {
-      SVal Size = allocationSizeValue(Call, *SizeIndex, C);
-      if (!Size.isUnknownOrUndef()) {
-        State =
-            State->set<QEMUPendingAllocationSizes>(Call.getOriginExpr(), Size);
-        C.addTransition(State);
-      }
-    }
+    if (std::optional<AllocationExtentDescriptor> Descriptor =
+            allocationExtentDescriptor(Call, C.getASTContext()))
+      savePendingAllocationExtent(Call, *Descriptor, C);
     checkAllocationOverflow(Call, C);
     checkAvailabilityAllocation(Call, C);
     if (isBitmapBitSink(Call, C.getASTContext()))
@@ -3836,17 +3963,27 @@ public:
   }
 
   void checkPostCall(const CallEvent &Call, CheckerContext &C) const {
-    if (std::optional<unsigned> SizeIndex = allocationSizeArgument(Call)) {
+    if (std::optional<AllocationExtentDescriptor> Descriptor =
+            allocationExtentDescriptor(Call, C.getASTContext())) {
       ProgramStateRef State = C.getState();
       const SVal *SavedSize =
           State->get<QEMUPendingAllocationSizes>(Call.getOriginExpr());
-      SVal Size =
-          SavedSize ? *SavedSize : allocationSizeValue(Call, *SizeIndex, C);
       State = State->remove<QEMUPendingAllocationSizes>(Call.getOriginExpr());
-      if (const MemRegion *Region = Call.getReturnValue().getAsRegion())
-        if (auto DefinedSize = Size.getAs<DefinedOrUnknownSVal>()) {
+      SVal Size = SavedSize ? *SavedSize : UnknownVal();
+      // Direct-size allocators cannot fail their size calculation, so recover
+      // it if another checker dropped our pre-call bookkeeping.  For checked
+      // products, absence of a saved size represents the overflow/failure
+      // path and must not be replaced with the wrapped multiplication.
+      if (!SavedSize && !Descriptor->ElementSizeArgument)
+        Size = allocationArgumentValue(Call, Descriptor->CountArgument, C);
+      if (const MemRegion *Region = Call.getReturnValue().getAsRegion()) {
+        if (auto DefinedSize = Size.getAs<DefinedOrUnknownSVal>())
           State = setDynamicExtent(State, Region, *DefinedSize);
-        }
+        const auto *FD = dyn_cast_or_null<FunctionDecl>(Call.getDecl());
+        if (FD && FD->getIdentifier() && FD->getName() == "g_memdup2" &&
+            isVirtqueueIovec(Call, 0, State))
+          State = State->add<QEMUVirtqueueIovecs>(Region->getBaseRegion());
+      }
       C.addTransition(State);
       return;
     }
