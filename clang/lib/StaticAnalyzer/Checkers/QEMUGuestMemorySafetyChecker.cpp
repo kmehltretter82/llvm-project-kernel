@@ -6,11 +6,12 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This experimental checker discovers QEMU MMIO and PIO callbacks from their
-// operation tables, marks guest-controlled callback arguments as tainted, and
-// relates tainted array indexes and memory-operation lengths to host object
-// extents.  A Level A report has no feasible in-bounds state.  A Level B
-// report has both in-bounds and out-of-bounds states and needs manual review.
+// This experimental checker discovers QEMU input callbacks and successful
+// guest-buffer reads, preserves their provenance through common request and
+// byte-order helpers, and relates tainted indexes and memory-operation lengths
+// to host object extents. A Level A report has no feasible in-bounds state. A
+// Level B report has both in-bounds and out-of-bounds states and needs manual
+// review.
 //
 //===----------------------------------------------------------------------===//
 
@@ -36,6 +37,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/raw_ostream.h"
+#include <algorithm>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -52,6 +54,9 @@ REGISTER_MAP_WITH_PROGRAMSTATE(QEMUPersistentFieldSources, SymbolRef,
                                const FieldDecl *)
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUPersistentLocalSources, const VarRegion *,
                                const FieldDecl *)
+REGISTER_MAP_WITH_PROGRAMSTATE(QEMUInputClasses, SymbolRef, unsigned)
+REGISTER_SET_WITH_PROGRAMSTATE(QEMUVirtqueueElements, const MemRegion *)
+REGISTER_SET_WITH_PROGRAMSTATE(QEMUVirtqueueIovecs, const MemRegion *)
 
 namespace {
 
@@ -63,6 +68,7 @@ enum class InputClass {
   Network,
   DiskImage,
   Virtio,
+  Virtqueue,
   Mixed
 };
 
@@ -196,6 +202,8 @@ static StringRef inputClassName(InputClass Source) {
     return "disk-image read";
   case InputClass::Virtio:
     return "virtio configuration";
+  case InputClass::Virtqueue:
+    return "virtqueue request";
   case InputClass::Mixed:
     return "mixed guest input";
   }
@@ -252,12 +260,12 @@ static bool hasUsableExtent(ProgramStateRef State, SVal Extent,
 class QEMUGuestMemorySafetyChecker
     : public Checker<check::ASTDecl<TranslationUnitDecl>, check::BeginFunction,
                      check::EndFunction, check::PreCall, check::PostCall,
-                     check::Bind, check::DeadSymbols,
+                     check::Bind, check::LiveSymbols, check::DeadSymbols,
                      check::PostStmt<ImplicitCastExpr>,
                      check::PreStmt<ArraySubscriptExpr>> {
   mutable llvm::DenseMap<const FunctionDecl *, CallbackInfo> Callbacks;
-  mutable llvm::DenseMap<const FieldDecl *, const FieldDecl *>
-      DynamicArrayCounts;
+  using FieldPath = llvm::SmallVector<const FieldDecl *, 4>;
+  mutable llvm::DenseMap<const FieldDecl *, FieldPath> DynamicArrayCounts;
   mutable llvm::DenseSet<const FieldDecl *> AmbiguousDynamicArrays;
   mutable llvm::DenseMap<const FunctionDecl *, ShiftedBoundPredicate>
       ShiftedBoundPredicates;
@@ -1199,6 +1207,9 @@ class QEMUGuestMemorySafetyChecker
     public:
       bool HasAllocation = false;
       llvm::DenseSet<const FieldDecl *> IntegerFields;
+      FieldPath IntegerFieldPath;
+      const Expr *IntegerFieldRoot = nullptr;
+      bool AmbiguousPath = false;
 
       bool VisitCallExpr(CallExpr *Call) override {
         const FunctionDecl *FD = Call->getDirectCallee();
@@ -1218,21 +1229,45 @@ class QEMUGuestMemorySafetyChecker
 
       bool VisitMemberExpr(MemberExpr *ME) override {
         const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl());
-        if (FD && FD->getType()->isIntegerType())
+        if (FD && FD->getType()->isIntegerType()) {
           IntegerFields.insert(FD);
+          FieldPath Path;
+          const Expr *Root = ME;
+          while (const auto *Member =
+                     dyn_cast<MemberExpr>(Root->IgnoreParenImpCasts())) {
+            const auto *PathField =
+                dyn_cast<FieldDecl>(Member->getMemberDecl());
+            if (!PathField) {
+              Path.clear();
+              break;
+            }
+            Path.push_back(PathField);
+            Root = Member->getBase();
+          }
+          std::reverse(Path.begin(), Path.end());
+          Root = Root->IgnoreParenImpCasts();
+          if (IntegerFieldPath.empty()) {
+            IntegerFieldPath = std::move(Path);
+            IntegerFieldRoot = Root;
+          } else if (IntegerFieldPath != Path ||
+                     !sameSimpleExpression(IntegerFieldRoot, Root)) {
+            AmbiguousPath = true;
+          }
+        }
         return true;
       }
     } Visitor;
     Visitor.TraverseStmt(const_cast<Expr *>(Assignment->getRHS()));
-    if (!Visitor.HasAllocation || Visitor.IntegerFields.size() != 1)
+    if (!Visitor.HasAllocation || Visitor.IntegerFields.size() != 1 ||
+        Visitor.IntegerFieldPath.empty() || Visitor.AmbiguousPath ||
+        !sameSimpleExpression(Member->getBase(), Visitor.IntegerFieldRoot))
       return;
 
-    const FieldDecl *CountField = *Visitor.IntegerFields.begin();
     if (AmbiguousDynamicArrays.contains(PointerField))
       return;
-    auto [Found, Inserted] =
-        DynamicArrayCounts.try_emplace(PointerField, CountField);
-    if (!Inserted && Found->second != CountField) {
+    auto [Found, Inserted] = DynamicArrayCounts.try_emplace(
+        PointerField, std::move(Visitor.IntegerFieldPath));
+    if (!Inserted && Found->second != Visitor.IntegerFieldPath) {
       DynamicArrayCounts.erase(PointerField);
       AmbiguousDynamicArrays.insert(PointerField);
     }
@@ -1316,6 +1351,90 @@ class QEMUGuestMemorySafetyChecker
           }
           return "";
         });
+  }
+
+  static const NoteTag *propagationNote(CheckerContext &C,
+                                        ProgramStateRef State, SVal Output,
+                                        SVal Input, InputClass Source,
+                                        StringRef Detail) {
+    std::vector<SymbolRef> Outputs = taint::getTaintedSymbols(State, Output);
+    std::vector<SymbolRef> Inputs = taint::getTaintedSymbols(State, Input);
+    std::string Message = inputClassName(Source).str() + " " + Detail.str();
+    return C.getNoteTag([Outputs = std::move(Outputs),
+                         Inputs = std::move(Inputs),
+                         Message = std::move(Message)](
+                            PathSensitiveBugReport &Report) -> std::string {
+      for (SymbolRef Symbol : Outputs) {
+        if (!Report.isInteresting(Symbol))
+          continue;
+        for (SymbolRef Input : Inputs)
+          Report.markInteresting(Input);
+        return Message;
+      }
+      return "";
+    });
+  }
+
+  static ProgramStateRef addInputTaint(ProgramStateRef State, SVal Value,
+                                       InputClass Source) {
+    State = taint::addTaint(State, Value);
+    for (SymbolRef Symbol : taint::getTaintedSymbols(State, Value)) {
+      const unsigned *Previous = State->get<QEMUInputClasses>(Symbol);
+      InputClass Merged =
+          Previous && static_cast<InputClass>(*Previous) != Source
+              ? InputClass::Mixed
+              : Source;
+      State =
+          State->set<QEMUInputClasses>(Symbol, static_cast<unsigned>(Merged));
+    }
+    return State;
+  }
+
+  static std::optional<InputClass> inputClassForValue(ProgramStateRef State,
+                                                      SVal Value) {
+    std::optional<InputClass> Result;
+    for (SymbolRef Symbol : taint::getTaintedSymbols(State, Value)) {
+      const unsigned *Stored = State->get<QEMUInputClasses>(Symbol);
+      if (!Stored)
+        continue;
+      InputClass Source = static_cast<InputClass>(*Stored);
+      if (Result && *Result != Source)
+        return InputClass::Mixed;
+      Result = Source;
+    }
+    if (!Result && taint::isTainted(State, Value))
+      return InputClass::Mixed;
+    return Result;
+  }
+
+  static std::optional<unsigned> endianScalarArgument(StringRef Name,
+                                                      unsigned ArgumentCount) {
+    if ((Name == "virtio_tswap16" || Name == "virtio_tswap32" ||
+         Name == "virtio_tswap64") &&
+        ArgumentCount >= 2)
+      return 1;
+    if (ArgumentCount < 1)
+      return std::nullopt;
+    if (Name == "__builtin_bswap16" || Name == "__builtin_bswap32" ||
+        Name == "__builtin_bswap64" || Name == "bswap16" || Name == "bswap24" ||
+        Name == "bswap32" || Name == "bswap64" || Name == "le16_to_cpu" ||
+        Name == "le32_to_cpu" || Name == "le64_to_cpu" ||
+        Name == "be16_to_cpu" || Name == "be32_to_cpu" ||
+        Name == "be64_to_cpu" || Name == "cpu_to_le16" ||
+        Name == "cpu_to_le32" || Name == "cpu_to_le64" ||
+        Name == "cpu_to_be16" || Name == "cpu_to_be32" || Name == "cpu_to_be64")
+      return 0;
+    return std::nullopt;
+  }
+
+  static std::optional<unsigned>
+  endianLoadPointerArgument(StringRef Name, unsigned ArgumentCount) {
+    if (Name.starts_with("virtio_ld") && Name.ends_with("_p") &&
+        ArgumentCount >= 2)
+      return 1;
+    if (Name.starts_with("ld") && Name.ends_with("_p") && ArgumentCount >= 1)
+      return 0;
+    return std::nullopt;
   }
 
   static bool isMigrationScalarSource(StringRef Name) {
@@ -1766,6 +1885,40 @@ class QEMUGuestMemorySafetyChecker
         if (VD->getType()->isArrayType())
           return C.getState()->getLValue(VD, C.getStackFrame());
     return C.getSVal(E);
+  }
+
+  static const MemRegion *pointerBaseRegion(SVal Value) {
+    const MemRegion *Region = Value.getAsRegion();
+    return Region ? Region->getBaseRegion() : nullptr;
+  }
+
+  static bool isTrackedVirtqueueIovec(ProgramStateRef State, SVal Value) {
+    const MemRegion *Region = pointerBaseRegion(Value);
+    return Region && State->contains<QEMUVirtqueueIovecs>(Region);
+  }
+
+  static bool isVirtqueueOutIovecValue(ProgramStateRef State, SVal Value) {
+    const auto *Pointer = dyn_cast_or_null<SymbolicRegion>(Value.getAsRegion());
+    const auto *Stored =
+        Pointer ? dyn_cast<SymbolRegionValue>(Pointer->getSymbol()) : nullptr;
+    const auto *Field =
+        Stored ? dyn_cast<FieldRegion>(Stored->getRegion()) : nullptr;
+    const FieldDecl *Declaration = Field ? Field->getDecl() : nullptr;
+    const auto *Parent =
+        Declaration ? dyn_cast<RecordDecl>(Declaration->getDeclContext())
+                    : nullptr;
+    if (!Field || !Declaration || !Parent ||
+        Parent->getName() != "VirtQueueElement" ||
+        Declaration->getName() != "out_sg")
+      return false;
+    return State->contains<QEMUVirtqueueElements>(Field->getBaseRegion());
+  }
+
+  static bool isVirtqueueIovec(const CallEvent &Call, unsigned Argument,
+                               ProgramStateRef State) {
+    return Argument < Call.getNumArgs() &&
+           (isTrackedVirtqueueIovec(State, Call.getArgSVal(Argument)) ||
+            isVirtqueueOutIovecValue(State, Call.getArgSVal(Argument)));
   }
 
   struct IntegerRange {
@@ -2456,7 +2609,7 @@ class QEMUGuestMemorySafetyChecker
     if (!taint::isTainted(State, Length)) {
       if (!Persistent)
         return;
-      State = taint::addTaint(State, Length);
+      State = addInputTaint(State, Length, Persistent->Source);
     }
     if (!Persistent)
       Persistent =
@@ -2935,12 +3088,12 @@ public:
       const MemRegion *Region = State->getRegion(Parameter, C.getStackFrame());
       SVal Value = State->getSVal(Region);
       if (Found->second.ParameterMask & Bit) {
-        State = taint::addTaint(State, Value);
+        State = addInputTaint(State, Value, Found->second.Source);
         Sources.push_back({Value, Parameter->getNameAsString()});
       }
       if (Found->second.PointeeMask & Bit)
         if (std::optional<SVal> Pointee = pointeeValue(State, Value)) {
-          State = taint::addTaint(State, *Pointee);
+          State = addInputTaint(State, *Pointee, Found->second.Source);
           Sources.push_back({*Pointee, Parameter->getNameAsString()});
         }
     }
@@ -3002,9 +3155,99 @@ public:
       return;
     if (modelShiftedBoundPredicate(Call, C))
       return;
+    std::optional<SVal> ConvertedInput;
+    if (std::optional<unsigned> Argument =
+            endianScalarArgument(Name, Call.getNumArgs())) {
+      ConvertedInput = Call.getArgSVal(*Argument);
+    } else if (std::optional<unsigned> Argument =
+                   endianLoadPointerArgument(Name, Call.getNumArgs())) {
+      ConvertedInput = pointeeValue(C.getState(), Call.getArgSVal(*Argument));
+    }
+    if (ConvertedInput) {
+      std::optional<InputClass> Source =
+          inputClassForValue(C.getState(), *ConvertedInput);
+      if (Source) {
+        ProgramStateRef State =
+            addInputTaint(C.getState(), Call.getReturnValue(), *Source);
+        const NoteTag *Tag = propagationNote(
+            C, State, Call.getReturnValue(), *ConvertedInput, *Source,
+            "value remains guest-controlled after byte-order conversion");
+        C.addTransition(State, Tag);
+        return;
+      }
+    }
+    if ((Name == "g_free" || Name == "free") && Call.getNumArgs() >= 1) {
+      if (const MemRegion *Region = pointerBaseRegion(Call.getArgSVal(0))) {
+        ProgramStateRef State = C.getState()
+                                    ->remove<QEMUVirtqueueElements>(Region)
+                                    ->remove<QEMUVirtqueueIovecs>(Region);
+        if (State != C.getState())
+          C.addTransition(State);
+      }
+      return;
+    }
+    if ((Name == "virtqueue_push" || Name == "virtqueue_detach_element" ||
+         Name == "virtqueue_unpop") &&
+        Call.getNumArgs() >= 2) {
+      if (const MemRegion *Element = pointerBaseRegion(Call.getArgSVal(1))) {
+        ProgramStateRef State =
+            C.getState()->remove<QEMUVirtqueueElements>(Element);
+        if (State != C.getState())
+          C.addTransition(State);
+      }
+      return;
+    }
+    if (Name == "virtqueue_pop" && Call.getNumArgs() >= 2) {
+      if (const MemRegion *Element = pointerBaseRegion(Call.getReturnValue())) {
+        ProgramStateRef State =
+            C.getState()->add<QEMUVirtqueueElements>(Element);
+        C.addTransition(State);
+      }
+      return;
+    }
+    if ((Name == "g_memdup2" || Name == "g_memdup") && Call.getNumArgs() >= 2 &&
+        isVirtqueueIovec(Call, 0, C.getState())) {
+      if (const MemRegion *Iovec = pointerBaseRegion(Call.getReturnValue())) {
+        ProgramStateRef State = C.getState()->add<QEMUVirtqueueIovecs>(Iovec);
+        C.addTransition(State);
+      }
+      return;
+    }
+    if (Name == "iov_copy" && Call.getNumArgs() >= 6 &&
+        isVirtqueueIovec(Call, 2, C.getState())) {
+      if (const MemRegion *Iovec = pointerBaseRegion(Call.getArgSVal(0))) {
+        ProgramStateRef State = C.getState()->add<QEMUVirtqueueIovecs>(Iovec);
+        C.addTransition(State);
+      }
+      return;
+    }
+    if ((Name == "iov_to_buf" || Name == "iov_to_buf_full") &&
+        Call.getNumArgs() >= 5 && isVirtqueueIovec(Call, 0, C.getState())) {
+      ProgramStateRef State = C.getState();
+      std::optional<BoundStates> Result =
+          compare(State, Call.getReturnValue(), BO_EQ, Call.getArgSVal(4),
+                  C.getSValBuilder());
+      if (!Result)
+        return;
+      if (Result->Unsafe)
+        C.addTransition(Result->Unsafe);
+      if (!Result->Safe)
+        return;
+      std::optional<SVal> Pointee =
+          pointeeValue(Result->Safe, Call.getArgSVal(3));
+      if (!Pointee)
+        return;
+      ProgramStateRef Tainted =
+          addInputTaint(Result->Safe, *Pointee, InputClass::Virtqueue);
+      const NoteTag *Tag =
+          sourceNote(C, Tainted, *Pointee, InputClass::Virtqueue,
+                     "populated guest-controlled data here");
+      C.addTransition(Tainted, Tag);
+      return;
+    }
     if (isMigrationScalarSource(Name)) {
-      ProgramStateRef State =
-          taint::addTaint(C.getState(), Call.getReturnValue());
+      ProgramStateRef State = addInputTaint(C.getState(), Call.getReturnValue(),
+                                            InputClass::Migration);
       if (std::optional<uint64_t> Maximum = migrationScalarMaximum(Name)) {
         SVal Zero = C.getSValBuilder().makeZeroVal(FD->getReturnType());
         SVal Upper =
@@ -3054,7 +3297,7 @@ public:
         pointeeValue(Success, Call.getArgSVal(Source->BufferArgument));
     if (!Pointee)
       return;
-    ProgramStateRef Tainted = taint::addTaint(Success, *Pointee);
+    ProgramStateRef Tainted = addInputTaint(Success, *Pointee, Source->Source);
     const NoteTag *Tag = sourceNote(C, Tainted, *Pointee, Source->Source,
                                     "populated guest-controlled data here");
     C.addTransition(Tainted, Tag);
@@ -3081,7 +3324,7 @@ public:
     ProgramStateRef State = C.getState();
     if (Value.isUnknownOrUndef() || taint::isTainted(State, Value))
       return;
-    State = taint::addTaint(State, Value);
+    State = addInputTaint(State, Value, Persistent->Source);
     for (SymbolRef Symbol : taint::getTaintedSymbols(State, Value)) {
       const FieldDecl *const *Previous =
           State->get<QEMUPersistentFieldSources>(Symbol);
@@ -3101,11 +3344,20 @@ public:
   void checkBind(SVal Location, SVal Value, const Stmt *S, bool AtDeclInit,
                  CheckerContext &C) const {
     const auto *Region = dyn_cast_or_null<VarRegion>(Location.getAsRegion());
-    if (!Region || !Region->getValueType()->isIntegerType())
+    if (!Region)
       return;
     ProgramStateRef State = C.getState();
     const Expr *SourceExpression =
         bindingSourceExpression(S, Region->getDecl());
+    if (const MemRegion *Iovec = pointerBaseRegion(Value))
+      if (isTrackedVirtqueueIovec(State, Value) ||
+          isVirtqueueOutIovecValue(State, Value))
+        State = State->add<QEMUVirtqueueIovecs>(Iovec);
+    if (!Region->getValueType()->isIntegerType()) {
+      if (State != C.getState())
+        C.addTransition(State);
+      return;
+    }
     std::optional<PersistentFieldInfo> Source =
         persistentGuestFieldFromAliases(SourceExpression, State, C, Value);
     if (!Value.isUnknownOrUndef() && taint::isTainted(State, Value)) {
@@ -3131,8 +3383,21 @@ public:
     for (const auto &Entry : Sources)
       if (SymReaper.isDead(Entry.first))
         State = State->remove<QEMUPersistentFieldSources>(Entry.first);
+    for (const MemRegion *Region : State->get<QEMUVirtqueueElements>())
+      if (!SymReaper.isLiveRegion(Region))
+        State = State->remove<QEMUVirtqueueElements>(Region);
+    for (const MemRegion *Region : State->get<QEMUVirtqueueIovecs>())
+      if (!SymReaper.isLiveRegion(Region))
+        State = State->remove<QEMUVirtqueueIovecs>(Region);
     if (State != C.getState())
       C.addTransition(State);
+  }
+
+  void checkLiveSymbols(ProgramStateRef State, SymbolReaper &SymReaper) const {
+    for (const MemRegion *Region : State->get<QEMUVirtqueueElements>())
+      SymReaper.markLive(Region);
+    for (const MemRegion *Region : State->get<QEMUVirtqueueIovecs>())
+      SymReaper.markLive(Region);
   }
 
   void checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const {
@@ -3158,7 +3423,7 @@ public:
     if (!taint::isTainted(State, Index)) {
       if (!Persistent)
         return;
-      State = taint::addTaint(State, Index);
+      State = addInputTaint(State, Index, Persistent->Source);
     }
     if (!Persistent)
       Persistent =
@@ -3184,9 +3449,15 @@ public:
         if (!Member || !Member->isArrow() ||
             DynamicCount == DynamicArrayCounts.end())
           return;
-        SVal Object = expressionValue(Member->getBase(), C);
-        SVal CountLocation = State->getLValue(DynamicCount->second, Object);
-        auto Location = CountLocation.getAs<Loc>();
+        SVal CountObject = expressionValue(Member->getBase(), C);
+        for (const FieldDecl *Field : DynamicCount->second) {
+          SVal CountLocation = State->getLValue(Field, CountObject);
+          auto Location = CountLocation.getAs<Loc>();
+          if (!Location)
+            return;
+          CountObject = CountLocation;
+        }
+        auto Location = CountObject.getAs<Loc>();
         if (!Location)
           return;
         Count = State->getSVal(*Location);
@@ -3230,7 +3501,7 @@ public:
         directReferencedField(ASE->getIdx()) == Persistent->Field) {
       auto Validated = MigrationValidatedFieldBounds.find(Persistent->Field);
       if (Validated != MigrationValidatedFieldBounds.end() &&
-          Validated->second.LimitField == DynamicCount->second) {
+          Validated->second.LimitField == DynamicCount->second.back()) {
         if (!Validated->second.Inclusive)
           return;
         std::optional<BoundStates> NotAtLimit =
@@ -3248,8 +3519,8 @@ public:
         return;
     }
     if (DynamicCount != DynamicArrayCounts.end() &&
-        scaledAddressIndexCoveredByGuard(ASE->getIdx(), DynamicCount->second,
-                                         Count, C))
+        scaledAddressIndexCoveredByGuard(ASE->getIdx(),
+                                         DynamicCount->second.back(), Count, C))
       return;
     if (addressIndexCoveredByGuard(ASE->getIdx(), Count, C))
       return;
