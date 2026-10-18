@@ -2650,18 +2650,6 @@ class QEMUGuestMemorySafetyChecker
     llvm_unreachable("unknown callback buffer length kind");
   }
 
-  static SVal callbackBufferParameterValue(const MemRegion *Base,
-                                           ProgramStateRef State,
-                                           CheckerContext &C) {
-    const ParmVarDecl *const *Parameter =
-        State->get<QEMUInputBufferParameters>(Base);
-    if (!Parameter || !*Parameter)
-      return UnknownVal();
-    const MemRegion *ParameterRegion =
-        State->getRegion(*Parameter, C.getStackFrame());
-    return State->getSVal(ParameterRegion);
-  }
-
   std::optional<std::pair<ProgramStateRef, SVal>>
   callbackBufferOffset(const MemRegion *Region, const MemRegion *Base,
                        ProgramStateRef State, CheckerContext &C) const {
@@ -2747,7 +2735,8 @@ class QEMUGuestMemorySafetyChecker
   void reportCallbackBufferRead(CheckerContext &C, ProgramStateRef Safe,
                                 ProgramStateRef Unsafe, SVal AccessEnd,
                                 SVal Length, const Expr *Where,
-                                InputClass Source, SVal BufferPointer) const {
+                                InputClass Source,
+                                const MemRegion *BufferBase) const {
     if (!Unsafe)
       return;
     bool Definite = !Safe;
@@ -2771,7 +2760,7 @@ class QEMUGuestMemorySafetyChecker
       Report->markInteresting(Symbol);
     for (SymbolRef Symbol : Length.symbols())
       Report->markInteresting(Symbol);
-    Report->markInteresting(BufferPointer);
+    Report->markInteresting(BufferBase);
     C.emitReport(std::move(Report));
   }
 
@@ -2791,8 +2780,6 @@ class QEMUGuestMemorySafetyChecker
     const unsigned *StoredClass = State->get<QEMUInputBufferClasses>(Base);
     if (!StoredLength || !StoredClass)
       return false;
-    SVal BufferPointer = callbackBufferParameterValue(Base, State, C);
-
     std::optional<std::pair<ProgramStateRef, SVal>> OffsetAndState =
         callbackBufferOffset(Region, Base, State, C);
     if (!OffsetAndState)
@@ -2845,9 +2832,9 @@ class QEMUGuestMemorySafetyChecker
       return true;
     InputClass Source = static_cast<InputClass>(*StoredClass);
     if (WithinBuffer->Unsafe)
-      reportCallbackBufferRead(
-          C, WithinBuffer->Safe, WithinBuffer->Unsafe, AccessEnd, Length,
-          Call.getArgExpr(BufferArgument), Source, BufferPointer);
+      reportCallbackBufferRead(C, WithinBuffer->Safe, WithinBuffer->Unsafe,
+                               AccessEnd, Length,
+                               Call.getArgExpr(BufferArgument), Source, Base);
     if (WithinBuffer->Safe)
       C.addTransition(WithinBuffer->Safe);
     return true;
@@ -2866,8 +2853,6 @@ class QEMUGuestMemorySafetyChecker
     const unsigned *StoredClass = State->get<QEMUInputBufferClasses>(Base);
     if (!StoredClass)
       return true;
-    SVal BufferPointer = callbackBufferParameterValue(Base, State, C);
-
     std::optional<std::pair<ProgramStateRef, SVal>> OffsetAndState =
         callbackBufferOffset(Region, Base, State, C);
     if (!OffsetAndState)
@@ -2926,7 +2911,7 @@ class QEMUGuestMemorySafetyChecker
     if (WithinBuffer->Unsafe)
       reportCallbackBufferRead(C, WithinBuffer->Safe, WithinBuffer->Unsafe,
                                AccessEnd, Length, Cast->getSubExpr(), Source,
-                               BufferPointer);
+                               Base);
     State = WithinBuffer->Safe;
     if (!State)
       return true;

@@ -70,6 +70,29 @@ static void virtio_set_config_copy(VirtIODevice *vdev, const uint8_t *config) { 
                                                     // expected-note@-1 {{Level B: virtio configuration callback buffer read may exceed the available guest-input bytes}}
 }
 
+static void virtio_set_config_alias(VirtIODevice *vdev, const uint8_t *config) { // expected-note {{virtio configuration callback buffer parameter 'config' supplies guest-controlled bytes}}
+  const uint8_t *alias = config;
+  callback_result = alias[4]; // expected-warning {{Level B: virtio configuration callback buffer read may exceed the available guest-input bytes}}
+                              // expected-note@-1 {{Level B: virtio configuration callback buffer read may exceed the available guest-input bytes}}
+}
+
+static void virtio_set_config_reassigned( // expected-note {{virtio configuration callback buffer parameter 'config' supplies guest-controlled bytes}}
+    VirtIODevice *vdev, const uint8_t *config) {
+  const uint8_t *alias = config;
+  config = 0;
+  callback_result = alias[4]; // expected-warning {{Level B: virtio configuration callback buffer read may exceed the available guest-input bytes}}
+                              // expected-note@-1 {{Level B: virtio configuration callback buffer read may exceed the available guest-input bytes}}
+}
+
+static uint8_t read_config_byte(const uint8_t *config) {
+  return config[4]; // expected-warning {{Level B: virtio configuration callback buffer read may exceed the available guest-input bytes}}
+                    // expected-note@-1 {{Level B: virtio configuration callback buffer read may exceed the available guest-input bytes}}
+}
+
+static void virtio_set_config_helper(VirtIODevice *vdev, const uint8_t *config) { // expected-note {{virtio configuration callback buffer parameter 'config' supplies guest-controlled bytes}}
+  callback_result = read_config_byte(config); // expected-note {{Calling 'read_config_byte'}}
+}
+
 static void virtio_set_config_direct_guarded(VirtIODevice *vdev,
                                              const uint8_t *config) {
   if (vdev->config_len <= 4)
@@ -129,6 +152,18 @@ static void register_virtio_config_direct_callback(VirtioDeviceClass *vdc) {
 
 static void register_virtio_config_copy_callback(VirtioDeviceClass *vdc) {
   vdc->set_config = virtio_set_config_copy;
+}
+
+static void register_virtio_config_alias_callback(VirtioDeviceClass *vdc) {
+  vdc->set_config = virtio_set_config_alias;
+}
+
+static void register_virtio_config_reassigned_callback(VirtioDeviceClass *vdc) {
+  vdc->set_config = virtio_set_config_reassigned;
+}
+
+static void register_virtio_config_helper_callback(VirtioDeviceClass *vdc) {
+  vdc->set_config = virtio_set_config_helper;
 }
 
 static void
