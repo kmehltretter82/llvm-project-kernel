@@ -4034,9 +4034,14 @@ public:
         if (auto DefinedSize = Size.getAs<DefinedOrUnknownSVal>())
           State = setDynamicExtent(State, Region, *DefinedSize);
         const auto *FD = dyn_cast_or_null<FunctionDecl>(Call.getDecl());
-        if (FD && FD->getIdentifier() && FD->getName() == "g_memdup2" &&
-            isVirtqueueIovec(Call, 0, State))
-          State = State->add<QEMUVirtqueueIovecs>(Region->getBaseRegion());
+        if (FD && FD->getIdentifier() && FD->getName() == "g_memdup2") {
+          if (std::optional<InputClass> Source =
+                  inputIovecSource(State, Call.getArgSVal(0))) {
+            State = addInputIovec(State, Call.getReturnValue(), *Source);
+            if (*Source == InputClass::Virtqueue)
+              State = State->add<QEMUVirtqueueIovecs>(Region->getBaseRegion());
+          }
+        }
       }
       C.addTransition(State);
       return;
