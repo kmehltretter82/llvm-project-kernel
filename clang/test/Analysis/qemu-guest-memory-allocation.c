@@ -1,4 +1,5 @@
 // RUN: %clang_analyze_cc1 -analyzer-checker=core,alpha.qemu.GuestMemorySafety -verify %s
+// RUN: %clang_analyze_cc1 -triple arm64-apple-macosx -analyzer-checker=core,alpha.qemu.GuestMemorySafety -verify %s
 
 typedef __SIZE_TYPE__ size_t;
 typedef __UINT64_TYPE__ uint64_t;

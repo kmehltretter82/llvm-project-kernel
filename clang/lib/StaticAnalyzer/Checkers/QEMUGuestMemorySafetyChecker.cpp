@@ -4065,8 +4065,8 @@ class QEMUGuestMemorySafetyChecker
     const auto *Multiply = dyn_cast<BinaryOperator>(Core);
     if (!Multiply || Multiply->getOpcode() != BO_Mul ||
         !Multiply->getType()->isUnsignedIntegerType() ||
-        !C.getASTContext().hasSameUnqualifiedType(
-            Multiply->getType(), C.getASTContext().getSizeType()))
+        C.getASTContext().getIntWidth(Multiply->getType()) !=
+            C.getASTContext().getIntWidth(C.getASTContext().getSizeType()))
       return AllocationAccessRelation::Unknown;
 
     SVal CurrentLeft = currentOperandValue(Multiply->getLHS(), C);
