@@ -64,6 +64,9 @@ REGISTER_MAP_WITH_PROGRAMSTATE(QEMUAllocationRelationKinds, SymbolRef, unsigned)
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUAllocationRelationLeft, SymbolRef, SVal)
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUAllocationRelationRight, SymbolRef, SVal)
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUPendingIovecSourceSizes, const Expr *, SVal)
+REGISTER_MAP_WITH_PROGRAMSTATE(QEMUPendingDMAMapRequestedExtents, const Expr *,
+                               SVal)
+REGISTER_MAP_WITH_PROGRAMSTATE(QEMUDMAMappedExtents, SymbolRef, SVal)
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUSavedTaintedScalars, const VarRegion *, SVal)
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUPersistentFieldSources, SymbolRef,
                                const FieldDecl *)
@@ -2727,6 +2730,74 @@ class QEMUGuestMemorySafetyChecker
     StringRef Direction;
   };
 
+  struct DirectDMAMapDescriptor {
+    unsigned LengthPointerArgument;
+  };
+
+  static std::optional<DirectDMAMapDescriptor>
+  directDMAMapDescriptor(const CallEvent &Call) {
+    const auto *FD = dyn_cast_or_null<FunctionDecl>(Call.getDecl());
+    if (!FD || !FD->getIdentifier() || !isVoidPointer(FD->getReturnType()))
+      return std::nullopt;
+
+    StringRef Name = FD->getName();
+    unsigned ParameterCount;
+    unsigned LengthPointerArgument;
+    if (Name == "address_space_map" || Name == "dma_memory_map") {
+      ParameterCount = 5;
+      LengthPointerArgument = 2;
+    } else if (Name == "pci_dma_map") {
+      ParameterCount = 4;
+      LengthPointerArgument = 2;
+    } else if (Name == "physical_memory_map" ||
+               Name == "cpu_physical_memory_map") {
+      ParameterCount = 3;
+      LengthPointerArgument = 1;
+    } else {
+      return std::nullopt;
+    }
+    if (FD->getNumParams() != ParameterCount ||
+        Call.getNumArgs() != ParameterCount)
+      return std::nullopt;
+    QualType LengthPointer =
+        FD->getParamDecl(LengthPointerArgument)->getType();
+    if (!LengthPointer->isPointerType() ||
+        !LengthPointer->getPointeeType()->isIntegerType())
+      return std::nullopt;
+    return DirectDMAMapDescriptor{LengthPointerArgument};
+  }
+
+  static std::optional<unsigned>
+  directDMAUnmapBufferArgument(const CallEvent &Call) {
+    const auto *FD = dyn_cast_or_null<FunctionDecl>(Call.getDecl());
+    if (!FD || !FD->getIdentifier() || !FD->getReturnType()->isVoidType())
+      return std::nullopt;
+    StringRef Name = FD->getName();
+    if ((Name == "address_space_unmap" || Name == "dma_memory_unmap" ||
+         Name == "pci_dma_unmap") &&
+        FD->getNumParams() == 5 && Call.getNumArgs() == 5)
+      return 1;
+    if ((Name == "physical_memory_unmap" ||
+         Name == "cpu_physical_memory_unmap") &&
+        FD->getNumParams() == 4 && Call.getNumArgs() == 4)
+      return 0;
+    return std::nullopt;
+  }
+
+  static std::optional<SVal> directDMAMappedExtent(ProgramStateRef State,
+                                                    SVal Buffer) {
+    // This intentionally models pointer-preserving aliases only.  QEMU code
+    // that casts a mapped host pointer to an integer and reconstructs another
+    // pointer needs a separate provenance model; treating arbitrary integer
+    // arithmetic as an alias here would be too noisy.
+    SymbolRef Base = Buffer.getLocSymbolInBase();
+    if (!Base)
+      return std::nullopt;
+    if (const SVal *Extent = State->get<QEMUDMAMappedExtents>(Base))
+      return *Extent;
+    return std::nullopt;
+  }
+
   static bool isBitmapBitSink(const CallEvent &Call, ASTContext &Context) {
     const auto *FD = dyn_cast_or_null<FunctionDecl>(Call.getDecl());
     if (!FD || !FD->getIdentifier() || FD->getNumParams() != 2 ||
@@ -4650,8 +4721,13 @@ class QEMUGuestMemorySafetyChecker
         expressionValue(Call.getArgExpr(Sink.LengthArgument), C);
     if (BoundRequired.isUnknownOrUndef())
       BoundRequired = Required;
-    SVal Extent =
-        getDynamicExtentWithOffset(State, Call.getArgSVal(Sink.BufferArgument));
+    std::optional<SVal> MappedExtent = directDMAMappedExtent(
+        State, Call.getArgSVal(Sink.BufferArgument));
+    bool IsDirectDMAMapping = MappedExtent.has_value();
+    SVal Extent = MappedExtent
+                      ? *MappedExtent
+                      : getDynamicExtentWithOffset(
+                            State, Call.getArgSVal(Sink.BufferArgument));
     StringRef SinkDescription = Sink.Description;
     bool HasOffset = false;
 
@@ -4707,8 +4783,14 @@ class QEMUGuestMemorySafetyChecker
         Pointee = Array->getElementType();
       if (!Pointee.isNull() && !Pointee->isVoidType() &&
           !Pointee->isIncompleteType()) {
-        SVal BaseExtent =
-            getDynamicExtentWithOffset(State, pointerValue(Pointer, C));
+        std::optional<SVal> MappedBaseExtent =
+            directDMAMappedExtent(State, pointerValue(Pointer, C));
+        if (MappedBaseExtent)
+          IsDirectDMAMapping = true;
+        SVal BaseExtent = MappedBaseExtent
+                              ? *MappedBaseExtent
+                              : getDynamicExtentWithOffset(
+                                    State, pointerValue(Pointer, C));
         if (!hasUsableExtent(State, BaseExtent, C.getSValBuilder()))
           if (std::optional<uint64_t> Bytes =
                   staticObjectExtent(Pointer, C.getASTContext()))
@@ -4796,8 +4878,16 @@ class QEMUGuestMemorySafetyChecker
         }
       }
     }
-    if (!GuestControlled)
+    if (!GuestControlled && !IsDirectDMAMapping)
       return false;
+    if (IsDirectDMAMapping) {
+      SinkDescription = HasOffset
+                            ? "direct DMA mapped-buffer offset plus access size"
+                            : "direct DMA mapped-buffer access size";
+      if (SourceDetail.empty())
+        SourceDetail = "DMA map returned length";
+      Witness.Input = InputClass::DMA;
+    }
     AllocationAccessRelation AllocationRelation =
         allocationAccessRelation(Call.getArgSVal(Sink.BufferArgument), Length,
                                  LengthExpression, State, C);
@@ -5277,6 +5367,31 @@ public:
   }
 
   void checkPreCall(const CallEvent &Call, CheckerContext &C) const {
+    if (std::optional<DirectDMAMapDescriptor> Map =
+            directDMAMapDescriptor(Call)) {
+      const Expr *Origin = Call.getOriginExpr();
+      std::optional<SVal> Requested =
+          pointeeValue(C.getState(),
+                       Call.getArgSVal(Map->LengthPointerArgument));
+      if (Origin && Requested && !Requested->isUnknownOrUndef()) {
+        ProgramStateRef State =
+            C.getState()->set<QEMUPendingDMAMapRequestedExtents>(Origin,
+                                                                 *Requested);
+        C.addTransition(State);
+      }
+      return;
+    }
+    if (std::optional<unsigned> BufferArgument =
+            directDMAUnmapBufferArgument(Call)) {
+      if (SymbolRef Base =
+              Call.getArgSVal(*BufferArgument).getLocSymbolInBase()) {
+        ProgramStateRef State =
+            C.getState()->remove<QEMUDMAMappedExtents>(Base);
+        if (State != C.getState())
+          C.addTransition(State);
+      }
+      return;
+    }
     if (std::optional<IovecAlias> Alias = iovecAlias(Call)) {
       if (Alias->SourceExtent != IovecAlias::SourceExtentKind::None) {
         const auto *FD = dyn_cast_or_null<FunctionDecl>(Call.getDecl());
@@ -5320,6 +5435,37 @@ public:
   }
 
   void checkPostCall(const CallEvent &Call, CheckerContext &C) const {
+    if (std::optional<DirectDMAMapDescriptor> Map =
+            directDMAMapDescriptor(Call)) {
+      ProgramStateRef State = C.getState();
+      const Expr *Origin = Call.getOriginExpr();
+      const SVal *Requested =
+          Origin ? State->get<QEMUPendingDMAMapRequestedExtents>(Origin)
+                 : nullptr;
+      if (Origin)
+        State = State->remove<QEMUPendingDMAMapRequestedExtents>(Origin);
+      std::optional<SVal> Returned =
+          pointeeValue(State, Call.getArgSVal(Map->LengthPointerArgument));
+      if (!Returned || Returned->isUnknownOrUndef()) {
+        if (State != C.getState())
+          C.addTransition(State);
+        return;
+      }
+      if (Requested) {
+        std::optional<BoundStates> WithinRequest = compare(
+            State, *Returned, BO_LE, *Requested, C.getSValBuilder());
+        if (!WithinRequest || !WithinRequest->Safe)
+          return;
+        State = WithinRequest->Safe;
+      }
+      if (SymbolRef Base = Call.getReturnValue().getLocSymbolInBase()) {
+        State = State->set<QEMUDMAMappedExtents>(Base, *Returned);
+        C.addTransition(State);
+      } else if (State != C.getState()) {
+        C.addTransition(State);
+      }
+      return;
+    }
     if (std::optional<AllocationExtentDescriptor> Descriptor =
             allocationExtentDescriptor(Call, C.getASTContext())) {
       ProgramStateRef State = C.getState();
@@ -5734,6 +5880,10 @@ public:
                     ->remove<QEMUAllocationRelationLeft>(Entry.first)
                     ->remove<QEMUAllocationRelationRight>(Entry.first);
       }
+    auto DMAMappedExtents = State->get<QEMUDMAMappedExtents>();
+    for (const auto &Entry : DMAMappedExtents)
+      if (SymReaper.isDead(Entry.first))
+        State = State->remove<QEMUDMAMappedExtents>(Entry.first);
     if (State != C.getState())
       C.addTransition(State);
   }
@@ -5745,6 +5895,12 @@ public:
         SymReaper.markLive(Symbol);
     }
     for (const auto &Entry : State->get<QEMUPendingIovecSourceSizes>())
+      for (SymbolRef Symbol : Entry.second.symbols())
+        SymReaper.markLive(Symbol);
+    for (const auto &Entry : State->get<QEMUPendingDMAMapRequestedExtents>())
+      for (SymbolRef Symbol : Entry.second.symbols())
+        SymReaper.markLive(Symbol);
+    for (const auto &Entry : State->get<QEMUDMAMappedExtents>())
       for (SymbolRef Symbol : Entry.second.symbols())
         SymReaper.markLive(Symbol);
     for (const MemRegion *Region : State->get<QEMUVirtqueueElements>())
