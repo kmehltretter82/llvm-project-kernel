@@ -1764,6 +1764,17 @@ def QEMUGuestMemorySafetyChecker : Checker<"GuestMemorySafety">,
                   "Report unbounded guest-controlled allocations as "
                   "availability risks",
                   "false",
+                  InAlpha>,
+    CmdLineOption<Boolean,
+                  "EmitStructuredWitness",
+                  "Emit a machine-readable witness note for supported "
+                  "memory-access diagnostics",
+                  "false",
+                  InAlpha>,
+    CmdLineOption<String,
+                  "QEMUSourceRoot",
+                  "Absolute QEMU source root used to normalize witness paths",
+                  "",
                   InAlpha>
   ]>,
   Documentation<NotDocumented>;

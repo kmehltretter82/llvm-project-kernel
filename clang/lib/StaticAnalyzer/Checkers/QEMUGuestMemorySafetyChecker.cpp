@@ -25,6 +25,7 @@
 #include "clang/AST/RecordLayout.h"
 #include "clang/StaticAnalyzer/Checkers/BuiltinCheckerRegistration.h"
 #include "clang/StaticAnalyzer/Checkers/Taint.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugReporter.h"
 #include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
 #include "clang/StaticAnalyzer/Core/Checker.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/AnalysisManager.h"
@@ -38,6 +39,8 @@
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/Base64.h"
+#include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <limits>
@@ -348,6 +351,9 @@ class QEMUGuestMemorySafetyChecker
                      check::PostStmt<ImplicitCastExpr>,
                      check::PreStmt<ArraySubscriptExpr>> {
   mutable llvm::DenseMap<const FunctionDecl *, CallbackInfo> Callbacks;
+  mutable llvm::DenseMap<const FunctionDecl *, std::string>
+      CallbackRegistrations;
+  mutable llvm::DenseSet<const FunctionDecl *> AmbiguousCallbackRegistrations;
   using FieldPath = llvm::SmallVector<const FieldDecl *, 4>;
   mutable llvm::DenseMap<const FieldDecl *, FieldPath> DynamicArrayCounts;
   mutable llvm::DenseSet<const FieldDecl *> AmbiguousDynamicArrays;
@@ -368,6 +374,8 @@ class QEMUGuestMemorySafetyChecker
   mutable std::unique_ptr<BugType> LevelBBug;
   mutable std::unique_ptr<BugType> LevelCBug;
   bool ReportLevelC = false;
+  bool EmitStructuredWitness = false;
+  std::string QEMUSourceRoot;
 
   static bool isNamedRecordPointer(QualType Type, StringRef Name) {
     if (!Type->isPointerType())
@@ -1490,6 +1498,65 @@ class QEMUGuestMemorySafetyChecker
       Add(fieldInitializer(Valid, "accepts"));
   }
 
+  void collectOperationTableCallbacks(
+      const InitListExpr *ILE,
+      llvm::SmallVectorImpl<const FunctionDecl *> &Result) const {
+    ILE = semanticInitList(ILE);
+    if (!ILE)
+      return;
+    const RecordDecl *RD = ILE->getType()->getAsRecordDecl();
+    if (!RD)
+      return;
+
+    llvm::DenseSet<const FunctionDecl *> Seen;
+    auto Add = [&](const Expr *E) {
+      if (const FunctionDecl *FD = referencedFunction(E)) {
+        FD = FD->getCanonicalDecl();
+        if (Seen.insert(FD).second)
+          Result.push_back(FD);
+      }
+    };
+    StringRef RecordName = RD->getName();
+    for (const FieldDecl *Field : RD->fields())
+      if (const CallbackFieldSpec *Spec =
+              callbackFieldSpec(RecordName, Field->getName()))
+        if (const FunctionDecl *FD =
+                referencedFunction(fieldInitializer(ILE, Field->getName())))
+          if (callbackSignatureMatches(FD, Spec->Signature))
+            Add(fieldInitializer(ILE, Field->getName()));
+
+    if (RecordName == "MemoryRegionOps") {
+      Add(fieldInitializer(ILE, "read"));
+      Add(fieldInitializer(ILE, "write"));
+      Add(fieldInitializer(ILE, "read_with_attrs"));
+      Add(fieldInitializer(ILE, "write_with_attrs"));
+      if (const InitListExpr *Valid =
+              semanticInitList(fieldInitializer(ILE, "valid")))
+        Add(fieldInitializer(Valid, "accepts"));
+    } else if (RecordName == "MemoryRegionPortio") {
+      Add(fieldInitializer(ILE, "read"));
+      Add(fieldInitializer(ILE, "write"));
+    }
+  }
+
+  void recordCallbackRegistration(const FunctionDecl *FD,
+                                  StringRef Registration) const {
+    if (!FD || Registration.empty())
+      return;
+    FD = FD->getCanonicalDecl();
+    if (AmbiguousCallbackRegistrations.contains(FD))
+      return;
+    auto Found = CallbackRegistrations.find(FD);
+    if (Found == CallbackRegistrations.end()) {
+      CallbackRegistrations[FD] = Registration.str();
+      return;
+    }
+    if (Found->second != Registration) {
+      CallbackRegistrations.erase(Found);
+      AmbiguousCallbackRegistrations.insert(FD);
+    }
+  }
+
   void setAddressLimit(const FunctionDecl *FD, uint64_t Limit) const {
     auto Found = Callbacks.find(FD->getCanonicalDecl());
     if (Found != Callbacks.end())
@@ -2047,6 +2114,298 @@ class QEMUGuestMemorySafetyChecker
     return true;
   }
 
+  static StringRef witnessProvenanceClass(InputClass Source) {
+    switch (Source) {
+    case InputClass::MMIO:
+      return "mmio";
+    case InputClass::PIO:
+      return "pio";
+    case InputClass::DMA:
+      return "dma";
+    case InputClass::Migration:
+      return "migration";
+    case InputClass::Network:
+      return "network";
+    case InputClass::DiskImage:
+      return "disk-image";
+    case InputClass::Virtio:
+      return "virtio-config";
+    case InputClass::Virtqueue:
+      return "virtqueue";
+    case InputClass::PCIConfig:
+    case InputClass::DeviceRequest:
+    case InputClass::Mixed:
+      return "unknown";
+    }
+    llvm_unreachable("unknown QEMU input class");
+  }
+
+  static StringRef witnessReproducerKind(InputClass Source) {
+    switch (Source) {
+    case InputClass::Migration:
+      return "migration";
+    case InputClass::Network:
+      return "packet";
+    case InputClass::DMA:
+    case InputClass::DiskImage:
+    case InputClass::Virtio:
+    case InputClass::Virtqueue:
+    case InputClass::DeviceRequest:
+      return "descriptor";
+    case InputClass::MMIO:
+    case InputClass::PIO:
+    case InputClass::PCIConfig:
+    case InputClass::Mixed:
+      return "qtest";
+    }
+    llvm_unreachable("unknown QEMU input class");
+  }
+
+  static StringRef arraySinkDirection(const ArraySubscriptExpr *Subscript,
+                                      ASTContext &Context) {
+    DynTypedNode Child = DynTypedNode::create(*Subscript);
+    for (unsigned Depth = 0; Depth < 8; ++Depth) {
+      auto Parents = Context.getParents(Child);
+      if (Parents.size() != 1)
+        return "indirect";
+      DynTypedNode Parent = Parents[0];
+      if (const auto *Cast = Parent.get<ImplicitCastExpr>()) {
+        if (Cast->getCastKind() == CK_LValueToRValue)
+          return "host-read";
+        Child = Parent;
+        continue;
+      }
+      if (Parent.get<ParenExpr>()) {
+        Child = Parent;
+        continue;
+      }
+      if (const auto *Assignment = Parent.get<BinaryOperator>())
+        if (Assignment->isAssignmentOp() &&
+            Assignment->getLHS()->IgnoreParenImpCasts() == Subscript)
+          return "host-write";
+      if (const auto *Unary = Parent.get<UnaryOperator>())
+        if (Unary->isIncrementDecrementOp() &&
+            Unary->getSubExpr()->IgnoreParenImpCasts() == Subscript)
+          return "host-write";
+      return "indirect";
+    }
+    return "indirect";
+  }
+
+  static std::optional<std::string>
+  singletonValue(ProgramStateRef State, SVal Value, SValBuilder &SVB) {
+    const llvm::APSInt *Minimum = SVB.getMinValue(State, Value);
+    const llvm::APSInt *Maximum = SVB.getMaxValue(State, Value);
+    if (!Minimum || !Maximum || *Minimum != *Maximum)
+      return std::nullopt;
+    llvm::SmallString<64> Buffer;
+    llvm::raw_svector_ostream OS(Buffer);
+    OS << *Minimum;
+    return std::string(OS.str());
+  }
+
+  static bool witnessStringValid(StringRef Value, size_t MaximumLength = 4096) {
+    if (Value.empty() || Value.size() > MaximumLength)
+      return false;
+    return llvm::none_of(Value, [](char Character) {
+      return static_cast<unsigned char>(Character) < 0x20;
+    });
+  }
+
+  std::optional<std::string>
+  qemuRelativePath(const PathSensitiveBugReport &Report,
+                   const SourceManager &SM) const {
+    if (QEMUSourceRoot.empty())
+      return std::nullopt;
+    PresumedLoc Presumed = SM.getPresumedLoc(Report.getLocation().asLocation());
+    if (Presumed.isInvalid())
+      return std::nullopt;
+    StringRef Filename = Presumed.getFilename();
+    StringRef Root = QEMUSourceRoot;
+    while (Root.ends_with("/"))
+      Root = Root.drop_back();
+    if (Root.empty() || !Filename.consume_front(Root) ||
+        !Filename.consume_front("/") || Filename.empty() ||
+        Filename.starts_with("/") || Filename.contains('\\'))
+      return std::nullopt;
+    SmallVector<StringRef, 16> Components;
+    Filename.split(Components, '/', -1, true);
+    for (StringRef Component : Components)
+      if (Component.empty() || Component == "." || Component == "..")
+        return std::nullopt;
+    if (!witnessStringValid(Filename))
+      return std::nullopt;
+    return Filename.str();
+  }
+
+  static std::string witnessExpression(const Expr *Expression,
+                                       ASTContext &Context) {
+    if (!Expression)
+      return {};
+    std::string Text;
+    llvm::raw_string_ostream OS(Text);
+    Expression->printPretty(OS, nullptr, Context.getPrintingPolicy());
+    OS.flush();
+    for (char &Character : Text)
+      if (static_cast<unsigned char>(Character) < 0x20)
+        Character = ' ';
+    return Text;
+  }
+
+  struct WitnessCallbackContext {
+    std::string Callback;
+    std::optional<std::string> Registration;
+  };
+
+  std::optional<WitnessCallbackContext>
+  callbackContext(const ExplodedNode *Node) const {
+    const FunctionDecl *Fallback = nullptr;
+    for (const LocationContext *LC = Node->getLocationContext(); LC;
+         LC = LC->getParent()) {
+      const auto *FD = dyn_cast<FunctionDecl>(LC->getDecl());
+      if (!FD)
+        continue;
+      if (!Fallback)
+        Fallback = FD;
+      FD = FD->getCanonicalDecl();
+      if (Callbacks.contains(FD)) {
+        auto Registration = CallbackRegistrations.find(FD);
+        return WitnessCallbackContext{
+            FD->getQualifiedNameAsString(),
+            Registration == CallbackRegistrations.end()
+                ? std::nullopt
+                : std::optional<std::string>(Registration->second)};
+      }
+    }
+    if (Fallback) {
+      Fallback = Fallback->getCanonicalDecl();
+      auto Registration = CallbackRegistrations.find(Fallback);
+      return WitnessCallbackContext{
+          Fallback->getQualifiedNameAsString(),
+          Registration == CallbackRegistrations.end()
+              ? std::nullopt
+              : std::optional<std::string>(Registration->second)};
+    }
+    return std::nullopt;
+  }
+
+  void addStructuredWitness(PathSensitiveBugReport &Report, CheckerContext &C,
+                            ProgramStateRef State, StringRef Message,
+                            std::optional<InputClass> Source,
+                            StringRef SourceDetail, StringRef Constraint,
+                            SVal ConcreteValue, StringRef SinkDirection,
+                            StringRef AddressOrOffset, StringRef AccessSize,
+                            StringRef ObjectExtent,
+                            StringRef MissingRelationship) const {
+    if (!EmitStructuredWitness)
+      return;
+    std::optional<std::string> QEMUPath =
+        qemuRelativePath(Report, C.getSourceManager());
+    std::optional<WitnessCallbackContext> Callback =
+        callbackContext(Report.getErrorNode());
+    if (!QEMUPath || !Callback)
+      return;
+
+    PresumedLoc Presumed =
+        C.getSourceManager().getPresumedLoc(Report.getLocation().asLocation());
+    if (Presumed.isInvalid())
+      return;
+    InputClass EffectiveSource = Source.value_or(InputClass::Mixed);
+    StringRef Provenance = witnessProvenanceClass(EffectiveSource);
+    StringRef Reproducer = witnessReproducerKind(EffectiveSource);
+    std::string ProvenanceSource = SourceDetail.empty()
+                                       ? inputClassName(EffectiveSource).str()
+                                       : SourceDetail.str();
+    std::optional<std::string> Concrete =
+        singletonValue(State, ConcreteValue, C.getSValBuilder());
+    bool IsParser = EffectiveSource == InputClass::DiskImage ||
+                    EffectiveSource == InputClass::DeviceRequest;
+    if (!witnessStringValid(Message, 8192) ||
+        !witnessStringValid(Callback->Callback) ||
+        (Callback->Registration &&
+         !witnessStringValid(*Callback->Registration)) ||
+        !witnessStringValid(ProvenanceSource) ||
+        !witnessStringValid(Constraint) ||
+        (Concrete && !witnessStringValid(*Concrete)) ||
+        !witnessStringValid(AddressOrOffset) ||
+        !witnessStringValid(AccessSize) || !witnessStringValid(ObjectExtent) ||
+        !witnessStringValid(MissingRelationship))
+      return;
+
+    llvm::SmallString<2048> JSONBuffer;
+    llvm::raw_svector_ostream JSONStream(JSONBuffer);
+    llvm::json::OStream JSON(JSONStream, 0);
+    JSON.object([&] {
+      JSON.attributeArray("boundary_values", [&] {
+        auto EmitBoundary = [&](StringRef Label, StringRef Value) {
+          JSON.object([&] {
+            JSON.attribute("label", Label);
+            JSON.attribute("value", Value);
+          });
+        };
+        EmitBoundary("extent-minus-one", "object extent - 1");
+        EmitBoundary("extent", "object extent");
+        EmitBoundary("extent-plus-one", "object extent + 1");
+      });
+      JSON.attributeBegin("concrete_value");
+      if (Concrete)
+        JSON.value(*Concrete);
+      else
+        JSON.value(nullptr);
+      JSON.attributeEnd();
+      JSON.attributeArray("constraints", [&] { JSON.value(Constraint); });
+      JSON.attributeObject("context", [&] {
+        JSON.attribute("callback", Callback->Callback);
+        JSON.attributeBegin("parser");
+        if (IsParser)
+          JSON.value(Callback->Callback);
+        else
+          JSON.value(nullptr);
+        JSON.attributeEnd();
+        JSON.attribute("qom_type", nullptr);
+        JSON.attributeBegin("registration");
+        if (Callback->Registration)
+          JSON.value(*Callback->Registration);
+        else
+          JSON.value(nullptr);
+        JSON.attributeEnd();
+      });
+      JSON.attributeObject("diagnostic", [&] {
+        JSON.attribute("checker", "alpha.qemu.GuestMemorySafety");
+        JSON.attribute("column", int64_t(Presumed.getColumn()));
+        JSON.attribute("line", int64_t(Presumed.getLine()));
+        JSON.attribute("message", Message);
+        JSON.attribute("qemu_path", *QEMUPath);
+      });
+      JSON.attribute("kind", "qemu-gms-witness");
+      JSON.attributeObject("provenance", [&] {
+        JSON.attribute("class", Provenance);
+        JSON.attribute("source", ProvenanceSource);
+      });
+      JSON.attributeObject("reproducer", [&] {
+        JSON.attribute("device", nullptr);
+        JSON.attribute("interface", Provenance);
+        JSON.attribute("kind", Reproducer);
+        JSON.attribute("machine", nullptr);
+      });
+      JSON.attribute("schema_version", 1);
+      JSON.attributeObject("sink", [&] {
+        JSON.attribute("access_size", AccessSize);
+        JSON.attribute("address_or_offset", AddressOrOffset);
+        JSON.attribute("direction", SinkDirection);
+        JSON.attribute("object_extent", ObjectExtent);
+      });
+      JSON.attributeObject("validation", [&] {
+        JSON.attribute("missing_relationship", MissingRelationship);
+        JSON.attribute("status", "unproven");
+      });
+    });
+    JSON.flush();
+    std::string Marker =
+        "QEMU_GMS_WITNESS_V1=" + llvm::encodeBase64(JSONBuffer.str());
+    Report.addNote(Marker, Report.getLocation());
+  }
+
   BugType &bugType(bool Definite) const {
     std::unique_ptr<BugType> &BT = Definite ? LevelABug : LevelBBug;
     if (!BT)
@@ -2058,10 +2417,41 @@ class QEMUGuestMemorySafetyChecker
     return *BT;
   }
 
+  struct MemoryAccessWitness {
+    StringRef Direction;
+    std::string Address;
+    SVal AccessSize;
+    std::optional<SVal> ByteOffset = std::nullopt;
+    std::string Base = {};
+    std::string Source = {};
+    std::optional<InputClass> Input = std::nullopt;
+  };
+
+  static std::optional<MemoryAccessWitness>
+  arrayAccessWitness(const ArraySubscriptExpr *Subscript, CheckerContext &C) {
+    StringRef Direction = arraySinkDirection(Subscript, C.getASTContext());
+    // An address-only or unresolved use still gets its human bounds report,
+    // but does not establish a memory access for the witness contract.
+    if (Direction != "host-read" && Direction != "host-write")
+      return std::nullopt;
+    QualType AccessType = Subscript->getType();
+    if (AccessType->isIncompleteType() ||
+        AccessType->isVariablyModifiedType() || AccessType->isDependentType())
+      return std::nullopt;
+    uint64_t AccessBytes =
+        C.getASTContext().getTypeSizeInChars(AccessType).getQuantity();
+    if (!AccessBytes)
+      return std::nullopt;
+    return MemoryAccessWitness{
+        Direction, witnessExpression(Subscript, C.getASTContext()),
+        C.getSValBuilder().makeIntVal(AccessBytes,
+                                      C.getASTContext().getSizeType())};
+  }
+
   void report(CheckerContext &C, ProgramStateRef Safe, ProgramStateRef Unsafe,
               SVal TaintedValue, const Expr *Where, StringRef Sink,
-              SVal ExtentOrCount, BoundUnit Unit,
-              StringRef SourceDetail = {}) const {
+              SVal ExtentOrCount, BoundUnit Unit, StringRef SourceDetail = {},
+              std::optional<MemoryAccessWitness> Witness = std::nullopt) const {
     if (!Unsafe)
       return;
     bool Definite = !Safe;
@@ -2105,6 +2495,44 @@ class QEMUGuestMemorySafetyChecker
       Report->addRange(Where->getSourceRange());
     for (SymbolRef Sym : taint::getTaintedSymbols(Unsafe, TaintedValue))
       Report->markInteresting(Sym);
+    if (Witness && (Witness->Direction == "host-read" ||
+                    Witness->Direction == "host-write")) {
+      // AccessSize is the actual transfer width in target C bytes.  The
+      // compared index or offset-plus-length is only the bound predicate.
+      std::string AccessSize =
+          "bytes " +
+          valueRange(Unsafe, Witness->AccessSize, C.getSValBuilder());
+      std::string ObjectExtent =
+          Units.str() + valueRange(Unsafe, ExtentOrCount, C.getSValBuilder());
+      std::string Constraint = Sink.str() +
+                               (Unit == BoundUnit::Bytes ? " > " : " >= ") +
+                               "host object " + BoundDescription.str();
+      std::string MissingRelationship =
+          Sink.str() + (Unit == BoundUnit::Bytes ? " <= " : " < ") +
+          "host object " + BoundDescription.str();
+      std::string Expression = witnessExpression(Where, C.getASTContext());
+      std::optional<InputClass> Source =
+          Witness->Input ? Witness->Input
+                         : inputClassForValue(Unsafe, TaintedValue);
+      std::string WitnessSource =
+          SourceDetail.empty()
+              ? (Expression.empty()
+                     ? inputClassName(Source.value_or(InputClass::Mixed)).str()
+                     : "expression '" + Expression + "'")
+              : SourceDetail.str();
+      if (!Witness->Source.empty())
+        WitnessSource = Witness->Source;
+      std::string AddressOrOffset = Witness->Address;
+      if (Witness->ByteOffset)
+        AddressOrOffset +=
+            ", byte offset " +
+            valueRange(Unsafe, *Witness->ByteOffset, C.getSValBuilder()) +
+            " from base '" + Witness->Base + "'";
+      addStructuredWitness(*Report, C, Unsafe, Message.str(), Source,
+                           WitnessSource, Constraint, TaintedValue,
+                           Witness->Direction, AddressOrOffset, AccessSize,
+                           ObjectExtent, MissingRelationship);
+    }
     C.emitReport(std::move(Report));
   }
 
@@ -2237,6 +2665,7 @@ class QEMUGuestMemorySafetyChecker
     unsigned BufferArgument;
     unsigned LengthArgument;
     StringRef Description;
+    StringRef Direction;
   };
 
   static bool isBitmapBitSink(const CallEvent &Call, ASTContext &Context) {
@@ -2271,24 +2700,24 @@ class QEMUGuestMemorySafetyChecker
          Name == "__builtin_memcpy" || Name == "__builtin_memmove" ||
          Name == "__builtin_memset") &&
         Call.getNumArgs() >= 3)
-      return MemorySink{0, 2, "memory-operation length"};
+      return MemorySink{0, 2, "memory-operation length", "host-write"};
     if ((Name == "address_space_read" || Name == "address_space_read_full") &&
         Call.getNumArgs() >= 5)
-      return MemorySink{3, 4, "memory-operation length"};
+      return MemorySink{3, 4, "memory-operation length", "host-write"};
     if ((Name == "dma_memory_read" || Name == "pci_dma_read") &&
         Call.getNumArgs() >= 4)
-      return MemorySink{2, 3, "memory-operation length"};
+      return MemorySink{2, 3, "memory-operation length", "host-write"};
     if (Name == "cpu_physical_memory_read" && Call.getNumArgs() >= 3)
-      return MemorySink{1, 2, "memory-operation length"};
+      return MemorySink{1, 2, "memory-operation length", "host-write"};
     if (Name == "physical_memory_read" && Call.getNumArgs() >= 3)
-      return MemorySink{1, 2, "memory-operation length"};
+      return MemorySink{1, 2, "memory-operation length", "host-write"};
     if (Name == "qemu_get_buffer" && Call.getNumArgs() >= 3)
-      return MemorySink{1, 2, "memory-operation length"};
+      return MemorySink{1, 2, "memory-operation length", "host-write"};
     if ((isDirectBlockRead(FD, "bdrv_pread") ||
          isDirectBlockRead(FD, "bdrv_co_pread") ||
          isDirectBlockRead(FD, "blk_pread")) &&
         Call.getNumArgs() == 5)
-      return MemorySink{3, 2, "memory-operation length"};
+      return MemorySink{3, 2, "memory-operation length", "host-write"};
     return std::nullopt;
   }
 
@@ -2300,20 +2729,20 @@ class QEMUGuestMemorySafetyChecker
     if ((Name == "memcpy" || Name == "memmove" || Name == "__builtin_memcpy" ||
          Name == "__builtin_memmove") &&
         Call.getNumArgs() >= 3)
-      return MemorySink{1, 2, "memory-operation source length"};
+      return MemorySink{1, 2, "memory-operation source length", "host-read"};
     if ((Name == "qemu_send_packet" || Name == "qemu_send_packet_raw" ||
          Name == "qemu_send_packet_async") &&
         Call.getNumArgs() >= 3)
-      return MemorySink{1, 2, "packet length"};
+      return MemorySink{1, 2, "packet length", "host-read"};
     if ((Name == "dma_memory_write" || Name == "pci_dma_write") &&
         Call.getNumArgs() >= 4)
-      return MemorySink{2, 3, "DMA source length"};
+      return MemorySink{2, 3, "DMA source length", "host-read"};
     if (Name == "cpu_physical_memory_write" && Call.getNumArgs() >= 3)
-      return MemorySink{1, 2, "DMA source length"};
+      return MemorySink{1, 2, "DMA source length", "host-read"};
     if (Name == "qemu_put_buffer" && Call.getNumArgs() >= 3)
-      return MemorySink{1, 2, "migration-output source length"};
+      return MemorySink{1, 2, "migration-output source length", "host-read"};
     if (Name == "bdrv_pwrite" && Call.getNumArgs() >= 5)
-      return MemorySink{3, 2, "block-write source length"};
+      return MemorySink{3, 2, "block-write source length", "host-read"};
     return std::nullopt;
   }
 
@@ -2733,7 +3162,8 @@ class QEMUGuestMemorySafetyChecker
   }
 
   void reportCallbackBufferRead(CheckerContext &C, ProgramStateRef Safe,
-                                ProgramStateRef Unsafe, SVal AccessEnd,
+                                ProgramStateRef Unsafe, SVal Offset,
+                                SVal AccessSizeValue, SVal AccessEnd,
                                 SVal Length, const Expr *Where,
                                 InputClass Source,
                                 const MemRegion *BufferBase) const {
@@ -2761,6 +3191,29 @@ class QEMUGuestMemorySafetyChecker
     for (SymbolRef Symbol : Length.symbols())
       Report->markInteresting(Symbol);
     Report->markInteresting(BufferBase);
+    std::string AccessSize =
+        "bytes " + valueRange(Unsafe, AccessSizeValue, C.getSValBuilder());
+    std::string ObjectExtent =
+        "bytes " + valueRange(Unsafe, Length, C.getSValBuilder());
+    std::string BufferExpression = witnessExpression(Where, C.getASTContext());
+    std::string SourceDetail =
+        BufferExpression.empty()
+            ? "callback buffer and length parameters"
+            : "callback buffer '" + BufferExpression + "' and length parameter";
+    if (const ParmVarDecl *const *Parameter =
+            Unsafe->get<QEMUInputBufferParameters>(BufferBase)) {
+      if (!(*Parameter)->getName().empty()) {
+        std::string AddressOrOffset =
+            "byte offset " + valueRange(Unsafe, Offset, C.getSValBuilder()) +
+            " from callback buffer parameter '" +
+            (*Parameter)->getNameAsString() + "'";
+        addStructuredWitness(
+            *Report, C, Unsafe, Message.str(), Source, SourceDetail,
+            "access end > available guest-input bytes", AccessEnd, "host-read",
+            AddressOrOffset, AccessSize, ObjectExtent,
+            "access end <= available guest-input bytes");
+      }
+    }
     C.emitReport(std::move(Report));
   }
 
@@ -2833,7 +3286,7 @@ class QEMUGuestMemorySafetyChecker
     InputClass Source = static_cast<InputClass>(*StoredClass);
     if (WithinBuffer->Unsafe)
       reportCallbackBufferRead(C, WithinBuffer->Safe, WithinBuffer->Unsafe,
-                               AccessEnd, Length,
+                               Offset, Access, AccessEnd, Length,
                                Call.getArgExpr(BufferArgument), Source, Base);
     if (WithinBuffer->Safe)
       C.addTransition(WithinBuffer->Safe);
@@ -2910,8 +3363,8 @@ class QEMUGuestMemorySafetyChecker
     InputClass Source = static_cast<InputClass>(*StoredClass);
     if (WithinBuffer->Unsafe)
       reportCallbackBufferRead(C, WithinBuffer->Safe, WithinBuffer->Unsafe,
-                               AccessEnd, Length, Cast->getSubExpr(), Source,
-                               Base);
+                               Offset, Access, AccessEnd, Length,
+                               Cast->getSubExpr(), Source, Base);
     State = WithinBuffer->Safe;
     if (!State)
       return true;
@@ -3851,6 +4304,8 @@ class QEMUGuestMemorySafetyChecker
     for (SVal Value : {Left, Right, Size})
       for (SymbolRef Sym : taint::getTaintedSymbols(State, Value))
         Report->markInteresting(Sym);
+    // Allocation arithmetic has no memory access width or effective address.
+    // Keep this human report outside the memory-access witness contract.
     C.emitReport(std::move(Report));
     return true;
   }
@@ -3960,6 +4415,7 @@ class QEMUGuestMemorySafetyChecker
       Report->addRange(Expression->getSourceRange());
       for (SymbolRef Symbol : taint::getTaintedSymbols(State, Value))
         Report->markInteresting(Symbol);
+      // Availability reports do not describe a host memory access.
       C.emitReport(std::move(Report));
       return;
     }
@@ -4025,8 +4481,28 @@ class QEMUGuestMemorySafetyChecker
     std::string SourceDetail;
     if (Persistent)
       SourceDetail = persistentSourceDescription(*Persistent);
-    report(C, Inside->Safe, Inside->Unsafe, Index, IndexExpression,
-           "bitmap bit index", Capacity, BoundUnit::Bits, SourceDetail);
+    SVal WordIndex = C.getSValBuilder().evalBinOp(
+        Inside->Unsafe, BO_Div, UnsignedIndex,
+        C.getSValBuilder().makeIntVal(LongBits,
+                                      C.getASTContext().getSizeType()),
+        C.getASTContext().getSizeType());
+    std::string Address =
+        "bitmap base '" +
+        witnessExpression(BitmapExpression, C.getASTContext()) +
+        "', bit index " +
+        valueRange(Inside->Unsafe, Index, C.getSValBuilder()) +
+        ", word index " +
+        valueRange(Inside->Unsafe, WordIndex, C.getSValBuilder()) +
+        " (unsigned long, " + std::to_string(LongBits) + " bits per word)";
+    const auto *FD = cast<FunctionDecl>(Call.getDecl());
+    StringRef Direction =
+        FD->getName() == "test_bit" ? "host-read" : "host-write";
+    report(
+        C, Inside->Safe, Inside->Unsafe, Index, IndexExpression,
+        "bitmap bit index", Capacity, BoundUnit::Bits, SourceDetail,
+        MemoryAccessWitness{Direction, std::move(Address),
+                            C.getSValBuilder().makeIntVal(
+                                LongBytes, C.getASTContext().getSizeType())});
   }
 
   AllocationAccessRelation
@@ -4118,6 +4594,12 @@ class QEMUGuestMemorySafetyChecker
 
     const Expr *Buffer =
         Call.getArgExpr(Sink.BufferArgument)->IgnoreParenImpCasts();
+    MemoryAccessWitness Witness{
+        Sink.Direction,
+        "effective address '" + witnessExpression(Buffer, C.getASTContext()) +
+            "'",
+        Length};
+    Witness.Input = inputClassForValue(State, Length);
     if (!hasUsableExtent(State, Extent, C.getSValBuilder()))
       if (std::optional<uint64_t> Bytes =
               staticObjectExtent(Buffer, C.getASTContext()))
@@ -4182,8 +4664,21 @@ class QEMUGuestMemorySafetyChecker
               persistentGuestFieldFromAliases(Offset, State, C, OffsetValue);
         if (taint::isTainted(State, OffsetValue)) {
           GuestControlled = true;
-          if (SourceDetail.empty() && OffsetPersistent)
-            SourceDetail = persistentSourceDescription(*OffsetPersistent);
+          // The bound arithmetic may simplify to a constant on a constrained
+          // path.  Preserve the controlling input's class before that step.
+          if (std::optional<InputClass> Source =
+                  inputClassForValue(State, OffsetValue))
+            Witness.Input = Witness.Input && *Witness.Input != *Source
+                                ? InputClass::Mixed
+                                : *Source;
+          if (SourceDetail.empty()) {
+            if (OffsetPersistent)
+              SourceDetail = persistentSourceDescription(*OffsetPersistent);
+            else
+              Witness.Source = "offset expression '" +
+                               witnessExpression(Offset, C.getASTContext()) +
+                               "'";
+          }
         }
         uint64_t ElementBytes =
             C.getASTContext().getTypeSizeInChars(Pointee).getQuantity();
@@ -4230,6 +4725,8 @@ class QEMUGuestMemorySafetyChecker
           BoundRequired = Total;
           Extent = BaseExtent;
           HasOffset = true;
+          Witness.ByteOffset = ByteOffset;
+          Witness.Base = witnessExpression(Pointer, C.getASTContext());
           SinkDescription = Sink.Description == "packet length"
                                 ? "packet offset plus length"
                                 : "memory-operation offset plus length";
@@ -4245,7 +4742,7 @@ class QEMUGuestMemorySafetyChecker
       return false;
     if (AllocationRelation == AllocationAccessRelation::Exceeds) {
       report(C, nullptr, State, Required, LengthExpression, SinkDescription,
-             Extent, BoundUnit::Bytes, SourceDetail);
+             Extent, BoundUnit::Bytes, SourceDetail, Witness);
       return true;
     }
     if (!hasUsableExtent(State, Extent, C.getSValBuilder()))
@@ -4277,7 +4774,7 @@ class QEMUGuestMemorySafetyChecker
       return false;
     report(C, Bounds->Safe, Bounds->Unsafe, Required,
            Call.getArgExpr(Sink.LengthArgument), SinkDescription, Extent,
-           BoundUnit::Bytes, SourceDetail);
+           BoundUnit::Bytes, SourceDetail, Witness);
     return true;
   }
 
@@ -4321,13 +4818,18 @@ class QEMUGuestMemorySafetyChecker
 
     MemorySink Sink{Copy.BufferArgument, Copy.LengthArgument,
                     Copy.ToBuffer ? "memory-operation length"
-                                  : "memory-operation source length"};
+                                  : "memory-operation source length",
+                    Copy.ToBuffer ? "host-write" : "host-read"};
     if (!checkMemorySink(Call, Sink, C, Success))
       C.addTransition(Success, Tag);
   }
 
 public:
   void setReportLevelC(bool Enable) { ReportLevelC = Enable; }
+  void setStructuredWitnessOptions(bool Enable, StringRef SourceRoot) {
+    EmitStructuredWitness = Enable;
+    QEMUSourceRoot = SourceRoot.str();
+  }
 
   void checkASTDecl(const TranslationUnitDecl *TU, AnalysisManager &Mgr,
                     BugReporter &BR) const {
@@ -4361,6 +4863,11 @@ public:
 
       bool VisitVarDecl(VarDecl *VD) override {
         const InitListExpr *ILE = semanticInitList(VD->getInit());
+        llvm::SmallVector<const FunctionDecl *, 4> RegisteredCallbacks;
+        Checker.collectOperationTableCallbacks(ILE, RegisteredCallbacks);
+        for (const FunctionDecl *FD : RegisteredCallbacks)
+          Checker.recordCallbackRegistration(FD,
+                                             VD->getQualifiedNameAsString());
         if (!isMemoryRegionOps(ILE))
           return true;
         const VarDecl *Canonical = VD->getCanonicalDecl();
@@ -5376,7 +5883,8 @@ public:
       if (!Outside || !Outside->Safe)
         return;
       report(C, Outside->Unsafe, Outside->Safe, Index, ASE->getIdx(),
-             "array index", Count, BoundUnit::Elements, SourceDetail);
+             "array index", Count, BoundUnit::Elements, SourceDetail,
+             arrayAccessWitness(ASE, C));
       return;
     }
 
@@ -5385,7 +5893,8 @@ public:
     if (!Inside || !Inside->Unsafe)
       return;
     report(C, Inside->Safe, Inside->Unsafe, Index, ASE->getIdx(), "array index",
-           Count, BoundUnit::Elements, SourceDetail);
+           Count, BoundUnit::Elements, SourceDetail,
+           arrayAccessWitness(ASE, C));
   }
 };
 
@@ -5395,6 +5904,11 @@ void ento::registerQEMUGuestMemorySafetyChecker(CheckerManager &Mgr) {
   auto *Checker = Mgr.registerChecker<QEMUGuestMemorySafetyChecker>();
   Checker->setReportLevelC(Mgr.getAnalyzerOptions().getCheckerBooleanOption(
       Checker, "ReportLevelC"));
+  Checker->setStructuredWitnessOptions(
+      Mgr.getAnalyzerOptions().getCheckerBooleanOption(Checker,
+                                                       "EmitStructuredWitness"),
+      Mgr.getAnalyzerOptions().getCheckerStringOption(Checker,
+                                                      "QEMUSourceRoot"));
 }
 
 bool ento::shouldRegisterQEMUGuestMemorySafetyChecker(
