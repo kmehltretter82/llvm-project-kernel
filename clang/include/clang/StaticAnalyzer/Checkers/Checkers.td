@@ -1767,8 +1767,8 @@ def QEMUGuestMemorySafetyChecker : Checker<"GuestMemorySafety">,
                   InAlpha>,
     CmdLineOption<Boolean,
                   "EmitStructuredWitness",
-                  "Emit a machine-readable witness note for supported "
-                  "memory-access diagnostics",
+                  "Emit a machine-readable witness outcome for "
+                  "GuestMemorySafety diagnostics",
                   "false",
                   InAlpha>,
     CmdLineOption<String,

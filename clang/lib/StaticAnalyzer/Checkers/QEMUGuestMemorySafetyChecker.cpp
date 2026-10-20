@@ -2406,6 +2406,42 @@ class QEMUGuestMemorySafetyChecker
     Report.addNote(Marker, Report.getLocation());
   }
 
+  void addStructuredWitnessNotApplicable(PathSensitiveBugReport &Report,
+                                         CheckerContext &C, StringRef Message,
+                                         StringRef Reason) const {
+    if (!EmitStructuredWitness)
+      return;
+    std::optional<std::string> QEMUPath =
+        qemuRelativePath(Report, C.getSourceManager());
+    if (!QEMUPath)
+      return;
+    PresumedLoc Presumed =
+        C.getSourceManager().getPresumedLoc(Report.getLocation().asLocation());
+    if (Presumed.isInvalid() || !witnessStringValid(Message, 8192) ||
+        !witnessStringValid(Reason))
+      return;
+
+    llvm::SmallString<1024> JSONBuffer;
+    llvm::raw_svector_ostream JSONStream(JSONBuffer);
+    llvm::json::OStream JSON(JSONStream, 0);
+    JSON.object([&] {
+      JSON.attributeObject("diagnostic", [&] {
+        JSON.attribute("checker", "alpha.qemu.GuestMemorySafety");
+        JSON.attribute("column", int64_t(Presumed.getColumn()));
+        JSON.attribute("line", int64_t(Presumed.getLine()));
+        JSON.attribute("message", Message);
+        JSON.attribute("qemu_path", *QEMUPath);
+      });
+      JSON.attribute("kind", "qemu-gms-witness-not-applicable");
+      JSON.attribute("reason", Reason);
+      JSON.attribute("schema_version", 1);
+    });
+    JSON.flush();
+    std::string Marker =
+        "QEMU_GMS_WITNESS_NA_V1=" + llvm::encodeBase64(JSONBuffer.str());
+    Report.addNote(Marker, Report.getLocation());
+  }
+
   BugType &bugType(bool Definite) const {
     std::unique_ptr<BugType> &BT = Definite ? LevelABug : LevelBBug;
     if (!BT)
@@ -2448,10 +2484,31 @@ class QEMUGuestMemorySafetyChecker
                                       C.getASTContext().getSizeType())};
   }
 
+  static bool
+  isAddressComputationOnly(const ArraySubscriptExpr *Subscript,
+                           ASTContext &Context) {
+    DynTypedNode Child = DynTypedNode::create(*Subscript);
+    for (unsigned Depth = 0; Depth < 8; ++Depth) {
+      auto Parents = Context.getParents(Child);
+      if (Parents.size() != 1)
+        return false;
+      DynTypedNode Parent = Parents[0];
+      if (Parent.get<ParenExpr>()) {
+        Child = Parent;
+        continue;
+      }
+      const auto *Unary = Parent.get<UnaryOperator>();
+      return Unary && Unary->getOpcode() == UO_AddrOf &&
+             Unary->getSubExpr()->IgnoreParenImpCasts() == Subscript;
+    }
+    return false;
+  }
+
   void report(CheckerContext &C, ProgramStateRef Safe, ProgramStateRef Unsafe,
               SVal TaintedValue, const Expr *Where, StringRef Sink,
               SVal ExtentOrCount, BoundUnit Unit, StringRef SourceDetail = {},
-              std::optional<MemoryAccessWitness> Witness = std::nullopt) const {
+              std::optional<MemoryAccessWitness> Witness = std::nullopt,
+              StringRef WitnessNotApplicableReason = {}) const {
     if (!Unsafe)
       return;
     bool Definite = !Safe;
@@ -2532,6 +2589,9 @@ class QEMUGuestMemorySafetyChecker
                            WitnessSource, Constraint, TaintedValue,
                            Witness->Direction, AddressOrOffset, AccessSize,
                            ObjectExtent, MissingRelationship);
+    } else if (!WitnessNotApplicableReason.empty()) {
+      addStructuredWitnessNotApplicable(*Report, C, Message.str(),
+                                        WitnessNotApplicableReason);
     }
     C.emitReport(std::move(Report));
   }
@@ -4305,7 +4365,9 @@ class QEMUGuestMemorySafetyChecker
       for (SymbolRef Sym : taint::getTaintedSymbols(State, Value))
         Report->markInteresting(Sym);
     // Allocation arithmetic has no memory access width or effective address.
-    // Keep this human report outside the memory-access witness contract.
+    // Account for it explicitly without fabricating memory-access geometry.
+    addStructuredWitnessNotApplicable(*Report, C, Message.str(),
+                                      "allocation-size-arithmetic");
     C.emitReport(std::move(Report));
     return true;
   }
@@ -4416,6 +4478,8 @@ class QEMUGuestMemorySafetyChecker
       for (SymbolRef Symbol : taint::getTaintedSymbols(State, Value))
         Report->markInteresting(Symbol);
       // Availability reports do not describe a host memory access.
+      addStructuredWitnessNotApplicable(*Report, C, Message.str(),
+                                        "allocation-availability");
       C.emitReport(std::move(Report));
       return;
     }
@@ -5882,9 +5946,13 @@ public:
           State, Index, BO_GE, Count, C.getSValBuilder());
       if (!Outside || !Outside->Safe)
         return;
-      report(C, Outside->Unsafe, Outside->Safe, Index, ASE->getIdx(),
-             "array index", Count, BoundUnit::Elements, SourceDetail,
-             arrayAccessWitness(ASE, C));
+      report(
+          C, Outside->Unsafe, Outside->Safe, Index, ASE->getIdx(),
+          "array index", Count, BoundUnit::Elements, SourceDetail,
+          arrayAccessWitness(ASE, C),
+          isAddressComputationOnly(ASE, C.getASTContext())
+              ? "address-computation-only"
+              : "");
       return;
     }
 
@@ -5894,7 +5962,10 @@ public:
       return;
     report(C, Inside->Safe, Inside->Unsafe, Index, ASE->getIdx(), "array index",
            Count, BoundUnit::Elements, SourceDetail,
-           arrayAccessWitness(ASE, C));
+           arrayAccessWitness(ASE, C),
+           isAddressComputationOnly(ASE, C.getASTContext())
+               ? "address-computation-only"
+               : "");
   }
 };
 

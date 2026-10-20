@@ -10,6 +10,7 @@ import sys
 
 
 MARKER = "QEMU_GMS_WITNESS_V1="
+NOT_APPLICABLE_MARKER = "QEMU_GMS_WITNESS_NA_V1="
 CHECKER = "alpha.qemu.GuestMemorySafety"
 
 
@@ -21,10 +22,19 @@ def fail(message):
 def expected_cases():
     cases = {}
 
-    def add(name, message, witness=None):
+    def add(name, message, witness=None, not_applicable=None,
+            unaccounted=False):
         if name in cases:
             fail(f"duplicate expected case {name}")
-        cases[name] = {"message": message, "witness": witness}
+        if sum((witness is not None, not_applicable is not None,
+                unaccounted)) != 1:
+            fail(f"case {name} must select exactly one witness outcome")
+        cases[name] = {
+            "message": message,
+            "witness": witness,
+            "not_applicable": not_applicable,
+            "unaccounted": unaccounted,
+        }
 
     def payload(name, concrete, source, constraint, direction, address, size,
                 extent, missing, provenance="mmio"):
@@ -61,6 +71,15 @@ def expected_cases():
             },
             "validation": {"missing_relationship": missing,
                            "status": "unproven"},
+        }
+
+    def not_applicable(reason):
+        return {
+            # The exact diagnostic fields are filled from the bound warning.
+            "diagnostic": None,
+            "kind": "qemu-gms-witness-not-applicable",
+            "reason": reason,
+            "schema_version": 1,
         }
 
     array_message = (
@@ -123,25 +142,36 @@ def expected_cases():
             "(unsigned long, 64 bits per word)", "bytes 8", "bits 64",
             "bitmap bit index < host object bit capacity"))
 
-    add("address_only", array_message.replace("value 4", "value 5"))
+    add(
+        "address_only",
+        array_message.replace("value 4", "value 5"),
+        not_applicable=not_applicable("address-computation-only"),
+    )
+    add(
+        "unresolved_member_access",
+        array_message,
+        unaccounted=True,
+    )
     add("allocation_overflow", (
         "Level B: guest-controlled allocation-size arithmetic overflows before "
         "the allocation (left [9223372036854775808, 18446744073709551615], "
         "right [9223372036854775808, 18446744073709551615])"
-    ))
+    ), not_applicable=not_applicable("allocation-size-arithmetic"))
     add("availability_allocation", (
         "Level C: guest-controlled allocation size in g_malloc has no proven "
         "upper bound below its integer type maximum "
         "(value [0, 18446744073709551615], source MMIO); "
         "allocation failure can terminate QEMU"
-    ))
+    ), not_applicable=not_applicable("allocation-availability"))
     return cases
 
 
 def source_cases(source, expected):
     by_line = {}
     names = set()
-    pattern = re.compile(r"// (WITNESS|NO-WITNESS): ([a-z][a-z0-9_]*)\s*$")
+    pattern = re.compile(
+        r"// (WITNESS|NOT-APPLICABLE|UNACCOUNTED): ([a-z][a-z0-9_]*)\s*$"
+    )
     for line_number, line in enumerate(source.read_text().splitlines(), 1):
         match = pattern.search(line)
         if not match:
@@ -152,7 +182,13 @@ def source_cases(source, expected):
         if name in names or line_number in by_line:
             fail(f"duplicate source case {name}")
         names.add(name)
-        if (kind == "WITNESS") != (expected[name]["witness"] is not None):
+        expected_kind = (
+            "WITNESS" if expected[name]["witness"] is not None
+            else "NOT-APPLICABLE"
+            if expected[name]["not_applicable"] is not None
+            else "UNACCOUNTED"
+        )
+        if kind != expected_kind:
             fail(f"source case {name} has the wrong witness expectation")
         by_line[line_number] = (name, len(line[:match.start()].rstrip()))
     if names != set(expected):
@@ -209,8 +245,8 @@ def validate(lines, source, qemu_path, expect_absent):
     for line in lines:
         match = pattern.match(line.rstrip("\n"))
         if not match:
-            if MARKER in line:
-                fail("witness marker is outside a diagnostic note")
+            if MARKER in line or NOT_APPLICABLE_MARKER in line:
+                fail("structured witness marker is outside a diagnostic note")
             if re.search(r"(?:^|: )(?:warning|error|fatal error): ", line):
                 fail(f"unexpected diagnostic: {line.rstrip()}")
             continue
@@ -235,7 +271,8 @@ def validate(lines, source, qemu_path, expect_absent):
             if message != expected[name]["message"]:
                 fail(f"case {name} has the wrong warning: {message}")
             current = {"name": name, "location": location,
-                       "message": message, "witness": None}
+                       "message": message, "witness": None,
+                       "not_applicable": None}
             observed[name] = current
         elif message.startswith(MARKER):
             if current is None:
@@ -261,15 +298,54 @@ def validate(lines, source, qemu_path, expect_absent):
                      f"expected: {json.dumps(wanted, sort_keys=True)}\n"
                      f"actual:   {json.dumps(witness, sort_keys=True)}")
             current["witness"] = witness
-        elif MARKER in message:
-            fail("witness marker is malformed")
+        elif message.startswith(NOT_APPLICABLE_MARKER):
+            if current is None:
+                fail("not-applicable note has no preceding warning")
+            name = current["name"]
+            if expect_absent or expected[name]["not_applicable"] is None:
+                fail(f"case {name} emitted a forbidden not-applicable record")
+            if current["not_applicable"] is not None:
+                fail(f"case {name} emitted more than one not-applicable record")
+            if current["witness"] is not None:
+                fail(f"case {name} emitted two structured witness outcomes")
+            if location != current["location"]:
+                fail(
+                    f"case {name} not-applicable record does not share its "
+                    "warning location"
+                )
+            record = decode_witness(message[len(NOT_APPLICABLE_MARKER):])
+            wanted = expected[name]["not_applicable"]
+            wanted["diagnostic"] = {
+                "checker": CHECKER,
+                "qemu_path": qemu_path,
+                "line": location[1],
+                "column": location[2],
+                "message": current["message"],
+            }
+            if canonical_json(record) != canonical_json(wanted):
+                fail(
+                    f"case {name} has the wrong not-applicable record\n"
+                    f"expected: {json.dumps(wanted, sort_keys=True)}\n"
+                    f"actual:   {json.dumps(record, sort_keys=True)}"
+                )
+            current["not_applicable"] = record
+        elif MARKER in message or NOT_APPLICABLE_MARKER in message:
+            fail("structured witness marker is malformed")
 
     if set(observed) != set(expected):
         fail(f"missing expected warnings: {sorted(set(expected) - set(observed))}")
     for name, report in observed.items():
-        wanted = not expect_absent and expected[name]["witness"] is not None
-        if wanted != (report["witness"] is not None):
+        wanted_witness = (
+            not expect_absent and expected[name]["witness"] is not None
+        )
+        wanted_not_applicable = (
+            not expect_absent
+            and expected[name]["not_applicable"] is not None
+        )
+        if wanted_witness != (report["witness"] is not None):
             fail(f"case {name} is missing its structured witness")
+        if wanted_not_applicable != (report["not_applicable"] is not None):
+            fail(f"case {name} is missing its not-applicable record")
 
 
 def main():

@@ -37,9 +37,10 @@ typedef struct NetClientInfo {
 
 static uint64_t result;
 
-// Each marked line must produce exactly one warning. WITNESS cases additionally
-// require exactly one payload, and NO-WITNESS cases must never produce one.
-// Keep each failing value a singleton so byte widths cannot hide in ranges.
+// Each marked line must produce exactly one warning. WITNESS cases require a
+// full payload, NOT-APPLICABLE cases require an explicit reason record, and the
+// UNACCOUNTED negative case must produce neither. Keep each failing value a
+// singleton so byte widths cannot hide in ranges.
 
 static void char_read(void *opaque, uint64_t addr, uint64_t data,
                       unsigned size) {
@@ -187,16 +188,31 @@ static void address_only(void *opaque, uint64_t addr, uint64_t data,
   int slots[4] = {0};
   if (data != 5)
     return;
-  consume_address(&slots[data]); // NO-WITNESS: address_only
+  consume_address(&slots[data]); // NOT-APPLICABLE: address_only
 }
 
 static const MemoryRegionOps address_only_ops = {.write = address_only};
+
+typedef struct WitnessMember {
+  int value;
+} WitnessMember;
+
+static void unresolved_member_access(void *opaque, uint64_t addr,
+                                     uint64_t data, unsigned size) {
+  WitnessMember slots[4] = {{0}};
+  if (data != 4)
+    return;
+  result = slots[data].value; // UNACCOUNTED: unresolved_member_access
+}
+
+static const MemoryRegionOps unresolved_member_access_ops = {
+    .write = unresolved_member_access};
 
 static void allocation_overflow(void *opaque, uint64_t addr, uint64_t data,
                                 unsigned size) {
   if (data <= ((uint64_t)-1) / 2)
     return;
-  malloc(data + data); // NO-WITNESS: allocation_overflow
+  malloc(data + data); // NOT-APPLICABLE: allocation_overflow
 }
 
 static const MemoryRegionOps allocation_overflow_ops = {
@@ -204,7 +220,7 @@ static const MemoryRegionOps allocation_overflow_ops = {
 
 static void availability_allocation(void *opaque, uint64_t addr, uint64_t data,
                                     unsigned size) {
-  g_malloc(data); // NO-WITNESS: availability_allocation
+  g_malloc(data); // NOT-APPLICABLE: availability_allocation
 }
 
 static const MemoryRegionOps availability_allocation_ops = {
