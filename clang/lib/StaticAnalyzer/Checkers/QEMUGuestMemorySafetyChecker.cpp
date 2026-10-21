@@ -356,8 +356,8 @@ static bool hasUsableExtent(ProgramStateRef State, SVal Extent,
 class QEMUGuestMemorySafetyChecker
     : public Checker<check::ASTDecl<TranslationUnitDecl>, check::BeginFunction,
                      check::EndFunction, check::PreCall, check::PostCall,
-                     check::Bind, check::LiveSymbols, check::DeadSymbols,
-                     check::PostStmt<ImplicitCastExpr>,
+                     check::Location, check::Bind, check::LiveSymbols,
+                     check::DeadSymbols, check::PostStmt<ImplicitCastExpr>,
                      check::PreStmt<ArraySubscriptExpr>> {
   mutable llvm::DenseMap<const FunctionDecl *, CallbackInfo> Callbacks;
   mutable llvm::DenseMap<const FunctionDecl *, std::string>
@@ -2306,7 +2306,8 @@ class QEMUGuestMemorySafetyChecker
                             SVal ConcreteValue, StringRef SinkDirection,
                             StringRef AddressOrOffset, StringRef AccessSize,
                             StringRef ObjectExtent,
-                            StringRef MissingRelationship) const {
+                            StringRef MissingRelationship,
+                            SourceLocation DiagnosticLocation = {}) const {
     if (!EmitStructuredWitness)
       return;
     std::optional<std::string> QEMUPath =
@@ -2316,8 +2317,30 @@ class QEMUGuestMemorySafetyChecker
     if (!QEMUPath || !Callback)
       return;
 
-    PresumedLoc Presumed =
-        C.getSourceManager().getPresumedLoc(Report.getLocation().asLocation());
+    const SourceManager &SM = C.getSourceManager();
+    SourceLocation RawReportLocation = Report.getLocation().asLocation();
+    SourceLocation ReportLocation = SM.getFileLoc(RawReportLocation);
+    if (RawReportLocation.isMacroID()) {
+      // Match Clang's diagnostic location rule: macro arguments use their
+      // spelling location while macro-body tokens use the expansion site.
+      DiagnosticLocation = ReportLocation;
+    } else if (DiagnosticLocation.isInvalid() ||
+               !DiagnosticLocation.isFileID()) {
+      DiagnosticLocation = ReportLocation;
+    } else {
+      PresumedLoc ReportPresumed = SM.getPresumedLoc(ReportLocation);
+      PresumedLoc AlternativePresumed = SM.getPresumedLoc(DiagnosticLocation);
+      // Path diagnostics normally use ReportLocation.  A multiline enclosing
+      // expression can instead be rendered at the accessed subexpression; use
+      // that location only when it identifies a different source line.  This
+      // preserves operator locations for same-line stores.
+      if (ReportPresumed.isInvalid() || AlternativePresumed.isInvalid() ||
+          StringRef(ReportPresumed.getFilename()) !=
+              AlternativePresumed.getFilename() ||
+          ReportPresumed.getLine() == AlternativePresumed.getLine())
+        DiagnosticLocation = ReportLocation;
+    }
+    PresumedLoc Presumed = SM.getPresumedLoc(DiagnosticLocation);
     if (Presumed.isInvalid())
       return;
     InputClass EffectiveSource = Source.value_or(InputClass::Mixed);
@@ -2499,34 +2522,30 @@ class QEMUGuestMemorySafetyChecker
     return *DirectDMALifetimeBug;
   }
 
-  bool reportDirectDMAUseAfterUnmap(CheckerContext &C, ProgramStateRef State,
-                                    const CallEvent &Call,
-                                    unsigned BufferArgument,
-                                    StringRef Direction, SVal AccessSize,
-                                    SVal PriorExtent,
-                                    const Expr *UnmapOrigin) const {
+  bool reportDirectDMAUseAfterUnmap(
+      CheckerContext &C, ProgramStateRef State, SVal Location,
+      const Expr *Where, StringRef Direction, SVal AccessSize, SVal PriorExtent,
+      const Expr *UnmapOrigin, SourceLocation DiagnosticLocation = {}) const {
     ExplodedNode *Node = C.generateErrorNode(State);
     if (!Node)
       return false;
 
     StringRef Message =
         "direct DMA mapped buffer is accessed after it was unmapped";
-    const Expr *BufferExpression = Call.getArgExpr(BufferArgument);
     auto Report = std::make_unique<PathSensitiveBugReport>(
         directDMALifetimeBugType(), Message, Node);
-    if (BufferExpression)
-      Report->addRange(BufferExpression->getSourceRange());
+    if (Where)
+      Report->addRange(Where->getSourceRange());
     if (UnmapOrigin)
       Report->addNote("DMA mapping unmapped here",
                       {UnmapOrigin, C.getSourceManager(), C.getStackFrame()});
-    for (SymbolRef Symbol : Call.getArgSVal(BufferArgument).symbols())
+    for (SymbolRef Symbol : Location.symbols())
       Report->markInteresting(Symbol);
     for (SymbolRef Symbol : AccessSize.symbols())
       Report->markInteresting(Symbol);
 
-    std::string Address =
-        "effective address '" +
-        witnessExpression(BufferExpression, C.getASTContext()) + "'";
+    std::string Address = "effective address '" +
+                          witnessExpression(Where, C.getASTContext()) + "'";
     addStructuredWitness(
         *Report, C, State, Message, InputClass::DMA,
         "direct DMA mapping returned by map API",
@@ -2534,7 +2553,7 @@ class QEMUGuestMemorySafetyChecker
         Direction, Address,
         "bytes " + valueRange(State, AccessSize, C.getSValBuilder()),
         "bytes " + valueRange(State, PriorExtent, C.getSValBuilder()),
-        "memory access must precede direct DMA unmap");
+        "memory access must precede direct DMA unmap", DiagnosticLocation);
     C.emitReport(std::move(Report));
     return true;
   }
@@ -2547,6 +2566,7 @@ class QEMUGuestMemorySafetyChecker
     std::string Base = {};
     std::string Source = {};
     std::optional<InputClass> Input = std::nullopt;
+    SourceLocation DiagnosticLocation = {};
   };
 
   static std::optional<MemoryAccessWitness>
@@ -2671,10 +2691,10 @@ class QEMUGuestMemorySafetyChecker
             ", byte offset " +
             valueRange(Unsafe, *Witness->ByteOffset, C.getSValBuilder()) +
             " from base '" + Witness->Base + "'";
-      addStructuredWitness(*Report, C, Unsafe, Message.str(), Source,
-                           WitnessSource, Constraint, TaintedValue,
-                           Witness->Direction, AddressOrOffset, AccessSize,
-                           ObjectExtent, MissingRelationship);
+      addStructuredWitness(
+          *Report, C, Unsafe, Message.str(), Source, WitnessSource, Constraint,
+          TaintedValue, Witness->Direction, AddressOrOffset, AccessSize,
+          ObjectExtent, MissingRelationship, Witness->DiagnosticLocation);
     } else if (!WitnessNotApplicableReason.empty()) {
       addStructuredWitnessNotApplicable(*Report, C, Message.str(),
                                         WitnessNotApplicableReason);
@@ -4865,9 +4885,10 @@ class QEMUGuestMemorySafetyChecker
         const Expr *Origin = Base && State->get<QEMUDMARetiredOrigins>(Base)
                                  ? *State->get<QEMUDMARetiredOrigins>(Base)
                                  : nullptr;
-        reportDirectDMAUseAfterUnmap(C, Positive->Safe, Call,
-                                     Sink.BufferArgument, Sink.Direction,
-                                     Length, *RetiredExtent, Origin);
+        reportDirectDMAUseAfterUnmap(C, Positive->Safe, BufferValue,
+                                     Call.getArgExpr(Sink.BufferArgument),
+                                     Sink.Direction, Length, *RetiredExtent,
+                                     Origin);
         return MemorySinkResult::LifetimePathSplit;
       }
     }
@@ -6129,6 +6150,104 @@ public:
     const NoteTag *Tag =
         sourceNote(C, State, Value, Persistent->Source, Detail);
     C.addTransition(State, Tag);
+  }
+
+  void checkLocation(SVal Location, bool IsLoad, const Stmt *S,
+                     CheckerContext &C) const {
+    const auto *At = dyn_cast_or_null<Expr>(S);
+    const MemRegion *Region = Location.getAsRegion();
+    SymbolRef Base = Location.getLocSymbolInBase();
+    if (!At || !Region || !Base)
+      return;
+
+    ProgramStateRef State = C.getState();
+    const SVal *MappedExtent = State->get<QEMUDMAMappedExtents>(Base);
+    const SVal *RetiredExtent = State->get<QEMUDMARetiredExtents>(Base);
+    if (!MappedExtent && !RetiredExtent)
+      return;
+
+    const auto *Typed = dyn_cast<TypedValueRegion>(Region);
+    if (!Typed)
+      return;
+    if (const auto *Field = dyn_cast<FieldRegion>(Region))
+      if (Field->getDecl()->isBitField())
+        return;
+
+    QualType AccessType = Typed->getValueType();
+    if (AccessType.isNull() || AccessType->isVoidType() ||
+        AccessType->isIncompleteType() ||
+        AccessType->isVariablyModifiedType() || AccessType->isDependentType())
+      return;
+    // Keep this first slice to concrete-offset scalar accesses.  Aggregate
+    // accesses can be represented as LazyCompoundVal instead of a location,
+    // and need a separate model before they can be covered consistently.
+    if (!AccessType->isScalarType() || AccessType->isSizelessType())
+      return;
+    int64_t AccessBytes =
+        C.getASTContext().getTypeSizeInChars(AccessType).getQuantity();
+    if (AccessBytes <= 0)
+      return;
+
+    QualType SizeType = C.getASTContext().getSizeType();
+    SVal AccessSize =
+        C.getSValBuilder().makeIntVal(uint64_t(AccessBytes), SizeType);
+    StringRef Direction = IsLoad ? "host-read" : "host-write";
+    // Loads can be diagnosed at the accessed subexpression when it appears on
+    // a different source line.  Stores are normally diagnosed at the
+    // assignment operator, so preserve the report's own location for them.
+    SourceLocation AccessLocation =
+        IsLoad ? At->IgnoreParenImpCasts()->getExprLoc() : SourceLocation();
+
+    // An active map wins defensively if malformed state ever contains both
+    // tokens.  A retired access is temporally invalid regardless of whether
+    // its derived offset can still be represented precisely.
+    if (!MappedExtent) {
+      if (RetiredExtent) {
+        const Expr *Origin = State->get<QEMUDMARetiredOrigins>(Base)
+                                 ? *State->get<QEMUDMARetiredOrigins>(Base)
+                                 : nullptr;
+        reportDirectDMAUseAfterUnmap(C, State, Location, At, Direction,
+                                     AccessSize, *RetiredExtent, Origin,
+                                     AccessLocation);
+      }
+      return;
+    }
+
+    const SymbolicRegion *Symbolic = Region->getSymbolicBase();
+    RegionOffset Offset = Region->getAsOffset();
+    unsigned CharWidth = C.getASTContext().getCharWidth();
+    if (!Symbolic || Symbolic->getSymbol() != Base || !Offset.isValid() ||
+        Offset.getRegion() != Symbolic || Offset.hasSymbolicOffset() ||
+        !CharWidth || Offset.getOffset() < 0 || Offset.getOffset() % CharWidth)
+      return;
+    uint64_t ByteOffset = uint64_t(Offset.getOffset()) / CharWidth;
+    if (uint64_t(AccessBytes) >
+        std::numeric_limits<uint64_t>::max() - ByteOffset)
+      return;
+    uint64_t AccessEndBytes = ByteOffset + uint64_t(AccessBytes);
+    llvm::APSInt Maximum =
+        C.getSValBuilder().getBasicValueFactory().getMaxValue(SizeType);
+    if (Maximum.getActiveBits() <= 64 &&
+        AccessEndBytes > Maximum.getZExtValue())
+      return;
+
+    SVal AccessEnd = C.getSValBuilder().makeIntVal(AccessEndBytes, SizeType);
+    std::optional<BoundStates> Within =
+        compare(State, AccessEnd, BO_LE, *MappedExtent, C.getSValBuilder());
+    if (!Within || !Within->Unsafe)
+      return;
+
+    MemoryAccessWitness Witness{
+        Direction,
+        "effective address '" + witnessExpression(At, C.getASTContext()) + "'",
+        AccessSize};
+    Witness.ByteOffset = C.getSValBuilder().makeIntVal(ByteOffset, SizeType);
+    Witness.Base = "direct DMA mapping";
+    Witness.Input = InputClass::DMA;
+    Witness.DiagnosticLocation = AccessLocation;
+    report(C, Within->Safe, Within->Unsafe, AccessEnd, At,
+           "direct DMA mapped-buffer typed access end", *MappedExtent,
+           BoundUnit::Bytes, "DMA map returned length", Witness);
   }
 
   void checkBind(SVal Location, SVal Value, const Stmt *S, bool AtDeclInit,

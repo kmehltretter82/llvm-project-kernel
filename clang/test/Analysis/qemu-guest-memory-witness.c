@@ -14,6 +14,7 @@
 // RUN:   %s qemu-guest-memory-witness.c
 
 typedef __SIZE_TYPE__ size_t;
+typedef __UINT32_TYPE__ uint32_t;
 typedef __UINT64_TYPE__ uint64_t;
 
 void *memcpy(void *, const void *, size_t);
@@ -24,6 +25,7 @@ int test_bit(long, const unsigned long *);
 void set_bit(long, unsigned long *);
 void clear_bit(long, unsigned long *);
 void consume_address(const void *);
+void consume_u32(uint32_t);
 
 typedef struct MemoryRegionOps {
   uint64_t (*read)(void *, uint64_t, unsigned);
@@ -39,6 +41,13 @@ typedef struct NetClientInfo {
 void *address_space_map(AddressSpace *, uint64_t, uint64_t *, _Bool,
                         unsigned);
 void address_space_unmap(AddressSpace *, void *, uint64_t, _Bool, uint64_t);
+
+#define DMA_LOAD_U32(pointer) (*(uint32_t *)(pointer))
+#define DMA_FORWARD_U32(value) consume_u32(value)
+#define DMA_ASSIGN_U32(value)                                                  \
+  do {                                                                         \
+    result = (value);                                                          \
+  } while (0)
 
 static uint64_t result;
 
@@ -256,6 +265,96 @@ static void dma_use_after_unmap(void *opaque, uint64_t addr, uint64_t data,
 
 static const MemoryRegionOps dma_use_after_unmap_ops = {
     .write = dma_use_after_unmap};
+
+static void dma_typed_short_load(void *opaque, uint64_t addr, uint64_t data,
+                                 unsigned size) {
+  AddressSpace *as = opaque;
+  uint64_t mapped = 4;
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, 0);
+  if (!buffer)
+    return;
+  if (mapped != 1) {
+    address_space_unmap(as, buffer, mapped, 0, 0);
+    return;
+  }
+  result =
+      *(uint32_t *)buffer; // WITNESS: dma_typed_short_load
+}
+
+static const MemoryRegionOps dma_typed_short_load_ops = {
+    .write = dma_typed_short_load};
+
+static void dma_typed_macro_short_load(void *opaque, uint64_t addr,
+                                       uint64_t data, unsigned size) {
+  AddressSpace *as = opaque;
+  uint64_t mapped = 4;
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, 0);
+  if (!buffer)
+    return;
+  if (mapped != 1) {
+    address_space_unmap(as, buffer, mapped, 0, 0);
+    return;
+  }
+  result = DMA_LOAD_U32(buffer); // WITNESS: dma_typed_macro_short_load
+}
+
+static const MemoryRegionOps dma_typed_macro_short_load_ops = {
+    .write = dma_typed_macro_short_load};
+
+static void dma_typed_macro_argument_short_load(void *opaque, uint64_t addr,
+                                                uint64_t data, unsigned size) {
+  AddressSpace *as = opaque;
+  uint64_t mapped = 4;
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, 0);
+  if (!buffer)
+    return;
+  if (mapped != 1) {
+    address_space_unmap(as, buffer, mapped, 0, 0);
+    return;
+  }
+  DMA_FORWARD_U32(
+      *(uint32_t *)buffer); // WITNESS: dma_typed_macro_argument_short_load
+}
+
+static const MemoryRegionOps dma_typed_macro_argument_short_load_ops = {
+    .write = dma_typed_macro_argument_short_load};
+
+static void dma_typed_assignment_macro_short_load(void *opaque, uint64_t addr,
+                                                  uint64_t data,
+                                                  unsigned size) {
+  AddressSpace *as = opaque;
+  uint64_t mapped = 4;
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, 0);
+  if (!buffer)
+    return;
+  if (mapped != 1) {
+    address_space_unmap(as, buffer, mapped, 0, 0);
+    return;
+  }
+  DMA_ASSIGN_U32( // WITNESS: dma_typed_assignment_macro_short_load
+      *(uint32_t *)buffer);
+}
+
+static const MemoryRegionOps dma_typed_assignment_macro_short_load_ops = {
+    .write = dma_typed_assignment_macro_short_load};
+
+static void dma_typed_multiline_short_store(void *opaque, uint64_t addr,
+                                            uint64_t data, unsigned size) {
+  AddressSpace *as = opaque;
+  uint64_t mapped = 4;
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 1, 0);
+  if (!buffer)
+    return;
+  if (mapped != 1) {
+    address_space_unmap(as, buffer, mapped, 1, 0);
+    return;
+  }
+  *(uint32_t *)buffer
+      = (uint32_t)data; // WITNESS: dma_typed_multiline_short_store
+}
+
+static const MemoryRegionOps dma_typed_multiline_short_store_ops = {
+    .write = dma_typed_multiline_short_store};
 
 static void dma_null_unmap_contract(AddressSpace *as) {
   uint64_t mapped = 8;

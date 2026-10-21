@@ -178,6 +178,63 @@ def expected_cases():
         "nonzero memory access occurs after direct DMA unmap",
         "host-read", "effective address 'buffer'", "bytes 1", "bytes 8",
         "memory access must precede direct DMA unmap", "dma"))
+    add("dma_typed_short_load", (
+        "Level A: guest-controlled direct DMA mapped-buffer typed access end "
+        "exceeds the host object extent (value 4, bytes 1, source DMA map "
+        "returned length)"
+    ), payload(
+        "dma_typed_short_load", "4", "DMA map returned length",
+        "direct DMA mapped-buffer typed access end > host object extent",
+        "host-read", "effective address '*(uint32_t *)buffer', byte offset 0 "
+        "from base 'direct DMA mapping'", "bytes 4", "bytes 1",
+        "direct DMA mapped-buffer typed access end <= host object extent",
+        "dma"))
+    add("dma_typed_macro_short_load", (
+        "Level A: guest-controlled direct DMA mapped-buffer typed access end "
+        "exceeds the host object extent (value 4, bytes 1, source DMA map "
+        "returned length)"
+    ), payload(
+        "dma_typed_macro_short_load", "4", "DMA map returned length",
+        "direct DMA mapped-buffer typed access end > host object extent",
+        "host-read", "effective address '(*(uint32_t *)(buffer))', byte "
+        "offset 0 from base 'direct DMA mapping'", "bytes 4", "bytes 1",
+        "direct DMA mapped-buffer typed access end <= host object extent",
+        "dma"))
+    add("dma_typed_macro_argument_short_load", (
+        "Level A: guest-controlled direct DMA mapped-buffer typed access end "
+        "exceeds the host object extent (value 4, bytes 1, source DMA map "
+        "returned length)"
+    ), payload(
+        "dma_typed_macro_argument_short_load", "4", "DMA map returned length",
+        "direct DMA mapped-buffer typed access end > host object extent",
+        "host-read", "effective address '*(uint32_t *)buffer', byte offset 0 "
+        "from base 'direct DMA mapping'", "bytes 4", "bytes 1",
+        "direct DMA mapped-buffer typed access end <= host object extent",
+        "dma"))
+    add("dma_typed_assignment_macro_short_load", (
+        "Level A: guest-controlled direct DMA mapped-buffer typed access end "
+        "exceeds the host object extent (value 4, bytes 1, source DMA map "
+        "returned length)"
+    ), payload(
+        "dma_typed_assignment_macro_short_load", "4",
+        "DMA map returned length",
+        "direct DMA mapped-buffer typed access end > host object extent",
+        "host-read", "effective address '(*(uint32_t *)buffer)', byte offset "
+        "0 from base 'direct DMA mapping'", "bytes 4", "bytes 1",
+        "direct DMA mapped-buffer typed access end <= host object extent",
+        "dma"))
+    add("dma_typed_multiline_short_store", (
+        "Level A: guest-controlled direct DMA mapped-buffer typed access end "
+        "exceeds the host object extent (value 4, bytes 1, source DMA map "
+        "returned length)"
+    ), payload(
+        "dma_typed_multiline_short_store", "4", "DMA map returned length",
+        "direct DMA mapped-buffer typed access end > host object extent",
+        "host-write", "effective address '*(uint32_t *)buffer', byte offset "
+        "0 from base 'direct DMA mapping'",
+        "bytes 4", "bytes 1",
+        "direct DMA mapped-buffer typed access end <= host object extent",
+        "dma"))
     add("dma_null_unmap_contract", (
         "direct DMA unmap is called with a null mapping"
     ), not_applicable=not_applicable("dma-map-unmap-contract"))
