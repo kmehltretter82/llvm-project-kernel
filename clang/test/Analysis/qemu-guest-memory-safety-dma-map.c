@@ -73,8 +73,12 @@ void address_space_offset_bad(AddressSpace *as) {
   unsigned char *buffer = address_space_map(as, 0, &mapped, 1, 0);
   if (!buffer)
     return;
-  memcpy(buffer + 4, source, 12); // expected-warning {{direct DMA mapped-buffer offset plus access size may exceed the host object extent}}
-  address_space_unmap(as, buffer, mapped, 1, requested);
+  if (mapped != 12) {
+    address_space_unmap(as, buffer, mapped, 1, 0);
+    return;
+  }
+  memcpy(buffer + 4, source, 12); // expected-warning {{direct DMA mapped-buffer offset plus access size exceeds the host object extent}}
+  address_space_unmap(as, buffer, mapped, 1, 12);
 }
 
 void dma_memory_requested_length_bad(AddressSpace *as) {

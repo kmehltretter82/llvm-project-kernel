@@ -4785,6 +4785,12 @@ class QEMUGuestMemorySafetyChecker
           !Pointee->isIncompleteType()) {
         std::optional<SVal> MappedBaseExtent =
             directDMAMappedExtent(State, pointerValue(Pointer, C));
+        // At PreCall the analyzer may have evaluated the complete pointer
+        // argument without retaining an SVal for its pointer-valued operand.
+        // If the complete addition is a known mapping, it has the same base
+        // symbol as the pointer operand and therefore the same full extent.
+        if (!MappedBaseExtent && MappedExtent)
+          MappedBaseExtent = MappedExtent;
         if (MappedBaseExtent)
           IsDirectDMAMapping = true;
         SVal BaseExtent = MappedBaseExtent
