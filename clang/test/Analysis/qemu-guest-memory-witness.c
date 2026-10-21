@@ -238,3 +238,28 @@ static void dma_map_unmap_contract(AddressSpace *as) {
     return;
   address_space_unmap(as, buffer, mapped, mapped, 0); // NOT-APPLICABLE: dma_map_unmap_contract
 }
+
+static void dma_use_after_unmap(void *opaque, uint64_t addr, uint64_t data,
+                                unsigned size) {
+  AddressSpace *as = opaque;
+  uint64_t mapped = 8;
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, 0);
+  if (!buffer)
+    return;
+  if (mapped != 8) {
+    address_space_unmap(as, buffer, mapped, 0, 0);
+    return;
+  }
+  address_space_unmap(as, buffer, mapped, 0, 0);
+  memcpy(&result, buffer, 1); // WITNESS: dma_use_after_unmap
+}
+
+static const MemoryRegionOps dma_use_after_unmap_ops = {
+    .write = dma_use_after_unmap};
+
+static void dma_null_unmap_contract(AddressSpace *as) {
+  uint64_t mapped = 8;
+  void *buffer = address_space_map(as, 0, &mapped, 0, 0);
+  if (!buffer)
+    address_space_unmap(as, buffer, mapped, 0, 0); // NOT-APPLICABLE: dma_null_unmap_contract
+}

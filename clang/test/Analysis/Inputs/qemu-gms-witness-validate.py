@@ -59,7 +59,11 @@ def expected_cases():
             "reproducer": {
                 "device": None,
                 "interface": provenance,
-                "kind": "packet" if provenance == "network" else "qtest",
+                "kind": (
+                    "packet" if provenance == "network"
+                    else "descriptor" if provenance == "dma"
+                    else "qtest"
+                ),
                 "machine": None,
             },
             "schema_version": 1,
@@ -165,6 +169,17 @@ def expected_cases():
     ), not_applicable=not_applicable("allocation-availability"))
     add("dma_map_unmap_contract", (
         "direct DMA unmap arguments match the reversed argument order"
+    ), not_applicable=not_applicable("dma-map-unmap-contract"))
+    add("dma_use_after_unmap", (
+        "direct DMA mapped buffer is accessed after it was unmapped"
+    ), payload(
+        "dma_use_after_unmap", "1",
+        "direct DMA mapping returned by map API",
+        "nonzero memory access occurs after direct DMA unmap",
+        "host-read", "effective address 'buffer'", "bytes 1", "bytes 8",
+        "memory access must precede direct DMA unmap", "dma"))
+    add("dma_null_unmap_contract", (
+        "direct DMA unmap is called with a null mapping"
     ), not_applicable=not_applicable("dma-map-unmap-contract"))
     return cases
 

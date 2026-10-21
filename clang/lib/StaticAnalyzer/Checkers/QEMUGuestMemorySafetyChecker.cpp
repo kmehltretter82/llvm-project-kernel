@@ -9,10 +9,12 @@
 // This experimental checker discovers QEMU input callbacks and successful
 // guest-buffer reads, preserves their provenance through common request and
 // byte-order helpers, and relates tainted indexes and memory-operation lengths
-// to host object extents. A Level A report has no feasible in-bounds state. A
-// Level B report has both in-bounds and out-of-bounds states and needs manual
-// review. An optional Level C mode reports unbounded guest-controlled requests
-// to allocators that terminate QEMU on allocation failure.
+// to host object extents. It also models the returned extent, unmap contract,
+// and lifetime of QEMU's direct DMA mappings. A Level A report has no feasible
+// in-bounds state. A Level B report has both in-bounds and out-of-bounds states
+// and needs manual review. An optional Level C mode reports unbounded
+// guest-controlled requests to allocators that terminate QEMU on allocation
+// failure.
 //
 //===----------------------------------------------------------------------===//
 
@@ -69,6 +71,8 @@ REGISTER_MAP_WITH_PROGRAMSTATE(QEMUPendingDMAMapRequestedExtents, const Expr *,
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUPendingDMAMapDirections, const Expr *, SVal)
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUDMAMappedExtents, SymbolRef, SVal)
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUDMAMappedDirections, SymbolRef, SVal)
+REGISTER_MAP_WITH_PROGRAMSTATE(QEMUDMARetiredExtents, SymbolRef, SVal)
+REGISTER_MAP_WITH_PROGRAMSTATE(QEMUDMARetiredOrigins, SymbolRef, const Expr *)
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUSavedTaintedScalars, const VarRegion *, SVal)
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUPersistentFieldSources, SymbolRef,
                                const FieldDecl *)
@@ -379,6 +383,7 @@ class QEMUGuestMemorySafetyChecker
   mutable std::unique_ptr<BugType> LevelBBug;
   mutable std::unique_ptr<BugType> LevelCBug;
   mutable std::unique_ptr<BugType> DirectDMAContractBug;
+  mutable std::unique_ptr<BugType> DirectDMALifetimeBug;
   bool ReportLevelC = false;
   bool EmitStructuredWitness = false;
   std::string QEMUSourceRoot;
@@ -2486,6 +2491,54 @@ class QEMUGuestMemorySafetyChecker
     return true;
   }
 
+  BugType &directDMALifetimeBugType() const {
+    if (!DirectDMALifetimeBug)
+      DirectDMALifetimeBug = std::make_unique<BugType>(
+          this, "Direct DMA mapping lifetime violation",
+          "QEMU guest memory safety");
+    return *DirectDMALifetimeBug;
+  }
+
+  bool reportDirectDMAUseAfterUnmap(CheckerContext &C, ProgramStateRef State,
+                                    const CallEvent &Call,
+                                    unsigned BufferArgument,
+                                    StringRef Direction, SVal AccessSize,
+                                    SVal PriorExtent,
+                                    const Expr *UnmapOrigin) const {
+    ExplodedNode *Node = C.generateErrorNode(State);
+    if (!Node)
+      return false;
+
+    StringRef Message =
+        "direct DMA mapped buffer is accessed after it was unmapped";
+    const Expr *BufferExpression = Call.getArgExpr(BufferArgument);
+    auto Report = std::make_unique<PathSensitiveBugReport>(
+        directDMALifetimeBugType(), Message, Node);
+    if (BufferExpression)
+      Report->addRange(BufferExpression->getSourceRange());
+    if (UnmapOrigin)
+      Report->addNote("DMA mapping unmapped here",
+                      {UnmapOrigin, C.getSourceManager(), C.getStackFrame()});
+    for (SymbolRef Symbol : Call.getArgSVal(BufferArgument).symbols())
+      Report->markInteresting(Symbol);
+    for (SymbolRef Symbol : AccessSize.symbols())
+      Report->markInteresting(Symbol);
+
+    std::string Address =
+        "effective address '" +
+        witnessExpression(BufferExpression, C.getASTContext()) + "'";
+    addStructuredWitness(
+        *Report, C, State, Message, InputClass::DMA,
+        "direct DMA mapping returned by map API",
+        "nonzero memory access occurs after direct DMA unmap", AccessSize,
+        Direction, Address,
+        "bytes " + valueRange(State, AccessSize, C.getSValBuilder()),
+        "bytes " + valueRange(State, PriorExtent, C.getSValBuilder()),
+        "memory access must precede direct DMA unmap");
+    C.emitReport(std::move(Report));
+    return true;
+  }
+
   struct MemoryAccessWitness {
     StringRef Direction;
     std::string Address;
@@ -2761,6 +2814,12 @@ class QEMUGuestMemorySafetyChecker
     StringRef Direction;
   };
 
+  enum class MemorySinkResult {
+    NotReported,
+    Reported,
+    LifetimePathSplit,
+  };
+
   struct DirectDMAMapDescriptor {
     unsigned LengthPointerArgument;
     unsigned DirectionArgument;
@@ -2872,6 +2931,16 @@ class QEMUGuestMemorySafetyChecker
     if (!Base)
       return std::nullopt;
     if (const SVal *Extent = State->get<QEMUDMAMappedExtents>(Base))
+      return *Extent;
+    return std::nullopt;
+  }
+
+  static std::optional<SVal> directDMARetiredExtent(ProgramStateRef State,
+                                                    SVal Buffer) {
+    SymbolRef Base = Buffer.getLocSymbolInBase();
+    if (!Base)
+      return std::nullopt;
+    if (const SVal *Extent = State->get<QEMUDMARetiredExtents>(Base))
       return *Extent;
     return std::nullopt;
   }
@@ -4773,12 +4842,35 @@ class QEMUGuestMemorySafetyChecker
                               : AllocationAccessRelation::Unknown;
   }
 
-  bool checkMemorySink(const CallEvent &Call, const MemorySink &Sink,
-                       CheckerContext &C,
-                       ProgramStateRef State = nullptr) const {
+  MemorySinkResult checkMemorySink(const CallEvent &Call,
+                                   const MemorySink &Sink, CheckerContext &C,
+                                   ProgramStateRef State = nullptr) const {
     if (!State)
       State = C.getState();
     SVal Length = Call.getArgSVal(Sink.LengthArgument);
+    SVal BufferValue = Call.getArgSVal(Sink.BufferArgument);
+    if (std::optional<SVal> RetiredExtent =
+            directDMARetiredExtent(State, BufferValue)) {
+      QualType LengthType = Call.getArgExpr(Sink.LengthArgument)->getType();
+      SVal Zero = C.getSValBuilder().makeZeroVal(LengthType);
+      std::optional<BoundStates> Positive =
+          compare(State, Length, BO_GT, Zero, C.getSValBuilder());
+      if (Positive && Positive->Safe) {
+        // A zero-byte memory operation does not dereference its pointer and
+        // remains a valid cleanup idiom.  Stop the positive path at the
+        // temporal error so it cannot cascade into a spatial diagnostic.
+        if (Positive->Unsafe)
+          C.addTransition(Positive->Unsafe);
+        SymbolRef Base = BufferValue.getLocSymbolInBase();
+        const Expr *Origin = Base && State->get<QEMUDMARetiredOrigins>(Base)
+                                 ? *State->get<QEMUDMARetiredOrigins>(Base)
+                                 : nullptr;
+        reportDirectDMAUseAfterUnmap(C, Positive->Safe, Call,
+                                     Sink.BufferArgument, Sink.Direction,
+                                     Length, *RetiredExtent, Origin);
+        return MemorySinkResult::LifetimePathSplit;
+      }
+    }
     const Expr *LengthExpression = Call.getArgExpr(Sink.LengthArgument);
     std::optional<PersistentFieldInfo> Persistent =
         persistentGuestField(LengthExpression);
@@ -4799,13 +4891,11 @@ class QEMUGuestMemorySafetyChecker
         expressionValue(Call.getArgExpr(Sink.LengthArgument), C);
     if (BoundRequired.isUnknownOrUndef())
       BoundRequired = Required;
-    std::optional<SVal> MappedExtent = directDMAMappedExtent(
-        State, Call.getArgSVal(Sink.BufferArgument));
+    std::optional<SVal> MappedExtent =
+        directDMAMappedExtent(State, BufferValue);
     bool IsDirectDMAMapping = MappedExtent.has_value();
-    SVal Extent = MappedExtent
-                      ? *MappedExtent
-                      : getDynamicExtentWithOffset(
-                            State, Call.getArgSVal(Sink.BufferArgument));
+    SVal Extent = MappedExtent ? *MappedExtent
+                               : getDynamicExtentWithOffset(State, BufferValue);
     StringRef SinkDescription = Sink.Description;
     bool HasOffset = false;
 
@@ -4914,7 +5004,7 @@ class QEMUGuestMemorySafetyChecker
         if (ElementBytes == 1 &&
             memorySinkCoveredByCallbackAccess(
                 Offset, Call.getArgExpr(Sink.LengthArgument), BaseExtent, C))
-          return false;
+          return MemorySinkResult::NotReported;
         SVal Scale = C.getSValBuilder().makeIntVal(
             ElementBytes, C.getASTContext().getSizeType());
         SVal ConvertedOffset = C.getSValBuilder().evalCast(
@@ -4963,7 +5053,7 @@ class QEMUGuestMemorySafetyChecker
       }
     }
     if (!GuestControlled && !IsDirectDMAMapping)
-      return false;
+      return MemorySinkResult::NotReported;
     if (IsDirectDMAMapping) {
       SinkDescription = HasOffset
                             ? "direct DMA mapped-buffer offset plus access size"
@@ -4972,18 +5062,17 @@ class QEMUGuestMemorySafetyChecker
         SourceDetail = "DMA map returned length";
       Witness.Input = InputClass::DMA;
     }
-    AllocationAccessRelation AllocationRelation =
-        allocationAccessRelation(Call.getArgSVal(Sink.BufferArgument), Length,
-                                 LengthExpression, State, C);
+    AllocationAccessRelation AllocationRelation = allocationAccessRelation(
+        BufferValue, Length, LengthExpression, State, C);
     if (!HasOffset && AllocationRelation == AllocationAccessRelation::Covered)
-      return false;
+      return MemorySinkResult::NotReported;
     if (AllocationRelation == AllocationAccessRelation::Exceeds) {
       report(C, nullptr, State, Required, LengthExpression, SinkDescription,
              Extent, BoundUnit::Bytes, SourceDetail, Witness);
-      return true;
+      return MemorySinkResult::Reported;
     }
     if (!hasUsableExtent(State, Extent, C.getSValBuilder()))
-      return false;
+      return MemorySinkResult::NotReported;
     if (!HasOffset)
       if (const llvm::APSInt *KnownExtent =
               C.getSValBuilder().getKnownValue(State, Extent))
@@ -4998,21 +5087,21 @@ class QEMUGuestMemorySafetyChecker
             unsigned Width =
                 std::max(Maximum.getBitWidth(), KnownExtent->getBitWidth());
             if (Maximum.zextOrTrunc(Width).ule(KnownExtent->zextOrTrunc(Width)))
-              return false;
+              return MemorySinkResult::NotReported;
           }
           if (std::optional<IntegerRange> Range =
                   integerRange(Call.getArgExpr(Sink.LengthArgument), C))
             if (Range->Maximum <= KnownExtent->getZExtValue())
-              return false;
+              return MemorySinkResult::NotReported;
         }
     std::optional<BoundStates> Bounds =
         compare(State, BoundRequired, BO_LE, Extent, C.getSValBuilder());
     if (!Bounds || !Bounds->Unsafe)
-      return false;
+      return MemorySinkResult::NotReported;
     report(C, Bounds->Safe, Bounds->Unsafe, Required,
            Call.getArgExpr(Sink.LengthArgument), SinkDescription, Extent,
            BoundUnit::Bytes, SourceDetail, Witness);
-    return true;
+    return MemorySinkResult::Reported;
   }
 
   void checkSuccessfulIovecCopy(const CallEvent &Call, const IovecCopy &Copy,
@@ -5057,7 +5146,8 @@ class QEMUGuestMemorySafetyChecker
                     Copy.ToBuffer ? "memory-operation length"
                                   : "memory-operation source length",
                     Copy.ToBuffer ? "host-write" : "host-read"};
-    if (!checkMemorySink(Call, Sink, C, Success))
+    if (checkMemorySink(Call, Sink, C, Success) ==
+        MemorySinkResult::NotReported)
       C.addTransition(Success, Tag);
   }
 
@@ -5471,19 +5561,52 @@ public:
     }
     if (std::optional<DirectDMAUnmapDescriptor> Unmap =
             directDMAUnmapDescriptor(Call)) {
-      if (SymbolRef Base =
-              Call.getArgSVal(Unmap->BufferArgument).getLocSymbolInBase()) {
-        ProgramStateRef State = C.getState();
+      ProgramStateRef State = C.getState();
+      SVal Buffer = Call.getArgSVal(Unmap->BufferArgument);
+      if (std::optional<DefinedOrUnknownSVal> Defined =
+              Buffer.getAs<DefinedOrUnknownSVal>()) {
+        auto [NonNull, Null] = State->assume(*Defined);
+        // address_space_unmap() and its wrappers require a successful map.
+        // In particular, a null buffer falls through memory_region_from_host()
+        // and is treated as an embedded BounceBuffer.  Diagnose only a path
+        // on which null is already proven; a merely nullable untracked caller
+        // argument is not enough evidence.
+        if (!NonNull && Null) {
+          reportDirectDMAContract(
+              C, Null, Call.getOriginExpr(),
+              "direct DMA unmap is called with a null mapping", Buffer);
+          return;
+        }
+      }
+      // An unmap must receive the pointer returned by the map operation, not
+      // an interior address.  Pointer-preserving copies and casts retain the
+      // same symbol, while getAsSymbol() deliberately does not look through
+      // a derived ElementRegion to its base.
+      if (SymbolRef Base = Buffer.getAsSymbol()) {
         const SVal *MappedExtent = State->get<QEMUDMAMappedExtents>(Base);
         const SVal *MappedDirection = State->get<QEMUDMAMappedDirections>(Base);
+        const SVal *RetiredExtent = State->get<QEMUDMARetiredExtents>(Base);
         SVal Length = Call.getArgSVal(Unmap->LengthArgument);
         SVal Direction = Call.getArgSVal(Unmap->DirectionArgument);
         SVal AccessLength = Call.getArgSVal(Unmap->AccessLengthArgument);
         const Expr *Where = Call.getOriginExpr();
+        if (!MappedExtent) {
+          if (RetiredExtent)
+            reportDirectDMAContract(
+                C, State, Where,
+                "direct DMA mapping is unmapped more than once", Buffer);
+          return;
+        }
+
+        SVal SavedExtent = *MappedExtent;
         bool Reported = false;
-        auto RetireMapping = [Base](ProgramStateRef Retired) {
-          return Retired->remove<QEMUDMAMappedExtents>(Base)
-              ->remove<QEMUDMAMappedDirections>(Base);
+        auto RetireMapping = [Base, SavedExtent,
+                              Where](ProgramStateRef Retired) {
+          Retired = Retired->remove<QEMUDMAMappedExtents>(Base)
+                        ->remove<QEMUDMAMappedDirections>(Base)
+                        ->set<QEMUDMARetiredExtents>(Base, SavedExtent);
+          return Where ? Retired->set<QEMUDMARetiredOrigins>(Base, Where)
+                       : Retired->remove<QEMUDMARetiredOrigins>(Base);
         };
 
         // Detect the distinctive reversed form (..., len, len, direction) by
@@ -5579,7 +5702,9 @@ public:
     if (isBitmapBitSink(Call, C.getASTContext()))
       checkBitmapBitSink(Call, C);
     if (std::optional<MemorySink> Sink = destinationMemorySink(Call))
-      checkMemorySink(Call, *Sink, C);
+      if (checkMemorySink(Call, *Sink, C) ==
+          MemorySinkResult::LifetimePathSplit)
+        return;
     if (const auto *FD = dyn_cast_or_null<FunctionDecl>(Call.getDecl()))
       if (FD->getIdentifier() &&
           (FD->getName() == "memcmp" || FD->getName() == "bcmp") &&
@@ -5627,8 +5752,40 @@ public:
           return;
         State = WithinRequest->Safe;
       }
-      if (SymbolRef Base = Call.getReturnValue().getLocSymbolInBase()) {
-        State = State->set<QEMUDMAMappedExtents>(Base, *Returned);
+      SVal ReturnValue = Call.getReturnValue();
+      if (std::optional<DefinedOrUnknownSVal> Defined =
+              ReturnValue.getAs<DefinedOrUnknownSVal>()) {
+        auto [NonNull, Null] = State->assume(*Defined);
+        QualType LengthType = Call.getArgExpr(Map->LengthPointerArgument)
+                                  ->getType()
+                                  ->getPointeeType();
+        SVal Zero = C.getSValBuilder().makeZeroVal(LengthType);
+
+        // The direct-map API returns a zero extent on failure.  Keep the
+        // return pointer and output extent correlated so a caller that proves
+        // the returned extent positive cannot acquire an impossible null
+        // successor (and vice versa).
+        if (Null) {
+          std::optional<BoundStates> ZeroExtent =
+              compare(Null, *Returned, BO_EQ, Zero, C.getSValBuilder());
+          if (ZeroExtent && ZeroExtent->Safe)
+            C.addTransition(ZeroExtent->Safe);
+        }
+        if (NonNull) {
+          std::optional<BoundStates> PositiveExtent =
+              compare(NonNull, *Returned, BO_GT, Zero, C.getSValBuilder());
+          State = PositiveExtent ? PositiveExtent->Safe : nullptr;
+        } else {
+          State = nullptr;
+        }
+      }
+      if (!State)
+        return;
+      if (SymbolRef Base = ReturnValue.getAsSymbol()) {
+        State = State->remove<QEMUDMARetiredExtents>(Base)
+                    ->remove<QEMUDMARetiredOrigins>(Base)
+                    ->set<QEMUDMAMappedExtents>(Base, *Returned)
+                    ->remove<QEMUDMAMappedDirections>(Base);
         if (Direction)
           State = State->set<QEMUDMAMappedDirections>(Base, *Direction);
         C.addTransition(State);
@@ -6056,6 +6213,11 @@ public:
       if (SymReaper.isDead(Entry.first))
         State = State->remove<QEMUDMAMappedExtents>(Entry.first)
                     ->remove<QEMUDMAMappedDirections>(Entry.first);
+    auto DMARetiredExtents = State->get<QEMUDMARetiredExtents>();
+    for (const auto &Entry : DMARetiredExtents)
+      if (SymReaper.isDead(Entry.first))
+        State = State->remove<QEMUDMARetiredExtents>(Entry.first)
+                    ->remove<QEMUDMARetiredOrigins>(Entry.first);
     if (State != C.getState())
       C.addTransition(State);
   }
@@ -6079,6 +6241,12 @@ public:
       for (SymbolRef Symbol : Entry.second.symbols())
         SymReaper.markLive(Symbol);
     for (const auto &Entry : State->get<QEMUDMAMappedDirections>())
+      for (SymbolRef Symbol : Entry.second.symbols())
+        SymReaper.markLive(Symbol);
+    // A retired mapping is a tombstone, not an owner.  Keep symbols used by
+    // its prior extent available while a real pointer alias keeps the base
+    // alive, but do not keep the retired base alive solely for this checker.
+    for (const auto &Entry : State->get<QEMUDMARetiredExtents>())
       for (SymbolRef Symbol : Entry.second.symbols())
         SymReaper.markLive(Symbol);
     for (const MemRegion *Region : State->get<QEMUVirtqueueElements>())
