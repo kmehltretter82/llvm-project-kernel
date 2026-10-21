@@ -99,7 +99,7 @@ def expected_cases():
     offset_message = (
         "Level B: guest-controlled memory-operation offset plus length may "
         "exceed the host object extent "
-        "(value [0, 18446744073709551615], bytes 8)"
+        "(value [9, 18446744073709551615], bytes 8)"
     )
     for name, direction in (("offset_destination", "host-write"),
                             ("offset_source", "host-read")):

@@ -2260,9 +2260,8 @@ class QEMUGuestMemorySafetyChecker
   std::optional<WitnessCallbackContext>
   callbackContext(const ExplodedNode *Node) const {
     const FunctionDecl *Fallback = nullptr;
-    for (const LocationContext *LC = Node->getLocationContext(); LC;
-         LC = LC->getParent()) {
-      const auto *FD = dyn_cast<FunctionDecl>(LC->getDecl());
+    for (const StackFrame &Frame : Node->stackframes()) {
+      const auto *FD = dyn_cast<FunctionDecl>(Frame.getDecl());
       if (!FD)
         continue;
       if (!Fallback)
