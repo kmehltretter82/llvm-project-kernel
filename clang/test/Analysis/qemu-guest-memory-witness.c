@@ -31,9 +31,14 @@ typedef struct MemoryRegionOps {
 } MemoryRegionOps;
 
 typedef struct NetClientState NetClientState;
+typedef struct AddressSpace AddressSpace;
 typedef struct NetClientInfo {
   long (*receive)(NetClientState *, const unsigned char *, size_t);
 } NetClientInfo;
+
+void *address_space_map(AddressSpace *, uint64_t, uint64_t *, _Bool,
+                        unsigned);
+void address_space_unmap(AddressSpace *, void *, uint64_t, _Bool, uint64_t);
 
 static uint64_t result;
 
@@ -225,3 +230,11 @@ static void availability_allocation(void *opaque, uint64_t addr, uint64_t data,
 
 static const MemoryRegionOps availability_allocation_ops = {
     .write = availability_allocation};
+
+static void dma_map_unmap_contract(AddressSpace *as) {
+  uint64_t mapped = 8;
+  void *buffer = address_space_map(as, 0, &mapped, 0, 0);
+  if (!buffer)
+    return;
+  address_space_unmap(as, buffer, mapped, mapped, 0); // NOT-APPLICABLE: dma_map_unmap_contract
+}

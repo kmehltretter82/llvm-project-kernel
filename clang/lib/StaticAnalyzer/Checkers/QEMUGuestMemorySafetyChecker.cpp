@@ -66,7 +66,9 @@ REGISTER_MAP_WITH_PROGRAMSTATE(QEMUAllocationRelationRight, SymbolRef, SVal)
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUPendingIovecSourceSizes, const Expr *, SVal)
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUPendingDMAMapRequestedExtents, const Expr *,
                                SVal)
+REGISTER_MAP_WITH_PROGRAMSTATE(QEMUPendingDMAMapDirections, const Expr *, SVal)
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUDMAMappedExtents, SymbolRef, SVal)
+REGISTER_MAP_WITH_PROGRAMSTATE(QEMUDMAMappedDirections, SymbolRef, SVal)
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUSavedTaintedScalars, const VarRegion *, SVal)
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUPersistentFieldSources, SymbolRef,
                                const FieldDecl *)
@@ -376,6 +378,7 @@ class QEMUGuestMemorySafetyChecker
   mutable std::unique_ptr<BugType> LevelABug;
   mutable std::unique_ptr<BugType> LevelBBug;
   mutable std::unique_ptr<BugType> LevelCBug;
+  mutable std::unique_ptr<BugType> DirectDMAContractBug;
   bool ReportLevelC = false;
   bool EmitStructuredWitness = false;
   std::string QEMUSourceRoot;
@@ -2455,6 +2458,34 @@ class QEMUGuestMemorySafetyChecker
     return *BT;
   }
 
+  BugType &directDMAContractBugType() const {
+    if (!DirectDMAContractBug)
+      DirectDMAContractBug = std::make_unique<BugType>(
+          this, "Direct DMA map/unmap contract violation",
+          "QEMU guest memory safety");
+    return *DirectDMAContractBug;
+  }
+
+  bool reportDirectDMAContract(CheckerContext &C, ProgramStateRef State,
+                               const Expr *Where, StringRef Message,
+                               SVal First = UnknownVal(),
+                               SVal Second = UnknownVal()) const {
+    ExplodedNode *Node = C.generateNonFatalErrorNode(State);
+    if (!Node)
+      return false;
+    auto Report = std::make_unique<PathSensitiveBugReport>(
+        directDMAContractBugType(), Message, Node);
+    if (Where)
+      Report->addRange(Where->getSourceRange());
+    for (SVal Value : {First, Second})
+      for (SymbolRef Symbol : Value.symbols())
+        Report->markInteresting(Symbol);
+    addStructuredWitnessNotApplicable(*Report, C, Message,
+                                      "dma-map-unmap-contract");
+    C.emitReport(std::move(Report));
+    return true;
+  }
+
   struct MemoryAccessWitness {
     StringRef Direction;
     std::string Address;
@@ -2732,6 +2763,16 @@ class QEMUGuestMemorySafetyChecker
 
   struct DirectDMAMapDescriptor {
     unsigned LengthPointerArgument;
+    unsigned DirectionArgument;
+    bool BooleanDirection;
+  };
+
+  struct DirectDMAUnmapDescriptor {
+    unsigned BufferArgument;
+    unsigned LengthArgument;
+    unsigned DirectionArgument;
+    unsigned AccessLengthArgument;
+    bool BooleanDirection;
   };
 
   static std::optional<DirectDMAMapDescriptor>
@@ -2743,16 +2784,29 @@ class QEMUGuestMemorySafetyChecker
     StringRef Name = FD->getName();
     unsigned ParameterCount;
     unsigned LengthPointerArgument;
-    if (Name == "address_space_map" || Name == "dma_memory_map") {
+    unsigned DirectionArgument;
+    bool BooleanDirection;
+    if (Name == "address_space_map") {
       ParameterCount = 5;
       LengthPointerArgument = 2;
+      DirectionArgument = 3;
+      BooleanDirection = true;
+    } else if (Name == "dma_memory_map") {
+      ParameterCount = 5;
+      LengthPointerArgument = 2;
+      DirectionArgument = 3;
+      BooleanDirection = false;
     } else if (Name == "pci_dma_map") {
       ParameterCount = 4;
       LengthPointerArgument = 2;
+      DirectionArgument = 3;
+      BooleanDirection = false;
     } else if (Name == "physical_memory_map" ||
                Name == "cpu_physical_memory_map") {
       ParameterCount = 3;
       LengthPointerArgument = 1;
+      DirectionArgument = 2;
+      BooleanDirection = true;
     } else {
       return std::nullopt;
     }
@@ -2764,24 +2818,48 @@ class QEMUGuestMemorySafetyChecker
     if (!LengthPointer->isPointerType() ||
         !LengthPointer->getPointeeType()->isIntegerType())
       return std::nullopt;
-    return DirectDMAMapDescriptor{LengthPointerArgument};
+    QualType Direction = FD->getParamDecl(DirectionArgument)->getType();
+    if (!Direction->isIntegralOrEnumerationType() ||
+        Direction->isBooleanType() != BooleanDirection)
+      return std::nullopt;
+    return DirectDMAMapDescriptor{LengthPointerArgument, DirectionArgument,
+                                  BooleanDirection};
   }
 
-  static std::optional<unsigned>
-  directDMAUnmapBufferArgument(const CallEvent &Call) {
+  static std::optional<DirectDMAUnmapDescriptor>
+  directDMAUnmapDescriptor(const CallEvent &Call) {
     const auto *FD = dyn_cast_or_null<FunctionDecl>(Call.getDecl());
     if (!FD || !FD->getIdentifier() || !FD->getReturnType()->isVoidType())
       return std::nullopt;
     StringRef Name = FD->getName();
-    if ((Name == "address_space_unmap" || Name == "dma_memory_unmap" ||
-         Name == "pci_dma_unmap") &&
-        FD->getNumParams() == 5 && Call.getNumArgs() == 5)
-      return 1;
-    if ((Name == "physical_memory_unmap" ||
-         Name == "cpu_physical_memory_unmap") &&
-        FD->getNumParams() == 4 && Call.getNumArgs() == 4)
-      return 0;
-    return std::nullopt;
+    unsigned ParameterCount;
+    DirectDMAUnmapDescriptor Descriptor;
+    if (Name == "address_space_unmap") {
+      ParameterCount = 5;
+      Descriptor = {1, 2, 3, 4, true};
+    } else if (Name == "dma_memory_unmap" || Name == "pci_dma_unmap") {
+      ParameterCount = 5;
+      Descriptor = {1, 2, 3, 4, false};
+    } else if (Name == "physical_memory_unmap" ||
+               Name == "cpu_physical_memory_unmap") {
+      ParameterCount = 4;
+      Descriptor = {0, 1, 2, 3, true};
+    } else {
+      return std::nullopt;
+    }
+    if (FD->getNumParams() != ParameterCount ||
+        Call.getNumArgs() != ParameterCount)
+      return std::nullopt;
+    QualType Length = FD->getParamDecl(Descriptor.LengthArgument)->getType();
+    QualType Direction =
+        FD->getParamDecl(Descriptor.DirectionArgument)->getType();
+    QualType AccessLength =
+        FD->getParamDecl(Descriptor.AccessLengthArgument)->getType();
+    if (!Length->isIntegerType() || !AccessLength->isIntegerType() ||
+        !Direction->isIntegralOrEnumerationType() ||
+        Direction->isBooleanType() != Descriptor.BooleanDirection)
+      return std::nullopt;
+    return Descriptor;
   }
 
   static std::optional<SVal> directDMAMappedExtent(ProgramStateRef State,
@@ -5376,24 +5454,103 @@ public:
     if (std::optional<DirectDMAMapDescriptor> Map =
             directDMAMapDescriptor(Call)) {
       const Expr *Origin = Call.getOriginExpr();
+      ProgramStateRef State = C.getState();
       std::optional<SVal> Requested =
-          pointeeValue(C.getState(),
-                       Call.getArgSVal(Map->LengthPointerArgument));
-      if (Origin && Requested && !Requested->isUnknownOrUndef()) {
-        ProgramStateRef State =
-            C.getState()->set<QEMUPendingDMAMapRequestedExtents>(Origin,
-                                                                 *Requested);
-        C.addTransition(State);
+          pointeeValue(State, Call.getArgSVal(Map->LengthPointerArgument));
+      if (Origin) {
+        if (Requested && !Requested->isUnknownOrUndef())
+          State =
+              State->set<QEMUPendingDMAMapRequestedExtents>(Origin, *Requested);
+        SVal Direction = Call.getArgSVal(Map->DirectionArgument);
+        if (!Direction.isUnknownOrUndef())
+          State = State->set<QEMUPendingDMAMapDirections>(Origin, Direction);
       }
+      if (State != C.getState())
+        C.addTransition(State);
       return;
     }
-    if (std::optional<unsigned> BufferArgument =
-            directDMAUnmapBufferArgument(Call)) {
+    if (std::optional<DirectDMAUnmapDescriptor> Unmap =
+            directDMAUnmapDescriptor(Call)) {
       if (SymbolRef Base =
-              Call.getArgSVal(*BufferArgument).getLocSymbolInBase()) {
-        ProgramStateRef State =
-            C.getState()->remove<QEMUDMAMappedExtents>(Base);
-        if (State != C.getState())
+              Call.getArgSVal(Unmap->BufferArgument).getLocSymbolInBase()) {
+        ProgramStateRef State = C.getState();
+        const SVal *MappedExtent = State->get<QEMUDMAMappedExtents>(Base);
+        const SVal *MappedDirection = State->get<QEMUDMAMappedDirections>(Base);
+        SVal Length = Call.getArgSVal(Unmap->LengthArgument);
+        SVal Direction = Call.getArgSVal(Unmap->DirectionArgument);
+        SVal AccessLength = Call.getArgSVal(Unmap->AccessLengthArgument);
+        const Expr *Where = Call.getOriginExpr();
+        bool Reported = false;
+        auto RetireMapping = [Base](ProgramStateRef Retired) {
+          return Retired->remove<QEMUDMAMappedExtents>(Base)
+              ->remove<QEMUDMAMappedDirections>(Base);
+        };
+
+        // Detect the distinctive reversed form (..., len, len, direction) by
+        // expression identity and by relating its last argument to the
+        // direction saved at map time.  Expression types alone are not
+        // sufficient: valid callers sometimes use a bool-sized access_len.
+        if (MappedDirection &&
+            sameSimpleExpression(Call.getArgExpr(Unmap->LengthArgument),
+                                 Call.getArgExpr(Unmap->DirectionArgument))) {
+          SVal AccessSource =
+              expressionValue(Call.getArgExpr(Unmap->AccessLengthArgument)
+                                  ->IgnoreParenImpCasts(),
+                              C);
+          if (isDefinitelyTrue(State, AccessSource, BO_EQ, *MappedDirection,
+                               C.getSValBuilder())) {
+            Reported = reportDirectDMAContract(
+                C, RetireMapping(State), Where,
+                "direct DMA unmap arguments match the reversed argument order",
+                Direction, AccessLength);
+          }
+        }
+
+        if (!Reported && MappedExtent) {
+          std::optional<BoundStates> Equal =
+              compare(State, Length, BO_EQ, *MappedExtent, C.getSValBuilder());
+          if (Equal && !Equal->Safe && Equal->Unsafe) {
+            Reported = reportDirectDMAContract(
+                C, RetireMapping(Equal->Unsafe), Where,
+                "direct DMA unmap length differs from the returned map length",
+                Length, *MappedExtent);
+          }
+        }
+
+        if (!Reported && MappedExtent) {
+          std::optional<BoundStates> Within = compare(
+              State, AccessLength, BO_LE, *MappedExtent, C.getSValBuilder());
+          if (Within && !Within->Safe && Within->Unsafe) {
+            Reported = reportDirectDMAContract(
+                C, RetireMapping(Within->Unsafe), Where,
+                "direct DMA unmap access length exceeds the returned map "
+                "length",
+                AccessLength, *MappedExtent);
+          }
+        }
+
+        if (!Reported && MappedDirection) {
+          std::optional<BoundStates> Equal = compare(
+              State, Direction, BO_EQ, *MappedDirection, C.getSValBuilder());
+          QualType AccessType =
+              Call.getArgExpr(Unmap->AccessLengthArgument)->getType();
+          SVal Zero = C.getSValBuilder().makeZeroVal(AccessType);
+          std::optional<BoundStates> Positive =
+              compare(State, AccessLength, BO_GT, Zero, C.getSValBuilder());
+          // A direction change while discarding a mapping without access is
+          // used by valid cleanup paths.  Require a definite nonzero transfer.
+          if (Equal && !Equal->Safe && Equal->Unsafe && Positive &&
+              Positive->Safe && !Positive->Unsafe)
+            Reported = reportDirectDMAContract(
+                C, RetireMapping(Equal->Unsafe), Where,
+                "direct DMA unmap direction differs from the map direction",
+                Direction, *MappedDirection);
+        }
+
+        State = RetireMapping(State);
+        // A nonfatal error node is itself the successor for a reported path.
+        // Adding the ordinary transition as well would fork a duplicate path.
+        if (!Reported && State != C.getState())
           C.addTransition(State);
       }
       return;
@@ -5445,11 +5602,17 @@ public:
             directDMAMapDescriptor(Call)) {
       ProgramStateRef State = C.getState();
       const Expr *Origin = Call.getOriginExpr();
-      const SVal *Requested =
-          Origin ? State->get<QEMUPendingDMAMapRequestedExtents>(Origin)
-                 : nullptr;
-      if (Origin)
-        State = State->remove<QEMUPendingDMAMapRequestedExtents>(Origin);
+      std::optional<SVal> Requested;
+      std::optional<SVal> Direction;
+      if (Origin) {
+        if (const SVal *Saved =
+                State->get<QEMUPendingDMAMapRequestedExtents>(Origin))
+          Requested = *Saved;
+        if (const SVal *Saved = State->get<QEMUPendingDMAMapDirections>(Origin))
+          Direction = *Saved;
+        State = State->remove<QEMUPendingDMAMapRequestedExtents>(Origin)
+                    ->remove<QEMUPendingDMAMapDirections>(Origin);
+      }
       std::optional<SVal> Returned =
           pointeeValue(State, Call.getArgSVal(Map->LengthPointerArgument));
       if (!Returned || Returned->isUnknownOrUndef()) {
@@ -5466,6 +5629,8 @@ public:
       }
       if (SymbolRef Base = Call.getReturnValue().getLocSymbolInBase()) {
         State = State->set<QEMUDMAMappedExtents>(Base, *Returned);
+        if (Direction)
+          State = State->set<QEMUDMAMappedDirections>(Base, *Direction);
         C.addTransition(State);
       } else if (State != C.getState()) {
         C.addTransition(State);
@@ -5889,7 +6054,8 @@ public:
     auto DMAMappedExtents = State->get<QEMUDMAMappedExtents>();
     for (const auto &Entry : DMAMappedExtents)
       if (SymReaper.isDead(Entry.first))
-        State = State->remove<QEMUDMAMappedExtents>(Entry.first);
+        State = State->remove<QEMUDMAMappedExtents>(Entry.first)
+                    ->remove<QEMUDMAMappedDirections>(Entry.first);
     if (State != C.getState())
       C.addTransition(State);
   }
@@ -5906,7 +6072,13 @@ public:
     for (const auto &Entry : State->get<QEMUPendingDMAMapRequestedExtents>())
       for (SymbolRef Symbol : Entry.second.symbols())
         SymReaper.markLive(Symbol);
+    for (const auto &Entry : State->get<QEMUPendingDMAMapDirections>())
+      for (SymbolRef Symbol : Entry.second.symbols())
+        SymReaper.markLive(Symbol);
     for (const auto &Entry : State->get<QEMUDMAMappedExtents>())
+      for (SymbolRef Symbol : Entry.second.symbols())
+        SymReaper.markLive(Symbol);
+    for (const auto &Entry : State->get<QEMUDMAMappedDirections>())
       for (SymbolRef Symbol : Entry.second.symbols())
         SymReaper.markLive(Symbol);
     for (const MemRegion *Region : State->get<QEMUVirtqueueElements>())

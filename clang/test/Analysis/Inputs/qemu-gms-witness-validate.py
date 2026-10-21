@@ -163,6 +163,9 @@ def expected_cases():
         "(value [0, 18446744073709551615], source MMIO); "
         "allocation failure can terminate QEMU"
     ), not_applicable=not_applicable("allocation-availability"))
+    add("dma_map_unmap_contract", (
+        "direct DMA unmap arguments match the reversed argument order"
+    ), not_applicable=not_applicable("dma-map-unmap-contract"))
     return cases
 
 
