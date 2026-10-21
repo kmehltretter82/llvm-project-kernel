@@ -14,6 +14,7 @@
 // RUN:   %s qemu-guest-memory-witness.c
 
 typedef __SIZE_TYPE__ size_t;
+typedef __UINT8_TYPE__ uint8_t;
 typedef __UINT32_TYPE__ uint32_t;
 typedef __UINT64_TYPE__ uint64_t;
 
@@ -239,6 +240,19 @@ static void availability_allocation(void *opaque, uint64_t addr, uint64_t data,
 
 static const MemoryRegionOps availability_allocation_ops = {
     .write = availability_allocation};
+
+typedef struct USBDevice {
+  uint8_t setup_buf[8];
+  uint8_t data_buf[4096];
+  int setup_len;
+} USBDevice;
+
+static void usb_setup_state(USBDevice *device) {
+  int length = (device->setup_buf[7] << 8) | device->setup_buf[6];
+  if (length != 4097)
+    return;
+  device->setup_len = length; // NOT-APPLICABLE: usb_setup_state
+}
 
 static void dma_map_unmap_contract(AddressSpace *as) {
   uint64_t mapped = 8;

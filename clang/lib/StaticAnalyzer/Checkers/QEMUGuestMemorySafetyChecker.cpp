@@ -87,6 +87,19 @@ REGISTER_MAP_WITH_PROGRAMSTATE(QEMUInputBufferClasses, const MemRegion *,
                                unsigned)
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUInputBufferParameters, const MemRegion *,
                                const ParmVarDecl *)
+REGISTER_SET_WITH_PROGRAMSTATE(QEMUNonNegativeUSBScalars, const VarRegion *)
+REGISTER_MAP_WITH_PROGRAMSTATE(QEMUUSBScalarLowZeroBits, const VarRegion *,
+                               unsigned)
+REGISTER_MAP_WITH_PROGRAMSTATE(QEMUInvalidUSBSetupLengthValues,
+                               const FieldRegion *, SVal)
+REGISTER_MAP_WITH_PROGRAMSTATE(QEMUInvalidUSBSetupLengthOrigins,
+                               const FieldRegion *, const Expr *)
+REGISTER_MAP_WITH_PROGRAMSTATE(QEMUInvalidUSBSetupLengthFrames,
+                               const FieldRegion *, const StackFrame *)
+REGISTER_MAP_WITH_PROGRAMSTATE(QEMUInvalidUSBSetupLengthKinds,
+                               const FieldRegion *, unsigned)
+REGISTER_MAP_WITH_PROGRAMSTATE(QEMUInvalidUSBSetupLengthDefinite,
+                               const FieldRegion *, unsigned)
 
 namespace {
 
@@ -101,6 +114,7 @@ enum class InputClass {
   Virtqueue,
   PCIConfig,
   DeviceRequest,
+  USB,
   Mixed
 };
 
@@ -165,6 +179,11 @@ struct BoundStates {
 };
 
 enum class BoundUnit { Bytes, Elements, Bits };
+
+enum class USBSetupLengthViolation : unsigned {
+  Negative = 1,
+  ExceedsCapacity = 2,
+};
 
 enum class AllocationRelationKind : unsigned {
   NonOverflowingAdd,
@@ -293,6 +312,8 @@ static StringRef inputClassName(InputClass Source) {
     return "PCI configuration";
   case InputClass::DeviceRequest:
     return "device request";
+  case InputClass::USB:
+    return "USB";
   case InputClass::Mixed:
     return "mixed guest input";
   }
@@ -357,7 +378,8 @@ class QEMUGuestMemorySafetyChecker
     : public Checker<check::ASTDecl<TranslationUnitDecl>, check::BeginFunction,
                      check::EndFunction, check::PreCall, check::PostCall,
                      check::Location, check::Bind, check::LiveSymbols,
-                     check::DeadSymbols, check::PostStmt<ImplicitCastExpr>,
+                     check::DeadSymbols, check::RegionChanges,
+                     check::PostStmt<ImplicitCastExpr>,
                      check::PreStmt<ArraySubscriptExpr>> {
   mutable llvm::DenseMap<const FunctionDecl *, CallbackInfo> Callbacks;
   mutable llvm::DenseMap<const FunctionDecl *, std::string>
@@ -416,6 +438,417 @@ class QEMUGuestMemorySafetyChecker
 
   static bool isInteger(QualType Type) {
     return Type->isIntegralOrEnumerationType();
+  }
+
+  static const FieldDecl *namedField(const RecordDecl *Record, StringRef Name) {
+    if (!Record)
+      return nullptr;
+    for (const FieldDecl *Field : Record->fields())
+      if (Field->getName() == Name)
+        return Field;
+    return nullptr;
+  }
+
+  static std::optional<uint64_t>
+  usbDeviceDataBufferCapacity(const RecordDecl *Record, ASTContext &Context) {
+    if (!Record || Record->getName() != "USBDevice")
+      return std::nullopt;
+    const FieldDecl *SetupBuffer = namedField(Record, "setup_buf");
+    const FieldDecl *DataBuffer = namedField(Record, "data_buf");
+    const FieldDecl *SetupLength = namedField(Record, "setup_len");
+    if (!SetupBuffer || !DataBuffer || !SetupLength ||
+        !isIntegerWidth(SetupLength->getType(), 32, Context))
+      return std::nullopt;
+
+    const ConstantArrayType *SetupArray =
+        Context.getAsConstantArrayType(SetupBuffer->getType());
+    const ConstantArrayType *DataArray =
+        Context.getAsConstantArrayType(DataBuffer->getType());
+    if (!SetupArray || !DataArray ||
+        SetupArray->getSize().getActiveBits() > 64 ||
+        SetupArray->getSize().getZExtValue() != 8 ||
+        !SetupArray->getElementType()->isUnsignedIntegerType() ||
+        !DataArray->getElementType()->isUnsignedIntegerType() ||
+        Context.getIntWidth(SetupArray->getElementType()) != 8 ||
+        Context.getIntWidth(DataArray->getElementType()) != 8)
+      return std::nullopt;
+
+    CharUnits Capacity = Context.getTypeSizeInChars(DataBuffer->getType());
+    if (Capacity.isZero() || Capacity.getQuantity() < 0)
+      return std::nullopt;
+    return static_cast<uint64_t>(Capacity.getQuantity());
+  }
+
+  static bool isUSBSetupBufferElement(const MemRegion *Region,
+                                      ASTContext &Context) {
+    const auto *Element = dyn_cast_or_null<ElementRegion>(Region);
+    const auto *Field =
+        Element ? dyn_cast<FieldRegion>(Element->getSuperRegion()) : nullptr;
+    const FieldDecl *Declaration = Field ? Field->getDecl() : nullptr;
+    const RecordDecl *Record = Declaration ? Declaration->getParent() : nullptr;
+    return Declaration && Declaration->getName() == "setup_buf" &&
+           usbDeviceDataBufferCapacity(Record, Context).has_value();
+  }
+
+  static std::optional<uint64_t>
+  usbSetupLengthCapacity(const FieldRegion *Region, ASTContext &Context) {
+    const FieldDecl *Field = Region ? Region->getDecl() : nullptr;
+    if (!Field || Field->getName() != "setup_len")
+      return std::nullopt;
+    return usbDeviceDataBufferCapacity(Field->getParent(), Context);
+  }
+
+  static bool isUSBDeviceObjectRegion(const MemRegion *Region,
+                                      ASTContext &Context) {
+    if (!Region)
+      return false;
+    Region = Region->StripCasts();
+    QualType Type;
+    if (const auto *Typed = dyn_cast<TypedValueRegion>(Region))
+      Type = Typed->getValueType();
+    else if (const auto *Symbolic = dyn_cast<SymbolicRegion>(Region))
+      Type = Symbolic->getPointeeStaticType();
+    const RecordDecl *Record =
+        Type.isNull() ? nullptr : Type.getUnqualifiedType()->getAsRecordDecl();
+    return usbDeviceDataBufferCapacity(Record, Context).has_value();
+  }
+
+  static const FieldRegion *usbSetupLengthRegion(const MemRegion *Object,
+                                                 CheckerContext &C) {
+    if (!Object)
+      return nullptr;
+    Object = Object->StripCasts();
+    const auto *Super = dyn_cast<SubRegion>(Object);
+    if (!Super)
+      return nullptr;
+    QualType Type;
+    if (const auto *Typed = dyn_cast<TypedValueRegion>(Object))
+      Type = Typed->getValueType();
+    else if (const auto *Symbolic = dyn_cast<SymbolicRegion>(Object))
+      Type = Symbolic->getPointeeStaticType();
+    const RecordDecl *Record =
+        Type.isNull() ? nullptr : Type.getUnqualifiedType()->getAsRecordDecl();
+    if (!usbDeviceDataBufferCapacity(Record, C.getASTContext()))
+      return nullptr;
+    const FieldDecl *SetupLength = namedField(Record, "setup_len");
+    return SetupLength ? C.getSValBuilder().getRegionManager().getFieldRegion(
+                             SetupLength, Super)
+                       : nullptr;
+  }
+
+  static bool isZeroAggregateInitializer(const Expr *Expression,
+                                         ASTContext &Context,
+                                         unsigned Depth = 0) {
+    if (!Expression || Depth > 16)
+      return false;
+    const Expr *E = Expression->IgnoreParenImpCasts();
+    if (const auto *Compound = dyn_cast<CompoundLiteralExpr>(E))
+      return isZeroAggregateInitializer(Compound->getInitializer(), Context,
+                                        Depth + 1);
+    if (isa<ImplicitValueInitExpr>(E))
+      return true;
+    if (const auto *Initializer = dyn_cast<InitListExpr>(E)) {
+      for (const Expr *Element : Initializer->inits())
+        if (!isZeroAggregateInitializer(Element, Context, Depth + 1))
+          return false;
+      return true;
+    }
+    if (std::optional<llvm::APSInt> Constant =
+            E->getIntegerConstantExpr(Context))
+      return Constant->isZero();
+    return false;
+  }
+
+  static bool usbLengthExpressionKnownNonNegative(const Expr *Expression,
+                                                  ProgramStateRef State,
+                                                  CheckerContext &C,
+                                                  unsigned Depth = 0) {
+    if (!Expression || Depth > 16)
+      return false;
+
+    const Expr *E = Expression->IgnoreParens();
+    ASTContext &Context = C.getASTContext();
+    if (const auto *Cast = dyn_cast<CastExpr>(E)) {
+      QualType Destination = Cast->getType();
+      QualType Source = Cast->getSubExpr()->getType();
+      if (Destination->isUnsignedIntegerOrEnumerationType())
+        return true;
+      if (!Destination->isSignedIntegerOrEnumerationType() ||
+          !Source->isIntegralOrEnumerationType())
+        return false;
+      if (Source->isUnsignedIntegerOrEnumerationType())
+        return Context.getIntWidth(Destination) > Context.getIntWidth(Source);
+      if (!Source->isSignedIntegerOrEnumerationType() ||
+          Context.getIntWidth(Destination) < Context.getIntWidth(Source))
+        return false;
+      return usbLengthExpressionKnownNonNegative(Cast->getSubExpr(), State, C,
+                                                 Depth + 1);
+    }
+    if (E->getType()->isUnsignedIntegerOrEnumerationType() ||
+        E->isKnownToHaveBooleanValue())
+      return true;
+    if (std::optional<llvm::APSInt> Constant =
+            E->getIntegerConstantExpr(Context))
+      return !Constant->isNegative();
+    if (const auto *Reference = dyn_cast<DeclRefExpr>(E)) {
+      const auto *Variable = dyn_cast<VarDecl>(Reference->getDecl());
+      if (!Variable)
+        return false;
+      const VarRegion *Region = State->getRegion(Variable, C.getStackFrame());
+      return State->contains<QEMUNonNegativeUSBScalars>(Region);
+    }
+    if (const auto *Unary = dyn_cast<UnaryOperator>(E)) {
+      if (Unary->getOpcode() == UO_LNot)
+        return true;
+      if (Unary->getOpcode() == UO_Plus)
+        return usbLengthExpressionKnownNonNegative(Unary->getSubExpr(), State,
+                                                   C, Depth + 1);
+      return false;
+    }
+    if (const auto *Conditional = dyn_cast<ConditionalOperator>(E))
+      return usbLengthExpressionKnownNonNegative(Conditional->getTrueExpr(),
+                                                 State, C, Depth + 1) &&
+             usbLengthExpressionKnownNonNegative(Conditional->getFalseExpr(),
+                                                 State, C, Depth + 1);
+    const auto *Binary = dyn_cast<BinaryOperator>(E);
+    if (!Binary)
+      return false;
+    if (Binary->isComparisonOp() || Binary->getOpcode() == BO_LAnd ||
+        Binary->getOpcode() == BO_LOr)
+      return true;
+    if (Binary->getOpcode() == BO_Or)
+      return usbLengthExpressionKnownNonNegative(Binary->getLHS(), State, C,
+                                                 Depth + 1) &&
+             usbLengthExpressionKnownNonNegative(Binary->getRHS(), State, C,
+                                                 Depth + 1);
+    if (Binary->getOpcode() == BO_And) {
+      for (const Expr *Operand : {Binary->getLHS(), Binary->getRHS()})
+        if (std::optional<llvm::APSInt> Mask =
+                Operand->getIntegerConstantExpr(Context))
+          if (!Mask->isNegative())
+            return true;
+      return false;
+    }
+    if (Binary->getOpcode() == BO_Shr)
+      return usbLengthExpressionKnownNonNegative(Binary->getLHS(), State, C,
+                                                 Depth + 1);
+    if (Binary->getOpcode() != BO_Shl ||
+        !usbLengthExpressionKnownNonNegative(Binary->getLHS(), State, C,
+                                             Depth + 1))
+      return false;
+    std::optional<llvm::APSInt> Shift =
+        Binary->getRHS()->getIntegerConstantExpr(Context);
+    QualType ResultType = Binary->getType();
+    QualType SourceType = Binary->getLHS()->IgnoreParenImpCasts()->getType();
+    if (!Shift || Shift->isNegative() || Shift->getActiveBits() > 64 ||
+        !ResultType->isIntegerType() || !SourceType->isIntegerType())
+      return false;
+    uint64_t ShiftAmount = Shift->getZExtValue();
+    uint64_t ResultWidth = Context.getIntWidth(ResultType);
+    uint64_t SourceWidth = Context.getIntWidth(SourceType);
+    return ShiftAmount < ResultWidth && SourceWidth + ShiftAmount < ResultWidth;
+  }
+
+  static bool usbStoredLengthKnownNonNegative(const Expr *Expression,
+                                              QualType Destination,
+                                              ProgramStateRef State,
+                                              CheckerContext &C) {
+    if (!Expression || !Destination->isIntegralOrEnumerationType())
+      return false;
+    if (Destination->isUnsignedIntegerOrEnumerationType())
+      return true;
+
+    const Expr *Input = Expression->IgnoreParens();
+    if (const auto *Conversion = dyn_cast<CastExpr>(Input))
+      if (C.getASTContext().hasSameUnqualifiedType(Conversion->getType(),
+                                                   Destination))
+        Input = Conversion->getSubExpr();
+    if (!usbLengthExpressionKnownNonNegative(Input, State, C))
+      return false;
+
+    QualType Source = Input->getType();
+    if (!Destination->isSignedIntegerOrEnumerationType() ||
+        !Source->isIntegralOrEnumerationType())
+      return false;
+    if (Source->isUnsignedIntegerOrEnumerationType()) {
+      if (C.getASTContext().getIntWidth(Destination) >
+          C.getASTContext().getIntWidth(Source))
+        return true;
+
+      SVal SourceValue = expressionValue(Input, C);
+      const llvm::APSInt *DynamicMaximum =
+          C.getSValBuilder().getMaxValue(State, SourceValue);
+      if (!DynamicMaximum || DynamicMaximum->isNegative())
+        return false;
+      llvm::APSInt DestinationMaximum =
+          C.getSValBuilder().getBasicValueFactory().getMaxValue(Destination);
+      unsigned Width = std::max(DynamicMaximum->getBitWidth(),
+                                DestinationMaximum.getBitWidth());
+      return DynamicMaximum->zextOrTrunc(Width).ule(
+          DestinationMaximum.zextOrTrunc(Width));
+    }
+    return Source->isSignedIntegerOrEnumerationType() &&
+           C.getASTContext().getIntWidth(Destination) >=
+               C.getASTContext().getIntWidth(Source);
+  }
+
+  static unsigned usbKnownLowZeroBits(const Expr *Expression,
+                                      ProgramStateRef State, CheckerContext &C,
+                                      unsigned Depth = 0) {
+    if (!Expression || Depth > 16)
+      return 0;
+    const Expr *E = Expression->IgnoreParens();
+    ASTContext &Context = C.getASTContext();
+    if (const auto *Cast = dyn_cast<CastExpr>(E)) {
+      if (!Cast->getType()->isIntegralOrEnumerationType())
+        return 0;
+      return std::min(
+          Context.getIntWidth(Cast->getType()),
+          usbKnownLowZeroBits(Cast->getSubExpr(), State, C, Depth + 1));
+    }
+    if (const auto *Reference = dyn_cast<DeclRefExpr>(E)) {
+      const auto *Variable = dyn_cast<VarDecl>(Reference->getDecl());
+      if (Variable) {
+        const VarRegion *Region = State->getRegion(Variable, C.getStackFrame());
+        if (const unsigned *Bits = State->get<QEMUUSBScalarLowZeroBits>(Region))
+          return *Bits;
+      }
+      return 0;
+    }
+    if (const auto *Literal = dyn_cast<IntegerLiteral>(E)) {
+      unsigned Width = Context.getIntWidth(Literal->getType());
+      return Literal->getValue().isZero()
+                 ? Width
+                 : std::min(Width, Literal->getValue().countTrailingZeros());
+    }
+    if (const auto *Unary = dyn_cast<UnaryOperator>(E)) {
+      if (Unary->getOpcode() == UO_Plus || Unary->getOpcode() == UO_Minus)
+        return usbKnownLowZeroBits(Unary->getSubExpr(), State, C, Depth + 1);
+      return 0;
+    }
+    const auto *Binary = dyn_cast<BinaryOperator>(E);
+    if (!Binary || !Binary->getType()->isUnsignedIntegerType())
+      return 0;
+    unsigned Width = Context.getIntWidth(Binary->getType());
+    unsigned Left = usbKnownLowZeroBits(Binary->getLHS(), State, C, Depth + 1);
+    unsigned Right = usbKnownLowZeroBits(Binary->getRHS(), State, C, Depth + 1);
+    if (Binary->getOpcode() == BO_Shl) {
+      std::optional<llvm::APSInt> Shift =
+          Binary->getRHS()->getIntegerConstantExpr(Context);
+      if (!Shift || Shift->isNegative() || Shift->getActiveBits() > 64 ||
+          Shift->getZExtValue() >= Width)
+        return 0;
+      return std::min<uint64_t>(Width, Left + Shift->getZExtValue());
+    }
+    if (Binary->getOpcode() == BO_Mul)
+      return std::min(Width, Left + Right);
+    if (Binary->getOpcode() == BO_And)
+      return std::max(Left, Right);
+    if (Binary->getOpcode() == BO_Or || Binary->getOpcode() == BO_Xor)
+      return std::min(Left, Right);
+    return 0;
+  }
+
+  static bool usbNarrowingConversionKnownZero(const Expr *Expression,
+                                              QualType Destination,
+                                              ProgramStateRef State,
+                                              CheckerContext &C) {
+    if (!Expression || !Destination->isIntegralOrEnumerationType())
+      return false;
+    ASTContext &Context = C.getASTContext();
+    const auto *Conversion = dyn_cast<CastExpr>(Expression->IgnoreParens());
+    if (!Conversion ||
+        !Conversion->getSubExpr()->getType()->isIntegralOrEnumerationType())
+      return false;
+    unsigned DestinationWidth = Context.getIntWidth(Destination);
+    if (Context.getIntWidth(Conversion->getSubExpr()->getType()) <=
+        DestinationWidth)
+      return false;
+    return usbKnownLowZeroBits(Conversion->getSubExpr(), State, C) >=
+           DestinationWidth;
+  }
+
+  static ProgramStateRef clearInvalidUSBSetupLength(ProgramStateRef State,
+                                                    const FieldRegion *Field) {
+    return State->remove<QEMUInvalidUSBSetupLengthValues>(Field)
+        ->remove<QEMUInvalidUSBSetupLengthOrigins>(Field)
+        ->remove<QEMUInvalidUSBSetupLengthFrames>(Field)
+        ->remove<QEMUInvalidUSBSetupLengthKinds>(Field)
+        ->remove<QEMUInvalidUSBSetupLengthDefinite>(Field);
+  }
+
+  static ProgramStateRef
+  clearInvalidUSBSetupLengthsWithin(ProgramStateRef State,
+                                    const MemRegion *Object) {
+    if (!Object)
+      return State;
+    Object = Object->StripCasts();
+    auto InvalidUSBSetupLengths = State->get<QEMUInvalidUSBSetupLengthValues>();
+    for (const auto &Entry : InvalidUSBSetupLengths)
+      if (Entry.first->isSubRegionOf(Object))
+        State = clearInvalidUSBSetupLength(State, Entry.first);
+    return State;
+  }
+
+  static const FieldRegion *
+  invalidUSBSetupLengthWithin(ProgramStateRef State, const MemRegion *Object) {
+    if (!Object)
+      return nullptr;
+    Object = Object->StripCasts();
+    for (const auto &Entry : State->get<QEMUInvalidUSBSetupLengthValues>())
+      if (Entry.first->isSubRegionOf(Object))
+        return Entry.first;
+    return nullptr;
+  }
+
+  static ProgramStateRef
+  markInvalidUSBSetupLength(ProgramStateRef State, const FieldRegion *Field,
+                            SVal Value, const Expr *Origin,
+                            const StackFrame *Frame,
+                            USBSetupLengthViolation Kind, bool Definite) {
+    return State->set<QEMUInvalidUSBSetupLengthValues>(Field, Value)
+        ->set<QEMUInvalidUSBSetupLengthOrigins>(Field, Origin)
+        ->set<QEMUInvalidUSBSetupLengthFrames>(Field, Frame)
+        ->set<QEMUInvalidUSBSetupLengthKinds>(Field,
+                                              static_cast<unsigned>(Kind))
+        ->set<QEMUInvalidUSBSetupLengthDefinite>(Field, Definite ? 1U : 0U);
+  }
+
+  static ProgramStateRef
+  copyInvalidUSBSetupLength(ProgramStateRef State, const FieldRegion *Source,
+                            const FieldRegion *Destination,
+                            const StackFrame *Frame) {
+    if (!Destination)
+      return State;
+
+    std::optional<SVal> Value;
+    const Expr *Origin = nullptr;
+    unsigned Kind = 0;
+    unsigned Definite = 0;
+    if (Source) {
+      if (const SVal *Stored =
+              State->get<QEMUInvalidUSBSetupLengthValues>(Source))
+        Value = *Stored;
+      if (const Expr *const *Stored =
+              State->get<QEMUInvalidUSBSetupLengthOrigins>(Source))
+        Origin = *Stored;
+      if (const unsigned *Stored =
+              State->get<QEMUInvalidUSBSetupLengthKinds>(Source))
+        Kind = *Stored;
+      if (const unsigned *Stored =
+              State->get<QEMUInvalidUSBSetupLengthDefinite>(Source))
+        Definite = *Stored;
+    }
+
+    State = clearInvalidUSBSetupLength(State, Destination);
+    if (!Value || !Origin ||
+        (Kind != static_cast<unsigned>(USBSetupLengthViolation::Negative) &&
+         Kind !=
+             static_cast<unsigned>(USBSetupLengthViolation::ExceedsCapacity)))
+      return State;
+    return markInvalidUSBSetupLength(State, Destination, *Value, Origin, Frame,
+                                     static_cast<USBSetupLengthViolation>(Kind),
+                                     Definite != 0);
   }
 
   static bool callbackSignatureMatches(const FunctionDecl *FD,
@@ -2143,6 +2576,8 @@ class QEMUGuestMemorySafetyChecker
       return "virtio-config";
     case InputClass::Virtqueue:
       return "virtqueue";
+    case InputClass::USB:
+      return "usb";
     case InputClass::PCIConfig:
     case InputClass::DeviceRequest:
     case InputClass::Mixed:
@@ -2163,6 +2598,8 @@ class QEMUGuestMemorySafetyChecker
     case InputClass::Virtqueue:
     case InputClass::DeviceRequest:
       return "descriptor";
+    case InputClass::USB:
+      return "qtest";
     case InputClass::MMIO:
     case InputClass::PIO:
     case InputClass::PCIConfig:
@@ -2702,6 +3139,43 @@ class QEMUGuestMemorySafetyChecker
     C.emitReport(std::move(Report));
   }
 
+  bool reportInvalidUSBSetupLength(CheckerContext &C, ProgramStateRef State,
+                                   SVal Value, const Expr *Origin,
+                                   uint64_t Capacity,
+                                   USBSetupLengthViolation Kind,
+                                   bool Definite) const {
+    ExplodedNode *Node = C.generateErrorNode(State);
+    if (!Node)
+      return false;
+
+    llvm::SmallString<256> Buffer;
+    llvm::raw_svector_ostream Message(Buffer);
+    Message << (Definite ? "Level A: guest-controlled "
+                         : "Level B: guest-controlled ")
+            << "USB setup length state ";
+    if (Kind == USBSetupLengthViolation::Negative) {
+      Message << (Definite ? "is negative" : "may be negative") << " (value "
+              << valueRange(State, Value, C.getSValBuilder()) << ", minimum 0";
+    } else {
+      Message << (Definite ? "exceeds " : "may exceed ")
+              << "the host object extent (value "
+              << valueRange(State, Value, C.getSValBuilder()) << ", bytes "
+              << Capacity;
+    }
+    Message << ", source USB setup packet field 'setup_buf')";
+
+    auto Report = std::make_unique<PathSensitiveBugReport>(bugType(Definite),
+                                                           Message.str(), Node);
+    if (Origin)
+      Report->addRange(Origin->getSourceRange());
+    for (SymbolRef Symbol : taint::getTaintedSymbols(State, Value))
+      Report->markInteresting(Symbol);
+    addStructuredWitnessNotApplicable(*Report, C, Message.str(),
+                                      "usb-state-capacity-contract");
+    C.emitReport(std::move(Report));
+    return true;
+  }
+
   static std::string
   persistentSourceDescription(const PersistentFieldInfo &Info) {
     return inputClassName(Info.Source).str() + "-stored field '" +
@@ -3194,6 +3668,13 @@ class QEMUGuestMemorySafetyChecker
       ProgramStateRef State;
       CheckerContext &C;
 
+      void addSource(InputClass Candidate) {
+        if (Source && *Source != Candidate)
+          Source = InputClass::Mixed;
+        else
+          Source = Candidate;
+      }
+
     public:
       std::optional<InputClass> Source;
 
@@ -3206,10 +3687,19 @@ class QEMUGuestMemorySafetyChecker
             State, QEMUGuestMemorySafetyChecker::expressionValue(DRE, C));
         if (!Candidate)
           return true;
-        if (Source && *Source != *Candidate)
-          Source = InputClass::Mixed;
-        else
-          Source = Candidate;
+        addSource(*Candidate);
+        return true;
+      }
+
+      bool VisitArraySubscriptExpr(ArraySubscriptExpr *Subscript) override {
+        const Expr *Base = Subscript->getBase()->IgnoreParenImpCasts();
+        const auto *Member = dyn_cast<MemberExpr>(Base);
+        const auto *Field =
+            Member ? dyn_cast<FieldDecl>(Member->getMemberDecl()) : nullptr;
+        if (Field && Field->getName() == "setup_buf" &&
+            QEMUGuestMemorySafetyChecker::usbDeviceDataBufferCapacity(
+                Field->getParent(), C.getASTContext()))
+          addSource(InputClass::USB);
         return true;
       }
     } Visitor(*this, State, C);
@@ -5874,6 +6364,37 @@ public:
     if (!FD || !FD->getIdentifier())
       return;
     StringRef Name = FD->getName();
+    if ((Name == "memset" || Name == "__builtin_memset") &&
+        Call.getNumArgs() >= 3) {
+      QualType DestinationType =
+          Call.getArgExpr(0)->IgnoreParenImpCasts()->getType();
+      const RecordDecl *Record = DestinationType->isPointerType()
+                                     ? DestinationType->getPointeeType()
+                                           .getUnqualifiedType()
+                                           ->getAsRecordDecl()
+                                     : nullptr;
+      if (usbDeviceDataBufferCapacity(Record, C.getASTContext())) {
+        ProgramStateRef State = C.getState();
+        QualType FillType = Call.getArgExpr(1)->getType();
+        QualType LengthType = Call.getArgExpr(2)->getType();
+        SVal Zero = C.getSValBuilder().makeZeroVal(FillType);
+        uint64_t ObjectBytes =
+            C.getASTContext()
+                .getTypeSizeInChars(DestinationType->getPointeeType())
+                .getQuantity();
+        SVal Required = C.getSValBuilder().makeIntVal(ObjectBytes, LengthType);
+        if (isDefinitelyTrue(State, Call.getArgSVal(1), BO_EQ, Zero,
+                             C.getSValBuilder()) &&
+            isDefinitelyTrue(State, Call.getArgSVal(2), BO_GE, Required,
+                             C.getSValBuilder())) {
+          const MemRegion *Destination = Call.getArgSVal(0).getAsRegion();
+          State = clearInvalidUSBSetupLengthsWithin(State, Destination);
+          if (State != C.getState())
+            C.addTransition(State);
+          return;
+        }
+      }
+    }
     if (std::optional<IovecCopy> Copy = iovecCopy(Call)) {
       checkSuccessfulIovecCopy(Call, *Copy, C);
       return;
@@ -6115,6 +6636,21 @@ public:
   void checkPostStmt(const ImplicitCastExpr *Cast, CheckerContext &C) const {
     if (Cast->getCastKind() != CK_LValueToRValue)
       return;
+    if (isUSBSetupBufferElement(C.getSVal(Cast->getSubExpr()).getAsRegion(),
+                                C.getASTContext())) {
+      SVal Value = C.getSVal(Cast);
+      if (Value.isUnknownOrUndef())
+        return;
+      ProgramStateRef State =
+          addInputTaint(C.getState(), Value, InputClass::USB);
+      if (State == C.getState())
+        return;
+      const NoteTag *Tag = sourceNote(
+          C, State, Value, InputClass::USB,
+          "setup packet field 'setup_buf' supplies guest-controlled bytes");
+      C.addTransition(State, Tag);
+      return;
+    }
     if (modelCallbackBufferLoad(Cast, C))
       return;
     std::optional<PersistentFieldInfo> Persistent =
@@ -6252,7 +6788,129 @@ public:
 
   void checkBind(SVal Location, SVal Value, const Stmt *S, bool AtDeclInit,
                  CheckerContext &C) const {
-    const auto *Region = dyn_cast_or_null<VarRegion>(Location.getAsRegion());
+    const MemRegion *BindingRegion = Location.getAsRegion();
+    if (isUSBDeviceObjectRegion(BindingRegion, C.getASTContext())) {
+      ProgramStateRef State = C.getState();
+      const FieldRegion *Destination = usbSetupLengthRegion(BindingRegion, C);
+      const Expr *Right = nullptr;
+      if (const auto *Assignment = dyn_cast_or_null<BinaryOperator>(S))
+        if (Assignment->getOpcode() == BO_Assign)
+          Right = Assignment->getRHS();
+      if (!Right)
+        Right = dyn_cast_or_null<Expr>(S);
+      if (isZeroAggregateInitializer(Right, C.getASTContext())) {
+        State = clearInvalidUSBSetupLengthsWithin(State, BindingRegion);
+        if (State != C.getState())
+          C.addTransition(State);
+        return;
+      }
+      const FieldRegion *Source = nullptr;
+      const MemRegion *SourceObject = nullptr;
+      if (std::optional<nonloc::LazyCompoundVal> Compound =
+              Value.getAs<nonloc::LazyCompoundVal>())
+        SourceObject = Compound->getRegion();
+      if (!SourceObject && Right)
+        SourceObject = C.getSVal(Right->IgnoreParenImpCasts()).getAsRegion();
+      Source = invalidUSBSetupLengthWithin(State, SourceObject);
+      State = copyInvalidUSBSetupLength(State, Source, Destination,
+                                        C.getStackFrame());
+      if (State != C.getState())
+        C.addTransition(State);
+      return;
+    }
+    if (const auto *Field = dyn_cast_or_null<FieldRegion>(BindingRegion)) {
+      std::optional<uint64_t> Capacity =
+          usbSetupLengthCapacity(Field, C.getASTContext());
+      if (!Capacity)
+        return;
+      const Expr *SourceExpression = nullptr;
+      if (const auto *Assignment = dyn_cast_or_null<BinaryOperator>(S))
+        if (Assignment->isAssignmentOp())
+          SourceExpression = Assignment->getOpcode() == BO_Assign
+                                 ? Assignment->getRHS()
+                                 : Assignment;
+      if (!SourceExpression)
+        SourceExpression = dyn_cast_or_null<Expr>(S);
+      SVal SourceValue =
+          SourceExpression ? expressionValue(SourceExpression, C) : Value;
+      if (SourceValue.isUnknownOrUndef())
+        SourceValue = Value;
+      std::optional<InputClass> Source =
+          inputClassInScalarExpression(SourceExpression, C.getState(), C);
+      if (!Source)
+        Source = inputClassForValue(C.getState(), SourceValue);
+      if (!Source && !Value.isUnknownOrUndef())
+        Source = inputClassForValue(C.getState(), Value);
+      ProgramStateRef State = clearInvalidUSBSetupLength(C.getState(), Field);
+      QualType Type = Field->getDecl()->getType();
+      // Preserve the assignment conversion represented by the RHS AST.  The
+      // checkBind value can still name the pre-conversion symbol for integral
+      // casts, which would compare (for example) an unsigned 64-bit source
+      // against the signed 32-bit setup_len bounds.
+      SVal StoredValue = SourceExpression ? C.getSVal(SourceExpression) : Value;
+      if (StoredValue.isUnknownOrUndef()) {
+        QualType ValueType = Value.getType(C.getASTContext());
+        StoredValue = ValueType.isNull()
+                          ? Value
+                          : C.getSValBuilder().evalCast(Value, Type, ValueType);
+      }
+      if (!Source || *Source != InputClass::USB ||
+          StoredValue.isUnknownOrUndef()) {
+        if (State != C.getState())
+          C.addTransition(State);
+        return;
+      }
+      if (usbNarrowingConversionKnownZero(SourceExpression, Type, State, C)) {
+        if (State != C.getState())
+          C.addTransition(State);
+        return;
+      }
+      State = addInputTaint(State, StoredValue, InputClass::USB);
+
+      const Expr *Origin = dyn_cast_or_null<Expr>(S);
+      ProgramStateRef NonNegativeState = State;
+      SVal Zero = C.getSValBuilder().makeZeroVal(Type);
+      if (!isDefinitelyTrue(State, StoredValue, BO_GE, Zero,
+                            C.getSValBuilder()) &&
+          !usbStoredLengthKnownNonNegative(SourceExpression, Type, State, C)) {
+        std::optional<BoundStates> NonNegative =
+            compare(State, StoredValue, BO_GE, Zero, C.getSValBuilder());
+        if (!NonNegative) {
+          if (State != C.getState())
+            C.addTransition(State);
+          return;
+        }
+        if (NonNegative->Unsafe) {
+          ProgramStateRef Invalid = markInvalidUSBSetupLength(
+              NonNegative->Unsafe, Field, StoredValue, Origin,
+              C.getStackFrame(), USBSetupLengthViolation::Negative,
+              !NonNegative->Safe);
+          C.addTransition(Invalid);
+        }
+        NonNegativeState = NonNegative->Safe;
+      }
+
+      if (NonNegativeState) {
+        SVal Limit = C.getSValBuilder().makeIntVal(*Capacity, Type);
+        std::optional<BoundStates> Within = compare(
+            NonNegativeState, StoredValue, BO_LE, Limit, C.getSValBuilder());
+        if (!Within) {
+          C.addTransition(NonNegativeState);
+          return;
+        }
+        if (Within->Unsafe) {
+          ProgramStateRef Invalid = markInvalidUSBSetupLength(
+              Within->Unsafe, Field, StoredValue, Origin, C.getStackFrame(),
+              USBSetupLengthViolation::ExceedsCapacity, !Within->Safe);
+          C.addTransition(Invalid);
+        }
+        if (Within->Safe)
+          C.addTransition(Within->Safe);
+      }
+      return;
+    }
+
+    const auto *Region = dyn_cast_or_null<VarRegion>(BindingRegion);
     if (!Region)
       return;
     ProgramStateRef State = C.getState();
@@ -6280,12 +6938,26 @@ public:
         inputClassInScalarExpression(SourceExpression, State, C);
     if (!BoundValue.isUnknownOrUndef() && BoundInput)
       State = addInputTaint(State, BoundValue, *BoundInput);
-    if (!BoundValue.isUnknownOrUndef() &&
-        taint::isTainted(State, BoundValue)) {
+    std::optional<InputClass> ScalarInput = BoundInput;
+    if (!ScalarInput && !BoundValue.isUnknownOrUndef())
+      ScalarInput = inputClassForValue(State, BoundValue);
+    if (!BoundValue.isUnknownOrUndef() && taint::isTainted(State, BoundValue)) {
       State = State->set<QEMUSavedTaintedScalars>(Region, BoundValue);
     } else {
       State = State->remove<QEMUSavedTaintedScalars>(Region);
     }
+    if (!BoundValue.isUnknownOrUndef() && ScalarInput &&
+        *ScalarInput == InputClass::USB &&
+        usbLengthExpressionKnownNonNegative(SourceExpression, State, C))
+      State = State->add<QEMUNonNegativeUSBScalars>(Region);
+    else
+      State = State->remove<QEMUNonNegativeUSBScalars>(Region);
+    unsigned LowZeroBits = usbKnownLowZeroBits(SourceExpression, State, C);
+    if (!BoundValue.isUnknownOrUndef() && ScalarInput &&
+        *ScalarInput == InputClass::USB && LowZeroBits)
+      State = State->set<QEMUUSBScalarLowZeroBits>(Region, LowZeroBits);
+    else
+      State = State->remove<QEMUUSBScalarLowZeroBits>(Region);
     if (Source)
       State = State->set<QEMUPersistentLocalSources>(Region, Source->Field);
     else
@@ -6300,6 +6972,13 @@ public:
     for (const auto &Entry : Saved)
       if (!SymReaper.isLiveRegion(Entry.first))
         State = State->remove<QEMUSavedTaintedScalars>(Entry.first);
+    for (const VarRegion *Region : State->get<QEMUNonNegativeUSBScalars>())
+      if (!SymReaper.isLiveRegion(Region))
+        State = State->remove<QEMUNonNegativeUSBScalars>(Region);
+    auto LowZeroBits = State->get<QEMUUSBScalarLowZeroBits>();
+    for (const auto &Entry : LowZeroBits)
+      if (!SymReaper.isLiveRegion(Entry.first))
+        State = State->remove<QEMUUSBScalarLowZeroBits>(Entry.first);
     auto Sources = State->get<QEMUPersistentFieldSources>();
     for (const auto &Entry : Sources)
       if (SymReaper.isDead(Entry.first))
@@ -6320,6 +6999,10 @@ public:
         State = State->remove<QEMUInputBufferLengths>(Entry.first)
                     ->remove<QEMUInputBufferClasses>(Entry.first)
                     ->remove<QEMUInputBufferParameters>(Entry.first);
+    auto InvalidUSBSetupLengths = State->get<QEMUInvalidUSBSetupLengthValues>();
+    for (const auto &Entry : InvalidUSBSetupLengths)
+      if (!SymReaper.isLiveRegion(Entry.first))
+        State = clearInvalidUSBSetupLength(State, Entry.first);
     auto AllocationRelations = State->get<QEMUAllocationRelationKinds>();
     for (const auto &Entry : AllocationRelations)
       if (SymReaper.isDead(Entry.first)) {
@@ -6379,6 +7062,11 @@ public:
       for (SymbolRef Symbol : Entry.second.symbols())
         SymReaper.markLive(Symbol);
     }
+    for (const auto &Entry : State->get<QEMUInvalidUSBSetupLengthValues>()) {
+      SymReaper.markLive(Entry.first);
+      for (SymbolRef Symbol : Entry.second.symbols())
+        SymReaper.markLive(Symbol);
+    }
     for (const auto &Entry : State->get<QEMUAllocationRelationLeft>())
       for (SymbolRef Symbol : Entry.second.symbols())
         SymReaper.markLive(Symbol);
@@ -6387,13 +7075,72 @@ public:
         SymReaper.markLive(Symbol);
   }
 
+  ProgramStateRef
+  checkRegionChanges(ProgramStateRef State,
+                     const InvalidatedSymbols *Invalidated,
+                     ArrayRef<const MemRegion *> ExplicitRegions,
+                     ArrayRef<const MemRegion *> InvalidatedRegions,
+                     const StackFrame *Frame, const CallEvent *Call) const {
+    // Unknown callees and modeled bulk writes can replace the complete USB
+    // object without producing a field bind.  Once such a call invalidates an
+    // ancestor of setup_len, the pending invalid-state fact is no longer
+    // justified.  Direct binds are handled precisely in checkBind and must not
+    // be cleared here merely because a sibling field changed.
+    if (!Call)
+      return State;
+    auto InvalidUSBSetupLengths = State->get<QEMUInvalidUSBSetupLengthValues>();
+    for (const auto &Entry : InvalidUSBSetupLengths) {
+      const FieldRegion *Field = Entry.first;
+      for (const MemRegion *InvalidatedRegion : InvalidatedRegions) {
+        if (Field->isSubRegionOf(InvalidatedRegion->StripCasts())) {
+          State = clearInvalidUSBSetupLength(State, Field);
+          break;
+        }
+      }
+    }
+    return State;
+  }
+
   void checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const {
     ProgramStateRef State = C.getState();
     const StackFrame *Frame = C.getStackFrame();
+    if (!Frame->getParent()) {
+      auto InvalidUSBSetupFrames =
+          State->get<QEMUInvalidUSBSetupLengthFrames>();
+      for (const auto &Entry : InvalidUSBSetupFrames) {
+        const FieldRegion *Field = Entry.first;
+        const SVal *Value = State->get<QEMUInvalidUSBSetupLengthValues>(Field);
+        const Expr *const *Origin =
+            State->get<QEMUInvalidUSBSetupLengthOrigins>(Field);
+        const unsigned *Kind =
+            State->get<QEMUInvalidUSBSetupLengthKinds>(Field);
+        const unsigned *Definite =
+            State->get<QEMUInvalidUSBSetupLengthDefinite>(Field);
+        std::optional<uint64_t> Capacity =
+            usbSetupLengthCapacity(Field, C.getASTContext());
+        if (Value && Origin && Kind && Definite && Capacity &&
+            (*Kind ==
+                 static_cast<unsigned>(USBSetupLengthViolation::Negative) ||
+             *Kind == static_cast<unsigned>(
+                          USBSetupLengthViolation::ExceedsCapacity)) &&
+            reportInvalidUSBSetupLength(
+                C, State, *Value, *Origin, *Capacity,
+                static_cast<USBSetupLengthViolation>(*Kind), *Definite != 0))
+          return;
+        State = clearInvalidUSBSetupLength(State, Field);
+      }
+    }
     auto SavedScalars = State->get<QEMUSavedTaintedScalars>();
     for (const auto &Entry : SavedScalars)
       if (Entry.first->getStackFrame() == Frame)
         State = State->remove<QEMUSavedTaintedScalars>(Entry.first);
+    for (const VarRegion *Region : State->get<QEMUNonNegativeUSBScalars>())
+      if (Region->getStackFrame() == Frame)
+        State = State->remove<QEMUNonNegativeUSBScalars>(Region);
+    auto LowZeroBits = State->get<QEMUUSBScalarLowZeroBits>();
+    for (const auto &Entry : LowZeroBits)
+      if (Entry.first->getStackFrame() == Frame)
+        State = State->remove<QEMUUSBScalarLowZeroBits>(Entry.first);
     auto LocalSources = State->get<QEMUPersistentLocalSources>();
     for (const auto &Entry : LocalSources)
       if (Entry.first->getStackFrame() == Frame)

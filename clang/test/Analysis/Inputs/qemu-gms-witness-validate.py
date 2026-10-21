@@ -167,6 +167,11 @@ def expected_cases():
         "(value [0, 18446744073709551615], source MMIO); "
         "allocation failure can terminate QEMU"
     ), not_applicable=not_applicable("allocation-availability"))
+    add("usb_setup_state", (
+        "Level A: guest-controlled USB setup length state exceeds the host "
+        "object extent (value 4097, bytes 4096, source USB setup packet "
+        "field 'setup_buf')"
+    ), not_applicable=not_applicable("usb-state-capacity-contract"))
     add("dma_map_unmap_contract", (
         "direct DMA unmap arguments match the reversed argument order"
     ), not_applicable=not_applicable("dma-map-unmap-contract"))
