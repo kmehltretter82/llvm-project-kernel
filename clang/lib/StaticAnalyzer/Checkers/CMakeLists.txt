@@ -4,6 +4,29 @@ set(LLVM_LINK_COMPONENTS
   TargetParser
   )
 
+set(qemu_contract_catalog_dir "${CMAKE_CURRENT_SOURCE_DIR}")
+set(qemu_contract_catalog_generator
+  "${CLANG_SOURCE_DIR}/utils/analyzer/qemu_contract_catalog.py")
+set(qemu_contract_catalog_stamp
+  "${CMAKE_CURRENT_BINARY_DIR}/QEMUContractCatalog.inc.checked")
+add_custom_command(
+  OUTPUT "${qemu_contract_catalog_stamp}"
+  COMMAND "${Python3_EXECUTABLE}" "${qemu_contract_catalog_generator}"
+          --catalog "${qemu_contract_catalog_dir}/QEMUContractCatalog.json"
+          --schema "${qemu_contract_catalog_dir}/QEMUContractCatalog.schema.json"
+          --output "${qemu_contract_catalog_dir}/QEMUContractCatalog.inc"
+          --check
+  COMMAND "${CMAKE_COMMAND}" -E touch "${qemu_contract_catalog_stamp}"
+  DEPENDS
+    "${qemu_contract_catalog_generator}"
+    "${qemu_contract_catalog_dir}/QEMUContractCatalog.json"
+    "${qemu_contract_catalog_dir}/QEMUContractCatalog.schema.json"
+    "${qemu_contract_catalog_dir}/QEMUContractCatalog.inc"
+  COMMENT "Checking the generated QEMU analyzer contract catalog"
+  VERBATIM)
+add_custom_target(qemu-contract-catalog-check
+  DEPENDS "${qemu_contract_catalog_stamp}")
+
 add_clang_library(clangStaticAnalyzerCheckers
   AnalysisOrderChecker.cpp
   AnalyzerStatsChecker.cpp
@@ -99,6 +122,7 @@ add_clang_library(clangStaticAnalyzerCheckers
   QEMUErrorOwnershipChecker.cpp
   QEMUGuestInputChecker.cpp
   QEMUGuestMemorySafetyChecker.cpp
+  QEMUIOMMUNotifierLifetimeChecker.cpp
   QEMULockContextChecker.cpp
   QEMUMigrationConsistencyChecker.cpp
   QEMUResourceLifetimeChecker.cpp
@@ -166,4 +190,5 @@ add_clang_library(clangStaticAnalyzerCheckers
   DEPENDS
   omp_gen
   ClangDriverOptions
+  qemu-contract-catalog-check
   )

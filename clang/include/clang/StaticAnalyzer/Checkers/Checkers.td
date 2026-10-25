@@ -660,12 +660,30 @@ def QEMUErrorOwnershipChecker : Checker<"ErrorOwnership">,
   HelpText<"Check path-sensitive ownership of QEMU Error objects">,
   Documentation<NotDocumented>;
 
+def QEMUIOMMUNotifierLifetimeChecker : Checker<"IOMMUNotifierLifetime">,
+  HelpText<"Check path-sensitive QEMU IOMMU notifier lifetime rules">,
+  Documentation<NotDocumented>;
+
 def QEMULockContextChecker : Checker<"LockContext">,
   HelpText<"Check path-sensitive QEMU RCU and BQL context rules">,
   Documentation<NotDocumented>;
 
 def QEMUMigrationConsistencyChecker : Checker<"MigrationConsistency">,
-  HelpText<"Check constant QEMU migration version relationships">,
+  HelpText<"Check QEMU migration version and schema relationships">,
+  CheckerOptions<[
+    CmdLineOption<Boolean,
+                  "EnableInlineVArrayDiagnostics",
+                  "Diagnose migration-loaded counts that can exceed fixed "
+                  "inline VMState arrays",
+                  "false",
+                  InAlpha>,
+    CmdLineOption<Boolean,
+                  "EnableFlexibleVArrayDiagnostics",
+                  "Diagnose migration-loaded counts that can exceed proven "
+                  "flexible VMState array allocations",
+                  "false",
+                  InAlpha>
+  ]>,
   Documentation<NotDocumented>;
 
 def QEMUResourceLifetimeChecker : Checker<"ResourceLifetime">,
@@ -1771,9 +1789,40 @@ def QEMUGuestMemorySafetyChecker : Checker<"GuestMemorySafety">,
                   "GuestMemorySafety diagnostics",
                   "false",
                   InAlpha>,
+    CmdLineOption<Boolean,
+                  "EnableInitializedByteTracking",
+                  "Track logical initialized-byte intervals and diagnose "
+                  "guest-visible disclosure beyond them",
+                  "false",
+                  InAlpha>,
+    CmdLineOption<Boolean,
+                  "EnableDMATransferResultDiagnostics",
+                  "Diagnose definitely discarded results from exact "
+                  "QEMU DMA transfer contracts",
+                  "false",
+                  InAlpha>,
+    CmdLineOption<Boolean,
+                  "EnableFailedCompletionPublicationDiagnostics",
+                  "Diagnose failed DMA operations followed by catalog-bound "
+                  "queue advancement and completion publication",
+                  "false",
+                  InAlpha>,
+    CmdLineOption<Integer,
+                  "MaxInitializedRangesPerObject",
+                  "Maximum exact initialized-byte intervals retained per "
+                  "object before conservatively abandoning diagnostics",
+                  "8",
+                  InAlpha>,
     CmdLineOption<String,
                   "QEMUSourceRoot",
                   "Absolute QEMU source root used to normalize witness paths",
+                  "",
+                  InAlpha>,
+    CmdLineOption<String,
+                  "SelectiveSummaryManifest",
+                  "Exact sealed selective CTU summary manifest used for "
+                  "opt-in, result-only QEMU DMA wrapper modeling; transfer "
+                  "effects remain explicitly unsupported",
                   "",
                   InAlpha>
   ]>,

@@ -9,8 +9,30 @@ import re
 import sys
 
 
-MARKER = "QEMU_GMS_WITNESS_V1="
-NOT_APPLICABLE_MARKER = "QEMU_GMS_WITNESS_NA_V1="
+CLANG_ROOT = Path(__file__).resolve().parents[3]
+ANALYZER_UTILS = CLANG_ROOT / "utils" / "analyzer"
+sys.path.insert(0, str(ANALYZER_UTILS))
+import qemu_contract_catalog as catalog_tool
+
+
+CATALOG = catalog_tool.load_json_strict(
+    CLANG_ROOT
+    / "lib"
+    / "StaticAnalyzer"
+    / "Checkers"
+    / "QEMUContractCatalog.json"
+)
+CATALOG_IDENTITY = {
+    "catalog_format": CATALOG["catalog_format"],
+    "catalog_model_version": CATALOG["model_version"],
+    "catalog_sha256": catalog_tool._sha256(
+        catalog_tool._normalized_catalog(CATALOG)
+    ),
+    "model_version": "qemu-gms-v3-v1",
+}
+
+MARKER = "QEMU_GMS_WITNESS_V2="
+NOT_APPLICABLE_MARKER = "QEMU_GMS_WITNESS_NA_V2="
 CHECKER = "alpha.qemu.GuestMemorySafety"
 
 
@@ -37,12 +59,18 @@ def expected_cases():
         }
 
     def payload(name, concrete, source, constraint, direction, address, size,
-                extent, missing, provenance="mmio"):
+                extent, missing, provenance="mmio", boundary_label="extent",
+                boundary_value="object extent",
+                rule_id="qemu.guest-memory.bounds"):
+        identity = dict(CATALOG_IDENTITY)
+        identity["rule_id"] = rule_id
         return {
             "boundary_values": [
-                {"label": "extent-minus-one", "value": "object extent - 1"},
-                {"label": "extent", "value": "object extent"},
-                {"label": "extent-plus-one", "value": "object extent + 1"},
+                {"label": boundary_label + "-minus-one",
+                 "value": boundary_value + " - 1"},
+                {"label": boundary_label, "value": boundary_value},
+                {"label": boundary_label + "-plus-one",
+                 "value": boundary_value + " + 1"},
             ],
             "concrete_value": concrete,
             "constraints": [constraint],
@@ -54,6 +82,7 @@ def expected_cases():
             },
             # The exact diagnostic fields are filled from the bound warning.
             "diagnostic": None,
+            "identity": identity,
             "kind": "qemu-gms-witness",
             "provenance": {"class": provenance, "source": source},
             "reproducer": {
@@ -62,11 +91,12 @@ def expected_cases():
                 "kind": (
                     "packet" if provenance == "network"
                     else "descriptor" if provenance == "dma"
+                    else "migration" if provenance == "migration"
                     else "qtest"
                 ),
                 "machine": None,
             },
-            "schema_version": 1,
+            "schema_version": 2,
             "sink": {
                 "access_size": size,
                 "address_or_offset": address,
@@ -77,13 +107,16 @@ def expected_cases():
                            "status": "unproven"},
         }
 
-    def not_applicable(reason):
+    def not_applicable(reason, rule_id="qemu.guest-memory.bounds"):
+        identity = dict(CATALOG_IDENTITY)
+        identity["rule_id"] = rule_id
         return {
             # The exact diagnostic fields are filled from the bound warning.
             "diagnostic": None,
+            "identity": identity,
             "kind": "qemu-gms-witness-not-applicable",
             "reason": reason,
-            "schema_version": 1,
+            "schema_version": 2,
         }
 
     array_message = (
@@ -130,7 +163,8 @@ def expected_cases():
             "access end > available guest-input bytes", "host-read",
             "byte offset 4 from callback buffer parameter 'packet'",
             f"bytes {width}", "bytes 3",
-            "access end <= available guest-input bytes", "network"))
+            "access end <= available guest-input bytes", "network",
+            rule_id="qemu.callback-buffer.bounds"))
 
     bitmap_message = (
         "Level A: guest-controlled bitmap bit index exceeds the host object "
@@ -151,30 +185,74 @@ def expected_cases():
         array_message.replace("value 4", "value 5"),
         not_applicable=not_applicable("address-computation-only"),
     )
+    for name in ("nested_address_read", "nested_address_write"):
+        add(
+            name,
+            array_message,
+            not_applicable=not_applicable("address-computation-only"),
+        )
     add(
-        "unresolved_member_access",
+        "subarray_decay",
         array_message,
-        unaccounted=True,
+        not_applicable=not_applicable("memory-access-geometry-unresolved"),
     )
+    add(
+        "smaller_dynamic_array_extent",
+        array_message.replace("value 4, elements 4", "value 1, elements 1"),
+        payload(
+            "smaller_dynamic_array_extent", "1", "expression 'data'",
+            "array index >= host object element count", "host-read",
+            "(*slots)[data]", "bytes 4", "elements 1",
+            "array index < host object element count"),
+    )
+    nested_array_message = array_message.replace(
+        "value 4, elements 4", "value 2, elements 2"
+    )
+    for name, direction in (("nested_final_read", "host-read"),
+                            ("nested_final_write", "host-write")):
+        add(name, nested_array_message, payload(
+            name, "2", "expression 'data'",
+            "array index >= host object element count", direction,
+            "slots[0][data]", "bytes 4", "elements 2",
+            "array index < host object element count"))
+    for name, direction in (("member_read", "host-read"),
+                            ("member_write", "host-write")):
+        add(name, array_message, payload(
+            name, "4", "expression 'data'",
+            "array index >= host object element count", direction,
+            "slots[data].value", "bytes 4", "elements 4",
+            "array index < host object element count"))
+    for name in ("member_bitfield_read", "member_bitfield_write"):
+        add(
+            name,
+            array_message,
+            not_applicable=not_applicable(
+                "memory-access-geometry-unresolved"
+            ),
+        )
     add("allocation_overflow", (
         "Level B: guest-controlled allocation-size arithmetic overflows before "
         "the allocation (left [9223372036854775808, 18446744073709551615], "
         "right [9223372036854775808, 18446744073709551615])"
-    ), not_applicable=not_applicable("allocation-size-arithmetic"))
+    ), not_applicable=not_applicable(
+        "allocation-size-arithmetic", "qemu.allocation-size.overflow"))
     add("availability_allocation", (
         "Level C: guest-controlled allocation size in g_malloc has no proven "
         "upper bound below its integer type maximum "
         "(value [0, 18446744073709551615], source MMIO); "
         "allocation failure can terminate QEMU"
-    ), not_applicable=not_applicable("allocation-availability"))
+    ), not_applicable=not_applicable(
+        "allocation-availability", "qemu.allocation.unbounded"))
     add("usb_setup_state", (
         "Level A: guest-controlled USB setup length state exceeds the host "
         "object extent (value 4097, bytes 4096, source USB setup packet "
         "field 'setup_buf')"
-    ), not_applicable=not_applicable("usb-state-capacity-contract"))
+    ), not_applicable=not_applicable(
+        "usb-state-capacity-contract", "qemu.usb.setup-length"))
     add("dma_map_unmap_contract", (
         "direct DMA unmap arguments match the reversed argument order"
-    ), not_applicable=not_applicable("dma-map-unmap-contract"))
+    ), not_applicable=not_applicable(
+        "dma-map-unmap-contract", "qemu.direct-dma.contract"))
     add("dma_use_after_unmap", (
         "direct DMA mapped buffer is accessed after it was unmapped"
     ), payload(
@@ -182,7 +260,8 @@ def expected_cases():
         "direct DMA mapping returned by map API",
         "nonzero memory access occurs after direct DMA unmap",
         "host-read", "effective address 'buffer'", "bytes 1", "bytes 8",
-        "memory access must precede direct DMA unmap", "dma"))
+        "memory access must precede direct DMA unmap", "dma",
+        rule_id="qemu.direct-dma.lifetime"))
     add("dma_typed_short_load", (
         "Level A: guest-controlled direct DMA mapped-buffer typed access end "
         "exceeds the host object extent (value 4, bytes 1, source DMA map "
@@ -242,7 +321,18 @@ def expected_cases():
         "dma"))
     add("dma_null_unmap_contract", (
         "direct DMA unmap is called with a null mapping"
-    ), not_applicable=not_applicable("dma-map-unmap-contract"))
+    ), not_applicable=not_applicable(
+        "dma-map-unmap-contract", "qemu.direct-dma.contract"))
+    add("initialized_output", (
+        "Level A: host-read length exceeds the initialized byte prefix "
+        "(read bytes 8, initialized bytes 4)"
+    ), payload(
+        "initialized_output", "4", "initialized-byte producer contract",
+        "host read exceeds contiguous initialized bytes 4", "host-read",
+        "effective address 'buffer', byte offset 0", "bytes 8", "bytes 8",
+        "host-read length <= contiguous initialized length", "migration",
+        "initialized-prefix", "initialized byte prefix",
+        rule_id="qemu.initialized-bytes.disclosure"))
     return cases
 
 

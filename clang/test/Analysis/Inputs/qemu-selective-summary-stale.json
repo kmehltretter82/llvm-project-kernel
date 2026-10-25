@@ -1,0 +1,9 @@
+{
+  "format": 1,
+  "kind": "qemu-selective-ctu-summary",
+  "result": "pass",
+  "qemu": {
+    "revision": "0000000000000000000000000000000000000000",
+    "dirty": false
+  }
+}

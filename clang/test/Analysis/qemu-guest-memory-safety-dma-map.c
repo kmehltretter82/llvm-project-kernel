@@ -9,6 +9,10 @@ typedef uint64_t dma_addr_t;
 
 typedef struct AddressSpace AddressSpace;
 typedef struct PCIDevice PCIDevice;
+typedef struct MemTxAttrs {
+  unsigned int unspecified : 1;
+} MemTxAttrs;
+#define MEMTXATTRS_UNSPECIFIED ((MemTxAttrs){0})
 typedef enum {
   DMA_DIRECTION_TO_DEVICE,
   DMA_DIRECTION_FROM_DEVICE,
@@ -18,10 +22,10 @@ void *memcpy(void *, const void *, size_t);
 void *memset(void *, int, size_t);
 void consume_u32(uint32_t);
 
-void *address_space_map(AddressSpace *, hwaddr, hwaddr *, _Bool, unsigned);
+void *address_space_map(AddressSpace *, hwaddr, hwaddr *, _Bool, MemTxAttrs);
 void address_space_unmap(AddressSpace *, void *, hwaddr, _Bool, hwaddr);
 void *dma_memory_map(AddressSpace *, dma_addr_t, dma_addr_t *, DMADirection,
-                     unsigned);
+                     MemTxAttrs);
 void dma_memory_unmap(AddressSpace *, void *, dma_addr_t, DMADirection,
                       dma_addr_t);
 void *pci_dma_map(PCIDevice *, dma_addr_t, dma_addr_t *, DMADirection);
@@ -43,7 +47,7 @@ typedef struct {
 void address_space_requested_length_bad(AddressSpace *as) {
   hwaddr requested = 8;
   hwaddr mapped = requested;
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 1, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 1, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return;
   memcpy(buffer, source, requested); // expected-warning {{direct DMA mapped-buffer access size may exceed the host object extent}}
@@ -52,7 +56,7 @@ void address_space_requested_length_bad(AddressSpace *as) {
 
 void address_space_returned_length_good(AddressSpace *as) {
   hwaddr mapped = 8;
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 1, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 1, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return;
   memcpy(buffer, source, mapped);
@@ -62,7 +66,7 @@ void address_space_returned_length_good(AddressSpace *as) {
 void address_space_guarded_length_good(AddressSpace *as) {
   hwaddr requested = 8;
   hwaddr mapped = requested;
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 1, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 1, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return;
   if (mapped < requested) {
@@ -75,7 +79,7 @@ void address_space_guarded_length_good(AddressSpace *as) {
 
 uint32_t address_space_typed_load_short_bad(AddressSpace *as) {
   hwaddr mapped = 4;
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return 0;
   if (mapped != 1) {
@@ -89,7 +93,7 @@ uint32_t address_space_typed_load_short_bad(AddressSpace *as) {
 
 uint32_t address_space_typed_macro_load_short_bad(AddressSpace *as) {
   hwaddr mapped = 4;
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return 0;
   if (mapped != 1) {
@@ -103,7 +107,7 @@ uint32_t address_space_typed_macro_load_short_bad(AddressSpace *as) {
 
 void address_space_typed_macro_argument_load_short_bad(AddressSpace *as) {
   hwaddr mapped = 4;
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return;
   if (mapped != 1) {
@@ -117,7 +121,7 @@ void address_space_typed_macro_argument_load_short_bad(AddressSpace *as) {
 
 void address_space_typed_store_short_bad(AddressSpace *as, uint32_t value) {
   hwaddr mapped = 4;
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 1, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 1, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return;
   if (mapped != 1) {
@@ -130,7 +134,7 @@ void address_space_typed_store_short_bad(AddressSpace *as, uint32_t value) {
 
 uint32_t address_space_typed_index_bad(AddressSpace *as) {
   hwaddr mapped = 8;
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return 0;
   if (mapped != 4) {
@@ -144,7 +148,7 @@ uint32_t address_space_typed_index_bad(AddressSpace *as) {
 
 uint32_t address_space_typed_size_t_overflow_scope(AddressSpace *as) {
   hwaddr mapped = sizeof(uint32_t);
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return 0;
   if (mapped != sizeof(uint32_t)) {
@@ -158,7 +162,7 @@ uint32_t address_space_typed_size_t_overflow_scope(AddressSpace *as) {
 
 uint32_t address_space_typed_field_bad(AddressSpace *as) {
   hwaddr mapped = sizeof(DMATypedRecord);
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return 0;
   if (mapped != sizeof(uint32_t)) {
@@ -172,7 +176,7 @@ uint32_t address_space_typed_field_bad(AddressSpace *as) {
 
 uint32_t address_space_typed_exact_end_good(AddressSpace *as) {
   hwaddr mapped = sizeof(uint32_t);
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return 0;
   if (mapped != sizeof(uint32_t)) {
@@ -186,7 +190,7 @@ uint32_t address_space_typed_exact_end_good(AddressSpace *as) {
 
 uint32_t address_space_typed_guarded_length_good(AddressSpace *as) {
   hwaddr mapped = sizeof(uint32_t);
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return 0;
   if (mapped < sizeof(uint32_t)) {
@@ -200,7 +204,7 @@ uint32_t address_space_typed_guarded_length_good(AddressSpace *as) {
 
 uint32_t address_space_typed_volatile_load_short_bad(AddressSpace *as) {
   hwaddr mapped = sizeof(uint32_t);
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return 0;
   if (mapped != 1) {
@@ -215,7 +219,7 @@ uint32_t address_space_typed_volatile_load_short_bad(AddressSpace *as) {
 void address_space_typed_volatile_store_short_bad(AddressSpace *as,
                                                   uint32_t value) {
   hwaddr mapped = sizeof(uint32_t);
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 1, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 1, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return;
   if (mapped != 1) {
@@ -228,7 +232,7 @@ void address_space_typed_volatile_store_short_bad(AddressSpace *as,
 
 uint32_t address_space_typed_pointer_alias_short_bad(AddressSpace *as) {
   hwaddr mapped = sizeof(uint32_t);
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return 0;
   uint32_t *alias = (uint32_t *)buffer;
@@ -249,7 +253,7 @@ void address_space_typed_aggregate_scope(AddressSpace *as,
                                          DMATypedRecord *destination,
                                          DMATypedRecord value) {
   hwaddr mapped = sizeof(DMATypedRecord);
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return;
   if (mapped != sizeof(uint32_t)) {
@@ -263,7 +267,7 @@ void address_space_typed_aggregate_scope(AddressSpace *as,
 
 void address_space_typed_address_only_good(AddressSpace *as) {
   hwaddr mapped = sizeof(uint32_t);
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return;
   uint32_t *address = &((uint32_t *)buffer)[1];
@@ -273,7 +277,7 @@ void address_space_typed_address_only_good(AddressSpace *as) {
 
 uint32_t address_space_typed_load_after_unmap_bad(AddressSpace *as) {
   hwaddr mapped = sizeof(uint32_t);
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return 0;
   address_space_unmap(as, buffer, mapped, 0, 0); // expected-note {{DMA mapping unmapped here}}
@@ -283,7 +287,7 @@ uint32_t address_space_typed_load_after_unmap_bad(AddressSpace *as) {
 void address_space_typed_store_after_unmap_bad(AddressSpace *as,
                                                uint32_t value) {
   hwaddr mapped = sizeof(DMATypedRecord);
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 1, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 1, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return;
   DMATypedRecord *record = (DMATypedRecord *)buffer;
@@ -294,7 +298,7 @@ void address_space_typed_store_after_unmap_bad(AddressSpace *as,
 uint32_t address_space_typed_symbolic_after_unmap_bad(AddressSpace *as,
                                                       size_t index) {
   hwaddr mapped = sizeof(DMATypedRecord);
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return 0;
   address_space_unmap(as, buffer, mapped, 0, 0); // expected-note {{DMA mapping unmapped here}}
@@ -304,7 +308,7 @@ uint32_t address_space_typed_symbolic_after_unmap_bad(AddressSpace *as,
 uint32_t dma_memory_typed_load_short_bad(AddressSpace *as) {
   dma_addr_t mapped = sizeof(uint32_t);
   unsigned char *buffer =
-      dma_memory_map(as, 0, &mapped, DMA_DIRECTION_TO_DEVICE, 0);
+      dma_memory_map(as, 0, &mapped, DMA_DIRECTION_TO_DEVICE, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return 0;
   if (mapped != 1) {
@@ -347,7 +351,7 @@ uint32_t physical_memory_typed_load_short_bad(void) {
 void address_space_source_bad(AddressSpace *as) {
   hwaddr requested = 8;
   hwaddr mapped = requested;
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return;
   memcpy(destination, buffer, requested); // expected-warning {{direct DMA mapped-buffer access size may exceed the host object extent}}
@@ -357,7 +361,7 @@ void address_space_source_bad(AddressSpace *as) {
 void address_space_offset_bad(AddressSpace *as) {
   hwaddr requested = 16;
   hwaddr mapped = requested;
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 1, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 1, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return;
   if (mapped != 12) {
@@ -372,7 +376,7 @@ void dma_memory_requested_length_bad(AddressSpace *as) {
   dma_addr_t requested = 8;
   dma_addr_t mapped = requested;
   unsigned char *buffer =
-      dma_memory_map(as, 0, &mapped, DMA_DIRECTION_FROM_DEVICE, 0);
+      dma_memory_map(as, 0, &mapped, DMA_DIRECTION_FROM_DEVICE, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return;
   memcpy(buffer, source, requested); // expected-warning {{direct DMA mapped-buffer access size may exceed the host object extent}}
@@ -403,7 +407,7 @@ void physical_memory_requested_length_bad(void) {
 void unmap_ends_extent_tracking(AddressSpace *as) {
   hwaddr requested = 8;
   hwaddr mapped = requested;
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 1, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 1, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return;
   address_space_unmap(as, buffer, mapped, 1, 0); // expected-note {{DMA mapping unmapped here}}
@@ -412,7 +416,7 @@ void unmap_ends_extent_tracking(AddressSpace *as) {
 
 void address_space_read_after_unmap_bad(AddressSpace *as) {
   hwaddr mapped = 8;
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return;
   address_space_unmap(as, buffer, mapped, 0, 0); // expected-note {{DMA mapping unmapped here}}
@@ -421,7 +425,7 @@ void address_space_read_after_unmap_bad(AddressSpace *as) {
 
 void address_space_write_after_unmap_bad(AddressSpace *as) {
   hwaddr mapped = 8;
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 1, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 1, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return;
   address_space_unmap(as, buffer, mapped, 1, 0); // expected-note {{DMA mapping unmapped here}}
@@ -430,7 +434,7 @@ void address_space_write_after_unmap_bad(AddressSpace *as) {
 
 void address_space_alias_after_unmap_bad(AddressSpace *as) {
   hwaddr mapped = 8;
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return;
   unsigned char *alias = buffer + 1;
@@ -443,11 +447,11 @@ void destination_lifetime_split_stops_only_invalid_path(AddressSpace *as,
   hwaddr destination_mapped = 8;
   hwaddr source_mapped = 8;
   unsigned char *mapped_destination =
-      address_space_map(as, 0, &destination_mapped, 1, 0);
+      address_space_map(as, 0, &destination_mapped, 1, MEMTXATTRS_UNSPECIFIED);
   if (!mapped_destination)
     return;
   unsigned char *mapped_source =
-      address_space_map(as, 8, &source_mapped, 0, 0);
+      address_space_map(as, 8, &source_mapped, 0, MEMTXATTRS_UNSPECIFIED);
   if (!mapped_source) {
     address_space_unmap(as, mapped_destination, destination_mapped, 1, 0);
     return;
@@ -464,11 +468,11 @@ void destination_spatial_report_preserves_source_lifetime(AddressSpace *as) {
   hwaddr destination_mapped = 8;
   hwaddr source_mapped = 8;
   unsigned char *mapped_destination =
-      address_space_map(as, 0, &destination_mapped, 1, 0);
+      address_space_map(as, 0, &destination_mapped, 1, MEMTXATTRS_UNSPECIFIED);
   if (!mapped_destination)
     return;
   unsigned char *mapped_source =
-      address_space_map(as, 8, &source_mapped, 0, 0);
+      address_space_map(as, 8, &source_mapped, 0, MEMTXATTRS_UNSPECIFIED);
   if (!mapped_source) {
     address_space_unmap(as, mapped_destination, destination_mapped, 1, 0);
     return;
@@ -480,7 +484,7 @@ void destination_spatial_report_preserves_source_lifetime(AddressSpace *as) {
 
 void address_space_double_unmap_bad(AddressSpace *as) {
   hwaddr mapped = 8;
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return;
   unsigned char *alias = buffer;
@@ -490,7 +494,7 @@ void address_space_double_unmap_bad(AddressSpace *as) {
 
 void address_space_zero_length_after_unmap_good(AddressSpace *as) {
   hwaddr mapped = 8;
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return;
   address_space_unmap(as, buffer, mapped, 0, 0);
@@ -499,12 +503,12 @@ void address_space_zero_length_after_unmap_good(AddressSpace *as) {
 
 void address_space_remap_after_unmap_good(AddressSpace *as) {
   hwaddr mapped = 8;
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return;
   address_space_unmap(as, buffer, mapped, 0, 0);
   mapped = 8;
-  buffer = address_space_map(as, 0, &mapped, 0, 0);
+  buffer = address_space_map(as, 0, &mapped, 0, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return;
   if (mapped < 1) {
@@ -518,7 +522,7 @@ void address_space_remap_after_unmap_good(AddressSpace *as) {
 void address_space_loop_remap_after_unmap_good(AddressSpace *as) {
   for (int i = 0; i != 2; ++i) {
     hwaddr mapped = 8;
-    unsigned char *buffer = address_space_map(as, 0, &mapped, 0, 0);
+    unsigned char *buffer = address_space_map(as, 0, &mapped, 0, MEMTXATTRS_UNSPECIFIED);
     if (!buffer)
       return;
     if (mapped < 1) {
@@ -532,7 +536,7 @@ void address_space_loop_remap_after_unmap_good(AddressSpace *as) {
 
 void address_space_unmap_reversed_order_bad(AddressSpace *as) {
   hwaddr mapped = 8;
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return;
   memcpy(destination, buffer, mapped);
@@ -543,7 +547,7 @@ void address_space_unmap_reversed_order_bad(AddressSpace *as) {
 
 void address_space_unmap_length_bad(AddressSpace *as) {
   hwaddr mapped = 8;
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 1, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 1, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return;
   if (mapped != 8)
@@ -553,7 +557,7 @@ void address_space_unmap_length_bad(AddressSpace *as) {
 
 void address_space_unmap_access_length_bad(AddressSpace *as) {
   hwaddr mapped = 8;
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 1, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 1, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return;
   if (mapped != 8)
@@ -563,7 +567,7 @@ void address_space_unmap_access_length_bad(AddressSpace *as) {
 
 void address_space_unmap_direction_bad(AddressSpace *as) {
   hwaddr mapped = 8;
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 0, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return;
   address_space_unmap(as, buffer, mapped, 1, 1); // expected-warning {{direct DMA unmap direction differs from the map direction}}
@@ -572,7 +576,7 @@ void address_space_unmap_direction_bad(AddressSpace *as) {
 void address_space_zero_access_direction_change_good(AddressSpace *as,
                                                      _Bool direction) {
   hwaddr mapped = 8;
-  unsigned char *buffer = address_space_map(as, 0, &mapped, direction, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, direction, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return;
   if (mapped != 8)
@@ -582,7 +586,7 @@ void address_space_zero_access_direction_change_good(AddressSpace *as,
 
 void address_space_partial_access_good(AddressSpace *as) {
   hwaddr mapped = 8;
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 1, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 1, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return;
   if (mapped != 8)
@@ -594,7 +598,7 @@ void address_space_partial_access_good(AddressSpace *as) {
 void dma_memory_unmap_direction_bad(AddressSpace *as) {
   dma_addr_t mapped = 8;
   unsigned char *buffer =
-      dma_memory_map(as, 0, &mapped, DMA_DIRECTION_TO_DEVICE, 0);
+      dma_memory_map(as, 0, &mapped, DMA_DIRECTION_TO_DEVICE, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     return;
   dma_memory_unmap(as, buffer, mapped, DMA_DIRECTION_FROM_DEVICE, 1); // expected-warning {{direct DMA unmap direction differs from the map direction}}
@@ -620,21 +624,21 @@ void physical_memory_bool_access_length_good(_Bool dirty) {
 
 void address_space_null_mapping_unmap_bad(AddressSpace *as) {
   hwaddr mapped = 8;
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 1, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 1, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     address_space_unmap(as, buffer, mapped, 1, 0); // expected-warning {{direct DMA unmap is called with a null mapping}}
 }
 
 void address_space_nonzero_extent_excludes_null_good(AddressSpace *as) {
   hwaddr mapped = 8;
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 1, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 1, MEMTXATTRS_UNSPECIFIED);
   if (mapped == 8 && !buffer)
     address_space_unmap(as, buffer, mapped, 1, 0);
 }
 
 void address_space_null_implies_zero_extent_good(AddressSpace *as) {
   hwaddr mapped = 8;
-  unsigned char *buffer = address_space_map(as, 0, &mapped, 1, 0);
+  unsigned char *buffer = address_space_map(as, 0, &mapped, 1, MEMTXATTRS_UNSPECIFIED);
   if (!buffer && mapped != 0)
     address_space_unmap(as, buffer, mapped, 1, 0);
 }
@@ -642,7 +646,7 @@ void address_space_null_implies_zero_extent_good(AddressSpace *as) {
 void dma_memory_null_mapping_unmap_bad(AddressSpace *as) {
   dma_addr_t mapped = 8;
   unsigned char *buffer =
-      dma_memory_map(as, 0, &mapped, DMA_DIRECTION_FROM_DEVICE, 0);
+      dma_memory_map(as, 0, &mapped, DMA_DIRECTION_FROM_DEVICE, MEMTXATTRS_UNSPECIFIED);
   if (!buffer)
     dma_memory_unmap(as, buffer, mapped, DMA_DIRECTION_FROM_DEVICE, 0); // expected-warning {{direct DMA unmap is called with a null mapping}}
 }

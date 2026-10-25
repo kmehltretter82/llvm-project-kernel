@@ -1,0 +1,965 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://clang.llvm.org/qemu/QEMUContractCatalog.schema.json",
+  "title": "QEMU static-analyzer contract catalog",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "catalog_format",
+    "model_version",
+    "contracts",
+    "callback_bindings",
+    "protocols"
+  ],
+  "properties": {
+    "catalog_format": {
+      "const": 5
+    },
+    "model_version": {
+      "type": "string",
+      "pattern": "^qemu-v3-[a-z0-9][a-z0-9.-]*$"
+    },
+    "contracts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/contract"
+      }
+    },
+    "callback_bindings": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/callback_binding"
+      }
+    },
+    "protocols": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/protocol"
+      }
+    }
+  },
+  "$defs": {
+    "selector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "name",
+        "header",
+        "translation_unit"
+      ],
+      "properties": {
+        "kind": {
+          "const": "function"
+        },
+        "name": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        },
+        "header": {
+          "type": "string",
+          "pattern": "^include/[A-Za-z0-9_./-]+\\.h$"
+        },
+        "translation_unit": {
+          "type": "string",
+          "pattern": "^(?:[A-Za-z0-9_.+-]+/)*[A-Za-z0-9_.+-]+\\.(?:c|cc|cpp|cxx)$"
+        }
+      }
+    },
+    "parameter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "type"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        },
+        "type": {
+          "type": "string",
+          "pattern": "^(?:const )?[A-Za-z_][A-Za-z0-9_]*(?: \\*+)?$"
+        }
+      }
+    },
+    "prototype": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "return_type",
+        "parameters"
+      ],
+      "properties": {
+        "return_type": {
+          "type": "string",
+          "pattern": "^(?:const )?[A-Za-z_][A-Za-z0-9_]*(?: \\*+)?$"
+        },
+        "parameters": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/parameter"
+          }
+        }
+      }
+    },
+    "member_step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "record_type",
+        "field",
+        "type",
+        "header"
+      ],
+      "properties": {
+        "record_type": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        },
+        "field": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        },
+        "type": {
+          "type": "string",
+          "pattern": "^(?:const )?[A-Za-z_][A-Za-z0-9_]*(?: \\*+)?$"
+        },
+        "header": {
+          "type": "string",
+          "pattern": "^include/[A-Za-z0-9_./-]+\\.h$"
+        }
+      }
+    },
+    "operand": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "source",
+        "phase"
+      ],
+      "properties": {
+        "role": {
+          "enum": [
+            "owner",
+            "guest_address",
+            "requested_length",
+            "mapped_buffer",
+            "mapped_length",
+            "direction",
+            "attributes",
+            "access_length",
+            "host_buffer",
+            "transfer_length",
+            "result",
+            "access_offset",
+            "capacity_selector",
+            "primary_capacity",
+            "alternate_capacity",
+            "status",
+            "endpoint_type",
+            "setup_parameter",
+            "notifier",
+            "callback",
+            "memory_region",
+            "flags",
+            "range_start",
+            "range_end",
+            "iommu_index",
+            "error"
+          ]
+        },
+        "source": {
+          "enum": [
+            "argument",
+            "argument_pointee",
+            "argument_member",
+            "return"
+          ]
+        },
+        "index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "phase": {
+          "enum": [
+            "pre",
+            "post"
+          ]
+        },
+        "path": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": {
+            "$ref": "#/$defs/member_step"
+          }
+        }
+      }
+    },
+    "rhs": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "operand"
+          ],
+          "properties": {
+            "operand": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "integer"
+          ],
+          "properties": {
+            "integer": {
+              "type": "integer"
+            }
+          }
+        }
+      ]
+    },
+    "predicate": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "constant"
+          ],
+          "properties": {
+            "constant": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "operand",
+            "operator"
+          ],
+          "properties": {
+            "operand": {
+              "type": "string"
+            },
+            "operator": {
+              "enum": [
+                "is_null",
+                "not_null",
+                "eq",
+                "ne",
+                "lt",
+                "le",
+                "gt",
+                "ge"
+              ]
+            },
+            "rhs": {
+              "$ref": "#/$defs/rhs"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "all"
+          ],
+          "properties": {
+            "all": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/predicate"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "any"
+          ],
+          "properties": {
+            "any": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/predicate"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "not"
+          ],
+          "properties": {
+            "not": {
+              "$ref": "#/$defs/predicate"
+            }
+          }
+        }
+      ]
+    },
+    "predicates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "success",
+        "partial_success",
+        "failure"
+      ],
+      "properties": {
+        "success": {
+          "$ref": "#/$defs/predicate"
+        },
+        "partial_success": {
+          "$ref": "#/$defs/predicate"
+        },
+        "failure": {
+          "$ref": "#/$defs/predicate"
+        }
+      }
+    },
+    "effect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "when",
+        "target"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "map",
+            "unmap",
+            "invalidate",
+            "transfer",
+            "packet-copy",
+            "initialize-resource",
+            "register-callback",
+            "unregister-callback"
+          ]
+        },
+        "when": {
+          "enum": [
+            "success",
+            "partial_success",
+            "failure"
+          ]
+        },
+        "target": {
+          "type": "string"
+        },
+        "extent": {
+          "type": "string"
+        },
+        "requested_extent": {
+          "type": "string"
+        },
+        "access_extent": {
+          "type": "string"
+        },
+        "direction": {
+          "type": "string"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "callback": {
+          "type": "string"
+        },
+        "memory_region": {
+          "type": "string"
+        },
+        "epoch": {
+          "enum": [
+            "create",
+            "retire"
+          ]
+        },
+        "offset": {
+          "type": "string"
+        },
+        "capacity_selector": {
+          "type": "string"
+        },
+        "primary_capacity": {
+          "type": "string"
+        },
+        "alternate_capacity": {
+          "type": "string"
+        }
+      }
+    },
+    "pair": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_id",
+        "relation"
+      ],
+      "properties": {
+        "contract_id": {
+          "type": "string",
+          "pattern": "^qemu\\.[a-z0-9][a-z0-9.-]*$"
+        },
+        "relation": {
+          "enum": [
+            "map-to-unmap",
+            "unmap-to-map",
+            "register-callback-to-unregister-callback",
+            "unregister-callback-to-register-callback"
+          ]
+        }
+      }
+    },
+    "contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "rule_id",
+        "family",
+        "kind",
+        "selector",
+        "prototype",
+        "direction_encoding",
+        "operands",
+        "predicates",
+        "effects",
+        "pair"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^qemu\\.[a-z0-9][a-z0-9.-]*$"
+        },
+        "rule_id": {
+          "type": "string",
+          "pattern": "^qemu\\.[a-z0-9][a-z0-9.-]*$"
+        },
+        "additional_rule_ids": {
+          "type": "array",
+          "maxItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^qemu\\.[a-z0-9][a-z0-9.-]*$"
+          }
+        },
+        "family": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$"
+        },
+        "kind": {
+          "enum": [
+            "map",
+            "unmap",
+            "transfer",
+            "packet-copy",
+            "initialize-resource",
+            "register-callback",
+            "unregister-callback"
+          ]
+        },
+        "selector": {
+          "$ref": "#/$defs/selector"
+        },
+        "prototype": {
+          "$ref": "#/$defs/prototype"
+        },
+        "direction_encoding": {
+          "enum": [
+            "bool-is-write",
+            "dma-direction",
+            "fixed-to-device",
+            "fixed-from-device",
+            "usb-token-pid",
+            "none"
+          ]
+        },
+        "operands": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/operand"
+          }
+        },
+        "predicates": {
+          "$ref": "#/$defs/predicates"
+        },
+        "effects": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/effect"
+          }
+        },
+        "pair": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/pair"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "callback_slot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "record_type",
+        "field",
+        "header",
+        "translation_unit",
+        "implementation"
+      ],
+      "properties": {
+        "record_type": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        },
+        "field": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        },
+        "header": {
+          "type": "string",
+          "pattern": "^include/[A-Za-z0-9_./-]+\\.h$"
+        },
+        "translation_unit": {
+          "type": "string",
+          "pattern": "^(?:[A-Za-z0-9_.+-]+/)*[A-Za-z0-9_.+-]+\\.(?:c|cc|cpp|cxx)$"
+        },
+        "implementation": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        }
+      }
+    },
+    "callback_registration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "record_type",
+        "field",
+        "header",
+        "translation_unit",
+        "prototype",
+        "variable",
+        "initializer"
+      ],
+      "properties": {
+        "record_type": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        },
+        "field": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        },
+        "header": {
+          "type": "string",
+          "pattern": "^include/[A-Za-z0-9_./-]+\\.h$"
+        },
+        "translation_unit": {
+          "type": "string",
+          "pattern": "^(?:[A-Za-z0-9_.+-]+/)*[A-Za-z0-9_.+-]+\\.(?:c|cc|cpp|cxx)$"
+        },
+        "variable": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        },
+        "initializer": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        },
+        "prototype": {
+          "$ref": "#/$defs/prototype"
+        }
+      }
+    },
+    "callback_entry_input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "source",
+        "index"
+      ],
+      "properties": {
+        "role": {
+          "enum": [
+            "control-request",
+            "control-value",
+            "control-index",
+            "control-length",
+            "packet-direction",
+            "packet-capacity-selector",
+            "packet-primary-capacity",
+            "packet-alternate-capacity",
+            "packet-setup-parameter",
+            "packet-endpoint-number",
+            "packet-endpoint-type"
+          ]
+        },
+        "source": {
+          "enum": [
+            "argument",
+            "argument_member"
+          ]
+        },
+        "index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "path": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": {
+            "$ref": "#/$defs/member_step"
+          }
+        }
+      }
+    },
+    "callback_input_buffer_condition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "mask",
+        "equals"
+      ],
+      "properties": {
+        "role": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        },
+        "mask": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 18446744073709551615
+        },
+        "equals": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        }
+      }
+    },
+    "callback_input_buffer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "buffer_index",
+        "length_role",
+        "active_when"
+      ],
+      "properties": {
+        "buffer_index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "length_role": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        },
+        "active_when": {
+          "$ref": "#/$defs/callback_input_buffer_condition"
+        }
+      }
+    },
+    "callback_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "rule_ids",
+        "family",
+        "slot",
+        "prototype",
+        "registration",
+        "entry_inputs",
+        "input_buffers"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^qemu\\.[a-z0-9][a-z0-9.-]*$"
+        },
+        "rule_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^qemu\\.[a-z0-9][a-z0-9.-]*$"
+          }
+        },
+        "family": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$"
+        },
+        "slot": {
+          "$ref": "#/$defs/callback_slot"
+        },
+        "prototype": {
+          "$ref": "#/$defs/prototype"
+        },
+        "registration": {
+          "$ref": "#/$defs/callback_registration"
+        },
+        "entry_inputs": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 7,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/callback_entry_input"
+          }
+        },
+        "input_buffers": {
+          "type": "array",
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/callback_input_buffer"
+          }
+        }
+      }
+    },
+    "protocol_scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "name",
+        "source",
+        "translation_unit",
+        "prototype"
+      ],
+      "properties": {
+        "kind": {
+          "const": "function-definition"
+        },
+        "name": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        },
+        "source": {
+          "type": "string",
+          "pattern": "^(?:[A-Za-z0-9_.+-]+/)*[A-Za-z0-9_.+-]+\\.(?:c|cc|cpp|cxx)$"
+        },
+        "translation_unit": {
+          "type": "string",
+          "pattern": "^(?:[A-Za-z0-9_.+-]+/)*[A-Za-z0-9_.+-]+\\.(?:c|cc|cpp|cxx)$"
+        },
+        "prototype": {
+          "$ref": "#/$defs/prototype"
+        }
+      }
+    },
+    "protocol_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "source"
+      ],
+      "properties": {
+        "role": {
+          "enum": [
+            "owner",
+            "queue",
+            "attempt",
+            "slot",
+            "vector",
+            "result"
+          ]
+        },
+        "source": {
+          "enum": [
+            "scope-argument",
+            "transfer-result",
+            "member-value-pre",
+            "integer-constant"
+          ]
+        },
+        "index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "record_type": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        },
+        "field": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        },
+        "value": {
+          "type": "integer",
+          "minimum": -9223372036854775808,
+          "maximum": 9223372036854775807
+        }
+      }
+    },
+    "protocol_selector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "phase",
+        "expected_count"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "transfer-call",
+            "member-update",
+            "function-call"
+          ]
+        },
+        "contract_id": {
+          "type": "string",
+          "pattern": "^qemu\\.[a-z0-9][a-z0-9.-]*$"
+        },
+        "name": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        },
+        "prototype": {
+          "$ref": "#/$defs/prototype"
+        },
+        "record_type": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        },
+        "field": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        },
+        "operation": {
+          "enum": [
+            "pre-decrement",
+            "post-decrement",
+            "pre-increment",
+            "post-increment",
+            "add-assign",
+            "subtract-assign"
+          ]
+        },
+        "phase": {
+          "enum": [
+            "post-call",
+            "bind",
+            "pre-call"
+          ]
+        },
+        "result_path": {
+          "const": "failure"
+        },
+        "expected_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64
+        }
+      }
+    },
+    "protocol_event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stage",
+        "selectors"
+      ],
+      "properties": {
+        "stage": {
+          "enum": [
+            "descriptor-failed",
+            "ring-advanced",
+            "interrupt-published"
+          ]
+        },
+        "selectors": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/protocol_selector"
+          }
+        }
+      }
+    },
+    "protocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "rule_id",
+        "family",
+        "scope",
+        "bindings",
+        "events"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^qemu\\.[a-z0-9][a-z0-9.-]*$"
+        },
+        "rule_id": {
+          "type": "string",
+          "pattern": "^qemu\\.[a-z0-9][a-z0-9.-]*$"
+        },
+        "family": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$"
+        },
+        "scope": {
+          "$ref": "#/$defs/protocol_scope"
+        },
+        "bindings": {
+          "type": "array",
+          "minItems": 6,
+          "maxItems": 6,
+          "items": {
+            "$ref": "#/$defs/protocol_binding"
+          }
+        },
+        "events": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {
+            "$ref": "#/$defs/protocol_event"
+          }
+        }
+      }
+    }
+  }
+}

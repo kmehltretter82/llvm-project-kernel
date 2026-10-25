@@ -1,0 +1,1356 @@
+{
+  "catalog_format": 5,
+  "model_version": "qemu-v3-io-contracts-v7",
+  "contracts": [
+    {
+      "id": "qemu.dma.address-space.map",
+      "rule_id": "qemu.direct-dma-map",
+      "family": "address-space",
+      "kind": "map",
+      "selector": {
+        "kind": "function",
+        "name": "address_space_map",
+        "header": "include/system/memory.h",
+        "translation_unit": "system/memory.c"
+      },
+      "prototype": {
+        "return_type": "void *",
+        "parameters": [
+          { "name": "as", "type": "AddressSpace *" },
+          { "name": "addr", "type": "hwaddr" },
+          { "name": "plen", "type": "hwaddr *" },
+          { "name": "is_write", "type": "bool" },
+          { "name": "attrs", "type": "MemTxAttrs" }
+        ]
+      },
+      "direction_encoding": "bool-is-write",
+      "operands": [
+        { "role": "owner", "source": "argument", "index": 0, "phase": "pre" },
+        { "role": "guest_address", "source": "argument", "index": 1, "phase": "pre" },
+        { "role": "requested_length", "source": "argument_pointee", "index": 2, "phase": "pre" },
+        { "role": "mapped_length", "source": "argument_pointee", "index": 2, "phase": "post" },
+        { "role": "direction", "source": "argument", "index": 3, "phase": "pre" },
+        { "role": "attributes", "source": "argument", "index": 4, "phase": "pre" },
+        { "role": "mapped_buffer", "source": "return", "phase": "post" }
+      ],
+      "predicates": {
+        "success": { "operand": "mapped_buffer", "operator": "not_null" },
+        "partial_success": {
+          "all": [
+            { "operand": "mapped_buffer", "operator": "not_null" },
+            { "operand": "mapped_length", "operator": "lt", "rhs": { "operand": "requested_length" } }
+          ]
+        },
+        "failure": { "operand": "mapped_buffer", "operator": "is_null" }
+      },
+      "effects": [
+        {
+          "kind": "map",
+          "when": "success",
+          "target": "mapped_buffer",
+          "extent": "mapped_length",
+          "requested_extent": "requested_length",
+          "direction": "direction",
+          "owner": "owner",
+          "epoch": "create"
+        }
+      ],
+      "pair": {
+        "contract_id": "qemu.dma.address-space.unmap",
+        "relation": "map-to-unmap"
+      }
+    },
+    {
+      "id": "qemu.dma.address-space.unmap",
+      "rule_id": "qemu.direct-dma-unmap",
+      "family": "address-space",
+      "kind": "unmap",
+      "selector": {
+        "kind": "function",
+        "name": "address_space_unmap",
+        "header": "include/system/memory.h",
+        "translation_unit": "system/memory.c"
+      },
+      "prototype": {
+        "return_type": "void",
+        "parameters": [
+          { "name": "as", "type": "AddressSpace *" },
+          { "name": "buffer", "type": "void *" },
+          { "name": "len", "type": "hwaddr" },
+          { "name": "is_write", "type": "bool" },
+          { "name": "access_len", "type": "hwaddr" }
+        ]
+      },
+      "direction_encoding": "bool-is-write",
+      "operands": [
+        { "role": "owner", "source": "argument", "index": 0, "phase": "pre" },
+        { "role": "mapped_buffer", "source": "argument", "index": 1, "phase": "pre" },
+        { "role": "mapped_length", "source": "argument", "index": 2, "phase": "pre" },
+        { "role": "direction", "source": "argument", "index": 3, "phase": "pre" },
+        { "role": "access_length", "source": "argument", "index": 4, "phase": "pre" }
+      ],
+      "predicates": {
+        "success": { "constant": true },
+        "partial_success": { "constant": false },
+        "failure": { "constant": false }
+      },
+      "effects": [
+        {
+          "kind": "unmap",
+          "when": "success",
+          "target": "mapped_buffer",
+          "extent": "mapped_length",
+          "access_extent": "access_length",
+          "direction": "direction",
+          "owner": "owner"
+        },
+        {
+          "kind": "invalidate",
+          "when": "success",
+          "target": "mapped_buffer",
+          "epoch": "retire"
+        }
+      ],
+      "pair": {
+        "contract_id": "qemu.dma.address-space.map",
+        "relation": "unmap-to-map"
+      }
+    },
+    {
+      "id": "qemu.dma.dma-memory.map",
+      "rule_id": "qemu.direct-dma-map",
+      "family": "dma-memory",
+      "kind": "map",
+      "selector": {
+        "kind": "function",
+        "name": "dma_memory_map",
+        "header": "include/system/dma.h",
+        "translation_unit": "system/dma-helpers.c"
+      },
+      "prototype": {
+        "return_type": "void *",
+        "parameters": [
+          { "name": "as", "type": "AddressSpace *" },
+          { "name": "addr", "type": "dma_addr_t" },
+          { "name": "len", "type": "dma_addr_t *" },
+          { "name": "dir", "type": "DMADirection" },
+          { "name": "attrs", "type": "MemTxAttrs" }
+        ]
+      },
+      "direction_encoding": "dma-direction",
+      "operands": [
+        { "role": "owner", "source": "argument", "index": 0, "phase": "pre" },
+        { "role": "guest_address", "source": "argument", "index": 1, "phase": "pre" },
+        { "role": "requested_length", "source": "argument_pointee", "index": 2, "phase": "pre" },
+        { "role": "mapped_length", "source": "argument_pointee", "index": 2, "phase": "post" },
+        { "role": "direction", "source": "argument", "index": 3, "phase": "pre" },
+        { "role": "attributes", "source": "argument", "index": 4, "phase": "pre" },
+        { "role": "mapped_buffer", "source": "return", "phase": "post" }
+      ],
+      "predicates": {
+        "success": { "operand": "mapped_buffer", "operator": "not_null" },
+        "partial_success": {
+          "all": [
+            { "operand": "mapped_buffer", "operator": "not_null" },
+            { "operand": "mapped_length", "operator": "lt", "rhs": { "operand": "requested_length" } }
+          ]
+        },
+        "failure": { "operand": "mapped_buffer", "operator": "is_null" }
+      },
+      "effects": [
+        {
+          "kind": "map",
+          "when": "success",
+          "target": "mapped_buffer",
+          "extent": "mapped_length",
+          "requested_extent": "requested_length",
+          "direction": "direction",
+          "owner": "owner",
+          "epoch": "create"
+        }
+      ],
+      "pair": {
+        "contract_id": "qemu.dma.dma-memory.unmap",
+        "relation": "map-to-unmap"
+      }
+    },
+    {
+      "id": "qemu.dma.dma-memory.unmap",
+      "rule_id": "qemu.direct-dma-unmap",
+      "family": "dma-memory",
+      "kind": "unmap",
+      "selector": {
+        "kind": "function",
+        "name": "dma_memory_unmap",
+        "header": "include/system/dma.h",
+        "translation_unit": "system/dma-helpers.c"
+      },
+      "prototype": {
+        "return_type": "void",
+        "parameters": [
+          { "name": "as", "type": "AddressSpace *" },
+          { "name": "buffer", "type": "void *" },
+          { "name": "len", "type": "dma_addr_t" },
+          { "name": "dir", "type": "DMADirection" },
+          { "name": "access_len", "type": "dma_addr_t" }
+        ]
+      },
+      "direction_encoding": "dma-direction",
+      "operands": [
+        { "role": "owner", "source": "argument", "index": 0, "phase": "pre" },
+        { "role": "mapped_buffer", "source": "argument", "index": 1, "phase": "pre" },
+        { "role": "mapped_length", "source": "argument", "index": 2, "phase": "pre" },
+        { "role": "direction", "source": "argument", "index": 3, "phase": "pre" },
+        { "role": "access_length", "source": "argument", "index": 4, "phase": "pre" }
+      ],
+      "predicates": {
+        "success": { "constant": true },
+        "partial_success": { "constant": false },
+        "failure": { "constant": false }
+      },
+      "effects": [
+        {
+          "kind": "unmap",
+          "when": "success",
+          "target": "mapped_buffer",
+          "extent": "mapped_length",
+          "access_extent": "access_length",
+          "direction": "direction",
+          "owner": "owner"
+        },
+        {
+          "kind": "invalidate",
+          "when": "success",
+          "target": "mapped_buffer",
+          "epoch": "retire"
+        }
+      ],
+      "pair": {
+        "contract_id": "qemu.dma.dma-memory.map",
+        "relation": "unmap-to-map"
+      }
+    },
+    {
+      "id": "qemu.dma.pci.map",
+      "rule_id": "qemu.direct-dma-map",
+      "family": "pci",
+      "kind": "map",
+      "selector": {
+        "kind": "function",
+        "name": "pci_dma_map",
+        "header": "include/hw/pci/pci_device.h",
+        "translation_unit": "hw/pci/pci.c"
+      },
+      "prototype": {
+        "return_type": "void *",
+        "parameters": [
+          { "name": "dev", "type": "PCIDevice *" },
+          { "name": "addr", "type": "dma_addr_t" },
+          { "name": "plen", "type": "dma_addr_t *" },
+          { "name": "dir", "type": "DMADirection" }
+        ]
+      },
+      "direction_encoding": "dma-direction",
+      "operands": [
+        { "role": "owner", "source": "argument", "index": 0, "phase": "pre" },
+        { "role": "guest_address", "source": "argument", "index": 1, "phase": "pre" },
+        { "role": "requested_length", "source": "argument_pointee", "index": 2, "phase": "pre" },
+        { "role": "mapped_length", "source": "argument_pointee", "index": 2, "phase": "post" },
+        { "role": "direction", "source": "argument", "index": 3, "phase": "pre" },
+        { "role": "mapped_buffer", "source": "return", "phase": "post" }
+      ],
+      "predicates": {
+        "success": { "operand": "mapped_buffer", "operator": "not_null" },
+        "partial_success": {
+          "all": [
+            { "operand": "mapped_buffer", "operator": "not_null" },
+            { "operand": "mapped_length", "operator": "lt", "rhs": { "operand": "requested_length" } }
+          ]
+        },
+        "failure": { "operand": "mapped_buffer", "operator": "is_null" }
+      },
+      "effects": [
+        {
+          "kind": "map",
+          "when": "success",
+          "target": "mapped_buffer",
+          "extent": "mapped_length",
+          "requested_extent": "requested_length",
+          "direction": "direction",
+          "owner": "owner",
+          "epoch": "create"
+        }
+      ],
+      "pair": {
+        "contract_id": "qemu.dma.pci.unmap",
+        "relation": "map-to-unmap"
+      }
+    },
+    {
+      "id": "qemu.dma.pci.unmap",
+      "rule_id": "qemu.direct-dma-unmap",
+      "family": "pci",
+      "kind": "unmap",
+      "selector": {
+        "kind": "function",
+        "name": "pci_dma_unmap",
+        "header": "include/hw/pci/pci_device.h",
+        "translation_unit": "hw/pci/pci.c"
+      },
+      "prototype": {
+        "return_type": "void",
+        "parameters": [
+          { "name": "dev", "type": "PCIDevice *" },
+          { "name": "buffer", "type": "void *" },
+          { "name": "len", "type": "dma_addr_t" },
+          { "name": "dir", "type": "DMADirection" },
+          { "name": "access_len", "type": "dma_addr_t" }
+        ]
+      },
+      "direction_encoding": "dma-direction",
+      "operands": [
+        { "role": "owner", "source": "argument", "index": 0, "phase": "pre" },
+        { "role": "mapped_buffer", "source": "argument", "index": 1, "phase": "pre" },
+        { "role": "mapped_length", "source": "argument", "index": 2, "phase": "pre" },
+        { "role": "direction", "source": "argument", "index": 3, "phase": "pre" },
+        { "role": "access_length", "source": "argument", "index": 4, "phase": "pre" }
+      ],
+      "predicates": {
+        "success": { "constant": true },
+        "partial_success": { "constant": false },
+        "failure": { "constant": false }
+      },
+      "effects": [
+        {
+          "kind": "unmap",
+          "when": "success",
+          "target": "mapped_buffer",
+          "extent": "mapped_length",
+          "access_extent": "access_length",
+          "direction": "direction",
+          "owner": "owner"
+        },
+        {
+          "kind": "invalidate",
+          "when": "success",
+          "target": "mapped_buffer",
+          "epoch": "retire"
+        }
+      ],
+      "pair": {
+        "contract_id": "qemu.dma.pci.map",
+        "relation": "unmap-to-map"
+      }
+    },
+    {
+      "id": "qemu.dma.physical-memory.map",
+      "rule_id": "qemu.direct-dma-map",
+      "family": "physical-memory",
+      "kind": "map",
+      "selector": {
+        "kind": "function",
+        "name": "physical_memory_map",
+        "header": "include/system/physmem.h",
+        "translation_unit": "system/physmem.c"
+      },
+      "prototype": {
+        "return_type": "void *",
+        "parameters": [
+          { "name": "addr", "type": "hwaddr" },
+          { "name": "plen", "type": "hwaddr *" },
+          { "name": "is_write", "type": "bool" }
+        ]
+      },
+      "direction_encoding": "bool-is-write",
+      "operands": [
+        { "role": "guest_address", "source": "argument", "index": 0, "phase": "pre" },
+        { "role": "requested_length", "source": "argument_pointee", "index": 1, "phase": "pre" },
+        { "role": "mapped_length", "source": "argument_pointee", "index": 1, "phase": "post" },
+        { "role": "direction", "source": "argument", "index": 2, "phase": "pre" },
+        { "role": "mapped_buffer", "source": "return", "phase": "post" }
+      ],
+      "predicates": {
+        "success": { "operand": "mapped_buffer", "operator": "not_null" },
+        "partial_success": {
+          "all": [
+            { "operand": "mapped_buffer", "operator": "not_null" },
+            { "operand": "mapped_length", "operator": "lt", "rhs": { "operand": "requested_length" } }
+          ]
+        },
+        "failure": { "operand": "mapped_buffer", "operator": "is_null" }
+      },
+      "effects": [
+        {
+          "kind": "map",
+          "when": "success",
+          "target": "mapped_buffer",
+          "extent": "mapped_length",
+          "requested_extent": "requested_length",
+          "direction": "direction",
+          "epoch": "create"
+        }
+      ],
+      "pair": {
+        "contract_id": "qemu.dma.physical-memory.unmap",
+        "relation": "map-to-unmap"
+      }
+    },
+    {
+      "id": "qemu.dma.physical-memory.unmap",
+      "rule_id": "qemu.direct-dma-unmap",
+      "family": "physical-memory",
+      "kind": "unmap",
+      "selector": {
+        "kind": "function",
+        "name": "physical_memory_unmap",
+        "header": "include/system/physmem.h",
+        "translation_unit": "system/physmem.c"
+      },
+      "prototype": {
+        "return_type": "void",
+        "parameters": [
+          { "name": "buffer", "type": "void *" },
+          { "name": "len", "type": "hwaddr" },
+          { "name": "is_write", "type": "bool" },
+          { "name": "access_len", "type": "hwaddr" }
+        ]
+      },
+      "direction_encoding": "bool-is-write",
+      "operands": [
+        { "role": "mapped_buffer", "source": "argument", "index": 0, "phase": "pre" },
+        { "role": "mapped_length", "source": "argument", "index": 1, "phase": "pre" },
+        { "role": "direction", "source": "argument", "index": 2, "phase": "pre" },
+        { "role": "access_length", "source": "argument", "index": 3, "phase": "pre" }
+      ],
+      "predicates": {
+        "success": { "constant": true },
+        "partial_success": { "constant": false },
+        "failure": { "constant": false }
+      },
+      "effects": [
+        {
+          "kind": "unmap",
+          "when": "success",
+          "target": "mapped_buffer",
+          "extent": "mapped_length",
+          "access_extent": "access_length",
+          "direction": "direction"
+        },
+        {
+          "kind": "invalidate",
+          "when": "success",
+          "target": "mapped_buffer",
+          "epoch": "retire"
+        }
+      ],
+      "pair": {
+        "contract_id": "qemu.dma.physical-memory.map",
+        "relation": "unmap-to-map"
+      }
+    },
+    {
+      "id": "qemu.transfer.address-space.read",
+      "rule_id": "qemu.dma-transfer-result",
+      "family": "address-space",
+      "kind": "transfer",
+      "selector": {
+        "kind": "function",
+        "name": "address_space_read",
+        "header": "include/system/memory.h",
+        "translation_unit": "system/physmem.c"
+      },
+      "prototype": {
+        "return_type": "MemTxResult",
+        "parameters": [
+          { "name": "as", "type": "const AddressSpace *" },
+          { "name": "addr", "type": "hwaddr" },
+          { "name": "attrs", "type": "MemTxAttrs" },
+          { "name": "buf", "type": "void *" },
+          { "name": "len", "type": "hwaddr" }
+        ]
+      },
+      "direction_encoding": "fixed-to-device",
+      "operands": [
+        { "role": "owner", "source": "argument", "index": 0, "phase": "pre" },
+        { "role": "guest_address", "source": "argument", "index": 1, "phase": "pre" },
+        { "role": "attributes", "source": "argument", "index": 2, "phase": "pre" },
+        { "role": "host_buffer", "source": "argument", "index": 3, "phase": "pre" },
+        { "role": "transfer_length", "source": "argument", "index": 4, "phase": "pre" },
+        { "role": "result", "source": "return", "phase": "post" }
+      ],
+      "predicates": {
+        "success": { "operand": "result", "operator": "eq", "rhs": { "integer": 0 } },
+        "partial_success": { "constant": false },
+        "failure": { "operand": "result", "operator": "ne", "rhs": { "integer": 0 } }
+      },
+      "effects": [
+        {
+          "kind": "transfer",
+          "when": "success",
+          "target": "host_buffer",
+          "extent": "transfer_length",
+          "owner": "owner"
+        }
+      ],
+      "pair": null
+    },
+    {
+      "id": "qemu.transfer.address-space.rw",
+      "rule_id": "qemu.dma-transfer-result",
+      "family": "address-space",
+      "kind": "transfer",
+      "selector": {
+        "kind": "function",
+        "name": "address_space_rw",
+        "header": "include/system/memory.h",
+        "translation_unit": "system/physmem.c"
+      },
+      "prototype": {
+        "return_type": "MemTxResult",
+        "parameters": [
+          { "name": "as", "type": "const AddressSpace *" },
+          { "name": "addr", "type": "hwaddr" },
+          { "name": "attrs", "type": "MemTxAttrs" },
+          { "name": "buf", "type": "void *" },
+          { "name": "len", "type": "hwaddr" },
+          { "name": "is_write", "type": "bool" }
+        ]
+      },
+      "direction_encoding": "bool-is-write",
+      "operands": [
+        { "role": "owner", "source": "argument", "index": 0, "phase": "pre" },
+        { "role": "guest_address", "source": "argument", "index": 1, "phase": "pre" },
+        { "role": "attributes", "source": "argument", "index": 2, "phase": "pre" },
+        { "role": "host_buffer", "source": "argument", "index": 3, "phase": "pre" },
+        { "role": "transfer_length", "source": "argument", "index": 4, "phase": "pre" },
+        { "role": "direction", "source": "argument", "index": 5, "phase": "pre" },
+        { "role": "result", "source": "return", "phase": "post" }
+      ],
+      "predicates": {
+        "success": { "operand": "result", "operator": "eq", "rhs": { "integer": 0 } },
+        "partial_success": { "constant": false },
+        "failure": { "operand": "result", "operator": "ne", "rhs": { "integer": 0 } }
+      },
+      "effects": [
+        {
+          "kind": "transfer",
+          "when": "success",
+          "target": "host_buffer",
+          "extent": "transfer_length",
+          "direction": "direction",
+          "owner": "owner"
+        }
+      ],
+      "pair": null
+    },
+    {
+      "id": "qemu.transfer.address-space.write",
+      "rule_id": "qemu.dma-transfer-result",
+      "family": "address-space",
+      "kind": "transfer",
+      "selector": {
+        "kind": "function",
+        "name": "address_space_write",
+        "header": "include/system/memory.h",
+        "translation_unit": "system/physmem.c"
+      },
+      "prototype": {
+        "return_type": "MemTxResult",
+        "parameters": [
+          { "name": "as", "type": "const AddressSpace *" },
+          { "name": "addr", "type": "hwaddr" },
+          { "name": "attrs", "type": "MemTxAttrs" },
+          { "name": "buf", "type": "const void *" },
+          { "name": "len", "type": "hwaddr" }
+        ]
+      },
+      "direction_encoding": "fixed-from-device",
+      "operands": [
+        { "role": "owner", "source": "argument", "index": 0, "phase": "pre" },
+        { "role": "guest_address", "source": "argument", "index": 1, "phase": "pre" },
+        { "role": "attributes", "source": "argument", "index": 2, "phase": "pre" },
+        { "role": "host_buffer", "source": "argument", "index": 3, "phase": "pre" },
+        { "role": "transfer_length", "source": "argument", "index": 4, "phase": "pre" },
+        { "role": "result", "source": "return", "phase": "post" }
+      ],
+      "predicates": {
+        "success": { "operand": "result", "operator": "eq", "rhs": { "integer": 0 } },
+        "partial_success": { "constant": false },
+        "failure": { "operand": "result", "operator": "ne", "rhs": { "integer": 0 } }
+      },
+      "effects": [
+        {
+          "kind": "transfer",
+          "when": "success",
+          "target": "host_buffer",
+          "extent": "transfer_length",
+          "owner": "owner"
+        }
+      ],
+      "pair": null
+    },
+    {
+      "id": "qemu.transfer.dma-memory.read",
+      "rule_id": "qemu.dma-transfer-result",
+      "family": "dma-memory",
+      "kind": "transfer",
+      "selector": {
+        "kind": "function",
+        "name": "dma_memory_read",
+        "header": "include/system/dma.h",
+        "translation_unit": "system/dma-helpers.c"
+      },
+      "prototype": {
+        "return_type": "MemTxResult",
+        "parameters": [
+          { "name": "as", "type": "AddressSpace *" },
+          { "name": "addr", "type": "dma_addr_t" },
+          { "name": "buf", "type": "void *" },
+          { "name": "len", "type": "dma_addr_t" },
+          { "name": "attrs", "type": "MemTxAttrs" }
+        ]
+      },
+      "direction_encoding": "fixed-to-device",
+      "operands": [
+        { "role": "owner", "source": "argument", "index": 0, "phase": "pre" },
+        { "role": "guest_address", "source": "argument", "index": 1, "phase": "pre" },
+        { "role": "host_buffer", "source": "argument", "index": 2, "phase": "pre" },
+        { "role": "transfer_length", "source": "argument", "index": 3, "phase": "pre" },
+        { "role": "attributes", "source": "argument", "index": 4, "phase": "pre" },
+        { "role": "result", "source": "return", "phase": "post" }
+      ],
+      "predicates": {
+        "success": { "operand": "result", "operator": "eq", "rhs": { "integer": 0 } },
+        "partial_success": { "constant": false },
+        "failure": { "operand": "result", "operator": "ne", "rhs": { "integer": 0 } }
+      },
+      "effects": [
+        {
+          "kind": "transfer",
+          "when": "success",
+          "target": "host_buffer",
+          "extent": "transfer_length",
+          "owner": "owner"
+        }
+      ],
+      "pair": null
+    },
+    {
+      "id": "qemu.transfer.dma-memory.rw",
+      "rule_id": "qemu.dma-transfer-result",
+      "family": "dma-memory",
+      "kind": "transfer",
+      "selector": {
+        "kind": "function",
+        "name": "dma_memory_rw",
+        "header": "include/system/dma.h",
+        "translation_unit": "system/dma-helpers.c"
+      },
+      "prototype": {
+        "return_type": "MemTxResult",
+        "parameters": [
+          { "name": "as", "type": "AddressSpace *" },
+          { "name": "addr", "type": "dma_addr_t" },
+          { "name": "buf", "type": "void *" },
+          { "name": "len", "type": "dma_addr_t" },
+          { "name": "dir", "type": "DMADirection" },
+          { "name": "attrs", "type": "MemTxAttrs" }
+        ]
+      },
+      "direction_encoding": "dma-direction",
+      "operands": [
+        { "role": "owner", "source": "argument", "index": 0, "phase": "pre" },
+        { "role": "guest_address", "source": "argument", "index": 1, "phase": "pre" },
+        { "role": "host_buffer", "source": "argument", "index": 2, "phase": "pre" },
+        { "role": "transfer_length", "source": "argument", "index": 3, "phase": "pre" },
+        { "role": "direction", "source": "argument", "index": 4, "phase": "pre" },
+        { "role": "attributes", "source": "argument", "index": 5, "phase": "pre" },
+        { "role": "result", "source": "return", "phase": "post" }
+      ],
+      "predicates": {
+        "success": { "operand": "result", "operator": "eq", "rhs": { "integer": 0 } },
+        "partial_success": { "constant": false },
+        "failure": { "operand": "result", "operator": "ne", "rhs": { "integer": 0 } }
+      },
+      "effects": [
+        {
+          "kind": "transfer",
+          "when": "success",
+          "target": "host_buffer",
+          "extent": "transfer_length",
+          "direction": "direction",
+          "owner": "owner"
+        }
+      ],
+      "pair": null
+    },
+    {
+      "id": "qemu.transfer.dma-memory.write",
+      "rule_id": "qemu.dma-transfer-result",
+      "family": "dma-memory",
+      "kind": "transfer",
+      "selector": {
+        "kind": "function",
+        "name": "dma_memory_write",
+        "header": "include/system/dma.h",
+        "translation_unit": "system/dma-helpers.c"
+      },
+      "prototype": {
+        "return_type": "MemTxResult",
+        "parameters": [
+          { "name": "as", "type": "AddressSpace *" },
+          { "name": "addr", "type": "dma_addr_t" },
+          { "name": "buf", "type": "const void *" },
+          { "name": "len", "type": "dma_addr_t" },
+          { "name": "attrs", "type": "MemTxAttrs" }
+        ]
+      },
+      "direction_encoding": "fixed-from-device",
+      "operands": [
+        { "role": "owner", "source": "argument", "index": 0, "phase": "pre" },
+        { "role": "guest_address", "source": "argument", "index": 1, "phase": "pre" },
+        { "role": "host_buffer", "source": "argument", "index": 2, "phase": "pre" },
+        { "role": "transfer_length", "source": "argument", "index": 3, "phase": "pre" },
+        { "role": "attributes", "source": "argument", "index": 4, "phase": "pre" },
+        { "role": "result", "source": "return", "phase": "post" }
+      ],
+      "predicates": {
+        "success": { "operand": "result", "operator": "eq", "rhs": { "integer": 0 } },
+        "partial_success": { "constant": false },
+        "failure": { "operand": "result", "operator": "ne", "rhs": { "integer": 0 } }
+      },
+      "effects": [
+        {
+          "kind": "transfer",
+          "when": "success",
+          "target": "host_buffer",
+          "extent": "transfer_length",
+          "owner": "owner"
+        }
+      ],
+      "pair": null
+    },
+    {
+      "id": "qemu.usb.packet-copy",
+      "rule_id": "qemu.initialized-bytes.disclosure",
+      "additional_rule_ids": ["qemu.guest-memory.bounds"],
+      "family": "usb",
+      "kind": "packet-copy",
+      "selector": {
+        "kind": "function",
+        "name": "usb_packet_copy",
+        "header": "include/hw/usb/usb.h",
+        "translation_unit": "hw/usb/core.c"
+      },
+      "prototype": {
+        "return_type": "void",
+        "parameters": [
+          { "name": "p", "type": "USBPacket *" },
+          { "name": "ptr", "type": "void *" },
+          { "name": "bytes", "type": "size_t" }
+        ]
+      },
+      "direction_encoding": "usb-token-pid",
+      "operands": [
+        { "role": "owner", "source": "argument", "index": 0, "phase": "pre" },
+        { "role": "host_buffer", "source": "argument", "index": 1, "phase": "pre" },
+        { "role": "transfer_length", "source": "argument", "index": 2, "phase": "pre" },
+        {
+          "role": "direction",
+          "source": "argument_member",
+          "index": 0,
+          "phase": "pre",
+          "path": [
+            {
+              "record_type": "USBPacket",
+              "field": "pid",
+              "type": "int",
+              "header": "include/hw/usb/usb.h"
+            }
+          ]
+        },
+        {
+          "role": "access_offset",
+          "source": "argument_member",
+          "index": 0,
+          "phase": "pre",
+          "path": [
+            {
+              "record_type": "USBPacket",
+              "field": "actual_length",
+              "type": "int",
+              "header": "include/hw/usb/usb.h"
+            }
+          ]
+        },
+        {
+          "role": "capacity_selector",
+          "source": "argument_member",
+          "index": 0,
+          "phase": "pre",
+          "path": [
+            {
+              "record_type": "USBPacket",
+              "field": "combined",
+              "type": "USBCombinedPacket *",
+              "header": "include/hw/usb/usb.h"
+            }
+          ]
+        },
+        {
+          "role": "primary_capacity",
+          "source": "argument_member",
+          "index": 0,
+          "phase": "pre",
+          "path": [
+            {
+              "record_type": "USBPacket",
+              "field": "iov",
+              "type": "QEMUIOVector",
+              "header": "include/hw/usb/usb.h"
+            },
+            {
+              "record_type": "QEMUIOVector",
+              "field": "size",
+              "type": "size_t",
+              "header": "include/qemu/iov.h"
+            }
+          ]
+        },
+        {
+          "role": "alternate_capacity",
+          "source": "argument_member",
+          "index": 0,
+          "phase": "pre",
+          "path": [
+            {
+              "record_type": "USBPacket",
+              "field": "combined",
+              "type": "USBCombinedPacket *",
+              "header": "include/hw/usb/usb.h"
+            },
+            {
+              "record_type": "USBCombinedPacket",
+              "field": "iov",
+              "type": "QEMUIOVector",
+              "header": "include/hw/usb/usb.h"
+            },
+            {
+              "record_type": "QEMUIOVector",
+              "field": "size",
+              "type": "size_t",
+              "header": "include/qemu/iov.h"
+            }
+          ]
+        },
+        {
+          "role": "status",
+          "source": "argument_member",
+          "index": 0,
+          "phase": "pre",
+          "path": [
+            {
+              "record_type": "USBPacket",
+              "field": "status",
+              "type": "int",
+              "header": "include/hw/usb/usb.h"
+            }
+          ]
+        },
+        {
+          "role": "endpoint_type",
+          "source": "argument_member",
+          "index": 0,
+          "phase": "pre",
+          "path": [
+            {
+              "record_type": "USBPacket",
+              "field": "ep",
+              "type": "USBEndpoint *",
+              "header": "include/hw/usb/usb.h"
+            },
+            {
+              "record_type": "USBEndpoint",
+              "field": "type",
+              "type": "uint8_t",
+              "header": "include/hw/usb/usb.h"
+            }
+          ]
+        },
+        {
+          "role": "setup_parameter",
+          "source": "argument_member",
+          "index": 0,
+          "phase": "pre",
+          "path": [
+            {
+              "record_type": "USBPacket",
+              "field": "parameter",
+              "type": "uint64_t",
+              "header": "include/hw/usb/usb.h"
+            }
+          ]
+        }
+      ],
+      "predicates": {
+        "success": { "constant": true },
+        "partial_success": { "constant": false },
+        "failure": { "constant": false }
+      },
+      "effects": [
+        {
+          "kind": "packet-copy",
+          "when": "success",
+          "target": "host_buffer",
+          "extent": "transfer_length",
+          "direction": "direction",
+          "owner": "owner",
+          "offset": "access_offset",
+          "capacity_selector": "capacity_selector",
+          "primary_capacity": "primary_capacity",
+          "alternate_capacity": "alternate_capacity"
+        }
+      ],
+      "pair": null
+    },
+    {
+      "id": "qemu.iommu.notifier-init",
+      "rule_id": "qemu.iommu-notifier-lifetime",
+      "family": "iommu-notifier",
+      "kind": "initialize-resource",
+      "selector": {
+        "kind": "function",
+        "name": "iommu_notifier_init",
+        "header": "include/system/memory.h",
+        "translation_unit": "system/memory.c"
+      },
+      "prototype": {
+        "return_type": "void",
+        "parameters": [
+          { "name": "n", "type": "IOMMUNotifier *" },
+          { "name": "fn", "type": "IOMMUNotify" },
+          { "name": "flags", "type": "IOMMUNotifierFlag" },
+          { "name": "start", "type": "hwaddr" },
+          { "name": "end", "type": "hwaddr" },
+          { "name": "iommu_idx", "type": "int" }
+        ]
+      },
+      "direction_encoding": "none",
+      "operands": [
+        { "role": "notifier", "source": "argument", "index": 0, "phase": "pre" },
+        { "role": "callback", "source": "argument", "index": 1, "phase": "pre" },
+        { "role": "flags", "source": "argument", "index": 2, "phase": "pre" },
+        { "role": "range_start", "source": "argument", "index": 3, "phase": "pre" },
+        { "role": "range_end", "source": "argument", "index": 4, "phase": "pre" },
+        { "role": "iommu_index", "source": "argument", "index": 5, "phase": "pre" }
+      ],
+      "predicates": {
+        "success": { "constant": true },
+        "partial_success": { "constant": false },
+        "failure": { "constant": false }
+      },
+      "effects": [
+        {
+          "kind": "initialize-resource",
+          "when": "success",
+          "target": "notifier",
+          "callback": "callback",
+          "epoch": "create"
+        }
+      ],
+      "pair": null
+    },
+    {
+      "id": "qemu.iommu.notifier-register",
+      "rule_id": "qemu.iommu-notifier-lifetime",
+      "family": "iommu-notifier",
+      "kind": "register-callback",
+      "selector": {
+        "kind": "function",
+        "name": "memory_region_register_iommu_notifier",
+        "header": "include/system/memory.h",
+        "translation_unit": "system/memory.c"
+      },
+      "prototype": {
+        "return_type": "int",
+        "parameters": [
+          { "name": "mr", "type": "MemoryRegion *" },
+          { "name": "n", "type": "IOMMUNotifier *" },
+          { "name": "errp", "type": "Error **" }
+        ]
+      },
+      "direction_encoding": "none",
+      "operands": [
+        { "role": "memory_region", "source": "argument", "index": 0, "phase": "pre" },
+        { "role": "notifier", "source": "argument", "index": 1, "phase": "pre" },
+        { "role": "error", "source": "argument", "index": 2, "phase": "pre" },
+        { "role": "result", "source": "return", "phase": "post" }
+      ],
+      "predicates": {
+        "success": { "operand": "result", "operator": "eq", "rhs": { "integer": 0 } },
+        "partial_success": { "constant": false },
+        "failure": { "operand": "result", "operator": "ne", "rhs": { "integer": 0 } }
+      },
+      "effects": [
+        {
+          "kind": "register-callback",
+          "when": "success",
+          "target": "notifier",
+          "memory_region": "memory_region",
+          "epoch": "create"
+        }
+      ],
+      "pair": {
+        "contract_id": "qemu.iommu.notifier-unregister",
+        "relation": "register-callback-to-unregister-callback"
+      }
+    },
+    {
+      "id": "qemu.iommu.notifier-unregister",
+      "rule_id": "qemu.iommu-notifier-lifetime",
+      "family": "iommu-notifier",
+      "kind": "unregister-callback",
+      "selector": {
+        "kind": "function",
+        "name": "memory_region_unregister_iommu_notifier",
+        "header": "include/system/memory.h",
+        "translation_unit": "system/memory.c"
+      },
+      "prototype": {
+        "return_type": "void",
+        "parameters": [
+          { "name": "mr", "type": "MemoryRegion *" },
+          { "name": "n", "type": "IOMMUNotifier *" }
+        ]
+      },
+      "direction_encoding": "none",
+      "operands": [
+        { "role": "memory_region", "source": "argument", "index": 0, "phase": "pre" },
+        { "role": "notifier", "source": "argument", "index": 1, "phase": "pre" }
+      ],
+      "predicates": {
+        "success": { "constant": true },
+        "partial_success": { "constant": false },
+        "failure": { "constant": false }
+      },
+      "effects": [
+        {
+          "kind": "unregister-callback",
+          "when": "success",
+          "target": "notifier",
+          "memory_region": "memory_region",
+          "epoch": "retire"
+        }
+      ],
+      "pair": {
+        "contract_id": "qemu.iommu.notifier-register",
+        "relation": "unregister-callback-to-register-callback"
+      }
+    }
+  ],
+  "callback_bindings": [
+    {
+      "id": "qemu.usb-device.handle-control",
+      "rule_ids": [
+        "qemu.callback-buffer.bounds",
+        "qemu.guest-memory.bounds"
+      ],
+      "family": "usb",
+      "slot": {
+        "record_type": "USBDeviceClass",
+        "field": "handle_control",
+        "header": "include/hw/usb/usb.h",
+        "translation_unit": "hw/usb/bus.c",
+        "implementation": "u2f_key_handle_control"
+      },
+      "prototype": {
+        "return_type": "void",
+        "parameters": [
+          { "name": "dev", "type": "USBDevice *" },
+          { "name": "p", "type": "USBPacket *" },
+          { "name": "request", "type": "int" },
+          { "name": "value", "type": "int" },
+          { "name": "index", "type": "int" },
+          { "name": "length", "type": "int" },
+          { "name": "data", "type": "uint8_t *" }
+        ]
+      },
+      "registration": {
+        "record_type": "TypeInfo",
+        "field": "class_init",
+        "header": "include/qom/object.h",
+        "translation_unit": "hw/usb/u2f.c",
+        "variable": "u2f_key_info",
+        "initializer": "u2f_key_class_init",
+        "prototype": {
+          "return_type": "void",
+          "parameters": [
+            { "name": "klass", "type": "ObjectClass *" },
+            { "name": "data", "type": "const void *" }
+          ]
+        }
+      },
+      "entry_inputs": [
+        { "role": "control-request", "source": "argument", "index": 2 },
+        { "role": "control-value", "source": "argument", "index": 3 },
+        { "role": "control-index", "source": "argument", "index": 4 },
+        { "role": "control-length", "source": "argument", "index": 5 }
+      ],
+      "input_buffers": [
+        {
+          "buffer_index": 6,
+          "length_role": "control-length",
+          "active_when": {
+            "role": "control-request",
+            "mask": 32768,
+            "equals": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "qemu.usb-device.handle-data",
+      "rule_ids": [
+        "qemu.guest-memory.bounds",
+        "qemu.initialized-bytes.disclosure"
+      ],
+      "family": "usb",
+      "slot": {
+        "record_type": "USBDeviceClass",
+        "field": "handle_data",
+        "header": "include/hw/usb/usb.h",
+        "translation_unit": "hw/usb/bus.c",
+        "implementation": "u2f_key_handle_data"
+      },
+      "prototype": {
+        "return_type": "void",
+        "parameters": [
+          { "name": "dev", "type": "USBDevice *" },
+          { "name": "p", "type": "USBPacket *" }
+        ]
+      },
+      "registration": {
+        "record_type": "TypeInfo",
+        "field": "class_init",
+        "header": "include/qom/object.h",
+        "translation_unit": "hw/usb/u2f.c",
+        "variable": "u2f_key_info",
+        "initializer": "u2f_key_class_init",
+        "prototype": {
+          "return_type": "void",
+          "parameters": [
+            { "name": "klass", "type": "ObjectClass *" },
+            { "name": "data", "type": "const void *" }
+          ]
+        }
+      },
+      "entry_inputs": [
+        {
+          "role": "packet-direction",
+          "source": "argument_member",
+          "index": 1,
+          "path": [
+            {
+              "record_type": "USBPacket",
+              "field": "pid",
+              "type": "int",
+              "header": "include/hw/usb/usb.h"
+            }
+          ]
+        },
+        {
+          "role": "packet-capacity-selector",
+          "source": "argument_member",
+          "index": 1,
+          "path": [
+            {
+              "record_type": "USBPacket",
+              "field": "combined",
+              "type": "USBCombinedPacket *",
+              "header": "include/hw/usb/usb.h"
+            }
+          ]
+        },
+        {
+          "role": "packet-primary-capacity",
+          "source": "argument_member",
+          "index": 1,
+          "path": [
+            {
+              "record_type": "USBPacket",
+              "field": "iov",
+              "type": "QEMUIOVector",
+              "header": "include/hw/usb/usb.h"
+            },
+            {
+              "record_type": "QEMUIOVector",
+              "field": "size",
+              "type": "size_t",
+              "header": "include/qemu/iov.h"
+            }
+          ]
+        },
+        {
+          "role": "packet-alternate-capacity",
+          "source": "argument_member",
+          "index": 1,
+          "path": [
+            {
+              "record_type": "USBPacket",
+              "field": "combined",
+              "type": "USBCombinedPacket *",
+              "header": "include/hw/usb/usb.h"
+            },
+            {
+              "record_type": "USBCombinedPacket",
+              "field": "iov",
+              "type": "QEMUIOVector",
+              "header": "include/hw/usb/usb.h"
+            },
+            {
+              "record_type": "QEMUIOVector",
+              "field": "size",
+              "type": "size_t",
+              "header": "include/qemu/iov.h"
+            }
+          ]
+        },
+        {
+          "role": "packet-setup-parameter",
+          "source": "argument_member",
+          "index": 1,
+          "path": [
+            {
+              "record_type": "USBPacket",
+              "field": "parameter",
+              "type": "uint64_t",
+              "header": "include/hw/usb/usb.h"
+            }
+          ]
+        },
+        {
+          "role": "packet-endpoint-number",
+          "source": "argument_member",
+          "index": 1,
+          "path": [
+            {
+              "record_type": "USBPacket",
+              "field": "ep",
+              "type": "USBEndpoint *",
+              "header": "include/hw/usb/usb.h"
+            },
+            {
+              "record_type": "USBEndpoint",
+              "field": "nr",
+              "type": "uint8_t",
+              "header": "include/hw/usb/usb.h"
+            }
+          ]
+        },
+        {
+          "role": "packet-endpoint-type",
+          "source": "argument_member",
+          "index": 1,
+          "path": [
+            {
+              "record_type": "USBPacket",
+              "field": "ep",
+              "type": "USBEndpoint *",
+              "header": "include/hw/usb/usb.h"
+            },
+            {
+              "record_type": "USBEndpoint",
+              "field": "type",
+              "type": "uint8_t",
+              "header": "include/hw/usb/usb.h"
+            }
+          ]
+        }
+      ],
+      "input_buffers": []
+    }
+  ],
+  "protocols": [
+    {
+      "id": "qemu.protocol.sdhci.adma-completion",
+      "rule_id": "qemu.failed-completion-publication",
+      "family": "sdhci",
+      "scope": {
+        "kind": "function-definition",
+        "name": "sdhci_do_adma",
+        "source": "hw/sd/sdhci.c",
+        "translation_unit": "hw/sd/sdhci.c",
+        "prototype": {
+          "return_type": "void",
+          "parameters": [
+            { "name": "s", "type": "SDHCIState *" }
+          ]
+        }
+      },
+      "bindings": [
+        { "role": "owner", "source": "scope-argument", "index": 0 },
+        { "role": "queue", "source": "integer-constant", "value": 0 },
+        { "role": "attempt", "source": "transfer-result" },
+        {
+          "role": "slot",
+          "source": "member-value-pre",
+          "record_type": "SDHCIState",
+          "field": "blkcnt"
+        },
+        { "role": "vector", "source": "integer-constant", "value": 0 },
+        { "role": "result", "source": "transfer-result" }
+      ],
+      "events": [
+        {
+          "stage": "descriptor-failed",
+          "selectors": [
+            {
+              "kind": "transfer-call",
+              "contract_id": "qemu.transfer.dma-memory.read",
+              "phase": "post-call",
+              "result_path": "failure",
+              "expected_count": 1
+            },
+            {
+              "kind": "transfer-call",
+              "contract_id": "qemu.transfer.dma-memory.write",
+              "phase": "post-call",
+              "result_path": "failure",
+              "expected_count": 1
+            }
+          ]
+        },
+        {
+          "stage": "ring-advanced",
+          "selectors": [
+            {
+              "kind": "member-update",
+              "record_type": "SDHCIState",
+              "field": "blkcnt",
+              "operation": "post-decrement",
+              "phase": "bind",
+              "expected_count": 2
+            }
+          ]
+        },
+        {
+          "stage": "interrupt-published",
+          "selectors": [
+            {
+              "kind": "function-call",
+              "name": "sdhci_end_transfer",
+              "prototype": {
+                "return_type": "void",
+                "parameters": [
+                  { "name": "s", "type": "SDHCIState *" }
+                ]
+              },
+              "phase": "pre-call",
+              "expected_count": 2
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -7,6 +7,12 @@ typedef struct BdrvChild BdrvChild;
 typedef struct NetClientState NetClientState;
 typedef struct VirtIODevice VirtIODevice;
 typedef struct QEMUIOVector QEMUIOVector;
+typedef struct AddressSpace AddressSpace;
+typedef struct MemTxAttrs {
+  unsigned int unspecified : 1;
+} MemTxAttrs;
+typedef uint64_t dma_addr_t;
+typedef unsigned MemTxResult;
 
 struct VirtIODevice {
   size_t config_len;
@@ -17,7 +23,8 @@ void *memmove(void *, const void *, size_t);
 void *memset(void *, int, size_t);
 int memcmp(const void *, const void *, size_t);
 void *malloc(size_t);
-unsigned dma_memory_read(void *, uint64_t, void *, size_t, unsigned);
+MemTxResult dma_memory_read(AddressSpace *, dma_addr_t, void *, dma_addr_t,
+                            MemTxAttrs);
 void physical_memory_read(uint64_t, void *, uint64_t);
 size_t qemu_get_buffer(void *, unsigned char *, size_t);
 int bdrv_pread(BdrvChild *, long long, long long, void *, unsigned);
@@ -943,7 +950,8 @@ static const MemoryRegionOps mmio_memmove_length_ops = {
 static void mmio_guest_physical_address_only(void *opaque, uint64_t addr,
                                              uint64_t data, unsigned size) {
   char destination[4];
-  dma_memory_read(opaque, addr, destination, sizeof(destination), 0);
+  dma_memory_read(opaque, addr, destination, sizeof(destination),
+                  (MemTxAttrs){0});
 }
 
 static const MemoryRegionOps mmio_guest_physical_address_only_ops = {
@@ -1093,8 +1101,9 @@ static void mmio_dma_index(void *opaque, uint64_t addr, uint64_t data,
                            unsigned size) {
   unsigned index;
   int slots[4] = {0};
-  if (dma_memory_read(opaque, addr, &index, sizeof(index), 0) != 0) // expected-note {{DMA populated guest-controlled data here}}
-                                                                      // expected-note@-1 {{Taking false branch}}
+  if (dma_memory_read(opaque, addr, &index, sizeof(index),
+                      (MemTxAttrs){0}) != 0) // expected-note@-1 {{DMA populated guest-controlled data here}}
+                                            // expected-note@-2 {{Taking false branch}}
     return;
   slots[index] = 1; // expected-warning {{Level B: guest-controlled array index may exceed the host object element count}}
                     // expected-note@-1 {{Level B: guest-controlled array index may exceed the host object element count}}
@@ -1104,7 +1113,8 @@ static void mmio_failed_dma_is_not_a_source(void *opaque, uint64_t addr,
                                             uint64_t data, unsigned size) {
   unsigned index;
   int slots[4] = {0};
-  if (dma_memory_read(opaque, addr, &index, sizeof(index), 0) == 0)
+  if (dma_memory_read(opaque, addr, &index, sizeof(index),
+                      (MemTxAttrs){0}) == 0)
     return;
   slots[index] = 1;
 }

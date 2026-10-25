@@ -15,6 +15,9 @@ add_clang_unittest(StaticAnalysisTests
   NoStateChangeFuncVisitorTest.cpp
   ObjcBug-124477.cpp
   ParamRegionTest.cpp
+  QEMUSharedFactsTest.cpp
+  QEMUSharedStateProducer.cpp
+  QEMUSharedStateTest.cpp
   RangeSetTest.cpp
   RegisterCustomCheckersTest.cpp
   StoreTest.cpp
