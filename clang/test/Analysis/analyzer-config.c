@@ -19,6 +19,8 @@
 // CHECK-NEXT: alpha.qemu.GuestMemorySafety:SelectiveSummaryManifest = ""
 // CHECK-NEXT: alpha.qemu.MigrationConsistency:EnableFlexibleVArrayDiagnostics = false
 // CHECK-NEXT: alpha.qemu.MigrationConsistency:EnableInlineVArrayDiagnostics = false
+// CHECK-NEXT: alpha.qemu.MigrationConsistency:EnablePointerVArrayDiagnostics = false
+// CHECK-NEXT: alpha.qemu.MigrationConsistency:ReachablePointerVArrayDescriptions = ""
 // CHECK-NEXT: alpha.unix.PthreadLock:WarnOnLockOrderReversal = false
 // CHECK-NEXT: apply-fixits = false
 // CHECK-NEXT: assume-at-least-one-iteration = false

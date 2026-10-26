@@ -682,6 +682,18 @@ def QEMUMigrationConsistencyChecker : Checker<"MigrationConsistency">,
                   "Diagnose migration-loaded counts that can exceed proven "
                   "flexible VMState array allocations",
                   "false",
+                  InAlpha>,
+    CmdLineOption<Boolean,
+                  "EnablePointerVArrayDiagnostics",
+                  "Diagnose migration-loaded counts that can exceed proven "
+                  "preallocated pointer VMState arrays",
+                  "false",
+                  InAlpha>,
+    CmdLineOption<String,
+                  "ReachablePointerVArrayDescriptions",
+                  "Semicolon-separated externally proven reachable VMState "
+                  "description identifiers for pointer VARRAY analysis",
+                  "",
                   InAlpha>
   ]>,
   Documentation<NotDocumented>;
