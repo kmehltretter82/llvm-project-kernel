@@ -4958,14 +4958,14 @@ class QEMUGuestMemorySafetyChecker
         Inputs ? Inputs->getObject("catalog_schema") : nullptr;
     if (!Catalog ||
         !jsonStringIs(*Catalog, "path", "QEMUContractCatalog.json") ||
-        !jsonIntegerIs(*Catalog, "bytes", 45537) ||
+        !jsonIntegerIs(*Catalog, "bytes", 48051) ||
         !jsonIntegerIs(*Catalog, "format",
                        qemu_contracts_generated::CatalogFormat) ||
         !jsonStringIs(*Catalog, "normalized_sha256",
                       qemu_contracts_generated::CatalogSHA256) ||
         !jsonStringIs(*Catalog, "sha256",
-                      "df09336dfcbf9a988922a4de0e391078959c62d5a83903104084a"
-                      "9189f79c2e6") ||
+                      "c2d0df195f76e50a0069cc0a2431f343c173c8f2b8602fffd2c6c"
+                      "ea8946095a0") ||
         !CatalogSchema ||
         !jsonStringIs(*CatalogSchema, "path",
                       "QEMUContractCatalog.schema.json") ||
@@ -4974,7 +4974,7 @@ class QEMUGuestMemorySafetyChecker
                       "3ce99b26b5bf117cb6cbb13676be43c76eedac28f13203b521c396"
                       "f685aa8d42") ||
         StringRef(qemu_contracts_generated::ModelVersion) !=
-            "qemu-v3-io-contracts-v7" ||
+            "qemu-v3-io-contracts-v8" ||
         StringRef(qemu_contracts_generated::SchemaSHA256) !=
             "09a169d61f4b526431cb22ab6c219adcbf263aa7f5f3abfd46701731c"
             "bee166d" ||
@@ -5118,8 +5118,8 @@ class QEMUGuestMemorySafetyChecker
 
     if (Bytes.size() != 92246 ||
         llvm::toHex(llvm::SHA256::hash(llvm::arrayRefFromStringRef(Bytes)),
-                    /*LowerCase=*/true) != "5fb6353de19ffe23ed80594d09cfa5b8e82"
-                                           "81437c9991bb196279e49042b35b9") {
+                    /*LowerCase=*/true) != "c7e7c8b42859f405eb9e0bbcc5ff6018dec"
+                                           "8ae4e9fb342eca089aaf59812e676") {
       SelectiveSummaries.clear();
       return Invalid("sealed byte identity differs");
     }
