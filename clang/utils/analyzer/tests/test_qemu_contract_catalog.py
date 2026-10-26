@@ -47,6 +47,11 @@ class QEMUContractCatalogTest(unittest.TestCase):
     def protocol(self, catalog):
         return catalog["protocols"][0]
 
+    def protocol_by_id(self, catalog, protocol_id):
+        return next(
+            entry for entry in catalog["protocols"] if entry["id"] == protocol_id
+        )
+
     def test_catalog_contains_exact_dma_usb_and_iommu_lifetime_slices(self):
         catalog_tool.validate_catalog(self.catalog)
         self.assertEqual(self.catalog["catalog_format"], 5)
@@ -725,7 +730,7 @@ class QEMUContractCatalogTest(unittest.TestCase):
         wrong_source = self.mutated_catalog()
         self.protocol(wrong_source)["bindings"][0]["source"] = "transfer-result"
         self.protocol(wrong_source)["bindings"][0].pop("index")
-        self.assert_catalog_error(wrong_source, "role 'owner' must use source")
+        self.assert_catalog_error(wrong_source, "role 'owner' must use one of")
 
         duplicate_role = self.mutated_catalog()
         self.protocol(duplicate_role)["bindings"][1]["role"] = "owner"
@@ -760,7 +765,7 @@ class QEMUContractCatalogTest(unittest.TestCase):
         )
         attempt["source"] = "integer-constant"
         attempt["value"] = 0
-        self.assert_catalog_error(wrong_attempt, "role 'attempt' must use source")
+        self.assert_catalog_error(wrong_attempt, "role 'attempt' must use one of")
 
         wrong_result = self.mutated_catalog()
         result = next(
@@ -770,7 +775,7 @@ class QEMUContractCatalogTest(unittest.TestCase):
         )
         result["source"] = "scope-argument"
         result["index"] = 0
-        self.assert_catalog_error(wrong_result, "role 'result' must use source")
+        self.assert_catalog_error(wrong_result, "role 'result' must use one of")
 
         wrong_owner_record = self.mutated_catalog()
         self.protocol(wrong_owner_record)["scope"]["prototype"]["parameters"][0][
@@ -851,18 +856,25 @@ class QEMUContractCatalogTest(unittest.TestCase):
 
     def test_generated_protocol_ranges_are_contiguous(self):
         generated = catalog_tool.generate(self.catalog, self.schema)
-        self.assertIn("ProtocolBindingRecordCount = 12;", generated)
-        self.assertIn("ProtocolSelectorRecordCount = 8;", generated)
-        self.assertIn("ProtocolEventRecordCount = 6;", generated)
-        self.assertIn("ProtocolRecordCount = 2;", generated)
-        self.assertIn('"descriptor-failed", 0, 2', generated)
-        self.assertIn('"ring-advanced", 2, 1', generated)
-        self.assertIn('"interrupt-published", 3, 1', generated)
-        self.assertIn('"void (SDHCIState *)", 0, 6, 0, 3', generated)
-        self.assertIn('"descriptor-failed", 4, 2', generated)
-        self.assertIn('"ring-advanced", 6, 1', generated)
-        self.assertIn('"interrupt-published", 7, 1', generated)
-        self.assertIn('"void (XlnxZynqDevcfg *)", 6, 6, 3, 3', generated)
+        self.assertIn("ProtocolBindingRecordCount = 24;", generated)
+        self.assertIn("ProtocolSelectorRecordCount = 14;", generated)
+        self.assertIn("ProtocolEventRecordCount = 12;", generated)
+        self.assertIn("ProtocolRecordCount = 4;", generated)
+        self.assertIn('"descriptor-failed", 0, 1', generated)
+        self.assertIn('"ring-advanced", 1, 1', generated)
+        self.assertIn('"interrupt-published", 2, 1', generated)
+        self.assertIn(
+            '"void (E1000ECore *, const E1000E_TxRing *)", 0, 6, 0, 3',
+            generated,
+        )
+        self.assertIn('"descriptor-failed", 3, 1', generated)
+        self.assertIn('"ring-advanced", 4, 1', generated)
+        self.assertIn('"interrupt-published", 5, 1', generated)
+        self.assertIn('"int (RTL8139State *, int)", 6, 6, 3, 3', generated)
+        self.assertIn('"descriptor-failed", 6, 2', generated)
+        self.assertIn('"void (SDHCIState *)", 12, 6, 6, 3', generated)
+        self.assertIn('"descriptor-failed", 10, 2', generated)
+        self.assertIn('"void (XlnxZynqDevcfg *)", 18, 6, 9, 3', generated)
 
     def test_protocol_selector_kinds_fail_closed(self):
         missing_contract = self.mutated_catalog()
@@ -884,6 +896,159 @@ class QEMUContractCatalogTest(unittest.TestCase):
         function = self.protocol(extra_function_field)["events"][2]["selectors"][0]
         function["field"] = "blkcnt"
         self.assert_catalog_error(extra_function_field, "function-call fields are not canonical")
+
+    def test_dynamic_protocol_bindings_fail_closed(self):
+        bad_queue_index = self.mutated_catalog()
+        protocol = self.protocol_by_id(
+            bad_queue_index, "qemu.protocol.e1000e.tx-descriptor-completion"
+        )
+        queue = next(
+            binding for binding in protocol["bindings"]
+            if binding["role"] == "queue"
+        )
+        queue["index"] = 2
+        self.assert_catalog_error(bad_queue_index, "outside the scope prototype")
+
+        bad_slot_index = self.mutated_catalog()
+        protocol = self.protocol_by_id(
+            bad_slot_index, "qemu.protocol.e1000e.tx-descriptor-completion"
+        )
+        slot = next(
+            binding for binding in protocol["bindings"]
+            if binding["role"] == "slot"
+        )
+        slot["index"] = 2
+        self.assert_catalog_error(bad_slot_index, "guest address argument 1")
+
+        void_queue = self.mutated_catalog()
+        protocol = self.protocol_by_id(
+            void_queue, "qemu.protocol.e1000e.tx-descriptor-completion"
+        )
+        protocol["scope"]["prototype"]["parameters"][1]["type"] = "void"
+        self.assert_catalog_error(
+            void_queue, "cannot take pointee type"
+        )
+
+        wrong_queue_member = self.mutated_catalog()
+        protocol = self.protocol_by_id(
+            wrong_queue_member, "qemu.protocol.e1000e.tx-descriptor-completion"
+        )
+        queue = next(
+            binding for binding in protocol["bindings"]
+            if binding["role"] == "queue"
+        )
+        queue["field"] = "other"
+        generated = catalog_tool.generate(wrong_queue_member, self.schema)
+        self.assertIn('"scope-argument-member-pre", 1, "E1000E_TxRing", "other"', generated)
+
+    def test_selective_and_ring_selectors_fail_closed(self):
+        wrong_summary = self.mutated_catalog()
+        protocol = self.protocol_by_id(
+            wrong_summary, "qemu.protocol.e1000e.tx-descriptor-completion"
+        )
+        protocol["events"][0]["selectors"][0]["contract_id"] = (
+            "qemu.selective-summary.other"
+        )
+        self.assert_catalog_error(wrong_summary, "unsupported selective summary")
+
+        missing_owner_relation = self.mutated_catalog()
+        protocol = self.protocol_by_id(
+            missing_owner_relation,
+            "qemu.protocol.e1000e.tx-descriptor-completion",
+        )
+        protocol["events"][0]["selectors"][0].pop("field")
+        self.assert_catalog_error(
+            missing_owner_relation, "fields are not canonical"
+        )
+
+        wrong_owner_relation = self.mutated_catalog()
+        protocol = self.protocol_by_id(
+            wrong_owner_relation,
+            "qemu.protocol.e1000e.tx-descriptor-completion",
+        )
+        protocol["events"][0]["selectors"][0]["operation"] = "contains-bits"
+        self.assert_catalog_error(
+            wrong_owner_relation, "invalid owner relation"
+        )
+
+        missing_indexed_value = self.mutated_catalog()
+        protocol = self.protocol_by_id(
+            missing_indexed_value, "qemu.protocol.rtl8139.classic-tx-completion"
+        )
+        protocol["events"][1]["selectors"][0].pop("value")
+        self.assert_catalog_error(
+            missing_indexed_value, "fields are not canonical"
+        )
+
+        wrong_indexed_operation = self.mutated_catalog()
+        protocol = self.protocol_by_id(
+            wrong_indexed_operation, "qemu.protocol.rtl8139.classic-tx-completion"
+        )
+        protocol["events"][1]["selectors"][0]["operation"] = "add-assign"
+        self.assert_catalog_error(
+            wrong_indexed_operation, "requires or-assign"
+        )
+
+        wrong_ring_argument = self.mutated_catalog()
+        protocol = self.protocol_by_id(
+            wrong_ring_argument, "qemu.protocol.e1000e.tx-descriptor-completion"
+        )
+        protocol["events"][1]["selectors"][0]["value_argument"] = 3
+        self.assert_catalog_error(
+            wrong_ring_argument, "outside the selector prototype"
+        )
+
+        wrong_queue_argument = self.mutated_catalog()
+        protocol = self.protocol_by_id(
+            wrong_queue_argument,
+            "qemu.protocol.e1000e.tx-descriptor-completion",
+        )
+        protocol["events"][1]["selectors"][0]["queue_argument"] = 3
+        self.assert_catalog_error(
+            wrong_queue_argument, "outside the selector prototype"
+        )
+
+        missing_queue_argument = self.mutated_catalog()
+        protocol = self.protocol_by_id(
+            missing_queue_argument,
+            "qemu.protocol.e1000e.tx-descriptor-completion",
+        )
+        protocol["events"][1]["selectors"][0].pop("queue_argument")
+        self.assert_catalog_error(
+            missing_queue_argument, "function-call fields are not canonical"
+        )
+
+        wrong_completion_vector = self.mutated_catalog()
+        protocol = self.protocol_by_id(
+            wrong_completion_vector,
+            "qemu.protocol.e1000e.tx-descriptor-completion",
+        )
+        protocol["events"][2]["selectors"][0]["value"] = 4
+        self.assert_catalog_error(
+            wrong_completion_vector, "must equal the vector binding"
+        )
+
+        missing_member_value = self.mutated_catalog()
+        protocol = self.protocol_by_id(
+            missing_member_value,
+            "qemu.protocol.rtl8139.classic-tx-completion",
+        )
+        protocol["events"][2]["selectors"][0].pop("value")
+        self.assert_catalog_error(
+            missing_member_value, "fields are not canonical"
+        )
+
+        wrong_member_completion = self.mutated_catalog()
+        protocol = self.protocol_by_id(
+            wrong_member_completion,
+            "qemu.protocol.rtl8139.classic-tx-completion",
+        )
+        completion = protocol["events"][2]["selectors"][0]
+        completion["operation"] = "post-decrement"
+        completion.pop("value")
+        self.assert_catalog_error(
+            wrong_member_completion, "completion member update requires or-assign"
+        )
 
     def test_duplicate_parameters_and_operands_are_rejected(self):
         duplicate_parameter = self.mutated_catalog()
