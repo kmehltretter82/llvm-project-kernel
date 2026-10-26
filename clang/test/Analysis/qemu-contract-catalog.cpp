@@ -21,10 +21,10 @@ static_assert(CallbackMemberStepRecordCount == 12);
 static_assert(CallbackEntryInputRecordCount == 11);
 static_assert(CallbackInputBufferRecordCount == 1);
 static_assert(CallbackBindingRecordCount == 2);
-static_assert(ProtocolBindingRecordCount == 6);
-static_assert(ProtocolSelectorRecordCount == 4);
-static_assert(ProtocolEventRecordCount == 3);
-static_assert(ProtocolRecordCount == 1);
+static_assert(ProtocolBindingRecordCount == 12);
+static_assert(ProtocolSelectorRecordCount == 8);
+static_assert(ProtocolEventRecordCount == 6);
+static_assert(ProtocolRecordCount == 2);
 
 static_assert(Contracts[0].ParameterBegin == 0);
 static_assert(Contracts[0].ReturnType[0] == 'v');
@@ -99,9 +99,16 @@ static_assert(CallbackInputBuffers[0].SelectorArgumentIndex == 2);
 static_assert(CallbackInputBuffers[0].SelectorMask == 0x8000);
 static_assert(CallbackInputBuffers[0].SelectorValue == 0);
 static_assert(Protocols[0].BindingBegin == 0);
-static_assert(Protocols[0].BindingCount == ProtocolBindingRecordCount);
+static_assert(Protocols[0].BindingCount == 6);
 static_assert(Protocols[0].EventBegin == 0);
-static_assert(Protocols[0].EventCount == ProtocolEventRecordCount);
+static_assert(Protocols[0].EventCount == 3);
+static_assert(Protocols[1].BindingBegin == 6);
+static_assert(Protocols[1].BindingCount == 6);
+static_assert(Protocols[1].EventBegin == 3);
+static_assert(Protocols[1].EventCount == 3);
+static_assert(Protocols[ProtocolRecordCount - 1].BindingBegin +
+                  Protocols[ProtocolRecordCount - 1].BindingCount ==
+              ProtocolBindingRecordCount);
 static_assert(ProtocolEvents[ProtocolEventRecordCount - 1].SelectorBegin +
                   ProtocolEvents[ProtocolEventRecordCount - 1].SelectorCount ==
               ProtocolSelectorRecordCount);

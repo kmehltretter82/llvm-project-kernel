@@ -8,8 +8,8 @@
 namespace clang::ento::qemu_contracts_generated {
 
 inline constexpr unsigned CatalogFormat = 5;
-inline constexpr char ModelVersion[] = "qemu-v3-io-contracts-v7";
-inline constexpr char CatalogSHA256[] = "d2c4f6423b58b6c5b617530d12ff1d2b99f4860984051e65632239f60c047c5c";
+inline constexpr char ModelVersion[] = "qemu-v3-io-contracts-v8";
+inline constexpr char CatalogSHA256[] = "c1df36f5de149afeb878ccf897ed8f2ed6ce7e6b1396d07d9086a75d1fe5b829";
 inline constexpr char SchemaSHA256[] = "09a169d61f4b526431cb22ab6c219adcbf263aa7f5f3abfd46701731cbee166d";
 
 struct ParameterRecord {
@@ -538,27 +538,41 @@ inline constexpr ProtocolBindingRecord ProtocolBindings[] = {
   {"qemu.protocol.sdhci.adma-completion", "result", "transfer-result", -1, "", "", 0LL, false},
   {"qemu.protocol.sdhci.adma-completion", "slot", "member-value-pre", -1, "SDHCIState", "blkcnt", 0LL, false},
   {"qemu.protocol.sdhci.adma-completion", "vector", "integer-constant", -1, "", "", 0LL, true},
+  {"qemu.protocol.xlnx-zynq-devcfg.dma-completion", "attempt", "transfer-result", -1, "", "", 0LL, false},
+  {"qemu.protocol.xlnx-zynq-devcfg.dma-completion", "owner", "scope-argument", 0, "", "", 0LL, false},
+  {"qemu.protocol.xlnx-zynq-devcfg.dma-completion", "queue", "integer-constant", -1, "", "", 0LL, true},
+  {"qemu.protocol.xlnx-zynq-devcfg.dma-completion", "result", "transfer-result", -1, "", "", 0LL, false},
+  {"qemu.protocol.xlnx-zynq-devcfg.dma-completion", "slot", "member-value-pre", -1, "XlnxZynqDevcfg", "dma_cmd_fifo_num", 0LL, false},
+  {"qemu.protocol.xlnx-zynq-devcfg.dma-completion", "vector", "integer-constant", -1, "", "", 0LL, true},
 };
-inline constexpr unsigned ProtocolBindingRecordCount = 6;
+inline constexpr unsigned ProtocolBindingRecordCount = 12;
 
 inline constexpr ProtocolSelectorRecord ProtocolSelectors[] = {
   {"qemu.protocol.sdhci.adma-completion", "descriptor-failed", "transfer-call", "qemu.transfer.dma-memory.read", "", "", "", "", "", "post-call", "failure", 1},
   {"qemu.protocol.sdhci.adma-completion", "descriptor-failed", "transfer-call", "qemu.transfer.dma-memory.write", "", "", "", "", "", "post-call", "failure", 1},
   {"qemu.protocol.sdhci.adma-completion", "ring-advanced", "member-update", "", "", "", "SDHCIState", "blkcnt", "post-decrement", "bind", "", 2},
   {"qemu.protocol.sdhci.adma-completion", "interrupt-published", "function-call", "", "sdhci_end_transfer", "void (SDHCIState *)", "", "", "", "pre-call", "", 2},
+  {"qemu.protocol.xlnx-zynq-devcfg.dma-completion", "descriptor-failed", "transfer-call", "qemu.transfer.dma-memory.read", "", "", "", "", "", "post-call", "failure", 1},
+  {"qemu.protocol.xlnx-zynq-devcfg.dma-completion", "descriptor-failed", "transfer-call", "qemu.transfer.dma-memory.write", "", "", "", "", "", "post-call", "failure", 1},
+  {"qemu.protocol.xlnx-zynq-devcfg.dma-completion", "ring-advanced", "member-update", "", "", "", "XlnxZynqDevcfg", "dma_cmd_fifo_num", "post-decrement", "bind", "", 1},
+  {"qemu.protocol.xlnx-zynq-devcfg.dma-completion", "interrupt-published", "function-call", "", "xlnx_zynq_devcfg_update_ixr", "void (XlnxZynqDevcfg *)", "", "", "", "pre-call", "", 1},
 };
-inline constexpr unsigned ProtocolSelectorRecordCount = 4;
+inline constexpr unsigned ProtocolSelectorRecordCount = 8;
 
 inline constexpr ProtocolEventRecord ProtocolEvents[] = {
   {"qemu.protocol.sdhci.adma-completion", "descriptor-failed", 0, 2},
   {"qemu.protocol.sdhci.adma-completion", "ring-advanced", 2, 1},
   {"qemu.protocol.sdhci.adma-completion", "interrupt-published", 3, 1},
+  {"qemu.protocol.xlnx-zynq-devcfg.dma-completion", "descriptor-failed", 4, 2},
+  {"qemu.protocol.xlnx-zynq-devcfg.dma-completion", "ring-advanced", 6, 1},
+  {"qemu.protocol.xlnx-zynq-devcfg.dma-completion", "interrupt-published", 7, 1},
 };
-inline constexpr unsigned ProtocolEventRecordCount = 3;
+inline constexpr unsigned ProtocolEventRecordCount = 6;
 
 inline constexpr ProtocolRecord Protocols[] = {
   {"qemu.protocol.sdhci.adma-completion", "qemu.failed-completion-publication", "sdhci", "sdhci_do_adma", "hw/sd/sdhci.c", "hw/sd/sdhci.c", "void (SDHCIState *)", 0, 6, 0, 3},
+  {"qemu.protocol.xlnx-zynq-devcfg.dma-completion", "qemu.failed-completion-publication", "xlnx-zynq-devcfg", "xlnx_zynq_devcfg_dma_go", "hw/dma/xlnx-zynq-devcfg.c", "hw/dma/xlnx-zynq-devcfg.c", "void (XlnxZynqDevcfg *)", 6, 6, 3, 3},
 };
-inline constexpr unsigned ProtocolRecordCount = 1;
+inline constexpr unsigned ProtocolRecordCount = 2;
 
 } // namespace clang::ento::qemu_contracts_generated

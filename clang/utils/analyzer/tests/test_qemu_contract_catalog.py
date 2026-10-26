@@ -50,7 +50,7 @@ class QEMUContractCatalogTest(unittest.TestCase):
     def test_catalog_contains_exact_dma_usb_and_iommu_lifetime_slices(self):
         catalog_tool.validate_catalog(self.catalog)
         self.assertEqual(self.catalog["catalog_format"], 5)
-        self.assertEqual(self.catalog["model_version"], "qemu-v3-io-contracts-v7")
+        self.assertEqual(self.catalog["model_version"], "qemu-v3-io-contracts-v8")
         selectors = {entry["selector"]["name"] for entry in self.catalog["contracts"]}
         self.assertEqual(
             selectors,
@@ -851,14 +851,18 @@ class QEMUContractCatalogTest(unittest.TestCase):
 
     def test_generated_protocol_ranges_are_contiguous(self):
         generated = catalog_tool.generate(self.catalog, self.schema)
-        self.assertIn("ProtocolBindingRecordCount = 6;", generated)
-        self.assertIn("ProtocolSelectorRecordCount = 4;", generated)
-        self.assertIn("ProtocolEventRecordCount = 3;", generated)
-        self.assertIn("ProtocolRecordCount = 1;", generated)
+        self.assertIn("ProtocolBindingRecordCount = 12;", generated)
+        self.assertIn("ProtocolSelectorRecordCount = 8;", generated)
+        self.assertIn("ProtocolEventRecordCount = 6;", generated)
+        self.assertIn("ProtocolRecordCount = 2;", generated)
         self.assertIn('"descriptor-failed", 0, 2', generated)
         self.assertIn('"ring-advanced", 2, 1', generated)
         self.assertIn('"interrupt-published", 3, 1', generated)
         self.assertIn('"void (SDHCIState *)", 0, 6, 0, 3', generated)
+        self.assertIn('"descriptor-failed", 4, 2', generated)
+        self.assertIn('"ring-advanced", 6, 1', generated)
+        self.assertIn('"interrupt-published", 7, 1', generated)
+        self.assertIn('"void (XlnxZynqDevcfg *)", 6, 6, 3, 3', generated)
 
     def test_protocol_selector_kinds_fail_closed(self):
         missing_contract = self.mutated_catalog()

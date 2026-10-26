@@ -1,6 +1,6 @@
 {
   "catalog_format": 5,
-  "model_version": "qemu-v3-io-contracts-v7",
+  "model_version": "qemu-v3-io-contracts-v8",
   "contracts": [
     {
       "id": "qemu.dma.address-space.map",
@@ -1347,6 +1347,87 @@
               },
               "phase": "pre-call",
               "expected_count": 2
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "qemu.protocol.xlnx-zynq-devcfg.dma-completion",
+      "rule_id": "qemu.failed-completion-publication",
+      "family": "xlnx-zynq-devcfg",
+      "scope": {
+        "kind": "function-definition",
+        "name": "xlnx_zynq_devcfg_dma_go",
+        "source": "hw/dma/xlnx-zynq-devcfg.c",
+        "translation_unit": "hw/dma/xlnx-zynq-devcfg.c",
+        "prototype": {
+          "return_type": "void",
+          "parameters": [
+            { "name": "s", "type": "XlnxZynqDevcfg *" }
+          ]
+        }
+      },
+      "bindings": [
+        { "role": "owner", "source": "scope-argument", "index": 0 },
+        { "role": "queue", "source": "integer-constant", "value": 0 },
+        { "role": "attempt", "source": "transfer-result" },
+        {
+          "role": "slot",
+          "source": "member-value-pre",
+          "record_type": "XlnxZynqDevcfg",
+          "field": "dma_cmd_fifo_num"
+        },
+        { "role": "vector", "source": "integer-constant", "value": 0 },
+        { "role": "result", "source": "transfer-result" }
+      ],
+      "events": [
+        {
+          "stage": "descriptor-failed",
+          "selectors": [
+            {
+              "kind": "transfer-call",
+              "contract_id": "qemu.transfer.dma-memory.read",
+              "phase": "post-call",
+              "result_path": "failure",
+              "expected_count": 1
+            },
+            {
+              "kind": "transfer-call",
+              "contract_id": "qemu.transfer.dma-memory.write",
+              "phase": "post-call",
+              "result_path": "failure",
+              "expected_count": 1
+            }
+          ]
+        },
+        {
+          "stage": "ring-advanced",
+          "selectors": [
+            {
+              "kind": "member-update",
+              "record_type": "XlnxZynqDevcfg",
+              "field": "dma_cmd_fifo_num",
+              "operation": "post-decrement",
+              "phase": "bind",
+              "expected_count": 1
+            }
+          ]
+        },
+        {
+          "stage": "interrupt-published",
+          "selectors": [
+            {
+              "kind": "function-call",
+              "name": "xlnx_zynq_devcfg_update_ixr",
+              "prototype": {
+                "return_type": "void",
+                "parameters": [
+                  { "name": "s", "type": "XlnxZynqDevcfg *" }
+                ]
+              },
+              "phase": "pre-call",
+              "expected_count": 1
             }
           ]
         }
