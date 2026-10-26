@@ -1,0 +1,117 @@
+{
+  "format": 1,
+  "kind": "qemu-reentrancy-summary",
+  "model": "qemu.reentrancy/v1",
+  "result": "pass",
+  "qemu": {
+    "revision": "fixture",
+    "dirty": false
+  },
+  "source": {
+    "path": "qemu-reentrancy-guard.c",
+    "bytes": 5311,
+    "sha256": "00e4262682251e88647722a0bb5ee033f44bfe114e73e30611d443b977c22d0d"
+  },
+  "protocols": [
+    {
+      "id": "fixture.vulnerable",
+      "entry": {"name": "vulnerable_entry", "return_type": "void", "parameters": ["void *"]},
+      "publication_wrapper": {"name": "publication_wrapper", "return_type": "void", "parameters": ["Held *"], "owner_argument": 0, "owner_member_path": ["owner"]},
+      "guard": {"record": "MemReentrancyGuard", "field": "engaged_in_io", "mode": "direct-field"},
+      "evidence": {"status": "complete", "external_registration": true, "guest_controlled_publication": true, "self_mmio_dispatch": true, "destructive_alias_path": true, "post_publication_use": true, "sha256": "77bb9fa825ff3bed2a83b1f64522a10f15fa4d0de310032c8b1be9b81145cb84"},
+      "rule_id": "qemu.reentrant-self-mmio",
+      "witness": {"complete": true, "edges": ["external-registration", "live-object", "real-dma-publication", "real-msix-publication", "guest-controlled-address-and-data", "same-device-bar0-doorbell", "zero-doorbell-command-dispatch", "reentrant-free-epctx-and-xfer", "post-publication-use", "same-owner-guard-enforcement"]},
+      "witness_sha256": "77bb9fa825ff3bed2a83b1f64522a10f15fa4d0de310032c8b1be9b81145cb84"
+    },
+    {
+      "id": "fixture.inlined-only",
+      "entry": {"name": "inlined_only_entry", "return_type": "void", "parameters": ["void *"]},
+      "publication_wrapper": {"name": "publication_wrapper", "return_type": "void", "parameters": ["Held *"], "owner_argument": 0, "owner_member_path": ["owner"]},
+      "guard": {"record": "MemReentrancyGuard", "field": "engaged_in_io", "mode": "direct-field"},
+      "evidence": {"status": "complete", "external_registration": true, "guest_controlled_publication": true, "self_mmio_dispatch": true, "destructive_alias_path": true, "post_publication_use": true, "sha256": "77bb9fa825ff3bed2a83b1f64522a10f15fa4d0de310032c8b1be9b81145cb84"},
+      "rule_id": "qemu.reentrant-self-mmio",
+      "witness": {"complete": true, "edges": ["external-registration", "live-object", "real-dma-publication", "real-msix-publication", "guest-controlled-address-and-data", "same-device-bar0-doorbell", "zero-doorbell-command-dispatch", "reentrant-free-epctx-and-xfer", "post-publication-use", "same-owner-guard-enforcement"]},
+      "witness_sha256": "77bb9fa825ff3bed2a83b1f64522a10f15fa4d0de310032c8b1be9b81145cb84"
+    },
+    {
+      "id": "fixture.direct-guarded",
+      "entry": {"name": "direct_guarded_entry", "return_type": "void", "parameters": ["void *"]},
+      "publication_wrapper": {"name": "publication_wrapper", "return_type": "void", "parameters": ["Held *"], "owner_argument": 0, "owner_member_path": ["owner"]},
+      "guard": {"record": "MemReentrancyGuard", "field": "engaged_in_io", "mode": "direct-field"},
+      "evidence": {"status": "complete", "external_registration": true, "guest_controlled_publication": true, "self_mmio_dispatch": true, "destructive_alias_path": true, "post_publication_use": true, "sha256": "77bb9fa825ff3bed2a83b1f64522a10f15fa4d0de310032c8b1be9b81145cb84"},
+      "rule_id": "qemu.reentrant-self-mmio",
+      "witness": {"complete": true, "edges": ["external-registration", "live-object", "real-dma-publication", "real-msix-publication", "guest-controlled-address-and-data", "same-device-bar0-doorbell", "zero-doorbell-command-dispatch", "reentrant-free-epctx-and-xfer", "post-publication-use", "same-owner-guard-enforcement"]},
+      "witness_sha256": "77bb9fa825ff3bed2a83b1f64522a10f15fa4d0de310032c8b1be9b81145cb84"
+    },
+    {
+      "id": "fixture.direct-alias-guarded",
+      "entry": {"name": "direct_alias_guarded_entry", "return_type": "void", "parameters": ["void *"]},
+      "publication_wrapper": {"name": "publication_wrapper", "return_type": "void", "parameters": ["Held *"], "owner_argument": 0, "owner_member_path": ["owner"]},
+      "guard": {"record": "MemReentrancyGuard", "field": "engaged_in_io", "mode": "direct-field"},
+      "evidence": {"status": "complete", "external_registration": true, "guest_controlled_publication": true, "self_mmio_dispatch": true, "destructive_alias_path": true, "post_publication_use": true, "sha256": "77bb9fa825ff3bed2a83b1f64522a10f15fa4d0de310032c8b1be9b81145cb84"},
+      "rule_id": "qemu.reentrant-self-mmio",
+      "witness": {"complete": true, "edges": ["external-registration", "live-object", "real-dma-publication", "real-msix-publication", "guest-controlled-address-and-data", "same-device-bar0-doorbell", "zero-doorbell-command-dispatch", "reentrant-free-epctx-and-xfer", "post-publication-use", "same-owner-guard-enforcement"]},
+      "witness_sha256": "77bb9fa825ff3bed2a83b1f64522a10f15fa4d0de310032c8b1be9b81145cb84"
+    },
+    {
+      "id": "fixture.helper-guarded",
+      "entry": {"name": "helper_guarded_entry", "return_type": "void", "parameters": ["void *"]},
+      "publication_wrapper": {"name": "publication_wrapper", "return_type": "void", "parameters": ["Held *"], "owner_argument": 0, "owner_member_path": ["owner"]},
+      "guard": {"record": "MemReentrancyGuard", "field": "engaged_in_io", "mode": "helper-functions", "engage_function": "engage_guard", "restore_function": "restore_guard"},
+      "evidence": {"status": "complete", "external_registration": true, "guest_controlled_publication": true, "self_mmio_dispatch": true, "destructive_alias_path": true, "post_publication_use": true, "sha256": "77bb9fa825ff3bed2a83b1f64522a10f15fa4d0de310032c8b1be9b81145cb84"},
+      "rule_id": "qemu.reentrant-self-mmio",
+      "witness": {"complete": true, "edges": ["external-registration", "live-object", "real-dma-publication", "real-msix-publication", "guest-controlled-address-and-data", "same-device-bar0-doorbell", "zero-doorbell-command-dispatch", "reentrant-free-epctx-and-xfer", "post-publication-use", "same-owner-guard-enforcement"]},
+      "witness_sha256": "77bb9fa825ff3bed2a83b1f64522a10f15fa4d0de310032c8b1be9b81145cb84"
+    },
+    {
+      "id": "fixture.previous-true-guarded",
+      "entry": {"name": "previous_true_guarded_entry", "return_type": "void", "parameters": ["void *"]},
+      "publication_wrapper": {"name": "publication_wrapper", "return_type": "void", "parameters": ["Held *"], "owner_argument": 0, "owner_member_path": ["owner"]},
+      "guard": {"record": "MemReentrancyGuard", "field": "engaged_in_io", "mode": "helper-functions", "engage_function": "engage_guard", "restore_function": "restore_guard"},
+      "evidence": {"status": "complete", "external_registration": true, "guest_controlled_publication": true, "self_mmio_dispatch": true, "destructive_alias_path": true, "post_publication_use": true, "sha256": "77bb9fa825ff3bed2a83b1f64522a10f15fa4d0de310032c8b1be9b81145cb84"},
+      "rule_id": "qemu.reentrant-self-mmio",
+      "witness": {"complete": true, "edges": ["external-registration", "live-object", "real-dma-publication", "real-msix-publication", "guest-controlled-address-and-data", "same-device-bar0-doorbell", "zero-doorbell-command-dispatch", "reentrant-free-epctx-and-xfer", "post-publication-use", "same-owner-guard-enforcement"]},
+      "witness_sha256": "77bb9fa825ff3bed2a83b1f64522a10f15fa4d0de310032c8b1be9b81145cb84"
+    },
+    {
+      "id": "fixture.nested-helper-guarded",
+      "entry": {"name": "nested_helper_guarded_entry", "return_type": "void", "parameters": ["void *"]},
+      "publication_wrapper": {"name": "publication_wrapper", "return_type": "void", "parameters": ["Held *"], "owner_argument": 0, "owner_member_path": ["owner"]},
+      "guard": {"record": "MemReentrancyGuard", "field": "engaged_in_io", "mode": "helper-functions", "engage_function": "engage_guard", "restore_function": "restore_guard"},
+      "evidence": {"status": "complete", "external_registration": true, "guest_controlled_publication": true, "self_mmio_dispatch": true, "destructive_alias_path": true, "post_publication_use": true, "sha256": "77bb9fa825ff3bed2a83b1f64522a10f15fa4d0de310032c8b1be9b81145cb84"},
+      "rule_id": "qemu.reentrant-self-mmio",
+      "witness": {"complete": true, "edges": ["external-registration", "live-object", "real-dma-publication", "real-msix-publication", "guest-controlled-address-and-data", "same-device-bar0-doorbell", "zero-doorbell-command-dispatch", "reentrant-free-epctx-and-xfer", "post-publication-use", "same-owner-guard-enforcement"]},
+      "witness_sha256": "77bb9fa825ff3bed2a83b1f64522a10f15fa4d0de310032c8b1be9b81145cb84"
+    },
+    {
+      "id": "fixture.different-owner",
+      "entry": {"name": "different_owner_guard_entry", "return_type": "void", "parameters": ["void *"]},
+      "publication_wrapper": {"name": "publication_wrapper", "return_type": "void", "parameters": ["Held *"], "owner_argument": 0, "owner_member_path": ["owner"]},
+      "guard": {"record": "MemReentrancyGuard", "field": "engaged_in_io", "mode": "direct-field"},
+      "evidence": {"status": "complete", "external_registration": true, "guest_controlled_publication": true, "self_mmio_dispatch": true, "destructive_alias_path": true, "post_publication_use": true, "sha256": "77bb9fa825ff3bed2a83b1f64522a10f15fa4d0de310032c8b1be9b81145cb84"},
+      "rule_id": "qemu.reentrant-self-mmio",
+      "witness": {"complete": true, "edges": ["external-registration", "live-object", "real-dma-publication", "real-msix-publication", "guest-controlled-address-and-data", "same-device-bar0-doorbell", "zero-doorbell-command-dispatch", "reentrant-free-epctx-and-xfer", "post-publication-use", "same-owner-guard-enforcement"]},
+      "witness_sha256": "77bb9fa825ff3bed2a83b1f64522a10f15fa4d0de310032c8b1be9b81145cb84"
+    },
+    {
+      "id": "fixture.guard-after",
+      "entry": {"name": "guard_after_publication_entry", "return_type": "void", "parameters": ["void *"]},
+      "publication_wrapper": {"name": "publication_wrapper", "return_type": "void", "parameters": ["Held *"], "owner_argument": 0, "owner_member_path": ["owner"]},
+      "guard": {"record": "MemReentrancyGuard", "field": "engaged_in_io", "mode": "direct-field"},
+      "evidence": {"status": "complete", "external_registration": true, "guest_controlled_publication": true, "self_mmio_dispatch": true, "destructive_alias_path": true, "post_publication_use": true, "sha256": "77bb9fa825ff3bed2a83b1f64522a10f15fa4d0de310032c8b1be9b81145cb84"},
+      "rule_id": "qemu.reentrant-self-mmio",
+      "witness": {"complete": true, "edges": ["external-registration", "live-object", "real-dma-publication", "real-msix-publication", "guest-controlled-address-and-data", "same-device-bar0-doorbell", "zero-doorbell-command-dispatch", "reentrant-free-epctx-and-xfer", "post-publication-use", "same-owner-guard-enforcement"]},
+      "witness_sha256": "77bb9fa825ff3bed2a83b1f64522a10f15fa4d0de310032c8b1be9b81145cb84"
+    },
+    {
+      "id": "fixture.restored-before",
+      "entry": {"name": "restored_before_publication_entry", "return_type": "void", "parameters": ["void *"]},
+      "publication_wrapper": {"name": "publication_wrapper", "return_type": "void", "parameters": ["Held *"], "owner_argument": 0, "owner_member_path": ["owner"]},
+      "guard": {"record": "MemReentrancyGuard", "field": "engaged_in_io", "mode": "helper-functions", "engage_function": "engage_guard", "restore_function": "restore_guard"},
+      "evidence": {"status": "complete", "external_registration": true, "guest_controlled_publication": true, "self_mmio_dispatch": true, "destructive_alias_path": true, "post_publication_use": true, "sha256": "77bb9fa825ff3bed2a83b1f64522a10f15fa4d0de310032c8b1be9b81145cb84"},
+      "rule_id": "qemu.reentrant-self-mmio",
+      "witness": {"complete": true, "edges": ["external-registration", "live-object", "real-dma-publication", "real-msix-publication", "guest-controlled-address-and-data", "same-device-bar0-doorbell", "zero-doorbell-command-dispatch", "reentrant-free-epctx-and-xfer", "post-publication-use", "same-owner-guard-enforcement"]},
+      "witness_sha256": "77bb9fa825ff3bed2a83b1f64522a10f15fa4d0de310032c8b1be9b81145cb84"
+    }
+  ]
+}

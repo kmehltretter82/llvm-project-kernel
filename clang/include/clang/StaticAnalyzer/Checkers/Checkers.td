@@ -686,6 +686,18 @@ def QEMUMigrationConsistencyChecker : Checker<"MigrationConsistency">,
   ]>,
   Documentation<NotDocumented>;
 
+def QEMUReentrancyGuardChecker : Checker<"ReentrancyGuard">,
+  HelpText<"Check sealed QEMU self-MMIO reentrancy schedules">,
+  CheckerOptions<[
+    CmdLineOption<String,
+                  "ReentrancySummaryManifest",
+                  "Exact sealed cross-entry summary for QEMU callback, "
+                  "self-MMIO, destructive-handler, and resumed-use edges",
+                  "",
+                  InAlpha>
+  ]>,
+  Documentation<NotDocumented>;
+
 def QEMUResourceLifetimeChecker : Checker<"ResourceLifetime">,
   HelpText<"Check path-sensitive QEMU resource lifetime rules">,
   Documentation<NotDocumented>;

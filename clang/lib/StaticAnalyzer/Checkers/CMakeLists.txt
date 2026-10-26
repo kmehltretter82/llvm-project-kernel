@@ -125,6 +125,7 @@ add_clang_library(clangStaticAnalyzerCheckers
   QEMUIOMMUNotifierLifetimeChecker.cpp
   QEMULockContextChecker.cpp
   QEMUMigrationConsistencyChecker.cpp
+  QEMUReentrancyGuardChecker.cpp
   QEMUResourceLifetimeChecker.cpp
   RetainCountChecker/RetainCountChecker.cpp
   RetainCountChecker/RetainCountDiagnostics.cpp
