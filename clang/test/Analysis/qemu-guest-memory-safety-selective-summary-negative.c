@@ -1,12 +1,12 @@
 // RUN: %clang_analyze_cc1 -triple x86_64-unknown-linux-gnu \
 // RUN:   -analyzer-checker=core,alpha.qemu.GuestMemorySafety \
 // RUN:   -analyzer-config alpha.qemu.GuestMemorySafety:EnableDMATransferResultDiagnostics=true \
-// RUN:   -analyzer-config alpha.qemu.GuestMemorySafety:SelectiveSummaryManifest=%S/../../../../validation/v3-selective-ctu-summary/current-d7314928.json \
+// RUN:   -analyzer-config alpha.qemu.GuestMemorySafety:SelectiveSummaryManifest=%S/../../../../validation/v3-selective-ctu-summary-pci-dma-stage1/current-d7314928-stage1-v2.json \
 // RUN:   -verify %s 2>&1 | FileCheck %s --check-prefix=COUNTERS-X86_64
 // RUN: %clang_analyze_cc1 -triple i386-unknown-linux-gnu \
 // RUN:   -analyzer-checker=core,alpha.qemu.GuestMemorySafety \
 // RUN:   -analyzer-config alpha.qemu.GuestMemorySafety:EnableDMATransferResultDiagnostics=true \
-// RUN:   -analyzer-config alpha.qemu.GuestMemorySafety:SelectiveSummaryManifest=%S/../../../../validation/v3-selective-ctu-summary/current-d7314928.json \
+// RUN:   -analyzer-config alpha.qemu.GuestMemorySafety:SelectiveSummaryManifest=%S/../../../../validation/v3-selective-ctu-summary-pci-dma-stage1/current-d7314928-stage1-v2.json \
 // RUN:   -verify %s 2>&1 | FileCheck %s --check-prefix=COUNTERS-I386
 // expected-no-diagnostics
 
@@ -46,5 +46,5 @@ void prototype_mismatch(void *buffer) {
   dma_buf_write(buffer, 1);
 }
 
-// COUNTERS-X86_64: QEMU_GMS_SELECTIVE_SUMMARY_V1 loaded=2 matched=0 consumed=0 unsupported=0
-// COUNTERS-I386: QEMU_GMS_SELECTIVE_SUMMARY_V1 loaded=2 matched=0 consumed=0 unsupported=0
+// COUNTERS-X86_64: QEMU_GMS_SELECTIVE_SUMMARY_V2 loaded=3 matched=0 consumed=0 unsupported=0
+// COUNTERS-I386: QEMU_GMS_SELECTIVE_SUMMARY_V2 loaded=3 matched=0 consumed=0 unsupported=0

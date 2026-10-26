@@ -552,6 +552,7 @@ class QEMUGuestMemorySafetyChecker
   std::string QEMUSourceRoot;
 
   enum class SelectiveSummaryDirection { FromDevice, ToDevice };
+  enum class SelectiveSummaryEffect { ResultAndExtentOnly, FullTransfer };
 
   struct SelectiveDMASummary {
     std::string Function;
@@ -562,10 +563,12 @@ class QEMUGuestMemorySafetyChecker
     unsigned DeclarationLine;
     unsigned DeclarationColumn;
     SelectiveSummaryDirection Direction;
+    SelectiveSummaryEffect Effect;
   };
 
   std::string SelectiveSummaryManifest;
-  llvm::SmallVector<SelectiveDMASummary, 2> SelectiveSummaries;
+  unsigned SelectiveSummaryFormat = 0;
+  llvm::SmallVector<SelectiveDMASummary, 3> SelectiveSummaries;
   mutable llvm::SmallDenseSet<const Expr *, 16> SelectiveSummaryMatchedCalls;
   mutable llvm::SmallDenseSet<const Expr *, 16> SelectiveSummaryConsumedCalls;
   mutable llvm::SmallDenseSet<const Expr *, 16>
@@ -4879,12 +4882,14 @@ class QEMUGuestMemorySafetyChecker
 
   bool loadSelectiveSummaryManifest(StringRef Path, CheckerManager &Mgr) {
     SelectiveSummaryManifest.clear();
+    SelectiveSummaryFormat = 0;
     SelectiveSummaries.clear();
     if (Path.empty())
       return true;
 
     auto Invalid = [&](StringRef Reason) {
       SelectiveSummaryManifest.clear();
+      SelectiveSummaryFormat = 0;
       SelectiveSummaries.clear();
       Mgr.reportInvalidCheckerOptionValue(
           this, "SelectiveSummaryManifest",
@@ -4912,10 +4917,12 @@ class QEMUGuestMemorySafetyChecker
     if (!Root)
       return Invalid("root is not an object");
 
-    if (!jsonIntegerIs(*Root, "format", 1) ||
+    std::optional<int64_t> Format = Root->getInteger("format");
+    if (!Format || (*Format != 1 && *Format != 2) ||
         !jsonStringIs(*Root, "kind", "qemu-selective-ctu-summary") ||
         !jsonStringIs(*Root, "result", "pass"))
       return Invalid("format, kind, or result differs");
+    bool IsV2 = *Format == 2;
 
     const llvm::json::Object *QEMU = Root->getObject("qemu");
     if (!QEMU ||
@@ -4925,37 +4932,102 @@ class QEMUGuestMemorySafetyChecker
       return Invalid("exact QEMU revision or clean-state identity differs");
 
     const llvm::json::Object *Coverage = Root->getObject("coverage");
-    if (!Coverage || !jsonIntegerIs(*Coverage, "requested", 2) ||
-        !jsonIntegerIs(*Coverage, "exact", 2) ||
+    int64_t ExpectedSummaryCount = IsV2 ? 3 : 2;
+    if (!Coverage ||
+        !jsonIntegerIs(*Coverage, "requested", ExpectedSummaryCount) ||
+        !jsonIntegerIs(*Coverage, "exact", ExpectedSummaryCount) ||
         !jsonIntegerIs(*Coverage, "unsupported", 0))
       return Invalid("producer coverage differs");
 
     const llvm::json::Object *Scope = Root->getObject("scope");
-    const llvm::json::Array *Allowlist =
-        Scope ? Scope->getArray("allowlist") : nullptr;
-    if (!Scope || !Allowlist || Allowlist->size() != 2 ||
-        (*Allowlist)[0].getAsString() !=
-            std::optional<StringRef>("dma_buf_read") ||
-        (*Allowlist)[1].getAsString() !=
-            std::optional<StringRef>("dma_buf_write") ||
-        !jsonStringIs(*Scope, "claim", "transfer-result-and-extent-only") ||
-        !jsonStringIs(*Scope, "helper", "dma_buf_rw") ||
-        !jsonStringIs(*Scope, "leaf", "dma_memory_rw") ||
-        !jsonStringIs(*Scope, "model", "qemu.dma.transfer-result/v1") ||
-        !jsonIntegerIs(*Scope, "max_depth", 3))
+    if (!Scope)
       return Invalid("bounded producer scope differs");
+    if (!IsV2) {
+      const llvm::json::Array *Allowlist = Scope->getArray("allowlist");
+      if (!Allowlist || Allowlist->size() != 2 ||
+          (*Allowlist)[0].getAsString() !=
+              std::optional<StringRef>("dma_buf_read") ||
+          (*Allowlist)[1].getAsString() !=
+              std::optional<StringRef>("dma_buf_write") ||
+          !jsonStringIs(*Scope, "claim",
+                        "transfer-result-and-extent-only") ||
+          !jsonStringIs(*Scope, "helper", "dma_buf_rw") ||
+          !jsonStringIs(*Scope, "leaf", "dma_memory_rw") ||
+          !jsonStringIs(*Scope, "model", "qemu.dma.transfer-result/v1") ||
+          !jsonIntegerIs(*Scope, "max_depth", 3))
+        return Invalid("bounded producer scope differs");
+    } else {
+      const llvm::json::Array *Families = Scope->getArray("families");
+      const llvm::json::Object *DMABufFamily =
+          Families && Families->size() == 2 ? (*Families)[0].getAsObject()
+                                           : nullptr;
+      const llvm::json::Object *PCIFamily =
+          Families && Families->size() == 2 ? (*Families)[1].getAsObject()
+                                           : nullptr;
+      const llvm::json::Array *DMABufAllowlist =
+          DMABufFamily ? DMABufFamily->getArray("allowlist") : nullptr;
+      const llvm::json::Array *PCIAllowlist =
+          PCIFamily ? PCIFamily->getArray("allowlist") : nullptr;
+      if (!DMABufFamily || !PCIFamily || !DMABufAllowlist ||
+          DMABufAllowlist->size() != 2 ||
+          (*DMABufAllowlist)[0].getAsString() !=
+              std::optional<StringRef>("dma_buf_read") ||
+          (*DMABufAllowlist)[1].getAsString() !=
+              std::optional<StringRef>("dma_buf_write") ||
+          !jsonStringIs(*DMABufFamily, "id", "qemu.dma-buf") ||
+          !jsonStringIs(*DMABufFamily, "claim",
+                        "transfer-result-and-extent-only") ||
+          !jsonStringIs(*DMABufFamily, "helper", "dma_buf_rw") ||
+          !PCIAllowlist || PCIAllowlist->size() != 1 ||
+          (*PCIAllowlist)[0].getAsString() !=
+              std::optional<StringRef>("pci_dma_read") ||
+          !jsonStringIs(*PCIFamily, "id", "qemu.pci-dma-read") ||
+          !jsonStringIs(*PCIFamily, "claim", "full-transfer-effect") ||
+          !jsonStringIs(*PCIFamily, "helper", "pci_dma_rw") ||
+          !jsonStringIs(*Scope, "leaf", "dma_memory_rw") ||
+          !jsonStringIs(*Scope, "model", "qemu.dma.transfer-result/v2") ||
+          !jsonIntegerIs(*Scope, "max_depth", 3))
+        return Invalid("bounded producer scope differs");
+    }
 
     const llvm::json::Object *Inputs = Root->getObject("inputs");
     const llvm::json::Object *Header =
         Inputs ? Inputs->getObject("header") : nullptr;
     const llvm::json::Object *Source =
         Inputs ? Inputs->getObject("source") : nullptr;
+    const llvm::json::Object *PCIHeader =
+        Inputs ? Inputs->getObject("pci_header") : nullptr;
+    const llvm::json::Object *PCIAnchor =
+        Inputs ? Inputs->getObject("pci_anchor") : nullptr;
+    const llvm::json::Object *Dependencies =
+        Inputs ? Inputs->getObject("dependencies") : nullptr;
+    const llvm::json::Object *PCIDependencies =
+        Inputs ? Inputs->getObject("pci_dependencies") : nullptr;
     const llvm::json::Object *Leaf =
         Inputs ? Inputs->getObject("leaf_contract") : nullptr;
     const llvm::json::Object *Catalog =
         Inputs ? Inputs->getObject("catalog") : nullptr;
     const llvm::json::Object *CatalogSchema =
         Inputs ? Inputs->getObject("catalog_schema") : nullptr;
+    bool InvalidPCIInputs =
+        IsV2 &&
+        (!PCIHeader ||
+         !jsonStringIs(*PCIHeader, "path", "include/hw/pci/pci_device.h") ||
+         !jsonIntegerIs(*PCIHeader, "bytes", 11649) ||
+         !jsonStringIs(*PCIHeader, "sha256",
+                       "27c4e2437bc9f1a2b202d8f433ebf7e9a9bb45d2bb6d7216115441f"
+                       "b96c89e3e") ||
+         !PCIAnchor ||
+         !jsonStringIs(*PCIAnchor, "path", "hw/net/e1000e_core.c") ||
+         !jsonIntegerIs(*PCIAnchor, "bytes", 107421) ||
+         !jsonStringIs(*PCIAnchor, "sha256",
+                       "afa1fd76b8a24f3055a85b1ab043fd5a5a3009dec7463b70f2e5257"
+                       "e35d2ec43") ||
+         !PCIDependencies ||
+         !jsonIntegerIs(*PCIDependencies, "count", 467) ||
+         !jsonStringIs(*PCIDependencies, "manifest_sha256",
+                       "1c4c17fa6f77e6d5dc71ff70016630b03ed4df22b82a211ac81bbcbb"
+                       "58954132"));
     if (!Catalog ||
         !jsonStringIs(*Catalog, "path", "QEMUContractCatalog.json") ||
         !jsonIntegerIs(*Catalog, "bytes", 48051) ||
@@ -4988,6 +5060,11 @@ class QEMUGuestMemorySafetyChecker
         !jsonStringIs(*Source, "sha256",
                       "b7b281a47eeeb60ea8719e5ea30807afb0c5861362c571c8c1325c54"
                       "4d55ef45") ||
+        !Dependencies || !jsonIntegerIs(*Dependencies, "count", 418) ||
+        !jsonStringIs(*Dependencies, "manifest_sha256",
+                      "6946e6ba1c5bc57b669f3835838f4b1fc122b4da1ca22b7314c29661"
+                      "5d11b0ac") ||
+        InvalidPCIInputs ||
         !Leaf || !jsonStringIs(*Leaf, "id", "qemu.transfer.dma-memory.rw") ||
         !jsonStringIs(*Leaf, "prototype",
                       "MemTxResult(AddressSpace*,dma_addr_t,void*,dma_addr_t,"
@@ -5006,7 +5083,8 @@ class QEMUGuestMemorySafetyChecker
       return Invalid("compiled leaf contract identity differs");
 
     const llvm::json::Array *Summaries = Root->getArray("summaries");
-    if (!Summaries || Summaries->size() != 2)
+    if (!Summaries || Summaries->size() !=
+                          static_cast<size_t>(ExpectedSummaryCount))
       return Invalid("summary inventory differs");
 
     constexpr llvm::StringLiteral Prototype =
@@ -5014,7 +5092,7 @@ class QEMUGuestMemorySafetyChecker
         "MemTxAttrs)";
     constexpr llvm::StringLiteral PrototypeSHA =
         "24871fbaeed4addcdf0df1ffc664bb6a0f0f84d24f9f2b1a23691f3cb39021b8";
-    for (unsigned Index = 0; Index != Summaries->size(); ++Index) {
+    for (unsigned Index = 0; Index != 2; ++Index) {
       const llvm::json::Object *Summary = (*Summaries)[Index].getAsObject();
       StringRef Function = Index == 0 ? "dma_buf_read" : "dma_buf_write";
       std::string LookupName = ("c:@F@" + Function).str();
@@ -5113,18 +5191,193 @@ class QEMUGuestMemorySafetyChecker
           Function.str(), LookupName, Prototype.str(), "include/system/dma.h",
           PrototypeSHA.str(), Line, 13,
           Index == 0 ? SelectiveSummaryDirection::FromDevice
-                     : SelectiveSummaryDirection::ToDevice});
+                     : SelectiveSummaryDirection::ToDevice,
+          SelectiveSummaryEffect::ResultAndExtentOnly});
     }
 
-    if (Bytes.size() != 92246 ||
+    if (!IsV2) {
+      if (Bytes.size() != 92246 ||
+          llvm::toHex(llvm::SHA256::hash(
+                          llvm::arrayRefFromStringRef(Bytes)),
+                      /*LowerCase=*/true) !=
+              "c7e7c8b42859f405eb9e0bbcc5ff6018dec8ae4e9fb342eca089aaf598"
+              "12e676") {
+        SelectiveSummaries.clear();
+        return Invalid("sealed byte identity differs");
+      }
+      SelectiveSummaryManifest = Path.str();
+      SelectiveSummaryFormat = 1;
+      return true;
+    }
+
+    const llvm::json::Object *PCISummary = (*Summaries)[2].getAsObject();
+    constexpr llvm::StringLiteral PCIPrototype =
+        "MemTxResult (PCIDevice *, dma_addr_t, void *, dma_addr_t)";
+    constexpr llvm::StringLiteral PCIPrototypeSHA =
+        "11c10047376ac209e09b080cb72f3364d7290ad421f90862a591ef7133ac5efe";
+    if (!PCISummary ||
+        !jsonStringIs(*PCISummary, "function", "pci_dma_read") ||
+        !jsonStringIs(*PCISummary, "lookup_name",
+                      "static-inline:include/hw/pci/pci_device.h:"
+                      "pci_dma_read") ||
+        !jsonStringIs(*PCISummary, "status", "exact") ||
+        !jsonStringIs(*PCISummary, "prototype", PCIPrototype) ||
+        !jsonStringIs(*PCISummary, "prototype_sha256", PCIPrototypeSHA) ||
+        !jsonIntegerIs(*PCISummary, "observed_depth", 2))
+      return Invalid("PCI summary identity differs");
+
+    const llvm::json::Array *PCIClosure = PCISummary->getArray("closure");
+    if (!PCIClosure || PCIClosure->size() != 4 ||
+        (*PCIClosure)[0].getAsString() !=
+            std::optional<StringRef>("pci_dma_read") ||
+        (*PCIClosure)[1].getAsString() !=
+            std::optional<StringRef>("pci_dma_rw") ||
+        (*PCIClosure)[2].getAsString() !=
+            std::optional<StringRef>("pci_get_address_space") ||
+        (*PCIClosure)[3].getAsString() !=
+            std::optional<StringRef>("dma_memory_rw"))
+      return Invalid("PCI summary closure differs");
+
+    const llvm::json::Object *PCISupportingDefinitions =
+        PCISummary->getObject("supporting_definitions");
+    const llvm::json::Object *PCIHelperDefinition =
+        PCISupportingDefinitions
+            ? PCISupportingDefinitions->getObject("pci_dma_rw")
+            : nullptr;
+    const llvm::json::Object *PCIGetterDefinition =
+        PCISupportingDefinitions
+            ? PCISupportingDefinitions->getObject("pci_get_address_space")
+            : nullptr;
+    if (!PCISupportingDefinitions || PCISupportingDefinitions->size() != 2 ||
+        !PCIHelperDefinition ||
+        !jsonStringIs(*PCIHelperDefinition, "path",
+                      "include/hw/pci/pci_device.h") ||
+        !jsonIntegerIs(*PCIHelperDefinition, "line", 256) ||
+        !jsonIntegerIs(*PCIHelperDefinition, "column", 27) ||
+        !jsonStringIs(*PCIHelperDefinition, "prototype_sha256",
+                      "4c6af3c284dffc68fc46105ad95e32b5d78efad45ba557de78d58a06a"
+                      "d5d1b86") ||
+        !jsonStringIs(*PCIHelperDefinition, "body_sha256",
+                      "eebb141180711f8ec8b4cc3ddab8b752e70e6dc673eece7b7cfeadbea"
+                      "23653af") ||
+        !PCIGetterDefinition ||
+        !jsonStringIs(*PCIGetterDefinition, "path",
+                      "include/hw/pci/pci_device.h") ||
+        !jsonIntegerIs(*PCIGetterDefinition, "line", 238) ||
+        !jsonIntegerIs(*PCIGetterDefinition, "column", 29) ||
+        !jsonStringIs(*PCIGetterDefinition, "prototype_sha256",
+                      "9eced98b15c220cd79ae8f180d95e84346e586194c82729d36e97af9a4"
+                      "c6807b") ||
+        !jsonStringIs(*PCIGetterDefinition, "body_sha256",
+                      "7d3645cee9fa7c2531fe7ac6bcff3b4def9c8166113701b5a4ac7996ad"
+                      "e30b72"))
+      return Invalid("PCI supporting definition identity differs");
+
+    const llvm::json::Object *PCIDeclaration =
+        PCISummary->getObject("declaration");
+    if (!PCIDeclaration ||
+        !jsonStringIs(*PCIDeclaration, "path",
+                      "include/hw/pci/pci_device.h") ||
+        !jsonIntegerIs(*PCIDeclaration, "line", 276) ||
+        !jsonIntegerIs(*PCIDeclaration, "column", 27) ||
+        !jsonStringIs(*PCIDeclaration, "prototype_sha256", PCIPrototypeSHA))
+      return Invalid("PCI summary declaration differs");
+
+    const llvm::json::Object *PCIEffect = PCISummary->getObject("effect");
+    const llvm::json::Object *PCIReturn =
+        PCIEffect ? PCIEffect->getObject("return_value") : nullptr;
+    const llvm::json::Object *PCITransfer =
+        PCIEffect ? PCIEffect->getObject("transfer") : nullptr;
+    const llvm::json::Object *PCIImport =
+        PCIEffect ? PCIEffect->getObject("import") : nullptr;
+    const llvm::json::Object *PCIOwner =
+        PCITransfer ? PCITransfer->getObject("owner") : nullptr;
+    const llvm::json::Object *PCIOwnerField =
+        PCIOwner ? PCIOwner->getObject("field") : nullptr;
+    const llvm::json::Object *PCIGuestAddress =
+        PCITransfer ? PCITransfer->getObject("guest_address") : nullptr;
+    const llvm::json::Object *PCIHostBuffer =
+        PCITransfer ? PCITransfer->getObject("host_buffer") : nullptr;
+    const llvm::json::Object *PCIExtent =
+        PCITransfer ? PCITransfer->getObject("extent") : nullptr;
+    const llvm::json::Object *PCIDirection =
+        PCITransfer ? PCITransfer->getObject("direction") : nullptr;
+    const llvm::json::Object *PCIAttributes =
+        PCITransfer ? PCITransfer->getObject("attributes") : nullptr;
+    const llvm::json::Array *PCILosses =
+        PCIImport ? PCIImport->getArray("losses") : nullptr;
+    const llvm::json::Object *PCIBufferInitialization =
+        PCIEffect ? PCIEffect->getObject("buffer_initialization") : nullptr;
+    const llvm::json::Object *PCIInitializationExtent =
+        PCIBufferInitialization
+            ? PCIBufferInitialization->getObject("extent")
+            : nullptr;
+    const llvm::json::Object *PCIInitializationSuccess =
+        PCIBufferInitialization
+            ? PCIBufferInitialization->getObject("success")
+            : nullptr;
+    const llvm::json::Object *PCIInitializationFailure =
+        PCIBufferInitialization
+            ? PCIBufferInitialization->getObject("failure")
+            : nullptr;
+    const llvm::json::Object *PCIInitializationPrerequisite =
+        PCIBufferInitialization
+            ? PCIBufferInitialization->getObject("prerequisite")
+            : nullptr;
+    if (!PCIReturn ||
+        !jsonStringIs(*PCIReturn, "op", "identity") ||
+        !jsonStringIs(*PCIReturn, "call_result", "dma_memory_rw") ||
+        !PCITransfer || !PCIOwnerField || !PCIGuestAddress || !PCIHostBuffer ||
+        !PCIExtent || !PCIDirection || !PCIAttributes || !PCIImport ||
+        !jsonIntegerIs(*PCIOwnerField, "argument", 0) ||
+        !jsonSingleStringArrayIs(*PCIOwnerField, "path", "bus_master_as") ||
+        PCIOwnerField->getBoolean("address_of") !=
+            std::optional<bool>(true) ||
+        !jsonIntegerIs(*PCIGuestAddress, "argument", 1) ||
+        !jsonIntegerIs(*PCIHostBuffer, "argument", 2) ||
+        !jsonIntegerIs(*PCIExtent, "argument", 3) ||
+        !jsonStringIs(*PCIDirection, "enum", "DMA_DIRECTION_TO_DEVICE") ||
+        !jsonStringIs(*PCIAttributes, "constant",
+                      "MEMTXATTRS_UNSPECIFIED") ||
+        PCIImport->getBoolean("value_result_state") !=
+            std::optional<bool>(true) ||
+        PCIImport->getBoolean("transfer_operation") !=
+            std::optional<bool>(true) ||
+        !PCILosses || !PCILosses->empty() || !PCIBufferInitialization ||
+        !PCIInitializationExtent ||
+        !jsonIntegerIs(*PCIInitializationExtent, "argument", 3) ||
+        !PCIInitializationSuccess ||
+        PCIInitializationSuccess->getBoolean("initialized") !=
+            std::optional<bool>(true) ||
+        !jsonStringIs(*PCIInitializationSuccess, "provenance", "guest-dma") ||
+        !PCIInitializationFailure ||
+        PCIInitializationFailure->getBoolean("initialized") !=
+            std::optional<bool>(true) ||
+        !jsonStringIs(*PCIInitializationFailure, "provenance",
+                      "deterministic-or-unknown") ||
+        !PCIInitializationPrerequisite ||
+        !jsonStringIs(*PCIInitializationPrerequisite, "attributes",
+                      "MEMTXATTRS_UNSPECIFIED") ||
+        !jsonIntegerIs(*PCIInitializationPrerequisite, "memory", 0))
+      return Invalid("PCI summary effect differs");
+
+    SelectiveSummaries.push_back(SelectiveDMASummary{
+        "pci_dma_read",
+        "static-inline:include/hw/pci/pci_device.h:pci_dma_read",
+        PCIPrototype.str(), "include/hw/pci/pci_device.h",
+        PCIPrototypeSHA.str(), 276, 27, SelectiveSummaryDirection::ToDevice,
+        SelectiveSummaryEffect::FullTransfer});
+
+    if (Bytes.size() != 189228 ||
         llvm::toHex(llvm::SHA256::hash(llvm::arrayRefFromStringRef(Bytes)),
-                    /*LowerCase=*/true) != "c7e7c8b42859f405eb9e0bbcc5ff6018dec"
-                                           "8ae4e9fb342eca089aaf59812e676") {
+                    /*LowerCase=*/true) != "32269e160a6180c60c9e2eb2ea7d8ba3812"
+                                           "0e2ff47d4daf1891b38c3753716fa") {
       SelectiveSummaries.clear();
       return Invalid("sealed byte identity differs");
     }
 
     SelectiveSummaryManifest = Path.str();
+    SelectiveSummaryFormat = 2;
     return true;
   }
 
@@ -6465,7 +6718,6 @@ class QEMUGuestMemorySafetyChecker
       return nullptr;
     const auto *FD = dyn_cast_or_null<FunctionDecl>(Call.getDecl());
     if (!FD || !FD->getIdentifier() || FD->isVariadic() ||
-        FD->getNumParams() != 5 || Call.getNumArgs() != 5 ||
         !FD->getDeclContext()->getRedeclContext()->isTranslationUnit() ||
         !FD->getLexicalDeclContext()->getRedeclContext()->isTranslationUnit())
       return nullptr;
@@ -6478,7 +6730,8 @@ class QEMUGuestMemorySafetyChecker
         return nullptr;
       Found = &Summary;
     }
-    if (!Found || !directDMATypeMatches(FD->getType(), Found->Prototype))
+    if (!Found || FD->getNumParams() != Call.getNumArgs() ||
+        !directDMATypeMatches(FD->getType(), Found->Prototype))
       return nullptr;
 
     const SourceManager &SM = C.getSourceManager();
@@ -6490,6 +6743,37 @@ class QEMUGuestMemorySafetyChecker
         Location.getColumn() != Found->DeclarationColumn)
       return nullptr;
 
+    if (Found->Effect == SelectiveSummaryEffect::FullTransfer) {
+      if (FD->getNumParams() != 4 ||
+          !isNamedRecordPointer(FD->getParamDecl(0)->getType(), "PCIDevice") ||
+          !directDMATypeMatches(FD->getParamDecl(1)->getType(),
+                                "dma_addr_t") ||
+          !isVoidPointer(FD->getParamDecl(2)->getType()) ||
+          !directDMATypeMatches(FD->getParamDecl(3)->getType(),
+                                "dma_addr_t"))
+        return nullptr;
+      const RecordDecl *PCIRecord = FD->getParamDecl(0)
+                                        ->getType()
+                                        ->getPointeeType()
+                                        .getUnqualifiedType()
+                                        ->getAsRecordDecl();
+      if (PCIRecord)
+        if (const RecordDecl *Definition = PCIRecord->getDefinition())
+          PCIRecord = Definition;
+      const FieldDecl *BusMasterAddressSpace =
+          namedField(PCIRecord, "bus_master_as");
+      if (!PCIRecord || !BusMasterAddressSpace ||
+          !catalogDeclarationSourceMatches(PCIRecord, Found->Header, SM) ||
+          !catalogDeclarationSourceMatches(BusMasterAddressSpace,
+                                           Found->Header, SM) ||
+          !directDMATypeMatches(BusMasterAddressSpace->getType(),
+                                "AddressSpace"))
+        return nullptr;
+      return Found;
+    }
+
+    if (FD->getNumParams() != 5)
+      return nullptr;
     QualType SGType = FD->getParamDecl(3)->getType();
     const RecordDecl *SGRecord =
         SGType->isPointerType()
@@ -6518,17 +6802,18 @@ class QEMUGuestMemorySafetyChecker
                : TransferBufferDirection::HostWrite;
   }
 
-  void recordSelectiveSummaryMatch(const CallEvent &Call, bool Consumed) const {
+  void recordSelectiveSummaryMatch(const CallEvent &Call,
+                                   const SelectiveDMASummary &Summary,
+                                   bool Consumed) const {
     const Expr *Origin = Call.getOriginExpr();
     if (!Origin)
       return;
     SelectiveSummaryMatchedCalls.insert(Origin);
-    // The result predicate is imported exactly.  The transfer extent remains
-    // min(requested_len, sg->size), but this first consumer deliberately does
-    // not manufacture a contiguous guest address for a scatter-gather list.
-    // Therefore spatial/effect propagation is an explicit unsupported part
-    // of every matched call, not an approximation using requested_len.
-    SelectiveSummaryUnsupportedCalls.insert(Origin);
+    // The scatter-gather summaries import the result predicate exactly but do
+    // not manufacture a contiguous guest address.  The PCI summary has an
+    // exact address and extent and therefore imports the full transfer facts.
+    if (Summary.Effect == SelectiveSummaryEffect::ResultAndExtentOnly)
+      SelectiveSummaryUnsupportedCalls.insert(Origin);
     if (Consumed)
       SelectiveSummaryConsumedCalls.insert(Origin);
   }
@@ -6553,11 +6838,13 @@ class QEMUGuestMemorySafetyChecker
           "The summarized MemTxResult is discarded, so transfer completion "
           "is not established",
           {Origin, C.getSourceManager(), C.getStackFrame()});
-      Report->addNote(
-          "This result-only consumer does not import the summarized "
-          "min(requested_len, sg->size) extent, scatter-gather guest "
-          "address, transfer effect, owner, direction, or residual writeback",
-          {Origin, C.getSourceManager(), C.getStackFrame()});
+      if (Summary.Effect == SelectiveSummaryEffect::ResultAndExtentOnly)
+        Report->addNote(
+            "This result-only consumer does not import the summarized "
+            "min(requested_len, sg->size) extent, scatter-gather guest "
+            "address, transfer effect, owner, direction, or residual "
+            "writeback",
+            {Origin, C.getSourceManager(), C.getStackFrame()});
     }
     for (SVal Value : {Call.getReturnValue(), Call.getArgSVal(0),
                        Call.getArgSVal(1), Call.getArgSVal(3)})
@@ -6581,7 +6868,12 @@ class QEMUGuestMemorySafetyChecker
     const SelectiveDMASummary *Summary = selectiveDMASummary(Call, C);
     if (!Summary)
       return false;
-    recordSelectiveSummaryMatch(Call, /*Consumed=*/false);
+    recordSelectiveSummaryMatch(Call, *Summary, /*Consumed=*/false);
+    if (Summary->Effect == SelectiveSummaryEffect::FullTransfer) {
+      MemorySink Sink{/*BufferArgument=*/2, /*LengthArgument=*/3,
+                      "memory-operation length", "host-write"};
+      (void)checkMemorySink(Call, Sink, C);
+    }
     return true;
   }
 
@@ -6590,23 +6882,135 @@ class QEMUGuestMemorySafetyChecker
     const SelectiveDMASummary *Summary = selectiveDMASummary(Call, C);
     if (!Summary)
       return false;
-    recordSelectiveSummaryMatch(Call, /*Consumed=*/true);
-    if (!EnableDMATransferResultDiagnostics ||
-        !dmaTransferResultIsDefinitelyDiscarded(Call, C.getASTContext()))
-      return true;
+    recordSelectiveSummaryMatch(Call, *Summary, /*Consumed=*/true);
 
     const auto *FD = cast<FunctionDecl>(Call.getDecl());
-    ProgramStateRef State = C.getState();
+    bool ReportDiscardedFailure =
+        EnableDMATransferResultDiagnostics &&
+        dmaTransferResultIsDefinitelyDiscarded(Call, C.getASTContext());
+    if (Summary->Effect == SelectiveSummaryEffect::ResultAndExtentOnly &&
+        !ReportDiscardedFailure)
+      return true;
+
+    ProgramStateRef InitialState = C.getState();
     SVal Zero = C.getSValBuilder().makeZeroVal(FD->getReturnType());
     std::optional<BoundStates> Result =
-        compare(State, Call.getReturnValue(), BO_EQ, Zero, C.getSValBuilder());
+        compare(InitialState, Call.getReturnValue(), BO_EQ, Zero,
+                C.getSValBuilder());
     if (!Result)
       return true;
-    if (Result->Unsafe && !reportIgnoredSelectiveSummaryFailure(
-                              C, Result->Unsafe, Call, *Summary))
-      C.addTransition(Result->Unsafe);
-    if (Result->Safe)
-      C.addTransition(Result->Safe);
+
+    if (Summary->Effect == SelectiveSummaryEffect::ResultAndExtentOnly) {
+      if (Result->Unsafe && !reportIgnoredSelectiveSummaryFailure(
+                                C, Result->Unsafe, Call, *Summary))
+        C.addTransition(Result->Unsafe);
+      if (Result->Safe)
+        C.addTransition(Result->Safe);
+      return true;
+    }
+
+    SymbolRef ResultSymbol = Call.getReturnValue().getAsSymbol();
+    SVal OwnerValue = Call.getArgSVal(0);
+    SVal GuestAddress = Call.getArgSVal(1);
+    SVal Buffer = Call.getArgSVal(2);
+    SVal Length = Call.getArgSVal(3);
+    QualType LengthType = Call.getArgExpr(3)->getType();
+    SVal Begin = C.getSValBuilder().makeZeroVal(LengthType);
+    const RecordDecl *PCIRecord = FD->getParamDecl(0)
+                                      ->getType()
+                                      ->getPointeeType()
+                                      .getUnqualifiedType()
+                                      ->getAsRecordDecl();
+    if (PCIRecord)
+      if (const RecordDecl *Definition = PCIRecord->getDefinition())
+        PCIRecord = Definition;
+    const FieldDecl *BusMasterAddressSpace =
+        namedField(PCIRecord, "bus_master_as");
+    SVal OwnerLocation = BusMasterAddressSpace
+                             ? InitialState->getLValue(BusMasterAddressSpace,
+                                                       OwnerValue)
+                             : UnknownVal();
+    const MemRegion *Owner = directDMAOwner(OwnerLocation);
+    if (ResultSymbol) {
+      llvm::SmallDenseSet<SymbolRef, 8> Dependencies;
+      auto AddDependencies = [&](SVal Value) {
+        for (SymbolRef Symbol : Value.symbols())
+          if (Symbol != ResultSymbol)
+            Dependencies.insert(Symbol);
+      };
+      AddDependencies(OwnerValue);
+      AddDependencies(OwnerLocation);
+      AddDependencies(GuestAddress);
+      AddDependencies(Buffer);
+      AddDependencies(Begin);
+      AddDependencies(Length);
+      if (const SymbolicRegion *OwnerBase =
+              Owner ? Owner->getSymbolicBase() : nullptr)
+        if (OwnerBase->getSymbol() != ResultSymbol)
+          Dependencies.insert(OwnerBase->getSymbol());
+      for (SymbolRef Dependency : Dependencies)
+        C.getSymbolManager().addSymbolDependency(ResultSymbol, Dependency);
+    }
+
+    auto Propagate = [&](ProgramStateRef ResultPath, bool Succeeded) {
+      if (!ResultPath)
+        return;
+      ProgramStateRef State = ResultPath;
+      if (ResultSymbol) {
+        State = qemu::state::setValueResultState(
+            State, ResultSymbol,
+            Succeeded ? qemu::facts::ResultStateKind::Complete
+                      : qemu::facts::ResultStateKind::Rejected);
+        std::optional<SVal> ActualLength;
+        if (Succeeded)
+          ActualLength = Length;
+        State = qemu::state::setTransferOperation(
+            State, ResultSymbol, Buffer, Owner, GuestAddress, Begin, Length,
+            ActualLength, qemu::facts::AccessDirection::HostWrite);
+      }
+
+      const NoteTag *Tag = nullptr;
+      if (Succeeded) {
+        if (std::optional<SVal> Pointee = pointeeValue(State, Buffer)) {
+          State = addInputTaint(State, *Pointee, InputClass::DMA);
+          for (SymbolRef Symbol : Pointee->symbols())
+            State = qemu::state::setValueProvenance(
+                State, Symbol, qemu::facts::ProvenanceKind::DMA);
+          Tag = sourceNote(C, State, *Pointee, InputClass::DMA,
+                           "populated guest-controlled data here");
+        }
+      }
+      // This exact pci_dma_read() wrapper hardcodes MEMTXATTRS_UNSPECIFIED
+      // (attrs.memory == 0).  That excludes the flatview access-denied return
+      // which can leave the buffer untouched; the remaining direct or
+      // dispatched read steps write every requested output byte even when a
+      // MemTxResult error is accumulated.  Failure bytes are initialized but
+      // are not assigned guest/DMA provenance.
+      if (EnableInitializedByteTracking) {
+        std::optional<InitializedBytePosition> Position =
+            initializedBytePosition(Buffer, C.getASTContext());
+        if (Position && State->get<QEMUInitializedByteObjectExtents>(
+                            Position->Base)) {
+          State =
+              State->remove<QEMUKnownNULTerminatorOffsets>(Position->Base);
+          State = overwriteInitializedByteRange(State, *Position, Length, C);
+          State = recordInitializedByteRange(
+              State, *Position, Length, InitializedByteKind::DMATransfer,
+              Call.getOriginExpr(),
+              Succeeded ? std::optional<InputClass>(InputClass::DMA)
+                        : std::nullopt,
+              C);
+        }
+      }
+
+      if (!Succeeded && ReportDiscardedFailure &&
+          reportIgnoredSelectiveSummaryFailure(C, State, Call, *Summary))
+        return;
+      C.addTransition(State, Tag);
+    };
+
+    Propagate(Result->Unsafe, /*Succeeded=*/false);
+    Propagate(Result->Safe, /*Succeeded=*/true);
     return true;
   }
 
@@ -6859,6 +7263,31 @@ class QEMUGuestMemorySafetyChecker
       const auto *FD = dyn_cast_or_null<FunctionDecl>(Frame->getDecl());
       if (directDMAContract(FD, Kind))
         return true;
+    }
+    return false;
+  }
+
+  bool isNestedSelectiveFullTransfer(CheckerContext &C) const {
+    const SourceManager &SM = C.getSourceManager();
+    for (const StackFrame *Frame = C.getStackFrame(); Frame;
+         Frame = Frame->getParent()) {
+      const auto *FD = dyn_cast_or_null<FunctionDecl>(Frame->getDecl());
+      if (!FD || !FD->getIdentifier())
+        continue;
+      for (const SelectiveDMASummary &Summary : SelectiveSummaries) {
+        if (Summary.Effect != SelectiveSummaryEffect::FullTransfer ||
+            FD->getName() != Summary.Function ||
+            !directDMATypeMatches(FD->getType(), Summary.Prototype))
+          continue;
+        const FunctionDecl *Declaration = FD->getCanonicalDecl();
+        if (!catalogDeclarationSourceMatches(Declaration, Summary.Header, SM))
+          continue;
+        PresumedLoc Location = SM.getPresumedLoc(Declaration->getLocation());
+        if (Location.isValid() &&
+            Location.getLine() == Summary.DeclarationLine &&
+            Location.getColumn() == Summary.DeclarationColumn)
+          return true;
+      }
     }
     return false;
   }
@@ -9540,7 +9969,8 @@ class QEMUGuestMemorySafetyChecker
     // The public transfer helpers are layered on top of one another.  Model
     // the outermost catalog contract once instead of treating the delegated
     // implementation call as a second guest-memory operation.
-    if (isNestedDirectDMAContract(C, "transfer"))
+    if (isNestedDirectDMAContract(C, "transfer") ||
+        isNestedSelectiveFullTransfer(C))
       return true;
 
     ProgramStateRef InitialState = C.getState();
@@ -9578,7 +10008,8 @@ class QEMUGuestMemorySafetyChecker
     std::optional<DMATransferDescriptor> Transfer = dmaTransferDescriptor(Call);
     if (!Transfer)
       return false;
-    if (isNestedDirectDMAContract(C, "transfer"))
+    if (isNestedDirectDMAContract(C, "transfer") ||
+        isNestedSelectiveFullTransfer(C))
       return true;
 
     // A default-mode, fixed host read has no post-call memory effect.  If its
@@ -9775,7 +10206,8 @@ public:
                                  AnalysisManager &Mgr, BugReporter &BR) const {
     if (SelectiveSummaryManifest.empty())
       return;
-    llvm::errs() << "QEMU_GMS_SELECTIVE_SUMMARY_V1 loaded="
+    llvm::errs() << "QEMU_GMS_SELECTIVE_SUMMARY_V"
+                 << SelectiveSummaryFormat << " loaded="
                  << SelectiveSummaries.size()
                  << " matched=" << SelectiveSummaryMatchedCalls.size()
                  << " consumed=" << SelectiveSummaryConsumedCalls.size()

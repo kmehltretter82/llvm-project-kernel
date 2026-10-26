@@ -87,7 +87,8 @@ def validate_record(record, qemu_path):
     if type(diagnostic["column"]) is not int or diagnostic["column"] <= 0:
         fail("diagnostic column is invalid")
     if not re.fullmatch(
-            r"Level B: DMA transfer failure from 'dma_buf_(read|write)' is ignored",
+            r"Level B: DMA transfer failure from "
+            r"'(dma_buf_(read|write)|pci_dma_read)' is ignored",
             diagnostic["message"]):
         fail("not-applicable record has the wrong diagnostic message")
 
@@ -95,11 +96,19 @@ def validate_record(record, qemu_path):
     expected = {
         "dma-transfer-result-discarded:qemu.selective-summary.dma-buf-read:host-read",
         "dma-transfer-result-discarded:qemu.selective-summary.dma-buf-write:host-write",
+        "dma-transfer-result-discarded:qemu.selective-summary.pci-dma-read:host-write",
     }
     if reason not in expected:
         fail(f"not-applicable record has the wrong reason: {reason}")
-    function = "read" if "dma-buf-read" in reason else "write"
-    if f"dma_buf_{function}" not in diagnostic["message"]:
+    function = {
+        "dma-transfer-result-discarded:qemu.selective-summary.dma-buf-read:host-read":
+            "dma_buf_read",
+        "dma-transfer-result-discarded:qemu.selective-summary.dma-buf-write:host-write":
+            "dma_buf_write",
+        "dma-transfer-result-discarded:qemu.selective-summary.pci-dma-read:host-write":
+            "pci_dma_read",
+    }[reason]
+    if function not in diagnostic["message"]:
         fail("not-applicable reason and diagnostic function disagree")
     return reason
 
@@ -111,13 +120,14 @@ def main():
     encoded_records = re.findall(
         re.escape(MARKER) + r"([A-Za-z0-9+/]+={0,2})", sys.stdin.read()
     )
-    if len(encoded_records) != 6:
-        fail(f"expected 6 not-applicable records, found {len(encoded_records)}")
+    if len(encoded_records) != 7:
+        fail(f"expected 7 not-applicable records, found {len(encoded_records)}")
     reasons = Counter(validate_record(decode(encoded), args.qemu_path)
                       for encoded in encoded_records)
     expected_counts = {
         "dma-transfer-result-discarded:qemu.selective-summary.dma-buf-read:host-read": 3,
         "dma-transfer-result-discarded:qemu.selective-summary.dma-buf-write:host-write": 3,
+        "dma-transfer-result-discarded:qemu.selective-summary.pci-dma-read:host-write": 1,
     }
     if reasons != expected_counts:
         fail(f"unexpected selective-summary witness counts: {dict(reasons)}")
