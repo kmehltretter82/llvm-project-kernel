@@ -660,6 +660,18 @@ def QEMUErrorOwnershipChecker : Checker<"ErrorOwnership">,
   HelpText<"Check path-sensitive ownership of QEMU Error objects">,
   Documentation<NotDocumented>;
 
+def QEMUAsyncTeardownChecker : Checker<"AsyncTeardown">,
+  HelpText<"Check sealed QEMU asynchronous callback teardown contracts">,
+  CheckerOptions<[
+    CmdLineOption<String,
+                  "AsyncTeardownSummaryManifest",
+                  "Path to a sealed cross-entry asynchronous teardown "
+                  "summary manifest",
+                  "",
+                  InAlpha>
+  ]>,
+  Documentation<NotDocumented>;
+
 def QEMUIOMMUNotifierLifetimeChecker : Checker<"IOMMUNotifierLifetime">,
   HelpText<"Check path-sensitive QEMU IOMMU notifier lifetime rules">,
   Documentation<NotDocumented>;
