@@ -1,0 +1,61 @@
+{
+  "format": 1,
+  "protocols": [
+    {
+      "id": "incomplete-schedule-must-fail-closed",
+      "source": {
+        "path": "qemu-async-teardown.c",
+        "sha256": "65f012d2ee087681e7d709e58fc6001349784fc6e94d476f64d7a381b4f9646d",
+        "bytes": 7010
+      },
+      "requester": {
+        "name": "queue_request",
+        "return_type": "void",
+        "parameters": ["Owner *"]
+      },
+      "request_api": {
+        "name": "async_request",
+        "return_type": "void",
+        "parameters": ["Backend *", "size_t", "EntropyCallback *", "void *"]
+      },
+      "callback": {
+        "name": "completion",
+        "return_type": "void",
+        "parameters": ["void *", "const void *", "size_t"]
+      },
+      "teardown": {
+        "name": "teardown",
+        "return_type": "void",
+        "parameters": ["Owner *", "Owner *", "int"]
+      },
+      "cancel_api": {
+        "name": "async_cancel",
+        "return_type": "void",
+        "parameters": ["Backend *", "EntropyCallback *", "const void *"]
+      },
+      "arguments": {
+        "request_backend": 0,
+        "request_callback": 2,
+        "request_opaque": 3,
+        "cancel_backend": 0,
+        "cancel_callback": 1,
+        "cancel_opaque": 2
+      },
+      "request_owner": "owner",
+      "teardown_owner": "owner",
+      "backend_member": "backend",
+      "evidence": {
+        "status": "incomplete",
+        "request_can_outlive_entry": true,
+        "teardown_releases_owner_after_return": true,
+        "completion_invokes_callback": true,
+        "callback_dereferences_owner": true,
+        "cancellation_is_synchronous": true,
+        "schedule": [
+          "request-enqueued",
+          "frontend-teardown"
+        ]
+      }
+    }
+  ]
+}

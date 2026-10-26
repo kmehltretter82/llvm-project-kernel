@@ -9,6 +9,7 @@
 // CHECK-NEXT: alpha.clone.CloneChecker:ReportNormalClones = true
 // CHECK-NEXT: alpha.cplusplus.STLAlgorithmModeling:AggressiveStdFindModeling = false
 // CHECK-NEXT: alpha.osx.cocoa.DirectIvarAssignment:AnnotatedFunctions = false
+// CHECK-NEXT: alpha.qemu.AsyncTeardown:AsyncTeardownSummaryManifest = ""
 // CHECK-NEXT: alpha.qemu.GuestMemorySafety:EmitStructuredWitness = false
 // CHECK-NEXT: alpha.qemu.GuestMemorySafety:EnableDMATransferResultDiagnostics = false
 // CHECK-NEXT: alpha.qemu.GuestMemorySafety:EnableFailedCompletionPublicationDiagnostics = false
