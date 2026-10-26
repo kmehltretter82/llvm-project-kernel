@@ -21,10 +21,10 @@ static_assert(CallbackMemberStepRecordCount == 12);
 static_assert(CallbackEntryInputRecordCount == 11);
 static_assert(CallbackInputBufferRecordCount == 1);
 static_assert(CallbackBindingRecordCount == 2);
-static_assert(ProtocolBindingRecordCount == 12);
-static_assert(ProtocolSelectorRecordCount == 8);
-static_assert(ProtocolEventRecordCount == 6);
-static_assert(ProtocolRecordCount == 2);
+static_assert(ProtocolBindingRecordCount == 24);
+static_assert(ProtocolSelectorRecordCount == 14);
+static_assert(ProtocolEventRecordCount == 12);
+static_assert(ProtocolRecordCount == 4);
 
 static_assert(Contracts[0].ParameterBegin == 0);
 static_assert(Contracts[0].ReturnType[0] == 'v');
@@ -106,12 +106,25 @@ static_assert(Protocols[1].BindingBegin == 6);
 static_assert(Protocols[1].BindingCount == 6);
 static_assert(Protocols[1].EventBegin == 3);
 static_assert(Protocols[1].EventCount == 3);
+static_assert(Protocols[2].BindingBegin == 12);
+static_assert(Protocols[2].EventBegin == 6);
+static_assert(Protocols[3].BindingBegin == 18);
+static_assert(Protocols[3].EventBegin == 9);
 static_assert(Protocols[ProtocolRecordCount - 1].BindingBegin +
                   Protocols[ProtocolRecordCount - 1].BindingCount ==
               ProtocolBindingRecordCount);
 static_assert(ProtocolEvents[ProtocolEventRecordCount - 1].SelectorBegin +
                   ProtocolEvents[ProtocolEventRecordCount - 1].SelectorCount ==
               ProtocolSelectorRecordCount);
-static_assert(ProtocolSelectors[0].Kind[0] == 't');
-static_assert(ProtocolSelectors[2].Kind[0] == 'm');
-static_assert(ProtocolSelectors[3].Kind[0] == 'f');
+static_assert(ProtocolSelectors[0].Kind[0] == 's');
+static_assert(ProtocolSelectors[1].Kind[0] == 'f');
+static_assert(ProtocolSelectors[1].QueueArgumentIndex == 1);
+static_assert(ProtocolSelectors[1].ValueArgumentIndex == 2);
+static_assert(ProtocolSelectors[1].IntegerValue == 1);
+static_assert(ProtocolSelectors[1].HasIntegerValue);
+static_assert(ProtocolSelectors[4].Kind[0] == 'i');
+static_assert(ProtocolSelectors[4].IntegerValue == 8192);
+static_assert(ProtocolSelectors[5].Kind[0] == 'm');
+static_assert(ProtocolSelectors[5].IntegerValue == 4);
+static_assert(ProtocolSelectors[6].Kind[0] == 't');
+static_assert(ProtocolSelectors[8].Kind[0] == 'm');

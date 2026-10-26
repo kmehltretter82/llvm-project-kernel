@@ -86,6 +86,10 @@ REGISTER_SET_WITH_PROGRAMSTATE(QEMUPendingInitializedBytePreciseBinds,
                                const MemRegion *)
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUFailedCompletionScopeOwners,
                                const StackFrame *, SVal)
+REGISTER_MAP_WITH_PROGRAMSTATE(QEMUFailedCompletionScopeQueues,
+                               const StackFrame *, SVal)
+REGISTER_MAP_WITH_PROGRAMSTATE(QEMUFailedCompletionScopeSlots,
+                               const StackFrame *, SVal)
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUDMAMappedDirections, SymbolRef, SVal)
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUDMARetiredOrigins, SymbolRef, const Expr *)
 REGISTER_MAP_WITH_PROGRAMSTATE(QEMUSavedTaintedScalars, const VarRegion *, SVal)
@@ -4583,21 +4587,51 @@ class QEMUGuestMemorySafetyChecker
     const auto *RingAdvanced = protocolEvent(Protocol, "ring-advanced");
     const auto *CompletionPublished =
         protocolEvent(Protocol, "interrupt-published");
+    auto IsPlainScopeArgument = [](const auto *Binding) {
+      return Binding && StringRef(Binding->Source) == "scope-argument" &&
+             Binding->ArgumentIndex >= 0 && !Binding->HasIntegerValue &&
+             StringRef(Binding->RecordType).empty() &&
+             StringRef(Binding->Field).empty();
+    };
+    auto IsIntegerConstant = [](const auto *Binding) {
+      return Binding && StringRef(Binding->Source) == "integer-constant" &&
+             Binding->ArgumentIndex == -1 && Binding->HasIntegerValue &&
+             StringRef(Binding->RecordType).empty() &&
+             StringRef(Binding->Field).empty();
+    };
+    auto IsTransferResult = [](const auto *Binding) {
+      return Binding && StringRef(Binding->Source) == "transfer-result" &&
+             Binding->ArgumentIndex == -1 && !Binding->HasIntegerValue &&
+             StringRef(Binding->RecordType).empty() &&
+             StringRef(Binding->Field).empty();
+    };
+    auto IsScopeArgumentMember = [](const auto *Binding) {
+      return Binding &&
+             StringRef(Binding->Source) == "scope-argument-member-pre" &&
+             Binding->ArgumentIndex >= 0 && !Binding->HasIntegerValue &&
+             !StringRef(Binding->RecordType).empty() &&
+             !StringRef(Binding->Field).empty();
+    };
+    auto IsTransferArgument = [](const auto *Binding) {
+      return Binding && StringRef(Binding->Source) == "transfer-argument" &&
+             Binding->ArgumentIndex >= 0 && !Binding->HasIntegerValue &&
+             StringRef(Binding->RecordType).empty() &&
+             StringRef(Binding->Field).empty();
+    };
+    bool QueueBindingValid = IsIntegerConstant(Queue) ||
+                             IsPlainScopeArgument(Queue) ||
+                             IsScopeArgumentMember(Queue);
+    bool SlotBindingValid =
+        Slot && ((StringRef(Slot->Source) == "member-value-pre" &&
+                  Slot->ArgumentIndex == -1 && !Slot->HasIntegerValue &&
+                  !StringRef(Slot->RecordType).empty() &&
+                  !StringRef(Slot->Field).empty()) ||
+                 IsPlainScopeArgument(Slot) || IsTransferArgument(Slot));
     if (!Owner || !Queue || !Attempt || !Slot || !Vector || !Result ||
         !DescriptorFailed || !RingAdvanced || !CompletionPublished ||
-        StringRef(Owner->Source) != "scope-argument" ||
-        Owner->ArgumentIndex < 0 || Owner->HasIntegerValue ||
-        StringRef(Queue->Source) != "integer-constant" ||
-        !Queue->HasIntegerValue || Queue->ArgumentIndex != -1 ||
-        StringRef(Attempt->Source) != "transfer-result" ||
-        Attempt->ArgumentIndex != -1 || Attempt->HasIntegerValue ||
-        StringRef(Slot->Source) != "member-value-pre" ||
-        Slot->ArgumentIndex != -1 || Slot->HasIntegerValue ||
-        StringRef(Slot->RecordType).empty() || StringRef(Slot->Field).empty() ||
-        StringRef(Vector->Source) != "integer-constant" ||
-        !Vector->HasIntegerValue || Vector->ArgumentIndex != -1 ||
-        StringRef(Result->Source) != "transfer-result" ||
-        Result->ArgumentIndex != -1 || Result->HasIntegerValue)
+        !IsPlainScopeArgument(Owner) || !QueueBindingValid ||
+        !IsTransferResult(Attempt) || !SlotBindingValid ||
+        !IsIntegerConstant(Vector) || !IsTransferResult(Result))
       return std::nullopt;
 
     if (!protocolSelectorRangeIsValid(Protocol, *DescriptorFailed) ||
@@ -4612,44 +4646,105 @@ class QEMUGuestMemorySafetyChecker
                   E = I + DescriptorFailed->SelectorCount;
          I != E; ++I) {
       const auto &Selector = qemu_contracts_generated::ProtocolSelectors[I];
-      const auto *Contract = contractByID(Selector.ContractID);
-      if (!Contract || StringRef(Contract->Kind) != "transfer" ||
-          StringRef(Selector.Kind) != "transfer-call" ||
+      StringRef Kind = Selector.Kind;
+      const auto *Contract =
+          Kind == "transfer-call" ? contractByID(Selector.ContractID) : nullptr;
+      bool DirectTransfer = Kind == "transfer-call" && Contract &&
+                            StringRef(Contract->Kind) == "transfer";
+      bool SelectiveSummary = Kind == "selective-summary-call" &&
+                              StringRef(Selector.ContractID) ==
+                                  "qemu.selective-summary.pci-dma-read";
+      bool OwnerRelationValid =
+          SelectiveSummary && !StringRef(Selector.RecordType).empty() &&
+          !StringRef(Selector.Field).empty() &&
+          (StringRef(Selector.Operation) == "pointer-member-value" ||
+           StringRef(Selector.Operation) == "embedded-member-address");
+      if ((!DirectTransfer && !SelectiveSummary) ||
           StringRef(Selector.Phase) != "post-call" ||
           StringRef(Selector.ResultPath) != "failure" ||
           Selector.ExpectedCount == 0 || !StringRef(Selector.Name).empty() ||
           !StringRef(Selector.Prototype).empty() ||
-          !StringRef(Selector.RecordType).empty() ||
-          !StringRef(Selector.Field).empty() ||
-          !StringRef(Selector.Operation).empty())
+          (DirectTransfer && (!StringRef(Selector.RecordType).empty() ||
+                              !StringRef(Selector.Field).empty() ||
+                              !StringRef(Selector.Operation).empty())) ||
+          (SelectiveSummary && !OwnerRelationValid) ||
+          Selector.QueueArgumentIndex != -1 ||
+          Selector.ValueArgumentIndex != -1 || Selector.HasIntegerValue)
         return std::nullopt;
     }
 
     const auto &Ring =
         qemu_contracts_generated::ProtocolSelectors[RingAdvanced
                                                         ->SelectorBegin];
-    if (StringRef(Ring.Kind) != "member-update" ||
-        StringRef(Ring.RecordType) != Slot->RecordType ||
-        StringRef(Ring.Field) != Slot->Field ||
-        StringRef(Ring.Operation) != "post-decrement" ||
-        StringRef(Ring.Phase) != "bind" || Ring.ExpectedCount == 0 ||
-        !StringRef(Ring.ContractID).empty() || !StringRef(Ring.Name).empty() ||
-        !StringRef(Ring.Prototype).empty() ||
+    StringRef RingKind = Ring.Kind;
+    bool MemberRing =
+        RingKind == "member-update" &&
+        StringRef(Slot->Source) == "member-value-pre" &&
+        StringRef(Ring.RecordType) == Slot->RecordType &&
+        StringRef(Ring.Field) == Slot->Field &&
+        StringRef(Ring.Operation) == "post-decrement" &&
+        StringRef(Ring.Phase) == "bind" && Ring.QueueArgumentIndex == -1 &&
+        Ring.ValueArgumentIndex == -1 && !Ring.HasIntegerValue &&
+        StringRef(Ring.Name).empty() && StringRef(Ring.Prototype).empty();
+    bool IndexedMemberRing =
+        RingKind == "indexed-member-update" &&
+        StringRef(Slot->Source) == "scope-argument" &&
+        !StringRef(Ring.RecordType).empty() && !StringRef(Ring.Field).empty() &&
+        StringRef(Ring.Operation) == "or-assign" &&
+        StringRef(Ring.Phase) == "bind" && Ring.QueueArgumentIndex == -1 &&
+        Ring.ValueArgumentIndex == -1 && Ring.HasIntegerValue &&
+        StringRef(Ring.Name).empty() && StringRef(Ring.Prototype).empty();
+    bool FunctionRing =
+        RingKind == "function-call" && !StringRef(Ring.Name).empty() &&
+        !StringRef(Ring.Prototype).empty() &&
+        StringRef(Ring.Phase) == "pre-call" && Ring.QueueArgumentIndex >= 0 &&
+        Ring.ValueArgumentIndex >= 0 && Ring.HasIntegerValue &&
+        StringRef(Ring.RecordType).empty() && StringRef(Ring.Field).empty() &&
+        StringRef(Ring.Operation).empty();
+    if ((!MemberRing && !IndexedMemberRing && !FunctionRing) ||
+        Ring.ExpectedCount == 0 || !StringRef(Ring.ContractID).empty() ||
         !StringRef(Ring.ResultPath).empty())
       return std::nullopt;
 
     const auto &Completion =
         qemu_contracts_generated::ProtocolSelectors[CompletionPublished
                                                         ->SelectorBegin];
-    if (StringRef(Completion.Kind) != "function-call" ||
-        StringRef(Completion.Name).empty() ||
-        StringRef(Completion.Prototype).empty() ||
-        StringRef(Completion.Phase) != "pre-call" ||
+    bool PlainFunctionCompletion =
+        StringRef(Completion.Kind) == "function-call" &&
+        !StringRef(Completion.Name).empty() &&
+        !StringRef(Completion.Prototype).empty() &&
+        StringRef(Completion.Phase) == "pre-call" &&
+        StringRef(Completion.Operation).empty() &&
+        Completion.QueueArgumentIndex == -1 &&
+        Completion.ValueArgumentIndex == -1 && !Completion.HasIntegerValue &&
+        StringRef(Completion.RecordType).empty() &&
+        StringRef(Completion.Field).empty();
+    bool BitFunctionCompletion =
+        StringRef(Completion.Kind) == "function-call" &&
+        !StringRef(Completion.Name).empty() &&
+        !StringRef(Completion.Prototype).empty() &&
+        StringRef(Completion.Phase) == "pre-call" &&
+        StringRef(Completion.Operation) == "contains-bits" &&
+        Completion.QueueArgumentIndex == -1 &&
+        Completion.ValueArgumentIndex >= 0 && Completion.HasIntegerValue &&
+        Completion.IntegerValue == Vector->IntegerValue &&
+        StringRef(Completion.RecordType).empty() &&
+        StringRef(Completion.Field).empty();
+    bool MemberCompletion = StringRef(Completion.Kind) == "member-update" &&
+                            StringRef(Completion.Name).empty() &&
+                            StringRef(Completion.Prototype).empty() &&
+                            !StringRef(Completion.RecordType).empty() &&
+                            !StringRef(Completion.Field).empty() &&
+                            StringRef(Completion.Operation) == "or-assign" &&
+                            StringRef(Completion.Phase) == "bind" &&
+                            Completion.QueueArgumentIndex == -1 &&
+                            Completion.ValueArgumentIndex == -1 &&
+                            Completion.HasIntegerValue &&
+                            Completion.IntegerValue == Vector->IntegerValue;
+    if ((!PlainFunctionCompletion && !BitFunctionCompletion &&
+         !MemberCompletion) ||
         Completion.ExpectedCount == 0 ||
         !StringRef(Completion.ContractID).empty() ||
-        !StringRef(Completion.RecordType).empty() ||
-        !StringRef(Completion.Field).empty() ||
-        !StringRef(Completion.Operation).empty() ||
         !StringRef(Completion.ResultPath).empty())
       return std::nullopt;
 
@@ -4695,9 +4790,48 @@ class QEMUGuestMemorySafetyChecker
       unsigned OwnerArgument =
           static_cast<unsigned>(Candidate->Owner->ArgumentIndex);
       if (OwnerArgument >= FD->getNumParams() ||
+          !FD->getParamDecl(OwnerArgument)->getType()->isPointerType())
+        return std::nullopt;
+      if (StringRef(Candidate->Slot->Source) == "member-value-pre" &&
           !isNamedRecordPointer(FD->getParamDecl(OwnerArgument)->getType(),
                                 Candidate->Slot->RecordType))
         return std::nullopt;
+      for (const auto *Binding : {Candidate->Queue, Candidate->Slot}) {
+        if (StringRef(Binding->Source) != "scope-argument")
+          continue;
+        unsigned Argument = static_cast<unsigned>(Binding->ArgumentIndex);
+        if (Argument >= FD->getNumParams() ||
+            !FD->getParamDecl(Argument)->getType()->isScalarType())
+          return std::nullopt;
+      }
+      if (StringRef(Candidate->Queue->Source) == "scope-argument-member-pre") {
+        unsigned Argument =
+            static_cast<unsigned>(Candidate->Queue->ArgumentIndex);
+        if (Argument >= FD->getNumParams() ||
+            !FD->getParamDecl(Argument)->getType()->isPointerType())
+          return std::nullopt;
+        const FieldDecl *QueueField = namedField(
+            FD->getParamDecl(Argument)->getType(), Candidate->Queue->Field);
+        if (!QueueField || !QueueField->getType()->isScalarType())
+          return std::nullopt;
+      }
+      for (unsigned SelectorIndex = Candidate->DescriptorFailed->SelectorBegin,
+                    SelectorEnd = SelectorIndex +
+                                  Candidate->DescriptorFailed->SelectorCount;
+           SelectorIndex != SelectorEnd; ++SelectorIndex) {
+        const auto &Selector =
+            qemu_contracts_generated::ProtocolSelectors[SelectorIndex];
+        if (StringRef(Selector.Kind) != "selective-summary-call")
+          continue;
+        const FieldDecl *OwnerRelation = namedField(
+            FD->getParamDecl(OwnerArgument)->getType(), Selector.Field);
+        if (!OwnerRelation ||
+            (StringRef(Selector.Operation) == "pointer-member-value" &&
+             !OwnerRelation->getType()->isPointerType()) ||
+            (StringRef(Selector.Operation) == "embedded-member-address" &&
+             !OwnerRelation->getType()->isRecordType()))
+          return std::nullopt;
+      }
       Found = *Candidate;
     }
     return Found;
@@ -4716,15 +4850,71 @@ class QEMUGuestMemorySafetyChecker
     return C.getSValBuilder().makeIntVal(Integer);
   }
 
+  static uint64_t protocolTypeMask(QualType Type, ASTContext &Context) {
+    if (!Type->isIntegralOrEnumerationType())
+      return 0;
+    unsigned Width = Context.getIntWidth(Type);
+    if (Width >= 64)
+      return std::numeric_limits<uint64_t>::max();
+    return Width ? (uint64_t{1} << Width) - 1 : 0;
+  }
+
+  static uint64_t protocolKnownSetBits(const SymExpr *Symbol,
+                                       ASTContext &Context,
+                                       unsigned Depth = 0) {
+    if (!Symbol || Depth > 12)
+      return 0;
+    if (const auto *Cast = dyn_cast<SymbolCast>(Symbol))
+      return protocolKnownSetBits(Cast->getOperand(), Context, Depth + 1) &
+             protocolTypeMask(Cast->getType(), Context);
+    if (const auto *Expression = dyn_cast<SymIntExpr>(Symbol)) {
+      uint64_t Left =
+          protocolKnownSetBits(Expression->getLHS(), Context, Depth + 1);
+      uint64_t Right = Expression->getRHS()->getLimitedValue();
+      if (Expression->getOpcode() == BO_Or)
+        return (Left | Right) &
+               protocolTypeMask(Expression->getType(), Context);
+      if (Expression->getOpcode() == BO_And)
+        return (Left & Right) &
+               protocolTypeMask(Expression->getType(), Context);
+      return 0;
+    }
+    if (const auto *Expression = dyn_cast<IntSymExpr>(Symbol)) {
+      uint64_t Left = Expression->getLHS()->getLimitedValue();
+      uint64_t Right =
+          protocolKnownSetBits(Expression->getRHS(), Context, Depth + 1);
+      if (Expression->getOpcode() == BO_Or)
+        return (Left | Right) &
+               protocolTypeMask(Expression->getType(), Context);
+      if (Expression->getOpcode() == BO_And)
+        return (Left & Right) &
+               protocolTypeMask(Expression->getType(), Context);
+      return 0;
+    }
+    if (const auto *Expression = dyn_cast<SymSymExpr>(Symbol)) {
+      uint64_t Left =
+          protocolKnownSetBits(Expression->getLHS(), Context, Depth + 1);
+      uint64_t Right =
+          protocolKnownSetBits(Expression->getRHS(), Context, Depth + 1);
+      if (Expression->getOpcode() == BO_Or)
+        return (Left | Right) &
+               protocolTypeMask(Expression->getType(), Context);
+      if (Expression->getOpcode() == BO_And)
+        return (Left & Right) &
+               protocolTypeMask(Expression->getType(), Context);
+    }
+    return 0;
+  }
+
+  static uint64_t protocolKnownSetBits(SVal Value, ASTContext &Context) {
+    if (const llvm::APSInt *Integer = Value.getAsInteger())
+      return Integer->getLimitedValue();
+    return protocolKnownSetBits(Value.getAsSymbol(), Context);
+  }
+
   static std::optional<FailedCompletionIdentity> failedCompletionOwnerIdentity(
       const FailedCompletionProtocolDescriptor &Protocol, ProgramStateRef State,
       CheckerContext &C) {
-    const auto *FD =
-        dyn_cast_or_null<FunctionDecl>(C.getStackFrame()->getDecl());
-    unsigned OwnerArgument =
-        static_cast<unsigned>(Protocol.Owner->ArgumentIndex);
-    if (!FD || OwnerArgument >= FD->getNumParams())
-      return std::nullopt;
     const SVal *Captured =
         State->get<QEMUFailedCompletionScopeOwners>(C.getStackFrame());
     if (!Captured || Captured->isUnknownOrUndef())
@@ -4733,18 +4923,50 @@ class QEMUGuestMemorySafetyChecker
     const MemRegion *Owner = directDMAOwner(Object);
     if (!Owner)
       return std::nullopt;
+    SVal Queue = UnknownVal();
+    if (StringRef(Protocol.Queue->Source) == "integer-constant") {
+      Queue = protocolIntegerConstant(Protocol.Queue->IntegerValue, C);
+    } else if (const SVal *CapturedQueue =
+                   State->get<QEMUFailedCompletionScopeQueues>(
+                       C.getStackFrame())) {
+      Queue = *CapturedQueue;
+    }
+    if (Queue.isUnknownOrUndef())
+      return std::nullopt;
+    SVal Slot = UnknownVal();
+    if (StringRef(Protocol.Slot->Source) == "scope-argument") {
+      const SVal *CapturedSlot =
+          State->get<QEMUFailedCompletionScopeSlots>(C.getStackFrame());
+      if (!CapturedSlot || CapturedSlot->isUnknownOrUndef())
+        return std::nullopt;
+      Slot = *CapturedSlot;
+    }
     return FailedCompletionIdentity{
-        Object, Owner, protocolIntegerConstant(Protocol.Queue->IntegerValue, C),
-        UnknownVal(),
+        Object, Owner, Queue, Slot,
         protocolIntegerConstant(Protocol.Vector->IntegerValue, C)};
   }
 
   static std::optional<FailedCompletionIdentity>
   failedCompletionIdentity(const FailedCompletionProtocolDescriptor &Protocol,
-                           ProgramStateRef State, CheckerContext &C) {
+                           ProgramStateRef State, CheckerContext &C,
+                           const CallEvent *TransferCall = nullptr) {
     std::optional<FailedCompletionIdentity> Identity =
         failedCompletionOwnerIdentity(Protocol, State, C);
     if (!Identity)
+      return std::nullopt;
+    if (StringRef(Protocol.Slot->Source) == "scope-argument")
+      return Identity;
+    if (StringRef(Protocol.Slot->Source) == "transfer-argument") {
+      unsigned Argument = static_cast<unsigned>(Protocol.Slot->ArgumentIndex);
+      if (!TransferCall || Argument >= TransferCall->getNumArgs())
+        return std::nullopt;
+      SVal Slot = TransferCall->getArgSVal(Argument);
+      if (Slot.isUnknownOrUndef())
+        return std::nullopt;
+      Identity->Slot = Slot;
+      return Identity;
+    }
+    if (StringRef(Protocol.Slot->Source) != "member-value-pre")
       return std::nullopt;
     const auto *FD =
         dyn_cast_or_null<FunctionDecl>(C.getStackFrame()->getDecl());
@@ -4778,7 +5000,8 @@ class QEMUGuestMemorySafetyChecker
                   E = I + Protocol.DescriptorFailed->SelectorCount;
          I != E; ++I) {
       const auto &Selector = qemu_contracts_generated::ProtocolSelectors[I];
-      if (StringRef(Selector.ContractID) != Contract.ID)
+      if (StringRef(Selector.Kind) != "transfer-call" ||
+          StringRef(Selector.ContractID) != Contract.ID)
         continue;
       if (Found)
         return false;
@@ -4787,11 +5010,149 @@ class QEMUGuestMemorySafetyChecker
     return Found;
   }
 
+  static const qemu_contracts_generated::ProtocolSelectorRecord *
+  protocolMatchesFailedSelectiveSummary(
+      const FailedCompletionProtocolDescriptor &Protocol,
+      const SelectiveDMASummary &Summary) {
+    if (Summary.Effect != SelectiveSummaryEffect::FullTransfer ||
+        Summary.Direction != SelectiveSummaryDirection::ToDevice ||
+        Summary.Function != "pci_dma_read" ||
+        Summary.LookupName !=
+            "static-inline:include/hw/pci/pci_device.h:pci_dma_read")
+      return nullptr;
+    const qemu_contracts_generated::ProtocolSelectorRecord *Found = nullptr;
+    for (unsigned I = Protocol.DescriptorFailed->SelectorBegin,
+                  E = I + Protocol.DescriptorFailed->SelectorCount;
+         I != E; ++I) {
+      const auto &Selector = qemu_contracts_generated::ProtocolSelectors[I];
+      if (StringRef(Selector.Kind) != "selective-summary-call" ||
+          StringRef(Selector.ContractID) !=
+              "qemu.selective-summary.pci-dma-read")
+        continue;
+      if (Found)
+        return nullptr;
+      Found = &Selector;
+    }
+    return Found;
+  }
+
+  static std::optional<SVal> expectedSelectiveSummaryDevice(
+      const FailedCompletionProtocolDescriptor &Protocol,
+      const qemu_contracts_generated::ProtocolSelectorRecord &Selector,
+      const FailedCompletionIdentity &Identity, ProgramStateRef State,
+      CheckerContext &C) {
+    const auto *Scope = dyn_cast_or_null<FunctionDecl>(
+        C.getStackFrame() ? C.getStackFrame()->getDecl() : nullptr);
+    unsigned OwnerArgument =
+        static_cast<unsigned>(Protocol.Owner->ArgumentIndex);
+    if (!Scope || OwnerArgument >= Scope->getNumParams())
+      return std::nullopt;
+    const FieldDecl *Field = namedField(
+        Scope->getParamDecl(OwnerArgument)->getType(), Selector.Field);
+    if (!Field || Field->getParent()->getName() != Selector.RecordType)
+      return std::nullopt;
+    SVal Location = State->getLValue(Field, Identity.OwnerValue);
+    auto LocValue = Location.getAs<Loc>();
+    if (!LocValue)
+      return std::nullopt;
+    if (StringRef(Selector.Operation) == "pointer-member-value") {
+      SVal Value = State->getSVal(*LocValue);
+      if (Value.isUnknownOrUndef())
+        return std::nullopt;
+      return Value;
+    }
+    if (StringRef(Selector.Operation) == "embedded-member-address")
+      return Location;
+    return std::nullopt;
+  }
+
+  static bool selectiveSummaryDMAOwnerMatchesProtocol(
+      const FailedCompletionProtocolDescriptor &Protocol,
+      const qemu_contracts_generated::ProtocolSelectorRecord &Selector,
+      const FailedCompletionIdentity &Identity, ProgramStateRef State,
+      const CallEvent &Call, SymbolRef Result, CheckerContext &C) {
+    if (Call.getNumArgs() != 4 || !Result ||
+        !qemu::state::hasFailedDMATransferResult(State, Result))
+      return false;
+    std::optional<SVal> ExpectedDevice =
+        expectedSelectiveSummaryDevice(Protocol, Selector, Identity, State, C);
+    if (!ExpectedDevice)
+      return false;
+
+    SVal ActualDevice = Call.getArgSVal(0);
+    bool DeviceMatches = isDefinitelyTrue(State, ActualDevice, BO_EQ,
+                                          *ExpectedDevice, C.getSValBuilder());
+    if (!DeviceMatches) {
+      const MemRegion *ActualRegion = ActualDevice.getAsRegion();
+      const MemRegion *ExpectedRegion = ExpectedDevice->getAsRegion();
+      if (StringRef(Selector.Operation) == "pointer-member-value") {
+        DeviceMatches =
+            ActualRegion && ExpectedRegion &&
+            ActualRegion->StripCasts() == ExpectedRegion->StripCasts();
+      } else if (StringRef(Selector.Operation) == "embedded-member-address") {
+        const auto *Scope = dyn_cast_or_null<FunctionDecl>(
+            C.getStackFrame() ? C.getStackFrame()->getDecl() : nullptr);
+        unsigned OwnerArgument =
+            static_cast<unsigned>(Protocol.Owner->ArgumentIndex);
+        const FieldDecl *Field =
+            Scope && OwnerArgument < Scope->getNumParams()
+                ? namedField(Scope->getParamDecl(OwnerArgument)->getType(),
+                             Selector.Field)
+                : nullptr;
+        const MemRegion *ActualIdentity =
+            ActualRegion ? ActualRegion->StripCasts() : nullptr;
+        const auto *ExpectedField =
+            ExpectedRegion ? dyn_cast<FieldRegion>(ExpectedRegion->StripCasts())
+                           : nullptr;
+        DeviceMatches =
+            Field && Field->getFieldIndex() == 0 && Identity.Owner &&
+            ActualIdentity && ExpectedField &&
+            ExpectedField->getDecl() == Field &&
+            ExpectedField->getSuperRegion()->StripCasts() == Identity.Owner &&
+            (ActualIdentity == ExpectedField ||
+             ActualIdentity == Identity.Owner);
+      }
+    }
+    if (!DeviceMatches)
+      return false;
+
+    const auto *FD = dyn_cast_or_null<FunctionDecl>(Call.getDecl());
+    if (!FD || FD->getNumParams() != 4)
+      return false;
+    const FieldDecl *BusMasterAddressSpace =
+        namedField(FD->getParamDecl(0)->getType(), "bus_master_as");
+    if (!BusMasterAddressSpace)
+      return false;
+    SVal OwnerLocation =
+        State->getLValue(BusMasterAddressSpace, Call.getArgSVal(0));
+    const MemRegion *ExpectedTransferOwner = directDMAOwner(OwnerLocation);
+    const qemu::state::TransferOperation *Transfer =
+        qemu::state::getTransferOperation(State, Result);
+    if (!ExpectedTransferOwner || !Transfer ||
+        Transfer->getOwner() != ExpectedTransferOwner ||
+        Transfer->getHostBufferDirection() !=
+            qemu::facts::AccessDirection::HostWrite ||
+        Transfer->getActualLength().has_value())
+      return false;
+    auto SameValue = [&](SVal Left, SVal Right) {
+      return Left == Right ||
+             isDefinitelyTrue(State, Left, BO_EQ, Right, C.getSValBuilder());
+    };
+    return SameValue(Transfer->getGuestAddress(), Call.getArgSVal(1)) &&
+           SameValue(Transfer->getHostBufferBase(), Call.getArgSVal(2)) &&
+           SameValue(Transfer->getRequestedLength(), Call.getArgSVal(3));
+  }
+
+  enum class FailedCompletionRingFilter {
+    RingAdvanced,
+    NotRingAdvanced,
+  };
+
   static const qemu::state::CompletionPublicationState *
   uniqueFailedCompletionPublication(ProgramStateRef State,
                                     const FailedCompletionIdentity &Identity,
                                     std::optional<SVal> RequiredSlot,
-                                    bool RequireRingAdvanced) {
+                                    FailedCompletionRingFilter RingFilter) {
     const qemu::state::CompletionPublicationState *Found = nullptr;
     for (const auto &Entry :
          State->get<qemu::state::CompletionPublicationMap>()) {
@@ -4801,10 +5162,14 @@ class QEMUGuestMemorySafetyChecker
           Publication.getVector() != Identity.Vector ||
           !Publication.hasStage(
               qemu::facts::CompletionPublicationStage::DescriptorFailed) ||
-          (RequiredSlot && Publication.getSlot() != *RequiredSlot) ||
-          (RequireRingAdvanced &&
-           !Publication.hasStage(
-               qemu::facts::CompletionPublicationStage::RingAdvanced)))
+          (RequiredSlot && Publication.getSlot() != *RequiredSlot))
+        continue;
+      bool RingAdvanced = Publication.hasStage(
+          qemu::facts::CompletionPublicationStage::RingAdvanced);
+      if ((RingFilter == FailedCompletionRingFilter::RingAdvanced &&
+           !RingAdvanced) ||
+          (RingFilter == FailedCompletionRingFilter::NotRingAdvanced &&
+           RingAdvanced))
         continue;
       if (Found)
         return nullptr;
@@ -4828,6 +5193,20 @@ class QEMUGuestMemorySafetyChecker
     for (const auto &Entry :
          State->get<qemu::state::CompletionPublicationMap>())
       if (Entry.second.getOwner() == Owner)
+        Results.push_back(Entry.second.getResult());
+    for (SymbolRef Result : Results)
+      State = removeFailedCompletionFactsForResult(State, Result);
+    return State;
+  }
+
+  static ProgramStateRef
+  removeFailedCompletionFactsForQueue(ProgramStateRef State,
+                                      const MemRegion *Owner, SVal Queue) {
+    llvm::SmallVector<SymbolRef, 4> Results;
+    for (const auto &Entry :
+         State->get<qemu::state::CompletionPublicationMap>())
+      if (Entry.second.getOwner() == Owner &&
+          Entry.second.getQueueID() == Queue)
         Results.push_back(Entry.second.getResult());
     for (SymbolRef Result : Results)
       State = removeFailedCompletionFactsForResult(State, Result);
@@ -5028,28 +5407,39 @@ class QEMUGuestMemorySafetyChecker
          !jsonStringIs(*PCIDependencies, "manifest_sha256",
                        "1c4c17fa6f77e6d5dc71ff70016630b03ed4df22b82a211ac81bbcbb"
                        "58954132"));
-    if (!Catalog ||
-        !jsonStringIs(*Catalog, "path", "QEMUContractCatalog.json") ||
-        !jsonIntegerIs(*Catalog, "bytes", 48051) ||
-        !jsonIntegerIs(*Catalog, "format",
-                       qemu_contracts_generated::CatalogFormat) ||
-        !jsonStringIs(*Catalog, "normalized_sha256",
-                      qemu_contracts_generated::CatalogSHA256) ||
-        !jsonStringIs(*Catalog, "sha256",
-                      "c2d0df195f76e50a0069cc0a2431f343c173c8f2b8602fffd2c6c"
-                      "ea8946095a0") ||
-        !CatalogSchema ||
-        !jsonStringIs(*CatalogSchema, "path",
-                      "QEMUContractCatalog.schema.json") ||
-        !jsonIntegerIs(*CatalogSchema, "bytes", 21988) ||
-        !jsonStringIs(*CatalogSchema, "sha256",
-                      "3ce99b26b5bf117cb6cbb13676be43c76eedac28f13203b521c396"
-                      "f685aa8d42") ||
+    // The selective summaries were sealed before the two Stage-2 failed-
+    // completion protocols were appended to the catalog.  Preserve that
+    // evidence only for this exact reviewed pair: the manifest must carry the
+    // historical catalog/schema identities and the compiled checker must
+    // carry the exact protocol-only successor identities.  The leaf contract
+    // is checked independently below.
+    bool SealedStage1CatalogOnStage2Protocols =
+        Catalog && jsonStringIs(*Catalog, "path", "QEMUContractCatalog.json") &&
+        jsonIntegerIs(*Catalog, "bytes", 48051) &&
+        jsonIntegerIs(*Catalog, "format", 5) &&
+        jsonStringIs(*Catalog, "normalized_sha256",
+                     "c1df36f5de149afeb878ccf897ed8f2ed6ce7e6b1396d07d9086a75"
+                     "d1fe5b829") &&
+        jsonStringIs(*Catalog, "sha256",
+                     "c2d0df195f76e50a0069cc0a2431f343c173c8f2b8602fffd2c6ce"
+                     "a8946095a0") &&
+        CatalogSchema &&
+        jsonStringIs(*CatalogSchema, "path",
+                     "QEMUContractCatalog.schema.json") &&
+        jsonIntegerIs(*CatalogSchema, "bytes", 21988) &&
+        jsonStringIs(*CatalogSchema, "sha256",
+                     "3ce99b26b5bf117cb6cbb13676be43c76eedac28f13203b521c396f6"
+                     "85aa8d42") &&
+        StringRef(qemu_contracts_generated::CatalogSHA256) ==
+            "17ca11c1a14d5d7129a33dc2691ee625999f54cef4ec1cb6c8cac51f"
+            "cfa8243e" &&
+        StringRef(qemu_contracts_generated::SchemaSHA256) ==
+            "c6dc6b60f89d72e792a7a076a31675dae3031a9a634183a4b58275d0"
+            "e3934b27" &&
+        qemu_contracts_generated::CatalogFormat == 5;
+    if (!SealedStage1CatalogOnStage2Protocols ||
         StringRef(qemu_contracts_generated::ModelVersion) !=
             "qemu-v3-io-contracts-v8" ||
-        StringRef(qemu_contracts_generated::SchemaSHA256) !=
-            "09a169d61f4b526431cb22ab6c219adcbf263aa7f5f3abfd46701731c"
-            "bee166d" ||
         !Header || !jsonStringIs(*Header, "path", "include/system/dma.h") ||
         !jsonIntegerIs(*Header, "bytes", 11848) ||
         !jsonStringIs(*Header, "sha256",
@@ -6967,6 +7357,9 @@ class QEMUGuestMemorySafetyChecker
         State = qemu::state::setTransferOperation(
             State, ResultSymbol, Buffer, Owner, GuestAddress, Begin, Length,
             ActualLength, qemu::facts::AccessDirection::HostWrite);
+        if (!Succeeded && EnableFailedCompletionPublicationDiagnostics)
+          State = startFailedSelectiveSummaryCompletionPublication(
+              State, Call, *Summary, ResultSymbol, C);
       }
 
       const NoteTag *Tag = nullptr;
@@ -7080,7 +7473,7 @@ class QEMUGuestMemorySafetyChecker
         !protocolMatchesFailedTransfer(*Protocol, *Transfer.Contract))
       return State;
     std::optional<FailedCompletionIdentity> Identity =
-        failedCompletionIdentity(*Protocol, State, C);
+        failedCompletionIdentity(*Protocol, State, C, &Call);
     if (!Identity)
       return State;
     return qemu::state::startCompletionPublication(
@@ -7090,8 +7483,36 @@ class QEMUGuestMemorySafetyChecker
         Call.getOriginExpr());
   }
 
+  static ProgramStateRef startFailedSelectiveSummaryCompletionPublication(
+      ProgramStateRef State, const CallEvent &Call,
+      const SelectiveDMASummary &Summary, SymbolRef Result, CheckerContext &C) {
+    if (!Result)
+      return State;
+    std::optional<FailedCompletionProtocolDescriptor> Protocol =
+        activeFailedCompletionProtocol(C);
+    if (!Protocol)
+      return State;
+    const qemu_contracts_generated::ProtocolSelectorRecord *Selector =
+        protocolMatchesFailedSelectiveSummary(*Protocol, Summary);
+    if (!Selector)
+      return State;
+    std::optional<FailedCompletionIdentity> Identity =
+        failedCompletionIdentity(*Protocol, State, C, &Call);
+    if (!Identity)
+      return State;
+    bool OwnerMatches = selectiveSummaryDMAOwnerMatchesProtocol(
+        *Protocol, *Selector, *Identity, State, Call, Result, C);
+    if (!OwnerMatches)
+      return State;
+    return qemu::state::startCompletionPublication(
+        State, Identity->Owner, Identity->Queue, Call.getReturnValue(),
+        Identity->Slot, Identity->Vector, Result,
+        qemu::facts::CompletionPublicationStage::DescriptorFailed,
+        Call.getOriginExpr());
+  }
+
   bool reportFailedCompletionPublication(
-      CheckerContext &C, ProgramStateRef State, const CallEvent &Call,
+      CheckerContext &C, ProgramStateRef State, const Stmt *CompletionOrigin,
       const FailedCompletionProtocolDescriptor &Protocol,
       const qemu::state::CompletionPublicationState &Publication) const {
     ExplodedNode *Node = C.generateNonFatalErrorNode(State);
@@ -7103,7 +7524,7 @@ class QEMUGuestMemorySafetyChecker
         "transfer completion";
     auto Report = std::make_unique<PathSensitiveBugReport>(
         failedCompletionPublicationBugType(), Message, Node);
-    if (const Expr *Origin = Call.getOriginExpr())
+    if (const auto *Origin = dyn_cast_or_null<Expr>(CompletionOrigin))
       Report->addRange(Origin->getSourceRange());
     if (const Stmt *Origin = Publication.getStageOrigin(
             qemu::facts::CompletionPublicationStage::DescriptorFailed))
@@ -7135,29 +7556,58 @@ class QEMUGuestMemorySafetyChecker
     const auto &Selector =
         qemu_contracts_generated::ProtocolSelectors[Protocol->RingAdvanced
                                                         ->SelectorBegin];
-    const auto *Operation = dyn_cast_or_null<UnaryOperator>(S);
-    const auto *Field = dyn_cast_or_null<FieldRegion>(Location.getAsRegion());
-    if (!Operation || Operation->getOpcode() != UO_PostDec || !Field ||
-        Field->getDecl()->getName() != Selector.Field ||
-        Field->getDecl()->getParent()->getName() != Selector.RecordType)
-      return false;
-
     ProgramStateRef State = C.getState();
     std::optional<FailedCompletionIdentity> Identity =
         failedCompletionIdentity(*Protocol, State, C);
-    if (!Identity || Field->getSuperRegion()->StripCasts() != Identity->Owner)
+    if (!Identity)
       return false;
-    auto FieldLocation = Location.getAs<Loc>();
-    if (!FieldLocation)
+
+    std::optional<SVal> RequiredSlot;
+    if (StringRef(Selector.Kind) == "member-update") {
+      const auto *Operation = dyn_cast_or_null<UnaryOperator>(S);
+      const auto *Field = dyn_cast_or_null<FieldRegion>(Location.getAsRegion());
+      if (!Operation || Operation->getOpcode() != UO_PostDec || !Field ||
+          Field->getDecl()->getName() != Selector.Field ||
+          Field->getDecl()->getParent()->getName() != Selector.RecordType ||
+          Field->getSuperRegion()->StripCasts() != Identity->Owner)
+        return false;
+      auto FieldLocation = Location.getAs<Loc>();
+      if (!FieldLocation)
+        return false;
+      SVal PreviousSlot = State->getSVal(*FieldLocation);
+      if (PreviousSlot.isUnknownOrUndef() || PreviousSlot != Identity->Slot)
+        return false;
+      RequiredSlot = PreviousSlot;
+    } else if (StringRef(Selector.Kind) == "indexed-member-update") {
+      const auto *Operation = dyn_cast_or_null<CompoundAssignOperator>(S);
+      const auto *Element =
+          dyn_cast_or_null<ElementRegion>(Location.getAsRegion());
+      const auto *Field =
+          Element
+              ? dyn_cast<FieldRegion>(Element->getSuperRegion()->StripCasts())
+              : nullptr;
+      if (!Operation || Operation->getOpcode() != BO_OrAssign || !Element ||
+          !Field || Field->getDecl()->getName() != Selector.Field ||
+          Field->getDecl()->getParent()->getName() != Selector.RecordType ||
+          Field->getSuperRegion()->StripCasts() != Identity->Owner ||
+          Identity->Slot.isUnknownOrUndef() ||
+          !isDefinitelyTrue(State, Element->getIndex(), BO_EQ, Identity->Slot,
+                            C.getSValBuilder()))
+        return false;
+      SVal RequiredValue = C.getSValBuilder().makeIntVal(
+          Selector.IntegerValue, Operation->getRHS()->getType());
+      if (!isDefinitelyTrue(State, C.getSVal(Operation->getRHS()), BO_EQ,
+                            RequiredValue, C.getSValBuilder()))
+        return false;
+      RequiredSlot = Identity->Slot;
+    } else {
       return false;
-    SVal PreviousSlot = State->getSVal(*FieldLocation);
-    if (PreviousSlot.isUnknownOrUndef() || PreviousSlot != Identity->Slot)
-      return false;
+    }
+
     const auto *Publication = uniqueFailedCompletionPublication(
-        State, *Identity, PreviousSlot, /*RequireRingAdvanced=*/false);
-    if (!Publication ||
-        Publication->hasStage(
-            qemu::facts::CompletionPublicationStage::RingAdvanced))
+        State, *Identity, RequiredSlot,
+        FailedCompletionRingFilter::NotRingAdvanced);
+    if (!Publication)
       return false;
 
     ProgramStateRef Updated = qemu::state::observeCompletionPublicationStage(
@@ -7165,6 +7615,122 @@ class QEMUGuestMemorySafetyChecker
         Publication->getAttemptID(), Publication->getSlot(),
         Publication->getVector(), Publication->getResult(),
         qemu::facts::CompletionPublicationStage::RingAdvanced, S);
+    if (Updated == State)
+      return false;
+    C.addTransition(Updated);
+    return true;
+  }
+
+  bool checkFailedCompletionMemberPublication(SVal Location, const Stmt *S,
+                                              CheckerContext &C) const {
+    std::optional<FailedCompletionProtocolDescriptor> Protocol =
+        activeFailedCompletionProtocol(C);
+    if (!Protocol)
+      return false;
+    const auto &Selector = qemu_contracts_generated::ProtocolSelectors
+        [Protocol->CompletionPublished->SelectorBegin];
+    if (StringRef(Selector.Kind) != "member-update" ||
+        StringRef(Selector.Operation) != "or-assign" ||
+        !Selector.HasIntegerValue)
+      return false;
+
+    const auto *Operation = dyn_cast_or_null<CompoundAssignOperator>(S);
+    const auto *Field = dyn_cast_or_null<FieldRegion>(Location.getAsRegion());
+    ProgramStateRef State = C.getState();
+    std::optional<FailedCompletionIdentity> Identity =
+        failedCompletionIdentity(*Protocol, State, C);
+    if (!Operation || Operation->getOpcode() != BO_OrAssign || !Field ||
+        !Identity || Field->getDecl()->getName() != Selector.Field ||
+        Field->getDecl()->getParent()->getName() != Selector.RecordType ||
+        Field->getSuperRegion()->StripCasts() != Identity->Owner)
+      return false;
+
+    SVal Required = C.getSValBuilder().makeIntVal(
+        Selector.IntegerValue, Operation->getRHS()->getType());
+    if (!isDefinitelyTrue(State, C.getSVal(Operation->getRHS()), BO_EQ,
+                          Required, C.getSValBuilder()))
+      return false;
+    std::optional<SVal> RequiredSlot;
+    if (!Identity->Slot.isUnknownOrUndef())
+      RequiredSlot = Identity->Slot;
+    const auto *Publication = uniqueFailedCompletionPublication(
+        State, *Identity, RequiredSlot,
+        FailedCompletionRingFilter::RingAdvanced);
+    if (!Publication)
+      return false;
+
+    ProgramStateRef Updated = qemu::state::observeCompletionPublicationStage(
+        State, Publication->getOwner(), Publication->getQueueID(),
+        Publication->getAttemptID(), Publication->getSlot(),
+        Publication->getVector(), Publication->getResult(),
+        qemu::facts::CompletionPublicationStage::InterruptPublished, S);
+    const qemu::state::CompletionPublicationState *Published =
+        qemu::state::getCompletionPublication(
+            Updated, Publication->getOwner(), Publication->getQueueID(),
+            Publication->getAttemptID(), Publication->getSlot());
+    std::optional<qemu::state::CompletionPublicationState> PublishedCopy;
+    if (qemu::state::isFailedDMACompletionPublished(Updated, Published))
+      PublishedCopy = *Published;
+
+    ProgramStateRef Cleaned =
+        removeFailedCompletionFactsForResult(Updated, Publication->getResult());
+    if (PublishedCopy && reportFailedCompletionPublication(
+                             C, Cleaned, S, *Protocol, *PublishedCopy))
+      return true;
+    if (Cleaned != State)
+      C.addTransition(Cleaned);
+    return true;
+  }
+
+  bool checkFailedCompletionRingAdvanceCall(const CallEvent &Call,
+                                            CheckerContext &C) const {
+    std::optional<FailedCompletionProtocolDescriptor> Protocol =
+        activeFailedCompletionProtocol(C);
+    if (!Protocol)
+      return false;
+    const auto &Selector =
+        qemu_contracts_generated::ProtocolSelectors[Protocol->RingAdvanced
+                                                        ->SelectorBegin];
+    if (StringRef(Selector.Kind) != "function-call")
+      return false;
+    const auto *FD = dyn_cast_or_null<FunctionDecl>(Call.getDecl());
+    unsigned QueueArgument = static_cast<unsigned>(Selector.QueueArgumentIndex);
+    unsigned ValueArgument = static_cast<unsigned>(Selector.ValueArgumentIndex);
+    if (!FD || !FD->getIdentifier() || Call.getNumArgs() == 0 ||
+        QueueArgument >= Call.getNumArgs() ||
+        ValueArgument >= Call.getNumArgs() || FD->getName() != Selector.Name ||
+        !directDMATypeMatches(FD->getType(), Selector.Prototype))
+      return false;
+
+    ProgramStateRef State = C.getState();
+    std::optional<FailedCompletionIdentity> Identity =
+        failedCompletionOwnerIdentity(*Protocol, State, C);
+    if (!Identity ||
+        !isDefinitelyTrue(State, Call.getArgSVal(0), BO_EQ,
+                          Identity->OwnerValue, C.getSValBuilder()) ||
+        !isDefinitelyTrue(State, Call.getArgSVal(QueueArgument), BO_EQ,
+                          Identity->Queue, C.getSValBuilder()))
+      return false;
+    SVal RequiredValue = C.getSValBuilder().makeIntVal(
+        Selector.IntegerValue, Call.getArgExpr(ValueArgument)->getType());
+    if (!isDefinitelyTrue(State, Call.getArgSVal(ValueArgument), BO_EQ,
+                          RequiredValue, C.getSValBuilder()))
+      return false;
+    std::optional<SVal> RequiredSlot;
+    if (!Identity->Slot.isUnknownOrUndef())
+      RequiredSlot = Identity->Slot;
+    const auto *Publication = uniqueFailedCompletionPublication(
+        State, *Identity, RequiredSlot,
+        FailedCompletionRingFilter::NotRingAdvanced);
+    if (!Publication)
+      return false;
+
+    ProgramStateRef Updated = qemu::state::observeCompletionPublicationStage(
+        State, Publication->getOwner(), Publication->getQueueID(),
+        Publication->getAttemptID(), Publication->getSlot(),
+        Publication->getVector(), Publication->getResult(),
+        qemu::facts::CompletionPublicationStage::RingAdvanced,
+        Call.getOriginExpr());
     if (Updated == State)
       return false;
     C.addTransition(Updated);
@@ -7179,8 +7745,10 @@ class QEMUGuestMemorySafetyChecker
       return false;
     const auto &Selector = qemu_contracts_generated::ProtocolSelectors
         [Protocol->CompletionPublished->SelectorBegin];
+    if (StringRef(Selector.Kind) != "function-call")
+      return false;
     const auto *FD = dyn_cast_or_null<FunctionDecl>(Call.getDecl());
-    if (!FD || !FD->getIdentifier() || Call.getNumArgs() != 1 ||
+    if (!FD || !FD->getIdentifier() || Call.getNumArgs() == 0 ||
         FD->getName() != Selector.Name ||
         !directDMATypeMatches(FD->getType(), Selector.Prototype))
       return false;
@@ -7192,8 +7760,60 @@ class QEMUGuestMemorySafetyChecker
         !isDefinitelyTrue(State, Call.getArgSVal(0), BO_EQ,
                           Identity->OwnerValue, C.getSValBuilder()))
       return false;
-    const auto *Publication = uniqueFailedCompletionPublication(
-        State, *Identity, std::nullopt, /*RequireRingAdvanced=*/false);
+
+    bool ContainsBits = StringRef(Selector.Operation) == "contains-bits";
+    if (!StringRef(Selector.Operation).empty() && !ContainsBits)
+      return false;
+    if (ContainsBits) {
+      unsigned ValueArgument =
+          static_cast<unsigned>(Selector.ValueArgumentIndex);
+      if (!Selector.HasIntegerValue || ValueArgument >= Call.getNumArgs())
+        return false;
+      QualType ArgumentType = Call.getArgExpr(ValueArgument)->getType();
+      SVal Required =
+          C.getSValBuilder().makeIntVal(Selector.IntegerValue, ArgumentType);
+      SVal Masked = C.getSValBuilder().evalBinOp(State, BO_And,
+                                                 Call.getArgSVal(ValueArgument),
+                                                 Required, ArgumentType);
+      uint64_t RequiredBits = static_cast<uint64_t>(Selector.IntegerValue);
+      bool ProvenBySolver =
+          isDefinitelyTrue(State, Masked, BO_EQ, Required, C.getSValBuilder());
+      bool ProvenByExpression =
+          Selector.IntegerValue > 0 &&
+          (protocolKnownSetBits(Call.getArgSVal(ValueArgument),
+                                C.getASTContext()) &
+           RequiredBits) == RequiredBits;
+      if (!ProvenBySolver && !ProvenByExpression)
+        return false;
+    }
+
+    std::optional<SVal> RequiredSlot;
+    if (!Identity->Slot.isUnknownOrUndef())
+      RequiredSlot = Identity->Slot;
+    const qemu::state::CompletionPublicationState *Publication = nullptr;
+    if (ContainsBits) {
+      for (const auto &Entry :
+           State->get<qemu::state::CompletionPublicationMap>()) {
+        const auto &Candidate = Entry.second;
+        if (Candidate.getOwner() != Identity->Owner ||
+            Candidate.getQueueID() != Identity->Queue ||
+            Candidate.getVector() != Identity->Vector ||
+            !Candidate.hasStage(
+                qemu::facts::CompletionPublicationStage::DescriptorFailed) ||
+            !Candidate.hasStage(
+                qemu::facts::CompletionPublicationStage::RingAdvanced) ||
+            (RequiredSlot && Candidate.getSlot() != *RequiredSlot) ||
+            !qemu::state::hasFailedDMATransferResult(State,
+                                                     Candidate.getResult()))
+          continue;
+        Publication = &Candidate;
+        break;
+      }
+    } else {
+      Publication = uniqueFailedCompletionPublication(
+          State, *Identity, RequiredSlot,
+          FailedCompletionRingFilter::RingAdvanced);
+    }
     if (!Publication)
       return false;
 
@@ -7212,9 +7832,14 @@ class QEMUGuestMemorySafetyChecker
       PublishedCopy = *Published;
 
     ProgramStateRef Cleaned =
-        removeFailedCompletionFactsForResult(Updated, Publication->getResult());
-    if (PublishedCopy && reportFailedCompletionPublication(
-                             C, Cleaned, Call, *Protocol, *PublishedCopy))
+        ContainsBits
+            ? removeFailedCompletionFactsForQueue(
+                  Updated, Publication->getOwner(), Publication->getQueueID())
+            : removeFailedCompletionFactsForResult(Updated,
+                                                   Publication->getResult());
+    if (PublishedCopy &&
+        reportFailedCompletionPublication(C, Cleaned, Call.getOriginExpr(),
+                                          *Protocol, *PublishedCopy))
       return true;
     if (Cleaned != State)
       C.addTransition(Cleaned);
@@ -10498,6 +11123,40 @@ public:
           if (!Owner.isUnknownOrUndef())
             State = State->set<QEMUFailedCompletionScopeOwners>(Frame, Owner);
         }
+        auto CaptureIdentityArgument = [&](const auto *Binding, auto SetValue) {
+          StringRef Source = Binding->Source;
+          if (Source != "scope-argument" &&
+              Source != "scope-argument-member-pre")
+            return;
+          unsigned Argument = static_cast<unsigned>(Binding->ArgumentIndex);
+          if (Argument >= FD->getNumParams())
+            return;
+          const MemRegion *ParameterRegion =
+              State->getRegion(FD->getParamDecl(Argument), Frame);
+          SVal Value = State->getSVal(ParameterRegion);
+          if (Source == "scope-argument-member-pre") {
+            const FieldDecl *Field = namedField(
+                FD->getParamDecl(Argument)->getType(), Binding->Field);
+            if (!Field)
+              return;
+            SVal FieldLocation = State->getLValue(Field, Value);
+            auto FieldLoc = FieldLocation.getAs<Loc>();
+            if (!FieldLoc)
+              return;
+            Value = State->getSVal(*FieldLoc);
+          }
+          if (!Value.isUnknownOrUndef())
+            State = SetValue(State, Value);
+        };
+        CaptureIdentityArgument(
+            Protocol->Queue, [Frame](ProgramStateRef Current, SVal Value) {
+              return Current->set<QEMUFailedCompletionScopeQueues>(Frame,
+                                                                   Value);
+            });
+        CaptureIdentityArgument(
+            Protocol->Slot, [Frame](ProgramStateRef Current, SVal Value) {
+              return Current->set<QEMUFailedCompletionScopeSlots>(Frame, Value);
+            });
       }
     if (!C.inTopFrame()) {
       if (State != C.getState())
@@ -10778,6 +11437,9 @@ public:
   }
 
   void checkPreCall(const CallEvent &Call, CheckerContext &C) const {
+    if (EnableFailedCompletionPublicationDiagnostics &&
+        checkFailedCompletionRingAdvanceCall(Call, C))
+      return;
     if (EnableFailedCompletionPublicationDiagnostics &&
         checkFailedCompletionPublication(Call, C))
       return;
@@ -12070,6 +12732,9 @@ public:
     if (EnableFailedCompletionPublicationDiagnostics &&
         checkFailedCompletionRingAdvance(Location, S, C))
       return;
+    if (EnableFailedCompletionPublicationDiagnostics &&
+        checkFailedCompletionMemberPublication(Location, S, C))
+      return;
     const MemRegion *BindingRegion = Location.getAsRegion();
     if (EnableInitializedByteTracking) {
       if (std::optional<InitializedBytePosition> Position =
@@ -12445,6 +13110,18 @@ public:
       for (SymbolRef Symbol : Entry.second.symbols())
         SymReaper.markLive(Symbol);
     }
+    for (const auto &Entry : State->get<QEMUFailedCompletionScopeQueues>()) {
+      if (const MemRegion *Region = Entry.second.getAsRegion())
+        SymReaper.markLive(Region);
+      for (SymbolRef Symbol : Entry.second.symbols())
+        SymReaper.markLive(Symbol);
+    }
+    for (const auto &Entry : State->get<QEMUFailedCompletionScopeSlots>()) {
+      if (const MemRegion *Region = Entry.second.getAsRegion())
+        SymReaper.markLive(Region);
+      for (SymbolRef Symbol : Entry.second.symbols())
+        SymReaper.markLive(Symbol);
+    }
     // Only a nonterminal publication with a live owner roots its join symbols.
     // Root the function-entry owner capture first: an external DMA call can
     // invalidate and reconjure the parameter region while the original owner
@@ -12708,6 +13385,8 @@ public:
               State = removeFailedCompletionFactsForOwner(State, Owner);
         }
       State = State->remove<QEMUFailedCompletionScopeOwners>(Frame);
+      State = State->remove<QEMUFailedCompletionScopeQueues>(Frame);
+      State = State->remove<QEMUFailedCompletionScopeSlots>(Frame);
       auto BufferParameters = State->get<QEMUInputBufferParameters>();
       for (const auto &Entry : BufferParameters)
         if (Entry.second->getDeclContext() == FD)

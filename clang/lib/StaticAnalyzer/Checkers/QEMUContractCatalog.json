@@ -1432,6 +1432,169 @@
           ]
         }
       ]
+    },
+    {
+      "id": "qemu.protocol.e1000e.tx-descriptor-completion",
+      "rule_id": "qemu.failed-completion-publication",
+      "family": "e1000e",
+      "scope": {
+        "kind": "function-definition",
+        "name": "e1000e_start_xmit",
+        "source": "hw/net/e1000e_core.c",
+        "translation_unit": "hw/net/e1000e_core.c",
+        "prototype": {
+          "return_type": "void",
+          "parameters": [
+            { "name": "core", "type": "E1000ECore *" },
+            { "name": "txr", "type": "const E1000E_TxRing *" }
+          ]
+        }
+      },
+      "bindings": [
+        { "role": "owner", "source": "scope-argument", "index": 0 },
+        {
+          "role": "queue",
+          "source": "scope-argument-member-pre",
+          "index": 1,
+          "record_type": "E1000E_TxRing",
+          "field": "i"
+        },
+        { "role": "attempt", "source": "transfer-result" },
+        { "role": "slot", "source": "transfer-argument", "index": 1 },
+        { "role": "vector", "source": "integer-constant", "value": 2 },
+        { "role": "result", "source": "transfer-result" }
+      ],
+      "events": [
+        {
+          "stage": "descriptor-failed",
+          "selectors": [
+            {
+              "kind": "selective-summary-call",
+              "contract_id": "qemu.selective-summary.pci-dma-read",
+              "record_type": "E1000Core",
+              "field": "owner",
+              "operation": "pointer-member-value",
+              "phase": "post-call",
+              "result_path": "failure",
+              "expected_count": 1
+            }
+          ]
+        },
+        {
+          "stage": "ring-advanced",
+          "selectors": [
+            {
+              "kind": "function-call",
+              "name": "e1000e_ring_advance",
+              "prototype": {
+                "return_type": "void",
+                "parameters": [
+                  { "name": "core", "type": "E1000ECore *" },
+                  { "name": "r", "type": "const E1000ERingInfo *" },
+                  { "name": "count", "type": "uint32_t" }
+                ]
+              },
+              "queue_argument": 1,
+              "value_argument": 2,
+              "value": 1,
+              "phase": "pre-call",
+              "expected_count": 1
+            }
+          ]
+        },
+        {
+          "stage": "interrupt-published",
+          "selectors": [
+            {
+              "kind": "function-call",
+              "name": "e1000e_set_interrupt_cause",
+              "prototype": {
+                "return_type": "void",
+                "parameters": [
+                  { "name": "core", "type": "E1000ECore *" },
+                  { "name": "val", "type": "uint32_t" }
+                ]
+              },
+              "operation": "contains-bits",
+              "value_argument": 1,
+              "value": 2,
+              "phase": "pre-call",
+              "expected_count": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "qemu.protocol.rtl8139.classic-tx-completion",
+      "rule_id": "qemu.failed-completion-publication",
+      "family": "rtl8139",
+      "scope": {
+        "kind": "function-definition",
+        "name": "rtl8139_transmit_one",
+        "source": "hw/net/rtl8139.c",
+        "translation_unit": "hw/net/rtl8139.c",
+        "prototype": {
+          "return_type": "int",
+          "parameters": [
+            { "name": "s", "type": "RTL8139State *" },
+            { "name": "descriptor", "type": "int" }
+          ]
+        }
+      },
+      "bindings": [
+        { "role": "owner", "source": "scope-argument", "index": 0 },
+        { "role": "queue", "source": "scope-argument", "index": 1 },
+        { "role": "attempt", "source": "transfer-result" },
+        { "role": "slot", "source": "scope-argument", "index": 1 },
+        { "role": "vector", "source": "integer-constant", "value": 4 },
+        { "role": "result", "source": "transfer-result" }
+      ],
+      "events": [
+        {
+          "stage": "descriptor-failed",
+          "selectors": [
+            {
+              "kind": "selective-summary-call",
+              "contract_id": "qemu.selective-summary.pci-dma-read",
+              "record_type": "RTL8139State",
+              "field": "parent_obj",
+              "operation": "embedded-member-address",
+              "phase": "post-call",
+              "result_path": "failure",
+              "expected_count": 1
+            }
+          ]
+        },
+        {
+          "stage": "ring-advanced",
+          "selectors": [
+            {
+              "kind": "indexed-member-update",
+              "record_type": "RTL8139State",
+              "field": "TxStatus",
+              "operation": "or-assign",
+              "value": 8192,
+              "phase": "bind",
+              "expected_count": 1
+            }
+          ]
+        },
+        {
+          "stage": "interrupt-published",
+          "selectors": [
+            {
+              "kind": "member-update",
+              "record_type": "RTL8139State",
+              "field": "IntrStatus",
+              "operation": "or-assign",
+              "value": 4,
+              "phase": "bind",
+              "expected_count": 1
+            }
+          ]
+        }
+      ]
     }
   ]
 }

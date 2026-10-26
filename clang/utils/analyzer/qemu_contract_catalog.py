@@ -49,7 +49,7 @@ from pathlib import Path
 # This deliberately pins every transitive JSON-Schema semantic keyword.  The
 # structural checks below provide useful errors; this identity prevents an
 # unreviewed schema broadening/narrowing through a keyword they do not name.
-EXPECTED_SCHEMA_SHA256 = "09a169d61f4b526431cb22ab6c219adcbf263aa7f5f3abfd46701731cbee166d"
+EXPECTED_SCHEMA_SHA256 = "c6dc6b60f89d72e792a7a076a31675dae3031a9a634183a4b58275d0e3934b27"
 
 
 CATALOG_KEYS = {
@@ -122,6 +122,9 @@ PROTOCOL_SELECTOR_KEYS = {
     "record_type",
     "field",
     "operation",
+    "queue_argument",
+    "value_argument",
+    "value",
     "phase",
     "result_path",
     "expected_count",
@@ -222,6 +225,8 @@ DIRECTION_ENCODINGS = {
 PROTOCOL_BINDING_ROLES = {"owner", "queue", "attempt", "slot", "vector", "result"}
 PROTOCOL_BINDING_SOURCES = {
     "scope-argument",
+    "scope-argument-member-pre",
+    "transfer-argument",
     "transfer-result",
     "member-value-pre",
     "integer-constant",
@@ -231,7 +236,13 @@ PROTOCOL_STAGES = (
     "ring-advanced",
     "interrupt-published",
 )
-PROTOCOL_SELECTOR_KINDS = {"transfer-call", "member-update", "function-call"}
+PROTOCOL_SELECTOR_KINDS = {
+    "transfer-call",
+    "selective-summary-call",
+    "member-update",
+    "indexed-member-update",
+    "function-call",
+}
 PROTOCOL_SELECTOR_PHASES = {"post-call", "bind", "pre-call"}
 PROTOCOL_MEMBER_OPERATIONS = {
     "pre-decrement",
@@ -240,6 +251,11 @@ PROTOCOL_MEMBER_OPERATIONS = {
     "post-increment",
     "add-assign",
     "subtract-assign",
+    "or-assign",
+}
+PROTOCOL_OWNER_RELATIONS = {
+    "pointer-member-value",
+    "embedded-member-address",
 }
 CALLBACK_ENTRY_INPUT_SOURCES = {"argument", "argument_member"}
 CALLBACK_ENTRY_INPUT_ROLES = {
@@ -1288,18 +1304,22 @@ def _validate_protocol_binding(binding, protocol, index, where):
             "{}.source has invalid value {!r}".format(binding_where, source)
         )
 
-    expected_source = {
-        "owner": "scope-argument",
-        "queue": "integer-constant",
-        "attempt": "transfer-result",
-        "slot": "member-value-pre",
-        "vector": "integer-constant",
-        "result": "transfer-result",
+    allowed_sources = {
+        "owner": {"scope-argument"},
+        "queue": {
+            "integer-constant",
+            "scope-argument",
+            "scope-argument-member-pre",
+        },
+        "attempt": {"transfer-result"},
+        "slot": {"member-value-pre", "scope-argument", "transfer-argument"},
+        "vector": {"integer-constant"},
+        "result": {"transfer-result"},
     }[role]
-    if source != expected_source:
+    if source not in allowed_sources:
         raise CatalogError(
-            "{} role {!r} must use source {!r}".format(
-                binding_where, role, expected_source
+            "{} role {!r} must use one of {}".format(
+                binding_where, role, sorted(allowed_sources)
             )
         )
 
@@ -1315,8 +1335,46 @@ def _validate_protocol_binding(binding, protocol, index, where):
         argument_index = binding["index"]
         if argument_index < 0 or argument_index >= len(parameters):
             raise CatalogError("{}.index is outside the scope prototype".format(binding_where))
-        if not _is_pointer(parameters[argument_index]["type"]):
+        parameter_type = parameters[argument_index]["type"]
+        if role == "owner" and not _is_pointer(parameter_type):
             raise CatalogError("{} owner argument must have pointer type".format(binding_where))
+        if role != "owner" and parameter_type == "void":
+            raise CatalogError(
+                "{} identity argument must have a value type".format(binding_where)
+            )
+    elif source == "scope-argument-member-pre":
+        if extra_fields != {"index", "record_type", "field"}:
+            raise CatalogError(
+                "{} scope-argument-member-pre requires exactly index, "
+                "record_type, and field".format(binding_where)
+            )
+        parameters = protocol["scope"]["prototype"]["parameters"]
+        argument_index = binding["index"]
+        if type(argument_index) is not int or not (
+            0 <= argument_index < len(parameters)
+        ):
+            raise CatalogError("{}.index is outside the scope prototype".format(binding_where))
+        _expect_string(
+            binding["record_type"], binding_where + ".record_type", IDENTIFIER_RE
+        )
+        _expect_string(binding["field"], binding_where + ".field", IDENTIFIER_RE)
+        if _pointer_record_name(parameters[argument_index]["type"]) != binding[
+            "record_type"
+        ]:
+            raise CatalogError(
+                "{} scope argument pointee must match record_type".format(
+                    binding_where
+                )
+            )
+    elif source == "transfer-argument":
+        if extra_fields != {"index"} or type(binding["index"]) is not int:
+            raise CatalogError(
+                "{} transfer-argument requires exactly an integer index".format(
+                    binding_where
+                )
+            )
+        if binding["index"] < 0:
+            raise CatalogError("{}.index must be nonnegative".format(binding_where))
     elif source == "transfer-result":
         if extra_fields:
             raise CatalogError(
@@ -1366,7 +1424,7 @@ def _validate_protocol_selector(selector, stage, index, contracts_by_id, where):
     ):
         raise CatalogError("{}.expected_count must be an integer from 1 to 64".format(selector_where))
 
-    if kind == "transfer-call":
+    if kind in {"transfer-call", "selective-summary-call"}:
         expected_fields = {
             "kind",
             "contract_id",
@@ -1374,19 +1432,41 @@ def _validate_protocol_selector(selector, stage, index, contracts_by_id, where):
             "result_path",
             "expected_count",
         }
+        if kind == "selective-summary-call":
+            expected_fields.update({"record_type", "field", "operation"})
         if set(selector) != expected_fields:
             raise CatalogError(
                 "{} transfer-call fields are not canonical".format(selector_where)
             )
         contract_id = selector["contract_id"]
         _expect_string(contract_id, selector_where + ".contract_id", ID_RE)
-        contract = contracts_by_id.get(contract_id)
-        if contract is None or contract["kind"] != "transfer":
-            raise CatalogError(
-                "{} references missing or non-transfer contract {!r}".format(
-                    selector_where, contract_id
+        if kind == "transfer-call":
+            contract = contracts_by_id.get(contract_id)
+            if contract is None or contract["kind"] != "transfer":
+                raise CatalogError(
+                    "{} references missing or non-transfer contract {!r}".format(
+                        selector_where, contract_id
+                    )
                 )
+        else:
+            if contract_id != "qemu.selective-summary.pci-dma-read":
+                raise CatalogError(
+                    "{} references unsupported selective summary {!r}".format(
+                        selector_where, contract_id
+                    )
+                )
+            _expect_string(
+                selector["record_type"],
+                selector_where + ".record_type",
+                IDENTIFIER_RE,
             )
+            _expect_string(
+                selector["field"], selector_where + ".field", IDENTIFIER_RE
+            )
+            if selector["operation"] not in PROTOCOL_OWNER_RELATIONS:
+                raise CatalogError(
+                    "{}.operation has invalid owner relation".format(selector_where)
+                )
         if phase != "post-call" or selector["result_path"] != "failure":
             raise CatalogError(
                 "{} transfer-call must select post-call failure".format(
@@ -1394,7 +1474,7 @@ def _validate_protocol_selector(selector, stage, index, contracts_by_id, where):
                 )
             )
         key = (kind, contract_id)
-    elif kind == "member-update":
+    elif kind in {"member-update", "indexed-member-update"}:
         expected_fields = {
             "kind",
             "record_type",
@@ -1403,6 +1483,8 @@ def _validate_protocol_selector(selector, stage, index, contracts_by_id, where):
             "phase",
             "expected_count",
         }
+        if kind == "indexed-member-update" or selector["operation"] == "or-assign":
+            expected_fields.add("value")
         if set(selector) != expected_fields:
             raise CatalogError(
                 "{} member-update fields are not canonical".format(selector_where)
@@ -1413,13 +1495,38 @@ def _validate_protocol_selector(selector, stage, index, contracts_by_id, where):
         _expect_string(selector["field"], selector_where + ".field", IDENTIFIER_RE)
         if selector["operation"] not in PROTOCOL_MEMBER_OPERATIONS:
             raise CatalogError("{}.operation has invalid value".format(selector_where))
+        if kind == "indexed-member-update":
+            if selector["operation"] != "or-assign":
+                raise CatalogError(
+                    "{} indexed-member-update requires or-assign".format(
+                        selector_where
+                    )
+                )
+            if type(selector["value"]) is not int or not (
+                SIGNED_LONG_LONG_MIN <= selector["value"] <= SIGNED_LONG_LONG_MAX
+            ):
+                raise CatalogError(
+                    "{}.value is outside signed long long range".format(
+                        selector_where
+                    )
+                )
         if phase != "bind":
             raise CatalogError("{} member-update phase must be bind".format(selector_where))
+        if kind == "member-update" and selector["operation"] == "or-assign":
+            if type(selector["value"]) is not int or not (
+                SIGNED_LONG_LONG_MIN <= selector["value"] <= SIGNED_LONG_LONG_MAX
+            ):
+                raise CatalogError(
+                    "{}.value is outside signed long long range".format(
+                        selector_where
+                    )
+                )
         key = (
             kind,
             selector["record_type"],
             selector["field"],
             selector["operation"],
+            selector.get("value"),
         )
     else:
         expected_fields = {
@@ -1429,6 +1536,10 @@ def _validate_protocol_selector(selector, stage, index, contracts_by_id, where):
             "phase",
             "expected_count",
         }
+        if stage == "ring-advanced":
+            expected_fields.update({"queue_argument", "value_argument", "value"})
+        elif selector.get("operation") == "contains-bits":
+            expected_fields.update({"operation", "value_argument", "value"})
         if set(selector) != expected_fields:
             raise CatalogError(
                 "{} function-call fields are not canonical".format(selector_where)
@@ -1437,17 +1548,94 @@ def _validate_protocol_selector(selector, stage, index, contracts_by_id, where):
         _validate_prototype(selector["prototype"], selector_where + ".prototype")
         if phase != "pre-call":
             raise CatalogError("{} function-call phase must be pre-call".format(selector_where))
-        key = (kind, selector["name"], _prototype_string(selector))
+        if stage == "ring-advanced":
+            queue_argument = selector["queue_argument"]
+            argument_index = selector["value_argument"]
+            parameters = selector["prototype"]["parameters"]
+            if type(queue_argument) is not int or not (
+                0 <= queue_argument < len(parameters)
+            ):
+                raise CatalogError(
+                    "{}.queue_argument is outside the selector prototype".format(
+                        selector_where
+                    )
+                )
+            if type(argument_index) is not int or not (
+                0 <= argument_index < len(parameters)
+            ):
+                raise CatalogError(
+                    "{}.value_argument is outside the selector prototype".format(
+                        selector_where
+                    )
+                )
+            if type(selector["value"]) is not int or not (
+                SIGNED_LONG_LONG_MIN <= selector["value"] <= SIGNED_LONG_LONG_MAX
+            ):
+                raise CatalogError(
+                    "{}.value is outside signed long long range".format(
+                        selector_where
+                    )
+                )
+        elif selector.get("operation") == "contains-bits":
+            argument_index = selector["value_argument"]
+            parameters = selector["prototype"]["parameters"]
+            if type(argument_index) is not int or not (
+                0 <= argument_index < len(parameters)
+            ):
+                raise CatalogError(
+                    "{}.value_argument is outside the selector prototype".format(
+                        selector_where
+                    )
+                )
+            if type(selector["value"]) is not int or not (
+                SIGNED_LONG_LONG_MIN <= selector["value"] <= SIGNED_LONG_LONG_MAX
+            ):
+                raise CatalogError(
+                    "{}.value is outside signed long long range".format(
+                        selector_where
+                    )
+                )
+        key = (
+            kind,
+            selector["name"],
+            _prototype_string(selector),
+            selector.get("operation"),
+            selector.get("queue_argument"),
+            selector.get("value_argument"),
+            selector.get("value"),
+        )
 
-    expected_kind = {
-        "descriptor-failed": "transfer-call",
-        "ring-advanced": "member-update",
-        "interrupt-published": "function-call",
+    expected_kinds = {
+        "descriptor-failed": {"transfer-call", "selective-summary-call"},
+        "ring-advanced": {
+            "member-update",
+            "indexed-member-update",
+            "function-call",
+        },
+        "interrupt-published": {"function-call", "member-update"},
     }[stage]
-    if kind != expected_kind:
+    if kind not in expected_kinds:
         raise CatalogError(
-            "{} stage {!r} requires selector kind {!r}".format(
-                selector_where, stage, expected_kind
+            "{} stage {!r} requires selector kind in {}".format(
+                selector_where, stage, sorted(expected_kinds)
+            )
+        )
+    if (
+        stage == "ring-advanced"
+        and kind == "member-update"
+        and selector["operation"] != "post-decrement"
+    ):
+        raise CatalogError(
+            "{} ring member update requires post-decrement".format(selector_where)
+        )
+    if (
+        stage == "interrupt-published"
+        and kind == "member-update"
+        and selector["operation"] != "or-assign"
+    ):
+        raise CatalogError(
+            "{} completion member update requires or-assign".format(
+                selector_where
             )
         )
     return key
@@ -1496,9 +1684,20 @@ def _validate_protocol(protocol, index, contracts_by_id):
     owner_binding = bindings_by_role["owner"]
     owner_type = scope["prototype"]["parameters"][owner_binding["index"]]["type"]
     slot_binding = bindings_by_role["slot"]
-    if _pointer_record_name(owner_type) != slot_binding["record_type"]:
+    if slot_binding["source"] == "member-value-pre" and (
+        _pointer_record_name(owner_type) != slot_binding["record_type"]
+    ):
         raise CatalogError(
             "{} owner pointee record type must match slot record_type".format(where)
+        )
+    if (
+        slot_binding["source"] == "transfer-argument"
+        and slot_binding["index"] != 1
+    ):
+        raise CatalogError(
+            "{} pci DMA transfer-argument slot must select guest address argument 1".format(
+                where
+            )
         )
 
     events = protocol["events"]
@@ -1534,12 +1733,39 @@ def _validate_protocol(protocol, index, contracts_by_id):
                     "{} has duplicate protocol selector".format(event_where)
                 )
             seen.add(key)
-            if expected_stage == "ring-advanced" and (
+            if expected_stage == "ring-advanced" and selector["kind"] == (
+                "member-update"
+            ) and (
                 selector["record_type"] != slot_binding["record_type"]
                 or selector["field"] != slot_binding["field"]
             ):
                 raise CatalogError(
                     "{} ring-advanced member must match slot binding".format(
+                        event_where
+                    )
+                )
+            if expected_stage == "ring-advanced" and selector["kind"] == (
+                "function-call"
+            ) and bindings_by_role["queue"]["source"] != (
+                "scope-argument-member-pre"
+            ):
+                raise CatalogError(
+                    "{} function ring advance requires a captured scope member queue".format(
+                        event_where
+                    )
+                )
+            if expected_stage == "interrupt-published" and (
+                (
+                    selector["kind"] == "function-call"
+                    and selector.get("operation") == "contains-bits"
+                )
+                or (
+                    selector["kind"] == "member-update"
+                    and selector["operation"] == "or-assign"
+                )
+            ) and selector["value"] != bindings_by_role["vector"]["value"]:
+                raise CatalogError(
+                    "{} completion value must equal the vector binding".format(
                         event_where
                     )
                 )
@@ -2323,7 +2549,11 @@ def validate_schema_document(schema):
     require_enum("protocol_binding", "source", PROTOCOL_BINDING_SOURCES)
     require_enum("protocol_selector", "kind", PROTOCOL_SELECTOR_KINDS)
     require_enum("protocol_selector", "phase", PROTOCOL_SELECTOR_PHASES)
-    require_enum("protocol_selector", "operation", PROTOCOL_MEMBER_OPERATIONS)
+    require_enum(
+        "protocol_selector",
+        "operation",
+        PROTOCOL_MEMBER_OPERATIONS | PROTOCOL_OWNER_RELATIONS | {"contains-bits"},
+    )
     require_enum("protocol_event", "stage", set(PROTOCOL_STAGES))
 
     member_path = definitions["operand"]["properties"]["path"]
@@ -2824,6 +3054,10 @@ def generate(catalog, schema):
                         selector.get("operation", ""),
                         selector["phase"],
                         selector.get("result_path", ""),
+                        selector.get("queue_argument", -1),
+                        selector.get("value_argument", -1),
+                        selector.get("value", 0),
+                        "value" in selector,
                         selector["expected_count"],
                     )
                 )
@@ -3026,6 +3260,10 @@ def generate(catalog, schema):
         "  const char *Operation;",
         "  const char *Phase;",
         "  const char *ResultPath;",
+        "  int QueueArgumentIndex;",
+        "  int ValueArgumentIndex;",
+        "  long long IntegerValue;",
+        "  bool HasIntegerValue;",
         "  unsigned ExpectedCount;",
         "};",
         "",
@@ -3365,8 +3603,12 @@ def generate(catalog, schema):
         ]
     )
     for selector in protocol_selectors:
-        fields = [_cpp_string(value) for value in selector[:-1]] + [
-            str(selector[-1])
+        fields = [_cpp_string(value) for value in selector[:11]] + [
+            str(selector[11]),
+            str(selector[12]),
+            _cpp_signed_long_long(selector[13]),
+            "true" if selector[14] else "false",
+            str(selector[15]),
         ]
         lines.append("  {{{}}},".format(", ".join(fields)))
     if not protocol_selectors:

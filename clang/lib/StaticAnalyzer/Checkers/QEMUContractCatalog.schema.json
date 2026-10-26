@@ -806,6 +806,8 @@
         "source": {
           "enum": [
             "scope-argument",
+            "scope-argument-member-pre",
+            "transfer-argument",
             "transfer-result",
             "member-value-pre",
             "integer-constant"
@@ -842,7 +844,9 @@
         "kind": {
           "enum": [
             "transfer-call",
+            "selective-summary-call",
             "member-update",
+            "indexed-member-update",
             "function-call"
           ]
         },
@@ -872,8 +876,25 @@
             "pre-increment",
             "post-increment",
             "add-assign",
-            "subtract-assign"
+            "subtract-assign",
+            "or-assign",
+            "pointer-member-value",
+            "embedded-member-address",
+            "contains-bits"
           ]
+        },
+        "queue_argument": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "value_argument": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "value": {
+          "type": "integer",
+          "minimum": -9223372036854775808,
+          "maximum": 9223372036854775807
         },
         "phase": {
           "enum": [
