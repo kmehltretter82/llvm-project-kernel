@@ -9,6 +9,16 @@
 // CHECK-NEXT: alpha.clone.CloneChecker:ReportNormalClones = true
 // CHECK-NEXT: alpha.cplusplus.STLAlgorithmModeling:AggressiveStdFindModeling = false
 // CHECK-NEXT: alpha.osx.cocoa.DirectIvarAssignment:AnnotatedFunctions = false
+// CHECK-NEXT: alpha.qemu.GuestMemorySafety:EmitStructuredWitness = false
+// CHECK-NEXT: alpha.qemu.GuestMemorySafety:EnableDMATransferResultDiagnostics = false
+// CHECK-NEXT: alpha.qemu.GuestMemorySafety:EnableFailedCompletionPublicationDiagnostics = false
+// CHECK-NEXT: alpha.qemu.GuestMemorySafety:EnableInitializedByteTracking = false
+// CHECK-NEXT: alpha.qemu.GuestMemorySafety:MaxInitializedRangesPerObject = 8
+// CHECK-NEXT: alpha.qemu.GuestMemorySafety:QEMUSourceRoot = ""
+// CHECK-NEXT: alpha.qemu.GuestMemorySafety:ReportLevelC = false
+// CHECK-NEXT: alpha.qemu.GuestMemorySafety:SelectiveSummaryManifest = ""
+// CHECK-NEXT: alpha.qemu.MigrationConsistency:EnableFlexibleVArrayDiagnostics = false
+// CHECK-NEXT: alpha.qemu.MigrationConsistency:EnableInlineVArrayDiagnostics = false
 // CHECK-NEXT: alpha.unix.PthreadLock:WarnOnLockOrderReversal = false
 // CHECK-NEXT: apply-fixits = false
 // CHECK-NEXT: assume-at-least-one-iteration = false
